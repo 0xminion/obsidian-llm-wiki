@@ -212,15 +212,53 @@ class Plans:
         data = json.loads(path.read_text())
         return cls(plans=[Plan.from_dict(d) for d in data])
 
-    def split_batches(self, parallel: int) -> list[list[Plan]]:
-        """Split plans into N batches for parallel processing."""
+    def split_batches(self, parallel: int, extract_dir: "Path | None" = None) -> list[list[Plan]]:
+        """Split plans into N batches for parallel processing.
+
+        If extract_dir is provided, uses content-size-aware splitting to avoid
+        blowing the max_total_content budget per batch. Otherwise falls back to
+        simple ceiling division.
+        """
         if not self.plans:
             return []
-        batch_size = max(1, -(-len(self.plans) // parallel))  # ceil division
-        batches = []
-        for i in range(0, len(self.plans), batch_size):
-            batches.append(self.plans[i : i + batch_size])
-        return batches
+
+        if extract_dir is None:
+            # Legacy: simple ceiling division
+            batch_size = max(1, -(-len(self.plans) // parallel))
+            batches = []
+            for i in range(0, len(self.plans), batch_size):
+                batches.append(self.plans[i : i + batch_size])
+            return batches
+
+        # Content-size-aware: bin-pack plans into N bins, minimizing max bin size
+        # Read content sizes from extract files
+        import json as _json
+        plan_sizes: list[tuple[Plan, int]] = []
+        for p in self.plans:
+            ext_file = extract_dir / f"{p.hash}.json"
+            if ext_file.exists():
+                try:
+                    ext = _json.loads(ext_file.read_text(encoding="utf-8"))
+                    plan_sizes.append((p, len(ext.get("content", ""))))
+                except (OSError, _json.JSONDecodeError):
+                    plan_sizes.append((p, 0))
+            else:
+                plan_sizes.append((p, 0))
+
+        # Sort descending by size (largest first — LPT bin packing heuristic)
+        plan_sizes.sort(key=lambda x: x[1], reverse=True)
+
+        # Greedy bin packing into N bins
+        bins: list[list[Plan]] = [[] for _ in range(parallel)]
+        bin_sizes = [0] * parallel
+        for plan, size in plan_sizes:
+            # Put into the bin with smallest current total
+            min_bin = min(range(parallel), key=lambda i: bin_sizes[i])
+            bins[min_bin].append(plan)
+            bin_sizes[min_bin] += size
+
+        # Remove empty bins
+        return [b for b in bins if b]
 
 
 # ─── Edge ─────────────────────────────────────────────────────────────────────

@@ -33,10 +33,35 @@ For each concept in CONCEPT_NEW:
 For each concept in CONCEPT_UPDATES:
   Read the existing concept file, add the new source to its sources list and links.
 
-STEP 4 — UPDATE MoCs
-For each MoC in MOC_TARGETS:
-  Read 04-Wiki/mocs/[moc-name].md
-  Add wikilink to the new entry with 1-sentence summary
+STEP 4 — CREATE/UPDATE MoCs (MANDATORY)
+For EVERY entry in this batch:
+  a) Determine which topic cluster it belongs to (e.g., "AI & The Economy", "Crypto & DeFi",
+     "Prediction Markets", "Design Philosophy", "Meritocracy & Education", "Culture & Language").
+  b) Check if a MoC file exists at 04-Wiki/mocs/[topic-name].md
+     - If YES: Read it, add the new entry wikilink with a 1-sentence summary under the appropriate section.
+     - If NO: CREATE a new MoC file with this structure:
+
+Write to: 04-Wiki/mocs/[topic-name].md
+---
+title: "[Topic Name]"
+type: moc
+date_created: {TODAY}
+date_updated: {TODAY}
+---
+
+# [Topic Name]
+
+## Synthesis
+[2-3 sentence synthesis of how the entries in this topic cluster relate to each other]
+
+## Concepts
+- [[concept-1]]
+- [[concept-2]]
+
+## Entries
+- [[Entry Title]] — 1-sentence summary
+
+  Do NOT skip MoC creation. Every batch MUST produce at least one MoC file (new or updated).
 
 STEP 5 — UPDATE INDEX
 Append entry and new concepts to 06-Config/wiki-index.md

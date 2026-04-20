@@ -168,6 +168,29 @@ class TestPlans:
         batches = plans.split_batches(parallel=3)
         assert batches == []
 
+    def test_split_batches_content_aware(self, tmp_path):
+        """Content-size-aware batching distributes large sources evenly."""
+        import json as _json
+        # Create extract files with varying content sizes
+        sizes = [50000, 30000, 15000, 8000, 5000, 2000]  # 6 sources, very different sizes
+        for i, size in enumerate(sizes):
+            ext = {"content": "x" * size, "title": f"Source {i}", "url": f"https://example.com/{i}"}
+            (tmp_path / f"p{i}.json").write_text(_json.dumps(ext))
+
+        plans = Plans(plans=[Plan(hash=f"p{i}", title=f"Source {i}") for i in range(6)])
+        batches = plans.split_batches(parallel=3, extract_dir=tmp_path)
+
+        # Should produce 3 batches
+        assert len(batches) == 3
+        # Each batch should have similar total content (within reason)
+        batch_totals = []
+        for batch in batches:
+            total = sum(sizes[int(p.hash[1:])] for p in batch)
+            batch_totals.append(total)
+        # Largest batch should not be more than 2x the smallest
+        # (with ceiling div this would be 50000+2000 vs 5000 = 10x)
+        assert max(batch_totals) / max(min(batch_totals), 1) < 3
+
     def test_save_and_load(self, tmp_path):
         plans = Plans(plans=[
             Plan(hash="abc", title="Test", tags=["ai"]),

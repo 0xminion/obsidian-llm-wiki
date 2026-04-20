@@ -40,9 +40,9 @@ def create_all(plans: Plans, cfg: Config, parallel: int = 3) -> dict:
     if not isinstance(parallel, int) or parallel < 1:
         raise ValueError(f"PARALLEL must be a positive integer, got: {parallel}")
 
-    # Split into batches
-    batches = plans.split_batches(parallel)
-    log.info("Split %d plans into %d batches", plan_count, len(batches))
+    # Split into batches (content-size-aware when extract_dir available)
+    batches = plans.split_batches(parallel, extract_dir=cfg.resolved_extract_dir)
+    log.info("Split %d plans into %d batches (content-size-aware)", plan_count, len(batches))
 
     # ─── Spawn parallel agents ────────────────────────────────────────────
     results: list[dict] = []
