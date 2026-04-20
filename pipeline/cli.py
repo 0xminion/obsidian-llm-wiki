@@ -145,6 +145,61 @@ def _collect_url_files(inbox_dir: Path) -> list[tuple[Path, str]]:
     return results
 
 
+@app.command()
+def init(
+    vault: Path = typer.Argument(None, help="Vault path (default: ~/MyVault)"),
+    force: bool = typer.Option(False, "--force", "-f", help="Auto-migrate without prompting"),
+    quiet: bool = typer.Option(False, "--quiet", "-q", help="Minimal output"),
+):
+    """Initialize or migrate vault structure."""
+    from pipeline.vault_setup import detect_vault, setup_vault, migrate_vault
+
+    vault_path = vault or Path.home() / "MyVault"
+    repo_root = Path(__file__).parent.parent
+
+    state = detect_vault(vault_path)
+
+    if state.state == "existing":
+        typer.echo(f"Vault ready: {vault_path}")
+        raise typer.Exit(code=0)
+
+    if state.state == "new":
+        typer.echo(f"Setting up new vault at {vault_path}")
+        actions = setup_vault(vault_path, repo_root=repo_root, quiet=quiet)
+        if not quiet:
+            for a in actions:
+                typer.echo(f"  + {a}")
+        typer.echo(f"\nSetup complete: {len(actions)} actions.")
+        raise typer.Exit(code=0)
+
+    # Incomplete
+    typer.echo(f"Incomplete vault at {vault_path}:")
+    if state.missing_dirs:
+        typer.echo(f"  Missing dirs: {', '.join(state.missing_dirs)}")
+    if state.missing_files:
+        typer.echo(f"  Missing files: {', '.join(state.missing_files)}")
+
+    if not force:
+        response = typer.confirm("Migrate vault structure?", default=True)
+        if not response:
+            typer.echo("Migration skipped.")
+            raise typer.Exit(code=1)
+
+    actions = migrate_vault(vault_path, state, repo_root=repo_root)
+    if not quiet:
+        for a in actions:
+            typer.echo(f"  + {a}")
+    typer.echo(f"\nMigration complete: {len(actions)} actions.")
+    raise typer.Exit(code=0)
+
+
+def _auto_setup(vault_path: Path) -> str:
+    """Auto-detect and setup/migrate vault. Returns state string."""
+    from pipeline.vault_setup import ensure_vault_ready
+    repo_root = Path(__file__).parent.parent
+    return ensure_vault_ready(vault_path, repo_root=repo_root, force=True)
+
+
 # ─── Main: ingest ─────────────────────────────────────────────────────────────
 
 @app.command()
@@ -161,6 +216,13 @@ def ingest(
     cfg = _load_cfg(vault)
     _setup_logging(verbose, cfg.log_file)
     t0 = time.time()
+
+    # Auto-setup vault if new or incomplete
+    vault_state = _auto_setup(cfg.vault_path)
+    if vault_state == "new":
+        typer.echo(f"New vault initialized at {cfg.vault_path}")
+    elif vault_state == "migrated":
+        typer.echo(f"Vault structure migrated at {cfg.vault_path}")
 
     typer.echo(f"Pipeline ingest — vault: {cfg.vault_path}")
     typer.echo(f"Extract dir: {cfg.resolved_extract_dir}")
