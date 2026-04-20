@@ -38,6 +38,17 @@ _REQUIRED_CONCEPT_SECTIONS = [
     "Links",
 ]
 
+_REQUIRED_SOURCE_SECTIONS = [
+    "Original content",
+]
+
+_MIN_SOURCE_BODY_LENGTH = 200
+
+# Source body patterns that indicate just a link instead of full content
+_LINK_ONLY_PATTERNS = [
+    re.compile(r"^\[Original source\]\(https?://", re.MULTILINE),
+]
+
 
 def validate_output(cfg: Config, since_manifest: Path) -> list[str]:
     """Check files created after the manifest timestamp for violations.
@@ -47,6 +58,7 @@ def validate_output(cfg: Config, since_manifest: Path) -> list[str]:
       - Required sections exist
       - No stub content (> 待补充, > TODO)
       - No banned tags
+      - Source notes have full content (not just links)
 
     Returns list of violation strings.
     """
@@ -66,6 +78,7 @@ def validate_output(cfg: Config, since_manifest: Path) -> list[str]:
     dirs_to_check = [
         (cfg.entries_dir, "entry", _REQUIRED_ENTRY_SECTIONS),
         (cfg.concepts_dir, "concept", _REQUIRED_CONCEPT_SECTIONS),
+        (cfg.sources_dir, "source", _REQUIRED_SOURCE_SECTIONS),
     ]
 
     for dir_path, note_type, required_sections in dirs_to_check:
@@ -101,7 +114,7 @@ def validate_output(cfg: Config, since_manifest: Path) -> list[str]:
             if tags_match:
                 tag_lines = tags_match.group(1)
                 for tag in _BANNED_TAGS:
-                    if f"- {tag}" in tag_lines.lower() or f"- \"{tag}\"" in tag_lines.lower():
+                    if f"- {tag}" in tag_lines.lower() or f'- "{tag}"' in tag_lines.lower():
                         violations.append(f"{rel_path}: banned tag: {tag}")
 
             # Check stub content
@@ -114,6 +127,21 @@ def validate_output(cfg: Config, since_manifest: Path) -> list[str]:
             for section in required_sections:
                 if f"## {section}" not in content and f"##{section}" not in content:
                     violations.append(f"{rel_path}: missing required section: ## {section}")
+
+            # Source-specific: check for link-only sources (not full content)
+            if note_type == "source":
+                body_text = body.strip()
+                if len(body_text) < _MIN_SOURCE_BODY_LENGTH:
+                    violations.append(
+                        f"{rel_path}: source body too short ({len(body_text)} chars) — "
+                        f"expected full content, not just a link"
+                    )
+                for pattern in _LINK_ONLY_PATTERNS:
+                    if pattern.search(content):
+                        violations.append(
+                            f"{rel_path}: source has link instead of full content"
+                        )
+                        break
 
     return violations
 
@@ -224,5 +252,8 @@ def _generate_section_content(section: str, content: str, note_type: str) -> str
             unique_links = list(dict.fromkeys(links))[:10]
             return "\n".join(f"- [[{link}]]" for link in unique_links)
         return ""
+
+    elif section == "Original content":
+        return "Full content should be embedded here from extraction."
 
     return ""

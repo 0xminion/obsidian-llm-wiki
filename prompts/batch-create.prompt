@@ -13,12 +13,19 @@ SOURCES:
 
 FOR EACH SOURCE, DO THESE STEPS:
 
-STEP 1 — CREATE SOURCE NOTE
+STEP 1 — CREATE SOURCE NOTE (MANDATORY: embed FULL content, never link)
 Write to: 04-Wiki/sources/[title].md
 Frontmatter: title, source_url, source_type, author, date_captured ({TODAY}), tags, status: processed
-Body: # Original content
 
-[full content]
+The body MUST contain the FULL extracted text from the CONTENT block above, copied verbatim under ## Original content.
+Do NOT write just a link. Do NOT summarize. Copy the entire content text.
+
+Body format:
+# [Title]
+
+## Original content
+
+[copy EVERYTHING from the CONTENT block above — the full transcript, article text, or tweet thread. Not a summary. Not a link. The complete text.]
 
 STEP 2 — CREATE ENTRY NOTE
 Write to: 04-Wiki/entries/[title].md
@@ -35,31 +42,50 @@ For each concept in CONCEPT_UPDATES:
 
 STEP 4 — CREATE/UPDATE MoCs (MANDATORY)
 For EVERY entry in this batch:
-  a) Determine which topic cluster it belongs to (e.g., "AI & The Economy", "Crypto & DeFi",
-     "Prediction Markets", "Design Philosophy", "Meritocracy & Education", "Culture & Language").
+  a) Determine which topic cluster it belongs to (e.g., "Prediction Markets / 预测市场",
+     "Crypto & DeFi / 加密与去中心化金融", "AI & The Economy / AI 与经济").
   b) Check if a MoC file exists at 04-Wiki/mocs/[topic-name].md
      - If YES: Read it, add the new entry wikilink with a 1-sentence summary under the appropriate section.
      - If NO: CREATE a new MoC file with this structure:
 
 Write to: 04-Wiki/mocs/[topic-name].md
 ---
-title: "[Topic Name]"
+title: "[Topic Name / 中文标题]"
 type: moc
+status: active
 date_created: {TODAY}
 date_updated: {TODAY}
+tags:
+  - map-of-content
+  - "[topic-tag]"
 ---
 
 # [Topic Name]
 
-## Synthesis
-[2-3 sentence synthesis of how the entries in this topic cluster relate to each other]
+## Overview / 概述
 
-## Concepts
-- [[concept-1]]
-- [[concept-2]]
+[2-3 sentence synthesized summary of what this topic covers and how entries relate]
 
-## Entries
+## [Topic Section 1] / [中文标题]
+
 - [[Entry Title]] — 1-sentence summary
+- [[Entry Title]] — 1-sentence summary
+
+## [Topic Section 2] / [中文标题]
+
+- [[Entry Title]] — 1-sentence summary
+
+## Bridge Concepts / 桥接概念
+
+- [[Concept Name]] — how it connects entries across sections
+
+## Cross-References / 关联图谱
+
+[ASCII diagram or description of how notes connect]
+
+## Related MoCs / 相关图谱
+
+- [[Related MoC]] — how it connects
 
   Do NOT skip MoC creation. Every batch MUST produce at least one MoC file (new or updated).
 

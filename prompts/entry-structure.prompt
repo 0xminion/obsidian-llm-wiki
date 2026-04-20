@@ -44,13 +44,11 @@ Body sections IN THIS ORDER (use ## and ### markdown headings):
 
 ## Core insights
 Key findings and arguments. Simple language, no jargon, concrete examples.
-Use a numbered list (1., 2., 3., etc.). Extract EVERYTHING significant.
-Each numbered item is substantive with a clear explanation.
+Use a bullet-point list (dash-prefixed). Extract EVERYTHING significant.
+Each bullet item is substantive with a clear explanation.
 
 ## Other takeaways
-Additional important findings. Numbered list that CONTINUES from Core
-insights numbering (e.g., if Core ends at 4, start Other at 5).
-No artificial limits.
+Additional important findings. Bullet-point list. No artificial limits.
 
 ## Diagrams
 Optional — include ONLY if a diagram genuinely aids understanding (processes,
@@ -58,7 +56,7 @@ relationships, hierarchies, comparisons). Use Obsidian mermaid code blocks.
 If not needed, write: 'n/a'
 
 ## Open questions
-Use a numbered list (1., 2., 3.). Questions, gaps, assumptions raised by
+Use a bullet-point list. Questions, gaps, assumptions raised by
 the source. What doesn't the source answer? What assumptions does it make?
 
 ## Linked concepts
@@ -85,18 +83,18 @@ Body sections IN THIS ORDER — ALL BODY TEXT IN CHINESE:
 3-5句中文摘要。简洁明了，不要废话。
 
 ## 核心发现
-关键发现和论点。通俗易懂，用具体例子。用编号列表。提取所有重要内容。
-每个编号项都要有实质内容。
+关键发现和论点。通俗易懂，用具体例子。用破折号列表。提取所有重要内容。
+每个项目都要有实质内容。
 
 ## 其他要点
-继续从核心发现的编号开始。不要人为限制数量。
+补充重要发现。破折号列表。不要人为限制数量。
 
 ## 图表
 可选——仅在图表确实有助于理解时才加入（流程、关系、层级、比较）。
 用Obsidian mermaid代码块。不需要则写：'n/a'
 
 ## 开放问题
-编号列表。源文件提出的问题、缺口、假设。
+破折号列表。源文件提出的问题、缺口、假设。
 
 ## 关联概念
 破折号列表。Wikilinks到相关概念笔记、条目笔记和MoC。
@@ -111,7 +109,7 @@ Body sections:
 ## Summary
 3-5 sentence overview.
 ## Key Findings
-Numbered list of findings with evidence and data points.
+Bullet-point list of findings with evidence and data points.
 ## Data/Evidence
 Tables, metrics, specific numbers from the source.
 ## Methodology
@@ -147,7 +145,7 @@ What this procedure achieves.
 ## Prerequisites
 What you need before starting.
 ## Steps
-Numbered step-by-step instructions.
+Bullet-point step-by-step instructions.
 ## Gotchas
 Common mistakes, edge cases, things that break.
 ## Linked concepts
