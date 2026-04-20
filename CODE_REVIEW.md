@@ -154,3 +154,69 @@ $ python3 -m py_compile pipeline/compile.py    # OK
 $ python3 -m py_compile pipeline/create.py     # OK
 $ python3 -m py_compile pipeline/plan.py       # OK
 ```
+
+---
+
+## Review 2026-04-20: Multi-Agent Audit (Agent 1: Comprehensive, Agent 2: Security, Agent 3: Integration)
+
+**Reviewers:** Agent1 (Comprehensive) + Agent2 (Security & Correctness) + Agent3 (Integration & Production)
+**Date:** 2026-04-20
+**Method:** Full end-to-end, 70+ files, 3 independent agents with cross-referencing
+**Tests:** 406 passed, 0 failed (post-fix)
+**Overall Health:** 9/10
+
+---
+
+### CRITICAL (Fixed)
+
+**C1. `_shared.py:239,263,283` — AssemblyAI auth header broken**
+All 3 API calls used `Bearer ***` (redaction placeholder left in code) instead of `Bearer {api_key}`. AssemblyAI transcription always failed silently.
+**Fix:** Replaced with `f\"Authorization: Bearer {api_key}\"` in all 3 locations.
+
+**C2. `templates.py:110-138` — Entry template missing 2 required sections**
+`generate_entry_content()` only generated 4 sections (Summary, Core insights, Other takeaways, Linked concepts). `lint.py` expects 6 for standard entries (also Diagrams, Open questions). Pipeline-created entries always failed lint.
+**Fix:** Added `## Diagrams` (n/a) and `## Open questions` sections.
+
+**C3. `validate.py:29-33` — Post-write validator only checked 3 of 6 entry sections**
+`_REQUIRED_ENTRY_SECTIONS` had only Summary, Core insights, Linked concepts. Missing: Other takeaways, Diagrams, Open questions.
+**Fix:** Expanded to all 6 sections.
+
+### HIGH (Fixed)
+
+**H1. `templates.py:38-40` — Source frontmatter field names wrong**
+Generated `type:` and `date:` but the Source template and `vault.py:write_source()` expect `source_type:` and `date_captured:`. Auto-generated sources had mismatched frontmatter.
+**Fix:** Changed to `source_type:` and `date_captured:`.
+
+**H2. `review.py:149` — archive_inbox passed empty set**
+After approving reviews, `archive_inbox(cfg, set())` passed an empty set — inbox files were never archived.
+**Fix:** Collect `plan_hash` from each approved review, pass `approved_hashes` set.
+
+**H3. `plan.py:165` — Redundant Exception catch**
+`except (json.JSONDecodeError, KeyError, Exception)` made the specific catches dead code — Exception catches everything.
+**Fix:** Split into `except (json.JSONDecodeError, KeyError)` and `except OSError`.
+
+**H4. `config.py:182-195` — int() on env vars crashes on bad values**
+`int(os.environ.get(\"MAX_RETRIES\", \"3\"))` crashes with unhandled ValueError if env var is non-numeric.
+**Fix:** Added `_int_env(key, default)` helper with try/except and warning log.
+
+**H5. `templates.py:32` — Default tag \"source\" is banned**
+Source template used `\"  - source\"` as default when no tags, but \"source\" is in `_BANNED_TAGS`. Validation always failed on tagless sources.
+**Fix:** Use empty string instead of banned default tag.
+
+### MID (Fixed)
+
+**M1. `plan.py:193-195` — Duplicate section comment** (removed)
+**M2. `validate.py:68-73` — Unnecessary JSON parse** (only mtime was used, removed json.loads + import)
+**M3. Unused imports removed:** Optional from youtube.py, podcast.py, web.py, compile.py; json/os/hashlib from extract.py
+**M4. `stats.py` — 3 local `import re` moved to top-level**
+
+### LOW (Fixed)
+
+**L1. `validate.py:128` — Dead code branch** (`f\"###{section}\"` can never match)
+**L2. `setup.sh:102-110` — Dead loop** (iterates scripts/*.py which don't exist)
+
+### NOT FIXED (Verified Correct)
+
+**N1. `models.py:286` — Edge.from_tsv() escape order**
+Agent report suggested reversing unescape order. Verified via round-trip testing: current order is correct. The alternative order introduces new failures. The inherent limitation (literal `\\t` ambiguity) is a property of the escape scheme, not the code.
+
