@@ -14,7 +14,6 @@ import re
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import Optional
 
 from pipeline.config import Config
 from pipeline.models import ExtractedSource, SourceType

@@ -121,6 +121,7 @@ def approve_reviews(cfg: Config, review_ids: Optional[list[int]] = None) -> dict
         pending = [r for r in pending if r["id"] in review_ids]
 
     stats = {"approved": 0, "written": 0, "failed": 0}
+    approved_hashes: set[str] = set()
 
     for review in pending:
         try:
@@ -133,6 +134,7 @@ def approve_reviews(cfg: Config, review_ids: Optional[list[int]] = None) -> dict
             store.review_approve(review["id"])
             stats["approved"] += 1
             stats["written"] += 1
+            approved_hashes.add(review["plan_hash"])
             log.info("Approved and wrote: %s", file_path.name)
 
         except Exception as e:
@@ -146,7 +148,7 @@ def approve_reviews(cfg: Config, review_ids: Optional[list[int]] = None) -> dict
         try:
             from pipeline.vault import reindex as vault_reindex, archive_inbox
             vault_reindex(cfg)
-            archive_inbox(cfg, set())
+            archive_inbox(cfg, approved_hashes)
         except Exception as e:
             log.warning("Post-approve reindex/archive failed: %s", e)
 

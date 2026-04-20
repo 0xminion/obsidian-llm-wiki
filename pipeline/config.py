@@ -8,10 +8,13 @@ Loads settings from:
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
+
+log = logging.getLogger(__name__)
 
 try:
     from dotenv import load_dotenv
@@ -160,6 +163,15 @@ class Config:
 
 
 
+def _int_env(key: str, default: int) -> int:
+    """Safely parse an integer from an environment variable."""
+    try:
+        return int(os.environ.get(key, str(default)))
+    except (ValueError, TypeError):
+        log.warning("Invalid integer for %s, using default %d", key, default)
+        return default
+
+
 def load_config(
     vault_path: Optional[Path] = None,
     env_file: Optional[Path] = None,
@@ -179,19 +191,19 @@ def load_config(
             or str(Path.home() / "MyVault")
         ),
         agent_cmd=os.environ.get("AGENT_CMD", "hermes"),
-        max_retries=int(os.environ.get("MAX_RETRIES", "3")),
-        parallel=int(os.environ.get("PARALLEL", "3")),
+        max_retries=_int_env("MAX_RETRIES", 3),
+        parallel=_int_env("PARALLEL", 3),
         transcript_api_key=os.environ.get("TRANSCRIPT_API_KEY", ""),
         supadata_api_key=os.environ.get("SUPADATA_API_KEY", ""),
         assemblyai_api_key=os.environ.get("ASSEMBLYAI_API_KEY", ""),
         qmd_cmd=os.environ.get("QMD_CMD", "qmd"),
         qmd_collection=os.environ.get("QMD_COLLECTION", "concepts"),
-        extract_timeout=int(os.environ.get("EXTRACT_TIMEOUT", "45")),
-        agent_timeout=int(os.environ.get("AGENT_TIMEOUT", "900")),
-        plan_timeout=int(os.environ.get("PLAN_TIMEOUT", "600")),
-        max_content_per_source=int(os.environ.get("MAX_CONTENT_PER_SOURCE", "8000")),
-        max_total_content=int(os.environ.get("MAX_TOTAL_CONTENT", "15000")),
-        max_content_insights=int(os.environ.get("MAX_CONTENT_INSIGHTS", "6000")),
+        extract_timeout=_int_env("EXTRACT_TIMEOUT", 45),
+        agent_timeout=_int_env("AGENT_TIMEOUT", 900),
+        plan_timeout=_int_env("PLAN_TIMEOUT", 600),
+        max_content_per_source=_int_env("MAX_CONTENT_PER_SOURCE", 8000),
+        max_total_content=_int_env("MAX_TOTAL_CONTENT", 15000),
+        max_content_insights=_int_env("MAX_CONTENT_INSIGHTS", 6000),
         whisper_language=os.environ.get("WHISPER_LANGUAGE", ""),
     )
 

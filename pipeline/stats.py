@@ -6,6 +6,7 @@ Consolidates vault-stats.sh into Python.
 
 from __future__ import annotations
 
+import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -79,14 +80,13 @@ def generate_dashboard(cfg: Config) -> str:
 
     # ─── Health Indicators ─────────────────────────────────────────────────────
     # Orphan check — O(N) indexed approach: build reference set once
-    import re as _re
     all_refs: set[str] = set()
     for ref_dir in (cfg.entries_dir, cfg.concepts_dir, cfg.mocs_dir, cfg.sources_dir):
         if not ref_dir.exists():
             continue
         for md in ref_dir.glob("*.md"):
             content = md.read_text(encoding="utf-8", errors="replace")
-            for m in _re.finditer(r'\[\[([^\]]+)\]\]', content):
+            for m in re.finditer(r'\[\[([^\]]+)\]\]', content):
                 all_refs.add(m.group(1))
 
     orphan_count = 0
@@ -105,7 +105,6 @@ def generate_dashboard(cfg: Config) -> str:
     log_file = cfg.config_dir / "log.md"
     last_ingest = "never"
     if log_file.exists():
-        import re
         log_content = log_file.read_text(encoding="utf-8", errors="replace")
         matches = re.findall(r"^## \[.*?\] ingest", log_content, re.MULTILINE)
         if matches:
@@ -132,7 +131,6 @@ def generate_dashboard(cfg: Config) -> str:
     lines.extend(["## Recent Activity", ""])
     if log_file.exists():
         log_content = log_file.read_text(encoding="utf-8", errors="replace")
-        import re
         recent = re.findall(r"^## \[.*?\].*", log_content, re.MULTILINE)
         lines.append("```")
         lines.extend(recent[-5:] if recent else ["(no activity)"])

@@ -12,7 +12,6 @@ import os
 import re
 import subprocess
 import tempfile
-from typing import Optional
 from urllib.parse import quote
 
 from pipeline.config import Config

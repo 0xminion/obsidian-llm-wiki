@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import logging
 import re
 from pathlib import Path
@@ -29,6 +28,9 @@ _REQUIRED_FM_FIELDS: dict[str, list[str]] = {
 _REQUIRED_ENTRY_SECTIONS = [
     "Summary",
     "Core insights",
+    "Other takeaways",
+    "Diagrams",
+    "Open questions",
     "Linked concepts",
 ]
 
@@ -67,9 +69,8 @@ def validate_output(cfg: Config, since_manifest: Path) -> list[str]:
     # Get manifest timestamp (when Stage 3 started)
     if since_manifest.exists():
         try:
-            manifest_data = json.loads(since_manifest.read_text(encoding="utf-8"))
             manifest_mtime = since_manifest.stat().st_mtime
-        except (json.JSONDecodeError, OSError):
+        except OSError:
             manifest_mtime = 0
     else:
         manifest_mtime = 0
@@ -125,7 +126,7 @@ def validate_output(cfg: Config, since_manifest: Path) -> list[str]:
 
             # Check required sections
             for section in required_sections:
-                if f"## {section}" not in content and f"##{section}" not in content:
+                if f"## {section}" not in content:
                     violations.append(f"{rel_path}: missing required section: ## {section}")
 
             # Source-specific: check for link-only sources (not full content)

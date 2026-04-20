@@ -458,6 +458,9 @@ class TestValidateCatchesIssues:
             "date_entry: 2026-01-01\nstatus: draft\ntemplate: standard\ntags:\n  - good\n---\n"
             "# Good Entry\n## Summary\nA proper summary.\n"
             "## Core insights\n- Insight one\n"
+            "## Other takeaways\n- None yet.\n"
+            "## Diagrams\nn/a\n"
+            "## Open questions\n- None yet.\n"
             "## Linked concepts\n- [[concept-a]]\n"
         )
 

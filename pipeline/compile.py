@@ -9,7 +9,6 @@ from __future__ import annotations
 import logging
 import subprocess
 from pathlib import Path
-from typing import Optional
 
 from pipeline.config import Config
 from pipeline.utils import count_md

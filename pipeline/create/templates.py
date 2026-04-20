@@ -29,15 +29,15 @@ def generate_source_content(
     source_type = extracted.get("type", "web")
     author = escape_yaml(extracted.get("author", ""))
     content = extracted.get("content", "")[:2000]
-    tags_yaml = "\n".join(f"  - {t}" for t in plan.tags) if plan.tags else "  - source"
+    tags_yaml = "\n".join(f"  - {t}" for t in plan.tags) if plan.tags else ""
     today = date.today().isoformat()
 
     return f"""---
 title: "{title}"
 source_url: "{url}"
-type: {source_type}
+source_type: {source_type}
 author: "{author}"
-date: {today}
+date_captured: {today}
 tags:
 {tags_yaml}
 template: {plan.template.value}
@@ -129,6 +129,14 @@ template: {plan.template.value}
 {core_insights_section}
 
 ## Other takeaways
+
+- None yet.
+
+## Diagrams
+
+n/a
+
+## Open questions
 
 - None yet.
 

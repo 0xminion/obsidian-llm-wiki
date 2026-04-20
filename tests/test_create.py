@@ -396,6 +396,12 @@ class TestValidateOutput:
             "A good summary.\n\n"
             "## Core insights\n\n"
             "1. Insight one.\n\n"
+            "## Other takeaways\n\n"
+            "- None yet.\n\n"
+            "## Diagrams\n\n"
+            "n/a\n\n"
+            "## Open questions\n\n"
+            "- None yet.\n\n"
             "## Linked concepts\n\n"
             "- [[some-concept]]\n",
             encoding="utf-8",

@@ -162,7 +162,10 @@ def _run_qmd(query: str, cfg: Config) -> list[ConceptMatch]:
     except subprocess.TimeoutExpired:
         log.warning("qmd timeout for query: %s", query[:80])
         return []
-    except (json.JSONDecodeError, KeyError, Exception) as e:
+    except (json.JSONDecodeError, KeyError) as e:
+        log.warning("qmd parse error: %s", e)
+        return []
+    except OSError as e:
         log.warning("qmd error: %s", e)
         return []
 
@@ -191,8 +194,6 @@ def concept_search(manifest: Manifest, cfg: Config) -> dict[str, list[ConceptMat
 # ─── Deterministic Planning (Rec 3) ──────────────────────────────────────────
 
 _CJK_RE = re.compile(r"[\u4e00-\u9fff\u3400-\u4dbf\u3000-\u303f]")
-
-# ─── Deterministic Planning (Rec 3) ──────────────────────────────────────────
 
 
 def detect_language(content: str) -> Language:

@@ -99,16 +99,6 @@ for f in process-inbox.sh stage1-extract.sh stage2-plan.sh stage3-create.sh rein
   [ -f "$VAULT_PATH/Meta/Scripts/$f" ] && rm "$VAULT_PATH/Meta/Scripts/$f" && cp_count=$((cp_count + 1))
 done
 
-# Python helpers
-for f in "$SCRIPT_DIR"/scripts/*.py; do
-  [ -f "$f" ] || continue
-  dest="$VAULT_PATH/Meta/Scripts/$(basename "$f")"
-  if [ ! -f "$dest" ] || ! diff -q "$f" "$dest" &>/dev/null; then
-    cp "$f" "$dest"
-    cp_count=$((cp_count + 1))
-  fi
-done
-
 # Lib
 for f in "$SCRIPT_DIR"/lib/*.sh "$SCRIPT_DIR"/lib/*.py; do
   [ -f "$f" ] || continue

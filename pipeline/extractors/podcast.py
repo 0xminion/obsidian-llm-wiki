@@ -14,7 +14,6 @@ import re
 import subprocess
 import tempfile
 import xml.etree.ElementTree as ET
-from typing import Optional
 from urllib.parse import quote
 
 from pipeline.config import Config
