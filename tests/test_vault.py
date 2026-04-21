@@ -443,3 +443,47 @@ class TestArchiveInbox:
         count = archive_inbox(cfg, {url_hash})
         assert count == 1
         assert (cfg.inbox_dir / "notes.txt").exists()  # non-.url untouched
+
+
+# ─── Edge Cache Tests ────────────────────────────────────────────────────────
+
+from pipeline.vault import clear_edge_cache
+
+class TestEdgeCache:
+    def test_duplicate_edge_skipped(self, cfg: Config):
+        clear_edge_cache()
+        edge = Edge(source="X", target="Y", type=EdgeType.SUPPORTS, description="first")
+        write_edge(cfg, edge)
+        write_edge(cfg, edge)  # same edge again
+        edges = read_edges(cfg)
+        assert len(edges) == 1
+
+    def test_clear_cache_reloads(self, cfg: Config):
+        clear_edge_cache()
+        edge = Edge(source="A", target="B", type=EdgeType.SUPPORTS, description="")
+        write_edge(cfg, edge)
+
+        # Manually append a duplicate directly to the file (bypassing cache)
+        with cfg.edges_file.open("a") as f:
+            f.write("A\tB\tsupports\tdupe\n")
+
+        # Cache still thinks (A,B,supports) exists — would skip
+        edge2 = Edge(source="A", target="B", type=EdgeType.SUPPORTS, description="new")
+        write_edge(cfg, edge2)  # skipped because cache says duplicate
+
+        # After clear, re-reads from file
+        clear_edge_cache()
+        edge3 = Edge(source="C", target="D", type=EdgeType.EXTENDS, description="")
+        write_edge(cfg, edge3)
+
+        edges = read_edges(cfg)
+        assert len(edges) == 3  # original + manual dupe + new edge
+
+    def test_different_types_not_duplicate(self, cfg: Config):
+        clear_edge_cache()
+        e1 = Edge(source="A", target="B", type=EdgeType.SUPPORTS, description="")
+        e2 = Edge(source="A", target="B", type=EdgeType.EXTENDS, description="")
+        write_edge(cfg, e1)
+        write_edge(cfg, e2)
+        edges = read_edges(cfg)
+        assert len(edges) == 2

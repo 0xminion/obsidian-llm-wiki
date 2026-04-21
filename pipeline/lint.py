@@ -3,11 +3,12 @@
 Consolidates all checks from lint-vault.sh (12 checks) and validate-output.sh
 (6 checks + fix mode) into a single Python module.
 
+Supports incremental checking via vault cache — only re-scans files that changed
+since the last lint run.
+
 Usage:
-    from pipeline.lint import LintChecker
-    checker = LintChecker(vault_path)
-    result = checker.run_all()
-    checker.write_report(result)
+    from pipeline.lint import run_lint
+    result = run_lault(vault_path, fix=False)
 
 Or via CLI:
     pipeline lint ~/MyVault
@@ -22,6 +23,10 @@ from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Optional
+
+import logging
+
+log = logging.getLogger(__name__)
 
 
 class Severity(Enum):
@@ -67,10 +72,7 @@ def _parse_frontmatter(content: str) -> dict:
         return {}
 
 
-def _extract_body(content: str) -> str:
-    """Extract body content (everything after frontmatter)."""
-    m = re.match(r"^---\s*\n.*?\n---\s*\n(.*)", content, re.DOTALL)
-    return m.group(1) if m else content
+from pipeline.utils import extract_body as _extract_body
 
 
 def _find_md_files(vault: Path, *dirs: str) -> list[Path]:
@@ -83,34 +85,110 @@ def _find_md_files(vault: Path, *dirs: str) -> list[Path]:
     return files
 
 
-# ─── Check Functions ─────────────────────────────────────────────────────────
+# ─── Cache-Aware Wikilink Index ─────────────────────────────────────────────
 
-def check_orphaned_notes(vault: Path) -> list[LintIssue]:
-    """Check 1: Files with zero incoming wikilinks."""
-    issues = []
-    all_notes = {}
-    note_names = set()
+_WIKI_DIRS = ("04-Wiki/entries", "04-Wiki/concepts", "04-Wiki/mocs", "04-Wiki/sources")
 
-    for d in ("04-Wiki/entries", "04-Wiki/concepts", "04-Wiki/mocs", "04-Wiki/sources"):
+
+def _build_wikilink_index(vault: Path, cache=None) -> tuple[dict[str, Path], dict[str, set[str]]]:
+    """Build note name index and wikilink graph.
+
+    Uses vault cache for incremental updates — only re-reads files whose mtime
+    changed since the last lint run.
+
+    Args:
+        vault: Vault root path
+        cache: Optional ContentStore with vault cache methods
+
+    Returns:
+        (note_paths, incoming_links) where:
+        - note_paths: {note_name: file_path}
+        - incoming_links: {note_name: set of notes that link TO it}
+    """
+    note_paths: dict[str, Path] = {}
+    outgoing: dict[str, set[str]] = {}  # note_name -> set of notes it links to
+
+    # Check if we can use cached data
+    use_cache = cache is not None
+    if use_cache:
+        for d in _WIKI_DIRS:
+            if cache.cache_is_directory_stale(vault / d):
+                use_cache = False
+                break
+
+    if use_cache:
+        cached_links = cache.cache_get_wikilinks(vault)
+        if cached_links:
+            # Rebuild note_paths from current filesystem (fast — no file reads)
+            for d in _WIKI_DIRS:
+                dir_path = vault / d
+                if not dir_path.exists():
+                    continue
+                for md in dir_path.glob("*.md"):
+                    note_paths[md.stem] = md
+
+            # Build incoming from cached outgoing
+            incoming: dict[str, set[str]] = {name: set() for name in note_paths}
+            for source, targets in cached_links.items():
+                for target in targets:
+                    if target in incoming:
+                        incoming[target].add(source)
+
+            log.debug("Lint: using cached wikilink index (%d notes)", len(note_paths))
+            return note_paths, incoming
+
+    # Cache miss or stale — build from scratch
+    for d in _WIKI_DIRS:
         dir_path = vault / d
         if not dir_path.exists():
             continue
         for md in dir_path.glob("*.md"):
             note_name = md.stem
-            note_names.add(note_name)
-            all_notes[note_name] = md
+            note_paths[note_name] = md
+            try:
+                content = md.read_text(encoding="utf-8", errors="replace")
+                links = set(re.findall(r"\[\[([^\]|#]+)\]", content))
+                outgoing[note_name] = links
+            except OSError:
+                outgoing[note_name] = set()
 
-    # Build set of all referenced note names
-    referenced = set()
-    for md in _find_md_files(vault, "04-Wiki/entries", "04-Wiki/concepts", "04-Wiki/mocs", "04-Wiki/sources"):
-        content = md.read_text(encoding="utf-8", errors="replace")
-        for match in re.finditer(r"\[\[([^\]|#]+)", content):
-            target = match.group(1).strip()
-            if target in note_names:
-                referenced.add(target)
+    # Build incoming links from outgoing
+    incoming: dict[str, set[str]] = {name: set() for name in note_paths}
+    for source, targets in outgoing.items():
+        for target in targets:
+            if target in incoming:
+                incoming[target].add(source)
 
-    for note_name, md_path in all_notes.items():
-        if note_name not in referenced:
+    # Update cache
+    if cache is not None:
+        cache.cache_set_wikilinks(outgoing)
+        for d in _WIKI_DIRS:
+            dir_path = vault / d
+            if dir_path.exists():
+                index = {}
+                for md in dir_path.glob("*.md"):
+                    try:
+                        index[md.name] = md.stat().st_mtime
+                    except OSError:
+                        pass
+                cache.cache_set_file_index(dir_path, index)
+        log.debug("Lint: rebuilt wikilink index (%d notes, cached)", len(note_paths))
+
+    return note_paths, incoming
+
+
+# ─── Check Functions ─────────────────────────────────────────────────────────
+
+def check_orphaned_notes(vault: Path, _cache=None) -> list[LintIssue]:
+    """Check 1: Files with zero incoming wikilinks.
+
+    Uses cached wikilink index when available.
+    """
+    issues = []
+    note_paths, incoming = _build_wikilink_index(vault, _cache)
+
+    for note_name, md_path in note_paths.items():
+        if not incoming.get(note_name):
             rel = md_path.relative_to(vault)
             issues.append(LintIssue(
                 check="orphaned_notes",
@@ -176,19 +254,20 @@ def check_stale_reviews(vault: Path, days: int = 14) -> list[LintIssue]:
     return issues
 
 
-def check_broken_wikilinks(vault: Path) -> list[LintIssue]:
-    """Check 4: Wikilinks pointing to non-existent notes."""
+def check_broken_wikilinks(vault: Path, _cache=None) -> list[LintIssue]:
+    """Check 4: Wikilinks pointing to non-existent notes.
+
+    Uses cached wikilink index when available.
+    """
     issues = []
+    note_paths, _ = _build_wikilink_index(vault, _cache)
+    existing_names = set(note_paths.keys())
 
-    # Build index of existing note names
-    existing_names = set()
-    for md in _find_md_files(vault, "04-Wiki/entries", "04-Wiki/concepts", "04-Wiki/mocs", "04-Wiki/sources"):
-        existing_names.add(md.stem)
-
-    for md in _find_md_files(vault, "04-Wiki/entries", "04-Wiki/concepts", "04-Wiki/mocs", "04-Wiki/sources"):
+    # Re-check outgoing links (from cache or re-read)
+    for md in note_paths.values():
         content = md.read_text(encoding="utf-8", errors="replace")
         rel = md.relative_to(vault)
-        for match in re.finditer(r"\[\[([^\]|#]+)", content):
+        for match in re.finditer(r"\[\[([^\]|#]+)\]", content):
             target = match.group(1).strip()
             if target and target not in existing_names:
                 issues.append(LintIssue(
@@ -414,6 +493,7 @@ _STUB_PATTERNS = [
     r"\bFIXME\b",
     r"\bPLACEHOLDER\b",
     r"\bTBD\b",
+    r"\bTo be written\b",
     r"待补充",
     r"待填",
     r"\[insert",
@@ -450,8 +530,10 @@ _BLOCKED_TAGS = {"x.com", "tweet", "http", "https", "rss", "feed", "url", "link"
 
 
 def check_tag_quality(vault: Path) -> list[LintIssue]:
-    """Check 12: Banned tags and too-short tags."""
+    """Check 12: Banned tags, too-short tags, and potential synonyms."""
     issues = []
+
+    all_tags: dict[str, list[str]] = {}  # tag -> list of file stems
 
     for md in _find_md_files(vault, "04-Wiki/entries", "04-Wiki/sources", "04-Wiki/concepts"):
         content = md.read_text(encoding="utf-8", errors="replace")
@@ -475,6 +557,30 @@ def check_tag_quality(vault: Path) -> list[LintIssue]:
                     severity=Severity.WARNING,
                     note=md.stem,
                     detail=f"Too-short tag: '{tag}'",
+                ))
+            else:
+                if tag_str not in all_tags:
+                    all_tags[tag_str] = []
+                all_tags[tag_str].append(md.stem)
+
+    # Synonym detection: find tags that differ only by hyphenation, pluralization, or case
+    tag_list = sorted(all_tags.keys())
+    for i, tag_a in enumerate(tag_list):
+        for tag_b in tag_list[i + 1:]:
+            # Skip if already reported
+            if tag_a == tag_b:
+                continue
+            # Check for near-duplicates
+            normalized_a = tag_a.replace("-", "").replace("_", "").rstrip("s")
+            normalized_b = tag_b.replace("-", "").replace("_", "").rstrip("s")
+            if normalized_a == normalized_b and tag_a != tag_b:
+                files_a = ", ".join(all_tags[tag_a][:3])
+                files_b = ", ".join(all_tags[tag_b][:3])
+                issues.append(LintIssue(
+                    check="tag_synonyms",
+                    severity=Severity.INFO,
+                    note=f"'{tag_a}' ↔ '{tag_b}'",
+                    detail=f"Possible synonyms — used in: {files_a} / {files_b}",
                 ))
 
     return issues
@@ -713,10 +819,27 @@ def fix_banned_tags(file_path: Path) -> bool:
 # ─── LintChecker ─────────────────────────────────────────────────────────────
 
 class LintChecker:
-    """Main lint checker — runs all checks on a vault."""
+    """Main lint checker — runs all checks on a vault.
+
+    Uses vault cache for incremental processing — only re-scans files
+    that changed since the last lint run.
+    """
 
     def __init__(self, vault_path: Path):
         self.vault = vault_path
+        self._cache = None
+        try:
+            from pipeline.store import ContentStore
+            self._cache = ContentStore.open_vault_cache(vault_path)
+        except Exception:
+            pass  # Graceful degradation — run without cache
+
+    def __del__(self):
+        if self._cache:
+            try:
+                self._cache.close()
+            except Exception:
+                pass
 
     def run_all(self, fix: bool = False) -> LintResult:
         """Run all lint checks. Optionally fix issues first."""
@@ -743,28 +866,34 @@ class LintChecker:
                 if fix_banned_tags(md):
                     result.fixes_applied += 1
 
+        # Checks that support cache (pass _cache kwarg)
+        cache_enabled = {"orphaned_notes", "broken_wikilinks"}
+
         # Run all checks
         checks = [
-            ("1. Orphaned Notes", check_orphaned_notes),
-            ("2. Unreviewed Entries", check_unreviewed_entries),
-            ("3. Stale Reviews", check_stale_reviews),
-            ("4. Broken Wikilinks", check_broken_wikilinks),
-            ("5. Empty Notes", check_empty_notes),
-            ("6. Concept Structure", check_concept_structure),
-            ("7. Entry Template Sections", check_entry_template_sections),
-            ("8. Orphaned Concepts", check_orphaned_concepts),
-            ("9. Wiki Index Drift", check_wiki_index_drift),
-            ("10. Edges Consistency", check_edges_consistency),
-            ("11. Stubs/Placeholders", check_stubs),
-            ("12. Tag Quality", check_tag_quality),
-            ("13. Frontmatter Validity", check_frontmatter_validity),
-            ("14. Required Sections", check_required_sections),
-            ("15. Markdown Format", check_markdown_format),
+            ("1. Orphaned Notes", check_orphaned_notes, "orphaned_notes"),
+            ("2. Unreviewed Entries", check_unreviewed_entries, "unreviewed_entries"),
+            ("3. Stale Reviews", check_stale_reviews, "stale_reviews"),
+            ("4. Broken Wikilinks", check_broken_wikilinks, "broken_wikilinks"),
+            ("5. Empty Notes", check_empty_notes, "empty_notes"),
+            ("6. Concept Structure", check_concept_structure, "concept_structure"),
+            ("7. Entry Template Sections", check_entry_template_sections, "entry_template_sections"),
+            ("8. Orphaned Concepts", check_orphaned_concepts, "orphaned_concepts"),
+            ("9. Wiki Index Drift", check_wiki_index_drift, "wiki_index_drift"),
+            ("10. Edges Consistency", check_edges_consistency, "edges_consistency"),
+            ("11. Stubs/Placeholders", check_stubs, "stubs"),
+            ("12. Tag Quality", check_tag_quality, "tag_quality"),
+            ("13. Frontmatter Validity", check_frontmatter_validity, "frontmatter_validity"),
+            ("14. Required Sections", check_required_sections, "required_sections"),
+            ("15. Markdown Format", check_markdown_format, "markdown_format"),
         ]
 
-        for name, check_fn in checks:
+        for name, check_fn, check_id in checks:
             try:
-                issues = check_fn(self.vault)
+                if check_id in cache_enabled and self._cache:
+                    issues = check_fn(self.vault, _cache=self._cache)
+                else:
+                    issues = check_fn(self.vault)
             except Exception as e:
                 issues = [LintIssue(
                     check=name,

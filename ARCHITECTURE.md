@@ -146,12 +146,20 @@ pipeline/
 │   ├── podcast.py  # Podcast: iTunes API → RSS → AssemblyAI/whisper
 │   └── web.py      # Web: defuddle → curl → liteparse → archive.org
 ├── plan.py         # Stage 2: deterministic planning + agent fallback
-├── create.py       # Stage 3: template creation + insight agent
+├── create/
+│   ├── __init__.py # Re-exports: create_all, create_file_templates
+│   ├── agent.py    # Agent orchestration, batch creation
+│   ├── orchestrator.py # Stage 3 entry point, batch splitting
+│   ├── prompts.py  # Prompt loading, batch prompt construction
+│   ├── templates.py # Template-based file creation
+│   └── validate.py # Output validation and auto-repair
+├── qmd.py          # Shared qmd semantic search (parallel queries)
 ├── review.py       # Review workflow: stage → approve → write
-├── vault.py        # Vault operations: write files, reindex, archive
+├── vault.py        # Vault operations: write files, edges, reindex, archive
 ├── compile.py      # Compile pass: concept merge, MoC rebuild
-├── lint.py         # Vault health checks (12 checks)
-└── stats.py        # Dashboard generation
+├── lint.py         # Vault health checks (12+ checks)
+├── stats.py        # Dashboard generation
+└── utils.py        # Shared utilities: escape_yaml, extract_body, strip_qmd_noise
 ```
 
 ---
@@ -744,14 +752,11 @@ Content store:
 
 ### Shell scripts (supplementary)
 
+All lint, compile, validate, stats, and review functionality has been migrated to Python (see CLI Commands above). Remaining shell scripts:
+
 | Script | Purpose |
 |--------|---------|
-| `compile-pass.sh` | Concept merge, MoC rebuild |
-| `lint-vault.sh` | 12 health checks |
-| `query-vault.sh` | Q&A with vault |
-| `review-pass.sh` | Interactive entry review |
-| `validate-output.sh` | Output validation + --fix |
-| `vault-stats.sh` | Dashboard generation |
+| `query-vault.sh` | Q&A with vault via qmd semantic search |
 | `update-tag-registry.sh` | Tag registry rebuild |
 
 ---
@@ -808,37 +813,13 @@ ASSEMBLYAI_API_KEY=...
 
 ## 16. Shell Scripts
 
-Most functionality has been migrated to Python. Remaining shell scripts provide unique capabilities:
+All core pipeline functionality (compile, lint, validate, stats, review) has been fully migrated to Python. See the module map and CLI Commands section above.
 
-### `compile-pass.sh`
-Cross-links entries to concepts, merges similar concepts, rebuilds MoCs. Called after pipeline creates new files.
+### Remaining scripts
 
-### `lint-vault.sh`
-12 health checks:
-1. Missing frontmatter
-2. Missing required fields
-3. Broken wikilinks
-4. Duplicate filenames
-5. Empty sections
-6. Stale entries
-7. Orphan concepts
-8. MoC structure
-9. Tag consistency
-10. File naming conventions
-11. YAML validity
-12. Edge file consistency
+**`query-vault.sh`** — Q&A interface using qmd semantic search. Queries the vault's vector index for interactive exploration.
 
-### `query-vault.sh`
-Q&A interface using qmd semantic search. Queries the vault's vector index.
-
-### `review-pass.sh`
-Interactive review of entries. Shows entry, prompts for approve/edit/skip.
-
-### `validate-output.sh`
-Validates pipeline output against schema. `--fix` mode auto-repairs common issues.
-
-### `update-tag-registry.sh`
-Rebuilds `tag-registry.md` from all vault files. Extracts tags from YAML frontmatter.
+**`update-tag-registry.sh`** — Rebuilds `tag-registry.md` from all vault files by extracting tags from YAML frontmatter.
 
 ---
 

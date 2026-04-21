@@ -25,6 +25,8 @@ from pipeline.config import Config
 from pipeline.models import (
     ConceptMatch, ExtractedSource, Language, Manifest, Plan, Plans, Template, SourceType,
 )
+from pipeline.utils import extract_body as _extract_body
+from pipeline.lint import _parse_frontmatter
 
 log = logging.getLogger(__name__)
 
@@ -49,12 +51,6 @@ def _jaccard_similarity(fp1: str, fp2: str, ngram: int = 3) -> float:
     if not ng1 or not ng2:
         return 0.0
     return len(ng1 & ng2) / len(ng1 | ng2)
-
-
-def _extract_body(content: str) -> str:
-    """Extract body text (after YAML frontmatter) from a markdown file."""
-    m = re.match(r"^---\n.*?\n---\n(.*)", content, re.DOTALL)
-    return m.group(1) if m else content
 
 
 # ─── Dedup check ──────────────────────────────────────────────────────────────
@@ -112,88 +108,35 @@ def dedup_check(manifest: Manifest, cfg: Config) -> Manifest:
 
 # ─── QMD concept search ──────────────────────────────────────────────────────
 
-def _run_qmd(query: str, cfg: Config) -> list[ConceptMatch]:
-    """Run qmd CLI semantic search and return concept matches.
-
-    Uses flags: --json -n 5 --min-score 0.2 -c <collection> --no-rerank
-    Falls back to empty list on any error (timeout, parse failure, etc.).
-    """
-    if not query or not query.strip():
-        return []
-
-    cmd = [
-        cfg.qmd_cmd, "query", query,
-        "--json", "-n", "5",
-        "--min-score", "0.2",
-        "-c", cfg.qmd_collection,
-    ]
-
-    try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=cfg.plan_timeout,
-        )
-
-        # Strip cmake/Vulkan noise from stdout — find JSON array start
-        stdout = result.stdout
-        for marker in ["[\n  {", "[\n{", "[{"]:
-            idx = stdout.find(marker)
-            if idx >= 0:
-                stdout = stdout[idx:].rstrip()
-                break
-
-        data = json.loads(stdout)
-        matches = []
-        for item in data:
-            if not isinstance(item, dict):
-                continue
-            score = item.get("score", 0)
-            if score < 0.2:
-                continue
-            # Extract concept name from file path
-            f = item.get("file", item.get("path", ""))
-            name = f.split("/")[-1].replace(".md", "") if "/" in f else f.replace(".md", "")
-            if name:
-                matches.append(ConceptMatch(concept=name, score=round(score, 3)))
-        return matches
-
-    except subprocess.TimeoutExpired:
-        log.warning("qmd timeout for query: %s", query[:80])
-        return []
-    except (json.JSONDecodeError, KeyError) as e:
-        log.warning("qmd parse error: %s", e)
-        return []
-    except OSError as e:
-        log.warning("qmd error: %s", e)
-        return []
-
-
 def concept_search(manifest: Manifest, cfg: Config) -> dict[str, list[ConceptMatch]]:
     """Search existing concepts via qmd for each source.
 
     Builds query from title + content preview + concept names.
     Returns hash -> [ConceptMatch] mapping.
+    Uses parallel qmd queries from shared module.
     """
-    result: dict[str, list[ConceptMatch]] = {}
+    from pipeline.qmd import run_qmd_concept_search
 
+    queries: dict[str, str] = {}
     for entry in manifest.entries:
-        # Build query from title + content preview
         query = f"{entry.title} {entry.content[:500]}".strip()[:800]
-        if not query:
-            result[entry.hash] = []
-            continue
+        queries[entry.hash] = query
 
-        matches = _run_qmd(query, cfg)
-        result[entry.hash] = matches
-
-    return result
+    return run_qmd_concept_search(queries, cfg)
 
 
 # ─── Deterministic Planning (Rec 3) ──────────────────────────────────────────
 
-_CJK_RE = re.compile(r"[\u4e00-\u9fff\u3400-\u4dbf\u3000-\u303f]")
+_CJK_RE = re.compile(
+    r"[\u4e00-\u9fff"     # CJK Unified Ideographs (base)
+    r"\u3400-\u4dbf"      # CJK Extension A
+    r"\U00020000-\U0002a6df"  # CJK Extension B
+    r"\U0002a700-\U0002b73f"  # CJK Extension C
+    r"\U0002b740-\U0002b81f"  # CJK Extension D
+    r"\u3000-\u303f"      # CJK Symbols and Punctuation
+    r"\uff00-\uffef"      # Fullwidth Forms
+    r"]"
+)
 
 
 def detect_language(content: str) -> Language:
@@ -344,6 +287,23 @@ def build_plan_prompt(
     if cfg.concepts_dir.is_dir():
         concept_count = len(list(cfg.concepts_dir.glob("*.md")))
 
+    # Extract existing tag vocabulary from vault
+    existing_tags = set()
+    for tag_dir in (cfg.entries_dir, cfg.concepts_dir):
+        if not tag_dir.exists():
+            continue
+        for md in tag_dir.glob("*.md"):
+            try:
+                fm = _parse_frontmatter(md.read_text(encoding="utf-8", errors="replace"))
+                tags = fm.get("tags", [])
+                if isinstance(tags, list):
+                    for t in tags:
+                        existing_tags.add(str(t).strip().lower())
+            except OSError:
+                continue
+    existing_tags.discard("")
+    tag_vocab = sorted(existing_tags)[:50]  # Cap at 50 most relevant
+
     # Build sources block
     sources_block_parts = []
     for i, entry in enumerate(manifest.entries):
@@ -372,6 +332,7 @@ Source {i+1}:
     prompt = f"""{common_section}You are a planning agent for an Obsidian wiki pipeline. For each extracted source below, output a creation plan as JSON.
 
 VAULT CONCEPTS DIRECTORY: {concept_count} existing concepts
+EXISTING TAG VOCABULARY (prefer reuse over minting new): {', '.join(tag_vocab[:30])}
 
 SOURCES TO PLAN:{sources_block}
 ---
@@ -386,6 +347,7 @@ RULES:
 - language: Chinese content → "zh", everything else → "en"
 - template: Data/methodology/findings → "technical". Narrative/philosophical → "standard". Chinese → "chinese".
 - tags: 3-6 topic-specific tags derived from content:
+  * PREFER reusing tags from EXISTING TAG VOCABULARY above — only mint new tags when content genuinely requires them
   * Prioritize specific entities (e.g. "bitcoin", "gpt-4") over broad categories (e.g. "crypto", "ai")
   * Include compound concepts where relevant (e.g. "smart-contracts", "yield-farming", "zero-knowledge")
   * Lowercase, hyphenated if multi-word

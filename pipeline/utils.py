@@ -38,3 +38,9 @@ def strip_qmd_noise(text: str) -> str:
                     if bracket == 0:
                         return candidate[:i + 1]
     return text
+
+
+def extract_body(content: str) -> str:
+    """Extract body text (after YAML frontmatter) from a markdown file."""
+    m = re.match(r"^---\n.*?\n---\n(.*)", content, re.DOTALL)
+    return m.group(1) if m else content

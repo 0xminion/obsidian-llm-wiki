@@ -378,7 +378,7 @@ class TestValidateOutput:
         manifest = cfg.config_dir / "manifest.json"
         manifest.write_text("[]", encoding="utf-8")
 
-        # Create a valid entry
+        # Create a valid entry with substantial body content
         entry = cfg.entries_dir / "valid-entry.md"
         entry.write_text(
             "---\n"
@@ -393,15 +393,20 @@ class TestValidateOutput:
             "---\n\n"
             "# Valid Entry\n\n"
             "## Summary\n\n"
-            "A good summary.\n\n"
+            "A comprehensive summary of the article that covers the main points and provides "
+            "sufficient detail for understanding the key arguments presented by the author.\n\n"
             "## Core insights\n\n"
-            "1. Insight one.\n\n"
+            "1. The first major insight relates to how systems evolve over time "
+            "and what factors drive their development in unexpected directions.\n\n"
+            "2. The second insight covers the relationship between complexity and maintainability "
+            "in modern software architectures.\n\n"
             "## Other takeaways\n\n"
-            "- None yet.\n\n"
+            "- One additional takeaway from the analysis is that incremental improvements "
+            "often outperform large-scale rewrites when dealing with legacy systems.\n\n"
             "## Diagrams\n\n"
             "n/a\n\n"
             "## Open questions\n\n"
-            "- None yet.\n\n"
+            "- How does this approach scale to larger datasets with billions of records?\n\n"
             "## Linked concepts\n\n"
             "- [[some-concept]]\n",
             encoding="utf-8",
@@ -606,14 +611,16 @@ class TestValidateOutput:
             "title: Test Concept\n"
             "type: concept\n"
             "status: evergreen\n"
-            "sources:\n  - \"[[source-1]]\"\n"
+            'sources:\n  - "[[source-1]]"\n'
             "tags:\n  - concept\n"
             "---\n\n"
             "# Test Concept\n\n"
             "## Core concept\n\n"
-            "Concept definition.\n\n"
+            "This concept describes the fundamental principle of systematic knowledge organization "
+            "and how it applies to building self-sustaining information architectures.\n\n"
             "## Context\n\n"
-            "Context here.\n\n"
+            "The concept emerges from decades of research in information science and has been "
+            "validated through numerous real-world implementations across different domains.\n\n"
             "## Links\n\n"
             "- [[related]]\n",
             encoding="utf-8",
@@ -748,13 +755,42 @@ class TestCreateAll:
         cfg.extract_dir = extract_dir
         _create_extract(extract_dir, sample_plan)
 
-        with patch("pipeline.create.agent.create_batch") as mock_batch:
-            mock_batch.return_value = {
-                "batch_idx": 0,
+        def mock_create_batch_side_effect(batch, idx, config):
+            """Mock that creates actual files so validation passes."""
+            from pipeline.vault import title_to_filename
+            for plan in batch:
+                fname = title_to_filename(plan.title)
+                entry_file = config.entries_dir / f"{fname}.md"
+                entry_file.parent.mkdir(parents=True, exist_ok=True)
+                entry_file.write_text(
+                    "---\ntitle: Test Article\n"
+                    'source: "[[test-article]]"\n'
+                    "date_entry: 2025-01-01\nstatus: review\ntemplate: standard\n"
+                    "tags:\n  - test\n---\n\n"
+                    "# Test Article\n\n"
+                    "## Summary\n\n"
+                    "A detailed summary covering the main arguments and findings from the source material "
+                    "with sufficient depth for meaningful analysis and future reference.\n\n"
+                    "## Core insights\n\n"
+                    "- The primary insight is that systematic approaches yield better long-term results "
+                    "than ad-hoc methods when building knowledge management systems.\n\n"
+                    "## Other takeaways\n\n"
+                    "- Secondary observations about implementation details and practical considerations "
+                    "that emerge from applying these principles in real-world scenarios.\n\n"
+                    "## Open questions\n\n"
+                    "- What are the limits of automation in knowledge curation?\n\n"
+                    "## Linked concepts\n\n"
+                    "- [[existing-concept]]\n",
+                    encoding="utf-8",
+                )
+            return {
+                "batch_idx": idx,
                 "status": "ok",
-                "plans": 1,
-                "hashes": [sample_plan.hash],
+                "plans": len(batch),
+                "hashes": [plan.hash for plan in batch],
             }
+
+        with patch("pipeline.create.agent.create_batch", side_effect=mock_create_batch_side_effect):
             plans = Plans(plans=[sample_plan])
             result = create_all(plans, cfg, parallel=1)
 

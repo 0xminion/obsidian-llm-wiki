@@ -21,7 +21,16 @@ from pipeline.models import Edge, EdgeType, ExtractedSource, Plan
 
 # ─── Title → Filename ────────────────────────────────────────────────────────
 
-_CJK_RE = re.compile(r"[\u4e00-\u9fff]")
+_CJK_RE = re.compile(
+    r"[\u4e00-\u9fff"     # CJK Unified Ideographs (base)
+    r"\u3400-\u4dbf"      # CJK Extension A
+    r"\U00020000-\U0002a6df"  # CJK Extension B
+    r"\U0002a700-\U0002b73f"  # CJK Extension C
+    r"\U0002b740-\U0002b81f"  # CJK Extension D
+    r"\u3000-\u303f"      # CJK Symbols and Punctuation
+    r"\uff00-\uffef"      # Fullwidth Forms
+    r"]"
+)
 
 
 def title_to_filename(title: str) -> str:
@@ -179,6 +188,7 @@ def write_entry(cfg: Config, plan: Plan, content: str) -> Path:
     })
 
     full_content = frontmatter + content
+    # Safety net: agent/review paths may omit the heading — templates always include it
     if not content.strip().startswith("#"):
         full_content = frontmatter + f"# {plan.title}\n\n{content}"
 
@@ -284,8 +294,49 @@ def update_moc(cfg: Config, moc_name: str, entry_name: str, description: str) ->
 
 # ─── Edge Management ─────────────────────────────────────────────────────────
 
+# In-memory edge cache to avoid O(N²) reads on every write.
+# Thread-safe via lock for concurrent write_edge() calls.
+import threading as _threading
+
+_edge_cache: set[tuple[str, str, str]] | None = None
+_edge_cache_path: Path | None = None
+_edge_cache_lock = _threading.Lock()
+
+
+def _load_edge_cache(edges_file: Path) -> set[tuple[str, str, str]]:
+    """Load existing edges into an in-memory set for O(1) duplicate checks."""
+    global _edge_cache, _edge_cache_path
+    with _edge_cache_lock:
+        if _edge_cache is not None and _edge_cache_path == edges_file:
+            return _edge_cache
+
+        cache: set[tuple[str, str, str]] = set()
+        if edges_file.exists():
+            for line in edges_file.read_text(encoding="utf-8").strip().split("\n"):
+                if line.startswith("source\t") or not line.strip():
+                    continue
+                parts = line.split("\t")
+                if len(parts) >= 3:
+                    cache.add((parts[0], parts[1], parts[2]))
+        _edge_cache = cache
+        _edge_cache_path = edges_file
+        return cache
+
+
+def clear_edge_cache() -> None:
+    """Reset the edge cache. Call after external edge file modifications."""
+    global _edge_cache, _edge_cache_path
+    with _edge_cache_lock:
+        _edge_cache = None
+        _edge_cache_path = None
+
+
 def write_edge(cfg: Config, edge: Edge) -> None:
-    """Append an edge to edges.tsv. Skips if duplicate."""
+    """Append an edge to edges.tsv. Skips if duplicate.
+
+    Uses an in-memory cache for O(1) duplicate checks instead of
+    re-reading the file on every call. Thread-safe.
+    """
     cfg.config_dir.mkdir(parents=True, exist_ok=True)
     edges_file = cfg.edges_file
 
@@ -293,18 +344,20 @@ def write_edge(cfg: Config, edge: Edge) -> None:
     if not edges_file.exists():
         edges_file.write_text("source\ttarget\ttype\tdescription\n", encoding="utf-8")
 
-    existing = edges_file.read_text(encoding="utf-8")
-
-    # Check for duplicate (same source, target, type)
-    for line in existing.strip().split("\n"):
-        if line.startswith("source\t"):
-            continue
-        parts = line.split("\t")
-        if len(parts) >= 3 and parts[0] == edge.source and parts[1] == edge.target and parts[2] == edge.type.value:
+    # Check duplicate via cache (O(1) instead of O(N))
+    cache = _load_edge_cache(edges_file)
+    edge_key = (edge.source, edge.target, edge.type.value)
+    with _edge_cache_lock:
+        if edge_key in cache:
             return  # duplicate, skip
 
+    # Append to file
     with edges_file.open("a", encoding="utf-8") as f:
         f.write(edge.to_tsv() + "\n")
+
+    # Update cache
+    with _edge_cache_lock:
+        cache.add(edge_key)
 
 
 def read_edges(cfg: Config) -> list[Edge]:

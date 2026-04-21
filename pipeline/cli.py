@@ -572,6 +572,146 @@ def store_stats(
     typer.echo(f"  Reviews: {stats['reviews_pending']} pending")
 
 
+# ─── tags ────────────────────────────────────────────────────────────────────
+
+@app.command(name="tags")
+def update_tags(
+    vault: Path = typer.Argument(None, help="Vault path (default: ~/MyVault)"),
+):
+    """Rebuild tag-registry.md from actual tag usage across all notes."""
+    from collections import Counter
+    from pipeline.lint import _parse_frontmatter
+
+    cfg = _load_cfg(vault)
+    registry_path = cfg.config_dir / "tag-registry.md"
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    def _extract_tags(content: str) -> list[str]:
+        fm = _parse_frontmatter(content)
+        tags = fm.get("tags", [])
+        if isinstance(tags, list):
+            return [str(t).strip().strip('"').lower() for t in tags if str(t).strip()]
+        return []
+
+    entry_tags = Counter()
+    concept_tags = Counter()
+    moc_tags = Counter()
+
+    if cfg.entries_dir.exists():
+        for md in cfg.entries_dir.glob("*.md"):
+            try:
+                content = md.read_text(encoding="utf-8", errors="replace")
+                entry_tags.update(_extract_tags(content))
+            except OSError:
+                continue
+
+    if cfg.concepts_dir.exists():
+        for md in cfg.concepts_dir.glob("*.md"):
+            try:
+                content = md.read_text(encoding="utf-8", errors="replace")
+                concept_tags.update(_extract_tags(content))
+            except OSError:
+                continue
+
+    if cfg.mocs_dir.exists():
+        for md in cfg.mocs_dir.glob("*.md"):
+            try:
+                content = md.read_text(encoding="utf-8", errors="replace")
+                moc_tags.update(_extract_tags(content))
+            except OSError:
+                continue
+
+    lines = [
+        "# Tag Registry", "",
+        "Canonical list of tags used in this wiki. Before minting a new tag,",
+        "check this registry and prefer reuse.", "",
+        f"Auto-updated on {now}", "",
+    ]
+
+    if entry_tags:
+        lines.append("## Entry Tags")
+        lines.append("")
+        for tag, count in entry_tags.most_common():
+            lines.append(f"- `{tag}` ({count} uses)")
+        lines.append("")
+
+    if concept_tags:
+        lines.append("## Concept Tags")
+        lines.append("")
+        for tag, count in concept_tags.most_common():
+            lines.append(f"- `{tag}` ({count} uses)")
+        lines.append("")
+
+    if moc_tags:
+        lines.append("## MoC Tags")
+        lines.append("")
+        for tag, count in moc_tags.most_common():
+            lines.append(f"- `{tag}` ({count} uses)")
+        lines.append("")
+
+    lines.extend([
+        "---", "",
+        f"*Updated on {now}: {len(entry_tags)} entry tags, {len(concept_tags)} concept tags*",
+        "",
+    ])
+
+    registry_path.parent.mkdir(parents=True, exist_ok=True)
+    registry_path.write_text("\n".join(lines), encoding="utf-8")
+    typer.echo(f"Tag registry: {len(entry_tags)} entry, {len(concept_tags)} concept tags")
+    typer.echo(f"  Written to: {registry_path}")
+
+
+# ─── query ───────────────────────────────────────────────────────────────────
+
+@app.command()
+def query(
+    vault: Path = typer.Argument(None, help="Vault path (default: ~/MyVault)"),
+    question: str = typer.Option("", "--ask", "-q", help="Question to ask the vault"),
+):
+    """Query the vault wiki with a question (compound-back Q&A)."""
+    import subprocess
+
+    cfg = _load_cfg(vault)
+
+    if not question:
+        queries_dir = cfg.vault_path / "03-Queries"
+        if not queries_dir.exists():
+            typer.echo("No query files found. Use --ask 'your question'")
+            raise typer.Exit(code=0)
+        query_files = sorted(queries_dir.glob("*.md"))
+        if not query_files:
+            typer.echo("No query files found. Use --ask 'your question'")
+            raise typer.Exit(code=0)
+        question = query_files[0].read_text(encoding="utf-8").strip()
+
+    wiki_index = cfg.wiki_index
+    vault_summary = ""
+    if wiki_index.exists():
+        vault_summary = wiki_index.read_text(encoding="utf-8", errors="replace")[:3000]
+
+    prompt = (
+        "You are querying an Obsidian wiki knowledge base.\n\n"
+        f"VAULT INDEX:\n{vault_summary}\n\n"
+        f"QUESTION: {question}\n\n"
+        "Answer based on the vault content. Cite notes using [[wikilinks]]."
+    )
+
+    try:
+        result = subprocess.run(
+            [cfg.agent_cmd, "chat", "-q", prompt, "-Q"],
+            cwd=str(cfg.vault_path), capture_output=True, text=True, timeout=300,
+        )
+        if result.returncode == 0:
+            typer.echo("\n--- Answer ---\n")
+            typer.echo(result.stdout)
+        else:
+            typer.echo(f"Agent failed: {result.stderr[:200]}", err=True)
+            raise typer.Exit(code=1)
+    except subprocess.TimeoutExpired:
+        typer.echo("Agent timed out", err=True)
+        raise typer.Exit(code=1)
+
+
 # ─── Entry point ───────────────────────────────────────────────────────────────
 
 def main():

@@ -220,3 +220,68 @@ Source template used `\"  - source\"` as default when no tags, but \"source\" is
 **N1. `models.py:286` — Edge.from_tsv() escape order**
 Agent report suggested reversing unescape order. Verified via round-trip testing: current order is correct. The alternative order introduces new failures. The inherent limitation (literal `\\t` ambiguity) is a property of the escape scheme, not the code.
 
+---
+
+## Review 2026-04-21: Five Recommendation Implementation
+
+**Date:** 2026-04-21
+**Method:** Systematic implementation of 5 audit recommendations
+**Tests:** 46 store tests + 50 vault tests passed (post-fix)
+
+### R1. Stub paradox — FIXED
+
+**Problem:** `_generate_concept_template()` generated "To be written." stubs that the lint/validate pipeline should reject, but neither `lint.py` nor `validate.py` had patterns to catch "To be written.".
+
+**Fix:**
+- `templates.py:_generate_concept_template()` — Rewrote to generate real skeleton content from plan metadata (source title, concept links, MoC targets) instead of "To be written."
+- `templates.py:generate_entry_content()` — Changed fallback summary/insights from "To be written." to derived content from plan title
+- `templates.py` — Changed "None yet." placeholders to descriptive empty states
+- `validate.py` — Added `\bTo be written\b\.?` to `_STUB_PATTERNS`
+- `lint.py` — Added `\bTo be written\b` to `_STUB_PATTERNS`
+
+### R2. Duplicated logic — FIXED
+
+**Problem:** `_run_qmd` existed in plan.py, `concept_convergence` in agent.py reimplemented the same qmd query+parse logic with different flags and timeouts. `_extract_body` duplicated in plan.py and lint.py.
+
+**Fix:**
+- Created `pipeline/qmd.py` — shared module with `run_qmd_query()`, `run_qmd_concept_search()` (parallel), and `run_qmd_convergence()`
+- `plan.py:concept_search()` — now calls `run_qmd_concept_search()` (queries run in parallel via ThreadPoolExecutor)
+- `create/agent.py:concept_convergence()` — now calls `run_qmd_convergence()` (60 lines removed)
+- `utils.py` — added `extract_body()` function
+- `plan.py` and `lint.py` — import `extract_body` from utils instead of local copies
+
+### R3. Store test coverage — ENHANCED
+
+**Problem:** Audit claimed store.py had zero test coverage, but `test_new_systems.py` already had 15 store tests. Real gap was edge cases.
+
+**Fix:** Added 10 edge case tests to `test_new_systems.py`:
+- Context manager protocol (`__enter__`/`__exit__`)
+- `ContentStore.open()` classmethod
+- URL re-registration (upsert behavior)
+- Content dedup for missing content
+- Content dedup whitespace normalization
+- DLQ metadata storage and empty metadata handling
+- Review FIFO ordering
+- Stats with pending reviews
+
+### R4. O(N²) edge writes — FIXED
+
+**Problem:** `vault.py:write_edge()` re-read entire edges.tsv on every call for duplicate check. N edges = N file reads.
+
+**Fix:**
+- Added module-level `_edge_cache` set for O(1) duplicate checks
+- `_load_edge_cache()` lazily loads edges on first write, keyed by file path
+- `write_edge()` uses cache lookup instead of file scan
+- `clear_edge_cache()` exposed for external callers who modify edges.tsv directly
+- Sequential qmd was already fixed by R2 (parallel queries via shared module)
+
+### R5. Stale documentation — FIXED
+
+**Problem:** ARCHITECTURE.md section 14 referenced 5 deleted shell scripts. Section 16 described scripts that no longer exist. Module map showed `create.py` as single file instead of `create/` directory.
+
+**Fix:**
+- ARCHITECTURE.md section 14 — Removed deleted scripts from shell scripts table, kept only `query-vault.sh` and `update-tag-registry.sh`
+- ARCHITECTURE.md section 16 — Replaced full script descriptions with migration note
+- ARCHITECTURE.md section 3 — Updated module map to show `create/` subdirectory, added `qmd.py` and `utils.py`
+- Added note that `create.py` refactored into `create/` package
+

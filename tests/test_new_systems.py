@@ -184,6 +184,80 @@ class TestContentStore:
         cleared = store.review_clear()
         assert cleared == 2
 
+    def test_context_manager_protocol(self, tmp_path: Path):
+        """ContentStore supports with-statement for clean shutdown."""
+        db_path = tmp_path / "store.db"
+        with ContentStore(db_path) as store:
+            store.register_url("https://example.com", "web")
+            assert store.is_url_extracted("https://example.com")
+        # Connection closed after with-block — reopen to verify data persisted
+        store2 = ContentStore(db_path)
+        assert store2.is_url_extracted("https://example.com")
+        store2.close()
+
+    def test_open_classmethod(self, tmp_path: Path):
+        """ContentStore.open() creates store.db inside given directory."""
+        store = ContentStore.open(tmp_path)
+        assert (tmp_path / "store.db").exists()
+        store.close()
+
+    def test_register_url_upsert(self, store: ContentStore):
+        """Re-registering same URL with different status updates it."""
+        store.register_url("https://example.com", "web", status="ok")
+        assert store.is_url_extracted("https://example.com")
+        # Re-register as failed
+        store.register_url("https://example.com", "web", status="failed")
+        assert not store.is_url_extracted("https://example.com")
+        stats = store.get_stats()
+        assert stats["urls_total"] == 1  # upsert, not duplicate row
+
+    def test_content_duplicate_missing(self, store: ContentStore):
+        """get_content_duplicate returns None for unregistered content."""
+        assert store.get_content_duplicate("never seen before") is None
+
+    def test_content_duplicate_whitespace_normalization(self, store: ContentStore):
+        """Content hash normalizes whitespace before comparison."""
+        store.register_content("Hello  World   Test", "Title", "web", "file1")
+        # Different whitespace should still match
+        assert store.get_content_duplicate("Hello World Test") == "file1"
+        assert store.get_content_duplicate("  Hello   World  Test  ") == "file1"
+
+    def test_dlq_metadata_stored(self, store: ContentStore):
+        """DLQ stores metadata dict as JSON."""
+        meta = {"source_type": "youtube", "attempts": 3}
+        store.dlq_add("https://yt.com", "timeout", "timed out", metadata=meta)
+        pending = store.dlq_get_pending()
+        assert len(pending) == 1
+        stored_meta = json.loads(pending[0]["metadata"])
+        assert stored_meta["source_type"] == "youtube"
+
+    def test_dlq_empty_metadata(self, store: ContentStore):
+        """DLQ handles None metadata gracefully."""
+        store.dlq_add("https://a.com", "unknown", "")
+        pending = store.dlq_get_pending()
+        assert json.loads(pending[0]["metadata"]) == {}
+
+    def test_review_get_pending_ordering(self, store: ContentStore):
+        """Reviews are returned in creation order (FIFO)."""
+        import time
+        store.review_add("h1", {"t": 1}, "source", "/a.md", "a")
+        # Small delay to ensure different timestamps
+        store.review_add("h2", {"t": 2}, "entry", "/b.md", "b")
+        pending = store.review_get_pending()
+        assert len(pending) == 2
+        assert pending[0]["plan_data"]["t"] == 1
+        assert pending[1]["plan_data"]["t"] == 2
+
+    def test_stats_with_reviews(self, store: ContentStore):
+        """Stats include pending review count."""
+        store.review_add("a", {}, "source", "/a.md", "a")
+        store.review_add("b", {}, "entry", "/b.md", "b")
+        stats = store.get_stats()
+        assert stats["reviews_pending"] == 2
+        store.review_approve(1)
+        stats = store.get_stats()
+        assert stats["reviews_pending"] == 1
+
 
 # ─── Deterministic Planning Tests ────────────────────────────────────────────
 
@@ -318,6 +392,50 @@ class TestGenerateEntryContent:
         }
         content = generate_entry_content(sample_plan, extracted, "test")
         assert "first paragraph" in content
+
+
+class TestGenerateConceptTemplate:
+    """Tests for _generate_concept_template — no stubs allowed."""
+
+    def test_no_stubs(self, sample_plan: Plan):
+        from pipeline.create.templates import _generate_concept_template
+        content = _generate_concept_template("Prediction Markets", sample_plan)
+        assert "To be written" not in content
+        assert "待补充" not in content
+        assert "TODO" not in content
+
+    def test_has_required_sections(self, sample_plan: Plan):
+        from pipeline.create.templates import _generate_concept_template
+        content = _generate_concept_template("Prediction Markets", sample_plan)
+        assert "## Core concept" in content
+        assert "## Context" in content
+        assert "## Links" in content
+
+    def test_derives_from_source(self, sample_plan: Plan):
+        from pipeline.create.templates import _generate_concept_template
+        content = _generate_concept_template("Prediction Markets", sample_plan)
+        # Should reference the source title
+        assert "Test Article" in content
+
+    def test_includes_moc_links(self, sample_plan: Plan):
+        from pipeline.create.templates import _generate_concept_template
+        sample_plan.moc_targets = ["MoC One", "MoC Two"]
+        content = _generate_concept_template("My Concept", sample_plan)
+        assert "[[MoC One]]" in content
+        assert "[[MoC Two]]" in content
+
+    def test_includes_concept_updates(self, sample_plan: Plan):
+        from pipeline.create.templates import _generate_concept_template
+        sample_plan.concept_updates = ["Existing Concept"]
+        content = _generate_concept_template("New Concept", sample_plan)
+        assert "[[Existing Concept]]" in content
+
+    def test_frontmatter_complete(self, sample_plan: Plan):
+        from pipeline.create.templates import _generate_concept_template
+        content = _generate_concept_template("Test Concept", sample_plan)
+        assert "type: concept" in content
+        assert "status: draft" in content
+        assert "sources:" in content
 
 
 # ─── Review Workflow Tests ────────────────────────────────────────────────────

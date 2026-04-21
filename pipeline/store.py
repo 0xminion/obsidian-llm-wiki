@@ -111,6 +111,12 @@ class ContentStore:
                 status TEXT DEFAULT 'pending'
             );
             CREATE INDEX IF NOT EXISTS idx_reviews_status ON pending_reviews(status);
+
+            CREATE TABLE IF NOT EXISTS vault_cache (
+                cache_key TEXT PRIMARY KEY,
+                cache_value TEXT NOT NULL,
+                updated_at REAL NOT NULL
+            );
         """)
         self._conn.commit()
 
@@ -336,6 +342,119 @@ class ContentStore:
         self._conn.commit()
         return cursor.rowcount
 
+    # ─── Vault Cache (for incremental lint/reindex) ───────────────────────────
+
+    def cache_set(self, key: str, value: str) -> None:
+        """Set a cache entry."""
+        now = time.time()
+        self._conn.execute(
+            """INSERT OR REPLACE INTO vault_cache (cache_key, cache_value, updated_at)
+               VALUES (?, ?, ?)""",
+            (key, value, now),
+        )
+        self._conn.commit()
+
+    def cache_get(self, key: str) -> Optional[str]:
+        """Get a cache entry value, or None if not found."""
+        row = self._conn.execute(
+            "SELECT cache_value FROM vault_cache WHERE cache_key = ?",
+            (key,),
+        ).fetchone()
+        return row["cache_value"] if row else None
+
+    def cache_get_time(self, key: str) -> Optional[float]:
+        """Get the last-updated timestamp for a cache entry."""
+        row = self._conn.execute(
+            "SELECT updated_at FROM vault_cache WHERE cache_key = ?",
+            (key,),
+        ).fetchone()
+        return row["updated_at"] if row else None
+
+    def cache_invalidate(self, key: str) -> None:
+        """Remove a cache entry."""
+        self._conn.execute("DELETE FROM vault_cache WHERE cache_key = ?", (key,))
+        self._conn.commit()
+
+    def cache_invalidate_all(self, prefix: str = "") -> int:
+        """Remove cache entries matching prefix. Returns count removed."""
+        if prefix:
+            cursor = self._conn.execute(
+                "DELETE FROM vault_cache WHERE cache_key LIKE ?",
+                (f"{prefix}%",),
+            )
+        else:
+            cursor = self._conn.execute("DELETE FROM vault_cache")
+        self._conn.commit()
+        return cursor.rowcount
+
+    def cache_get_file_index(self, directory: Path) -> dict[str, float]:
+        """Get cached file mtime index for a directory.
+
+        Returns {relative_path: mtime}. Returns empty dict if not cached.
+        """
+        cached = self.cache_get(f"file_index:{directory}")
+        if not cached:
+            return {}
+        try:
+            data = json.loads(cached)
+            return {k: float(v) for k, v in data.items()}
+        except (json.JSONDecodeError, ValueError):
+            return {}
+
+    def cache_set_file_index(self, directory: Path, index: dict[str, float]) -> None:
+        """Store file mtime index for a directory."""
+        self.cache_set(f"file_index:{directory}", json.dumps(index))
+
+    def cache_is_directory_stale(self, directory: Path) -> bool:
+        """Check if a directory has changed since last cache.
+
+        Returns True if:
+        - No cache exists
+        - Any file was added/removed
+        - Any file's mtime changed
+        """
+        if not directory.exists():
+            return True
+
+        cached_index = self.cache_get_file_index(directory)
+        if not cached_index:
+            return True
+
+        current_index = {}
+        for md in directory.glob("*.md"):
+            try:
+                current_index[md.name] = md.stat().st_mtime
+            except OSError:
+                continue
+
+        # Different number of files
+        if set(cached_index.keys()) != set(current_index.keys()):
+            return True
+
+        # Check mtimes
+        for name, mtime in current_index.items():
+            cached_mtime = cached_index.get(name, 0)
+            if abs(mtime - cached_mtime) > 0.01:
+                return True
+
+        return False
+
+    def cache_get_wikilinks(self, vault_path: Path) -> dict[str, set[str]]:
+        """Get cached wikilink index: {note_name -> set of linked note names}."""
+        cached = self.cache_get("wikilinks:index")
+        if not cached:
+            return {}
+        try:
+            data = json.loads(cached)
+            return {k: set(v) for k, v in data.items()}
+        except (json.JSONDecodeError, ValueError):
+            return {}
+
+    def cache_set_wikilinks(self, links: dict[str, set[str]]) -> None:
+        """Store wikilink index."""
+        data = {k: list(v) for k, v in links.items()}
+        self.cache_set("wikilinks:index", json.dumps(data))
+
     # ─── Stats ────────────────────────────────────────────────────────────────
 
     def get_stats(self) -> dict:
@@ -376,3 +495,16 @@ class ContentStore:
     def open(cls, extract_dir: Path) -> ContentStore:
         """Open or create the content store in the extract directory."""
         return cls(extract_dir / "store.db")
+
+    @classmethod
+    def open_vault_cache(cls, vault_path: Path) -> ContentStore:
+        """Open or create a persistent vault cache in Meta/Scripts/cache.db.
+
+        This cache persists across pipeline runs and stores:
+        - File mtime indices for incremental lint/reindex
+        - Wikilink graph for fast orphan/link checks
+        - Tag registry metadata
+        """
+        cache_dir = vault_path / "Meta" / "Scripts"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        return cls(cache_dir / "cache.db")

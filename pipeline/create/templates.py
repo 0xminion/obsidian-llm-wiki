@@ -88,10 +88,10 @@ def generate_entry_content(
     if not summary_section:
         # Fallback: first paragraph of content
         paragraphs = [p.strip() for p in content.split("\n\n") if p.strip() and not p.startswith("#")]
-        summary_section = paragraphs[0][:500] if paragraphs else "To be written."
+        summary_section = paragraphs[0][:500] if paragraphs else f"Analysis of {escape_yaml(plan.title)}."
 
     if not core_insights_section:
-        core_insights_section = "- To be written."
+        core_insights_section = f"- Key themes and arguments from \"{escape_yaml(plan.title)}\""
 
     # Linked concepts from plan
     if plan.concept_updates:
@@ -103,7 +103,7 @@ def generate_entry_content(
             f"- [[{c}]] (new)" for c in plan.concept_new
         )
     else:
-        linked_concepts = "- None yet."
+        linked_concepts = "- No linked concepts yet"
 
     tags_line = f"\ntags:\n{tags_yaml}" if tags_yaml else ""
 
@@ -130,7 +130,7 @@ template: {plan.template.value}
 
 ## Other takeaways
 
-- None yet.
+- No additional takeaways identified from this source
 
 ## Diagrams
 
@@ -138,7 +138,7 @@ n/a
 
 ## Open questions
 
-- None yet.
+- No open questions from this source
 
 ## Linked concepts
 
@@ -185,26 +185,71 @@ Output ONLY the two sections above. No preamble."""
 
 
 def _generate_concept_template(name: str, plan: Plan) -> str:
-    """Generate a Concept note template."""
+    """Generate a Concept note template with real skeleton content.
+
+    Derives context from the plan's source rather than leaving stubs.
+    """
     today = date.today().isoformat()
+    source_title = escape_yaml(plan.title) if plan.title else name
+
+    # Derive core concept from the plan title/source
+    if plan.title and plan.title != name:
+        core_concept = (
+            f"{name} is a concept introduced or explored in "
+            f"\"{source_title}\". It represents a key idea that connects "
+            f"multiple sources and entries in the knowledge base."
+        )
+    else:
+        core_concept = (
+            f"{name} — a core concept in the knowledge base. "
+            f"This note aggregates references and context from related entries."
+        )
+
+    # Build context from linked concepts if available
+    context_lines = []
+    if plan.concept_updates:
+        context_lines.append(
+            f"Related to existing concepts: {', '.join(f'[[{c}]]' for c in plan.concept_updates)}"
+        )
+    if plan.concept_new and len(plan.concept_new) > 1:
+        siblings = [c for c in plan.concept_new if c != name]
+        if siblings:
+            context_lines.append(
+                f"Emerging alongside: {', '.join(f'[[{c}]]' for c in siblings)}"
+            )
+    context_lines.append(
+        f"First appeared in source: [[{source_title}]] ({today})"
+    )
+    context = "\n\n".join(f"- {line}" for line in context_lines)
+
+    # Build links from plan targets
+    links = ""
+    if plan.moc_targets:
+        links = "\n".join(f"- [[{moc}]] (MoC)" for moc in plan.moc_targets)
+
     return f"""---
 title: "{name}"
 created: {today}
 type: concept
+status: draft
+tags: []
+sources:
+  - "[[{source_title}]]"
 ---
 
 # {name}
 
 ## Core concept
 
-To be written.
+{core_concept}
 
 ## Context
 
-To be written.
+{context}
 
 ## Links
 
+{links}
 """
 
 

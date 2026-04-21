@@ -12,15 +12,14 @@ from pipeline.models import ConceptMatch, ExtractedSource, Manifest, Plan, Plans
 from pipeline.plan import (
     _fingerprint,
     _jaccard_similarity,
-    _extract_body,
     _parse_agent_output,
-    _run_qmd,
     build_plan_prompt,
     concept_search,
     dedup_check,
     generate_plans,
     plan_sources,
 )
+from pipeline.utils import extract_body as _extract_body
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -183,10 +182,11 @@ class TestDedupCheck:
 
 # ─── QMD wrapper ──────────────────────────────────────────────────────────────
 
+from pipeline.qmd import run_qmd_query
+
 class TestRunQmd:
     def test_successful_query(self, monkeypatch):
         """Mock qmd CLI returning valid JSON results."""
-        cfg = Config(vault_path=Path("/tmp"), qmd_cmd="qmd", plan_timeout=5)
         qmd_output = json.dumps([
             {"concept": "ai-safety", "score": 0.85, "file": "/path/ai-safety.md", "snippet": "..."},
             {"concept": "alignment", "score": 0.72, "file": "/path/alignment.md", "snippet": "..."},
@@ -198,44 +198,38 @@ class TestRunQmd:
             result.returncode = 0
             return result
 
-        monkeypatch.setattr("pipeline.plan.subprocess.run", mock_run)
-        matches = _run_qmd("artificial intelligence", cfg)
+        monkeypatch.setattr("pipeline.qmd.subprocess.run", mock_run)
+        matches = run_qmd_query("artificial intelligence", "qmd", "/tmp/coll", timeout=5)
         assert len(matches) == 2
         assert matches[0].concept == "ai-safety"
         assert matches[0].score == 0.85
         assert matches[1].concept == "alignment"
 
     def test_timeout_returns_empty(self, monkeypatch):
-        cfg = Config(vault_path=Path("/tmp"), qmd_cmd="qmd", plan_timeout=1)
-
         def mock_run(*args, **kwargs):
             raise subprocess.TimeoutExpired(cmd="qmd", timeout=1)
 
-        monkeypatch.setattr("pipeline.plan.subprocess.run", mock_run)
-        matches = _run_qmd("query", cfg)
+        monkeypatch.setattr("pipeline.qmd.subprocess.run", mock_run)
+        matches = run_qmd_query("query", "qmd", "/tmp/coll", timeout=1)
         assert matches == []
 
     def test_invalid_json_returns_empty(self, monkeypatch):
-        cfg = Config(vault_path=Path("/tmp"), qmd_cmd="qmd", plan_timeout=5)
-
         def mock_run(*args, **kwargs):
             result = MagicMock()
             result.stdout = "not valid json {{{"
             result.returncode = 0
             return result
 
-        monkeypatch.setattr("pipeline.plan.subprocess.run", mock_run)
-        matches = _run_qmd("query", cfg)
+        monkeypatch.setattr("pipeline.qmd.subprocess.run", mock_run)
+        matches = run_qmd_query("query", "qmd", "/tmp/coll", timeout=5)
         assert matches == []
 
     def test_empty_query_returns_empty(self):
-        cfg = Config(vault_path=Path("/tmp"), qmd_cmd="qmd", plan_timeout=5)
-        assert _run_qmd("", cfg) == []
-        assert _run_qmd("   ", cfg) == []
+        assert run_qmd_query("", "qmd", "/tmp/coll") == []
+        assert run_qmd_query("   ", "qmd", "/tmp/coll") == []
 
     def test_noise_stripped(self, monkeypatch):
         """qmd CLI outputs cmake/Vulkan noise before JSON."""
-        cfg = Config(vault_path=Path("/tmp"), qmd_cmd="qmd", plan_timeout=5)
         noise = "cmake error: something\nVulkan warning\n"
         valid = json.dumps([{"concept": "test", "score": 0.5, "file": "/test.md"}])
 
@@ -245,12 +239,11 @@ class TestRunQmd:
             result.returncode = 0
             return result
 
-        monkeypatch.setattr("pipeline.plan.subprocess.run", mock_run)
-        matches = _run_qmd("query", cfg)
+        monkeypatch.setattr("pipeline.qmd.subprocess.run", mock_run)
+        matches = run_qmd_query("query", "qmd", "/tmp/coll", timeout=5)
         assert len(matches) == 1
 
     def test_low_score_filtered(self, monkeypatch):
-        cfg = Config(vault_path=Path("/tmp"), qmd_cmd="qmd", plan_timeout=5)
         qmd_output = json.dumps([
             {"concept": "good", "score": 0.5, "file": "/good.md"},
             {"concept": "low", "score": 0.1, "file": "/low.md"},
@@ -262,14 +255,13 @@ class TestRunQmd:
             result.returncode = 0
             return result
 
-        monkeypatch.setattr("pipeline.plan.subprocess.run", mock_run)
-        matches = _run_qmd("query", cfg)
+        monkeypatch.setattr("pipeline.qmd.subprocess.run", mock_run)
+        matches = run_qmd_query("query", "qmd", "/tmp/coll", timeout=5)
         assert len(matches) == 1
         assert matches[0].concept == "good"
 
     def test_file_path_parsed(self, monkeypatch):
         """Concept name extracted from file path."""
-        cfg = Config(vault_path=Path("/tmp"), qmd_cmd="qmd", plan_timeout=5)
         qmd_output = json.dumps([
             {"concept": "", "score": 0.8, "file": "/vault/concepts/prediction-markets.md"},
         ])
@@ -280,9 +272,77 @@ class TestRunQmd:
             result.returncode = 0
             return result
 
-        monkeypatch.setattr("pipeline.plan.subprocess.run", mock_run)
-        matches = _run_qmd("query", cfg)
+        monkeypatch.setattr("pipeline.qmd.subprocess.run", mock_run)
+        matches = run_qmd_query("query", "qmd", "/tmp/coll", timeout=5)
         assert matches[0].concept == "prediction-markets"
+
+
+class TestQmdConceptSearch:
+    """Tests for parallel qmd concept search."""
+
+    def test_parallel_search_returns_all_hashes(self, tmp_path, monkeypatch):
+        from pipeline.qmd import run_qmd_concept_search
+        cfg = _make_config(tmp_path)
+        queries = {"hash1": "query one", "hash2": "query two", "hash3": "query three"}
+
+        call_count = 0
+
+        def mock_run(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            result = MagicMock()
+            result.stdout = json.dumps([{"concept": f"c{call_count}", "score": 0.8, "file": f"/c{call_count}.md"}])
+            result.returncode = 0
+            return result
+
+        monkeypatch.setattr("pipeline.qmd.subprocess.run", mock_run)
+        results = run_qmd_concept_search(queries, cfg)
+        assert len(results) == 3
+        assert all(h in results for h in queries)
+        assert call_count == 3
+
+    def test_empty_queries_return_empty(self, tmp_path):
+        from pipeline.qmd import run_qmd_concept_search
+        cfg = _make_config(tmp_path)
+        queries = {"h1": "", "h2": "   "}
+        results = run_qmd_concept_search(queries, cfg)
+        assert results == {"h1": [], "h2": []}
+
+
+class TestQmdConvergence:
+    """Tests for qmd convergence wrapper used by creation stage."""
+
+    def test_convergence_returns_dict_format(self, tmp_path, monkeypatch):
+        from pipeline.qmd import run_qmd_convergence
+        cfg = _make_config(tmp_path)
+        extract_dir = tmp_path / "extracted"
+        extract_dir.mkdir(parents=True, exist_ok=True)
+
+        # Create extract files for plans
+        for i, h in enumerate(["aaa111", "bbb222"]):
+            ext = {"content": f"Content about topic {i}", "title": f"Topic {i}"}
+            (extract_dir / f"{h}.json").write_text(json.dumps(ext))
+
+        plans = [
+            Plan(hash="aaa111", title="Topic 0", concept_new=["New Concept"], concept_updates=[]),
+            Plan(hash="bbb222", title="Topic 1", concept_new=[], concept_updates=["Existing"]),
+        ]
+
+        def mock_run(*args, **kwargs):
+            result = MagicMock()
+            result.stdout = json.dumps([{"concept": "test", "score": 0.6, "file": "/test.md"}])
+            result.returncode = 0
+            return result
+
+        monkeypatch.setattr("pipeline.qmd.subprocess.run", mock_run)
+        convergence = run_qmd_convergence(plans, cfg)
+        assert "aaa111" in convergence
+        assert "bbb222" in convergence
+        # Check dict format (not ConceptMatch objects)
+        assert isinstance(convergence["aaa111"], list)
+        if convergence["aaa111"]:
+            assert "concept" in convergence["aaa111"][0]
+            assert "score" in convergence["aaa111"][0]
 
 
 # ─── Concept search ───────────────────────────────────────────────────────────
@@ -296,12 +356,15 @@ class TestConceptSearch:
 
         call_count = 0
 
-        def mock_run_qmd(query, cfg):
+        def mock_qmd_search(queries, cfg, no_rerank=False):
             nonlocal call_count
-            call_count += 1
-            return [ConceptMatch(concept=f"concept-{call_count}", score=0.7)]
+            result = {}
+            for h in queries:
+                call_count += 1
+                result[h] = [ConceptMatch(concept=f"concept-{call_count}", score=0.7)]
+            return result
 
-        monkeypatch.setattr("pipeline.plan._run_qmd", mock_run_qmd)
+        monkeypatch.setattr("pipeline.qmd.run_qmd_concept_search", mock_qmd_search)
         result = concept_search(manifest, cfg)
         assert src1.hash in result
         assert src2.hash in result
@@ -540,8 +603,8 @@ class TestPlanSources:
             {"hash": src2.hash, "title": "Article B", "language": "en", "template": "standard", "tags": []},
         ])
 
-        def mock_run_qmd(query, cfg):
-            return [ConceptMatch(concept="test-concept", score=0.7)]
+        def mock_qmd_search(queries, cfg, no_rerank=False):
+            return {h: [ConceptMatch(concept="test-concept", score=0.7)] for h in queries}
 
         def mock_run_agent(*args, **kwargs):
             result = MagicMock()
@@ -549,7 +612,7 @@ class TestPlanSources:
             result.returncode = 0
             return result
 
-        monkeypatch.setattr("pipeline.plan._run_qmd", mock_run_qmd)
+        monkeypatch.setattr("pipeline.qmd.run_qmd_concept_search", mock_qmd_search)
         monkeypatch.setattr("pipeline.plan.subprocess.run", mock_run_agent)
 
         plans = plan_sources(manifest, cfg)

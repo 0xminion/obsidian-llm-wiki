@@ -456,11 +456,18 @@ class TestValidateCatchesIssues:
         (entries / "good-entry.md").write_text(
             "---\ntitle: Good Entry\nsource: \"[[good]]\"\n"
             "date_entry: 2026-01-01\nstatus: draft\ntemplate: standard\ntags:\n  - good\n---\n"
-            "# Good Entry\n## Summary\nA proper summary.\n"
-            "## Core insights\n- Insight one\n"
-            "## Other takeaways\n- None yet.\n"
+            "# Good Entry\n## Summary\n"
+            "A comprehensive and well-structured summary that covers the essential points "
+            "of the source material with adequate detail for future reference.\n"
+            "## Core insights\n"
+            "- The primary insight demonstrates how systematic approaches to knowledge "
+            "management create compounding returns over time.\n"
+            "## Other takeaways\n"
+            "- Additional observations about implementation patterns and best practices "
+            "that inform practical decisions in real-world scenarios.\n"
             "## Diagrams\nn/a\n"
-            "## Open questions\n- None yet.\n"
+            "## Open questions\n"
+            "- What are the boundary conditions for this approach?\n"
             "## Linked concepts\n- [[concept-a]]\n"
         )
 
