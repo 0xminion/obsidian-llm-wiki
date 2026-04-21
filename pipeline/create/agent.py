@@ -19,10 +19,12 @@ def _run_agent(prompt: str, cfg: Config, timeout: int = 900) -> str:
     """Run the agent command with the given prompt.
 
     Uses: hermes chat -q "prompt" -Q
-    Saves prompt to disk for debugging (not used as subprocess input).
+    Saves prompt to disk for debugging/replay).
     Handles hermes internal timeout (exit 124) gracefully — files created
     before timeout are still valid.
     """
+    from pipeline.metrics import record_agent_call
+
     agent_cmd = os.environ.get("AGENT_CMD", cfg.agent_cmd)
     try:
         # Save prompt to disk for debugging/replay
@@ -30,12 +32,22 @@ def _run_agent(prompt: str, cfg: Config, timeout: int = 900) -> str:
         prompt_file.parent.mkdir(parents=True, exist_ok=True)
         prompt_file.write_text(prompt, encoding="utf-8")
 
+        t0 = time.monotonic()
         result = subprocess.run(
             [agent_cmd, "chat", "-q", prompt, "-Q"],
             capture_output=True,
             text=True,
             timeout=timeout,
         )
+        duration = time.monotonic() - t0
+
+        output = result.stdout or ""
+
+        # Record metrics
+        record_agent_call(prompt_chars=len(prompt), output_chars=len(output))
+
+        log.info("Agent call: %d chars in, %d chars out, %.1fs",
+                 len(prompt), len(output), duration)
         # hermes may return 124 on internal timeout (not subprocess.TimeoutExpired)
         if result.returncode == 124:
             log.warning("Agent timed out (exit 124) — files created before timeout are still valid")

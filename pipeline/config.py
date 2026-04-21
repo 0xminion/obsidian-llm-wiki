@@ -23,9 +23,9 @@ except ImportError:
 
 
 def hashlib_md5_short(s: str) -> str:
-    """Portable short MD5 hash (matches shell md5sum | cut -c1-8)."""
+    """Portable short MD5 hash (12 chars, consistent across modules)."""
     import hashlib
-    return hashlib.md5(s.encode()).hexdigest()[:8]
+    return hashlib.md5(s.encode()).hexdigest()[:12]
 
 
 def _find_env_file() -> Optional[Path]:
@@ -152,12 +152,23 @@ class Config:
         return self.config_dir / "log.md"
 
     def validate(self) -> list[str]:
-        """Check for missing required paths. Returns list of errors."""
+        """Check for missing required paths and invalid config. Returns list of errors."""
         errors = []
         if not self.vault_path.exists():
             errors.append(f"Vault path does not exist: {self.vault_path}")
         if not self.sources_dir.parent.exists():
             errors.append(f"04-Wiki directory missing: {self.sources_dir.parent}")
+        # Numeric bounds
+        if self.parallel < 1:
+            errors.append(f"parallel must be >= 1, got {self.parallel}")
+        if self.parallel > 20:
+            errors.append(f"parallel > 20 is likely a mistake, got {self.parallel}")
+        if self.max_retries < 1:
+            errors.append(f"max_retries must be >= 1, got {self.max_retries}")
+        if self.extract_timeout < 5:
+            errors.append(f"extract_timeout too low (<5s), got {self.extract_timeout}")
+        if self.agent_timeout < 30:
+            errors.append(f"agent_timeout too low (<30s), got {self.agent_timeout}")
         return errors
 
 

@@ -72,9 +72,8 @@ class ExtractedSource:
     @property
     def content_hash(self) -> str:
         """16-char hash of normalized content for dedup detection."""
-        import re
-        normalized = re.sub(r"\s+", " ", self.content.lower().strip())[:2000]
-        return hashlib.md5(normalized.encode()).hexdigest()[:16]
+        from pipeline.utils import content_hash
+        return content_hash(self.content)
 
     @property
     def content_length(self) -> int:

@@ -9,7 +9,16 @@ from pathlib import Path
 log = logging.getLogger(__name__)
 
 # Regex matching CJK Unified Ideographs (Chinese characters)
-_CJK_RE = re.compile(r"[\u4e00-\u9fff]")
+_CJK_RE = re.compile(
+    r"[\u4e00-\u9fff"     # CJK Unified Ideographs (base)
+    r"\u3400-\u4dbf"      # CJK Extension A
+    r"\U00020000-\U0002a6df"  # CJK Extension B
+    r"\U0002a700-\U0002b73f"  # CJK Extension C
+    r"\U0002b740-\U0002b81f"  # CJK Extension D
+    r"\u3000-\u303f"      # CJK Symbols and Punctuation
+    r"\uff00-\uffef"      # Fullwidth Forms
+    r"]"
+)
 
 
 def count_md(directory: Path) -> int:
@@ -52,6 +61,38 @@ def extract_body(content: str) -> str:
     """Extract body text (after YAML frontmatter) from a markdown file."""
     m = re.match(r"^---\n.*?\n---\n(.*)", content, re.DOTALL)
     return m.group(1) if m else content
+
+
+def parse_frontmatter(content: str) -> dict:
+    """Extract YAML frontmatter as a dict. Returns empty dict if invalid."""
+    try:
+        import yaml
+    except ImportError:
+        return {}
+    m = re.match(r"^---\s*\n(.*?)\n---", content, re.DOTALL)
+    if not m:
+        return {}
+    try:
+        fm = yaml.safe_load(m.group(1))
+        return fm if isinstance(fm, dict) else {}
+    except Exception:
+        return {}
+
+
+def extract_tags(content: str) -> list[str]:
+    """Extract tags from YAML frontmatter."""
+    fm = parse_frontmatter(content)
+    tags = fm.get("tags", [])
+    if isinstance(tags, list):
+        return [str(t).strip().strip('"').lower() for t in tags if str(t).strip()]
+    return []
+
+
+def content_hash(content: str) -> str:
+    """16-char hash of normalized content for dedup detection."""
+    import hashlib
+    normalized = re.sub(r"\s+", " ", content.lower().strip())[:2000]
+    return hashlib.md5(normalized.encode()).hexdigest()[:16]
 
 
 # ═══════════════════════════════════════════════════════════

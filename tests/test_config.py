@@ -75,10 +75,10 @@ class TestHashlibMd5Short:
         assert hashlib_md5_short("test") == hashlib_md5_short("test")
 
     def test_length(self):
-        assert len(hashlib_md5_short("anything")) == 8
+        assert len(hashlib_md5_short("anything")) == 12
 
     def test_matches_shell(self):
-        """Must match: echo -n 'test' | md5sum | cut -c1-8"""
+        """Must match: echo -n 'test' | md5sum | cut -c1-12"""
         import hashlib
-        expected = hashlib.md5(b"test").hexdigest()[:8]
+        expected = hashlib.md5(b"test").hexdigest()[:12]
         assert hashlib_md5_short("test") == expected

@@ -9,20 +9,14 @@ from pathlib import Path
 
 from pipeline.config import Config
 from pipeline.models import Plan
+from pipeline.utils import load_prompt
 
 log = logging.getLogger(__name__)
 
 
 def _load_prompt(name: str, cfg: Config) -> str:
-    """Load a .prompt template by name."""
-    prompt_path = cfg.prompts_dir / f"{name}.prompt"
-    if not prompt_path.exists():
-        # Fallback: repo-relative prompts dir
-        prompt_path = Path(__file__).parent.parent.parent / "prompts" / f"{name}.prompt"
-    if not prompt_path.exists():
-        log.warning("Prompt not found: %s", name)
-        return ""
-    return prompt_path.read_text(encoding="utf-8").strip()
+    """Load a .prompt template by name. Delegates to utils.load_prompt."""
+    return load_prompt(name, cfg.prompts_dir)
 
 
 def build_batch_prompt(

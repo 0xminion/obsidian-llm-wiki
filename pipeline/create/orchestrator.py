@@ -21,17 +21,10 @@ log = logging.getLogger(__name__)
 def _update_tag_registry(cfg: Config) -> None:
     """Rebuild tag-registry.md from actual tag usage across all notes."""
     from collections import Counter
-    from pipeline.lint import _parse_frontmatter
+    from pipeline.utils import extract_tags
 
     registry_path = cfg.config_dir / "tag-registry.md"
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-
-    def _extract_tags(content: str) -> list[str]:
-        fm = _parse_frontmatter(content)
-        tags = fm.get("tags", [])
-        if isinstance(tags, list):
-            return [str(t).strip().strip('"').lower() for t in tags if str(t).strip()]
-        return []
 
     entry_tags = Counter()
     concept_tags = Counter()
@@ -40,7 +33,7 @@ def _update_tag_registry(cfg: Config) -> None:
         for md in cfg.entries_dir.glob("*.md"):
             try:
                 content = md.read_text(encoding="utf-8", errors="replace")
-                entry_tags.update(_extract_tags(content))
+                entry_tags.update(extract_tags(content))
             except OSError:
                 continue
 
@@ -48,7 +41,7 @@ def _update_tag_registry(cfg: Config) -> None:
         for md in cfg.concepts_dir.glob("*.md"):
             try:
                 content = md.read_text(encoding="utf-8", errors="replace")
-                concept_tags.update(_extract_tags(content))
+                concept_tags.update(extract_tags(content))
             except OSError:
                 continue
 

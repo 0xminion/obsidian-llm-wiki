@@ -54,25 +54,13 @@ class LintResult:
     fixes_applied: int = 0
 
 
-# ─── YAML Frontmatter Parsing ────────────────────────────────────────────────
+# ─── Shared Utilities ─────────────────────────────────────────────────────────
 
-def _parse_frontmatter(content: str) -> dict:
-    """Extract YAML frontmatter as a dict. Returns empty dict if invalid."""
-    try:
-        import yaml
-    except ImportError:
-        return {}
-    m = re.match(r"^---\s*\n(.*?)\n---", content, re.DOTALL)
-    if not m:
-        return {}
-    try:
-        fm = yaml.safe_load(m.group(1))
-        return fm if isinstance(fm, dict) else {}
-    except Exception:
-        return {}
-
-
-from pipeline.utils import extract_body as _extract_body
+from pipeline.utils import (
+    extract_body as _extract_body,
+    parse_frontmatter as _parse_frontmatter,
+    extract_tags as _extract_tags,
+)
 
 
 def _find_md_files(vault: Path, *dirs: str) -> list[Path]:

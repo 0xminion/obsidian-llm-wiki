@@ -17,46 +17,7 @@ from typing import Optional
 
 from pipeline.config import Config
 from pipeline.models import Edge, EdgeType, ExtractedSource, Plan
-
-
-# ─── Title → Filename ────────────────────────────────────────────────────────
-
-_CJK_RE = re.compile(
-    r"[\u4e00-\u9fff"     # CJK Unified Ideographs (base)
-    r"\u3400-\u4dbf"      # CJK Extension A
-    r"\U00020000-\U0002a6df"  # CJK Extension B
-    r"\U0002a700-\U0002b73f"  # CJK Extension C
-    r"\U0002b740-\U0002b81f"  # CJK Extension D
-    r"\u3000-\u303f"      # CJK Symbols and Punctuation
-    r"\uff00-\uffef"      # Fullwidth Forms
-    r"]"
-)
-
-
-def title_to_filename(title: str) -> str:
-    """Convert a title to a safe filename.
-
-    Chinese titles: keep Chinese characters, replace special punctuation.
-    English titles: kebab-case lowercase.
-    Truncates to 120 chars. Never uses URL slugs.
-    """
-    if _CJK_RE.search(title):
-        # Chinese title: keep Chinese chars, replace specials
-        s = title
-        s = re.sub(r"[:\uff1a]", "-", s)          # colons → hyphen
-        s = re.sub(r"[?\uff1f!\uff01,\uff0c\u3002\u3001.]", " ", s)  # punctuation → space
-        s = re.sub(r"[\"'\"\u300a\u300b\u300c\u300d()\uff08\uff09]", "", s)  # strip quotes/brackets
-        s = s.strip()
-        return s[:120]
-    else:
-        # English title: kebab-case
-        s = title.lower()
-        s = s.replace("\u2019", "'").replace("\u2018", "'")  # normalize curly quotes
-        s = re.sub(r"[''']", "", s)  # remove apostrophes
-        s = re.sub(r"[^a-zA-Z0-9]", "-", s)  # non-alnum → hyphen
-        s = re.sub(r"-{2,}", "-", s)  # collapse multiple hyphens
-        s = s.strip("-")
-        return s[:120]
+from pipeline.utils import title_to_filename
 
 
 # ─── Collision Detection ─────────────────────────────────────────────────────

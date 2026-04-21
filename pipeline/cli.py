@@ -251,6 +251,10 @@ def ingest(
         extract_dir = cfg.resolved_extract_dir
         extract_dir.mkdir(parents=True, exist_ok=True)
 
+        # ─── Metrics ────────────────────────────────────────────────────────
+        from pipeline.metrics import reset_metrics, start_stage, end_stage, get_metrics
+        reset_metrics()
+
         # ─── Collect URLs ──────────────────────────────────────────────────
         url_entries = _collect_url_files(cfg.inbox_dir)
         urls = [u for _, u in url_entries]
@@ -273,6 +277,7 @@ def ingest(
             t1 = t0  # stage was skipped, elapsed is 0
         else:
             typer.echo("Stage 1: Extracting...")
+            start_stage("extract")
             if dry_run:
                 typer.echo("  [DRY RUN] Would extract the following URLs:")
                 for url in urls:
@@ -281,6 +286,7 @@ def ingest(
             else:
                 manifest = extract_all(urls, cfg, parallel=parallel)
             elapsed_1 = time.time() - t1
+            end_stage("extract")
             typer.echo(f"  Extracted {len(manifest.entries)} sources in {elapsed_1:.1f}s")
 
         # ─── Stage 2: Plan ─────────────────────────────────────────────────
@@ -295,12 +301,14 @@ def ingest(
             t2 = t1  # stage was skipped, elapsed is 0
         else:
             typer.echo("Stage 2: Planning...")
+            start_stage("plan")
             if dry_run:
                 typer.echo("  [DRY RUN] Would generate plans for extracted sources.")
                 plans = Plans(plans=[])
             else:
                 plans = plan_sources(manifest, cfg)
             elapsed_2 = time.time() - t2
+            end_stage("plan")
             typer.echo(f"  Generated {len(plans.plans)} plans in {elapsed_2:.1f}s")
 
         if review and not resume:
@@ -317,6 +325,7 @@ def ingest(
 
         # ─── Stage 3: Create ───────────────────────────────────────────────
         typer.echo("Stage 3: Creating vault files...")
+        start_stage("create")
         t3 = time.time()
         if dry_run:
             typer.echo("  [DRY RUN] Would create vault files for plans.")
@@ -327,6 +336,7 @@ def ingest(
         else:
             stats = create_all(plans, cfg, parallel=parallel)
         elapsed_3 = time.time() - t3
+        end_stage("create")
         typer.echo(f"  Created: {stats['created']}, Failed: {stats['failed']} in {elapsed_3:.1f}s")
 
         # ─── Summary ───────────────────────────────────────────────────────
@@ -339,6 +349,13 @@ def ingest(
         typer.echo(f"  Stage 3 (Create):   {elapsed_3:.1f}s")
         typer.echo(f"  Total:              {elapsed_total:.1f}s")
         typer.echo("")
+
+        # Agent metrics
+        metrics = get_metrics()
+        if metrics.total_agent_calls > 0:
+            typer.echo(metrics.summary())
+            typer.echo("")
+
         typer.echo(f"Done in {elapsed_total:.1f}s")
 
     finally:
@@ -448,11 +465,15 @@ def compile_pass(
 ):
     """Run the compile pass — concept convergence, MoC updates, edge construction."""
     from pipeline.compile import run_compile
+    from pipeline.metrics import reset_metrics, start_stage, end_stage, get_metrics
 
     cfg = _load_cfg(vault)
     typer.echo(f"Compile pass — vault: {cfg.vault_path}")
 
+    reset_metrics()
+    start_stage("compile")
     result = run_compile(cfg)
+    end_stage("compile")
 
     if result["success"]:
         typer.echo(f"Compile pass complete. ({result['entries']} entries, "
@@ -460,6 +481,11 @@ def compile_pass(
         # Reindex after compile
         content = vault_reindex(cfg)
         typer.echo(f"Reindexed wiki-index.md ({content.count(chr(10))} lines)")
+
+        metrics = get_metrics()
+        if metrics.total_agent_calls > 0:
+            typer.echo("")
+            typer.echo(metrics.summary())
     else:
         error = result.get("error", "Unknown error")
         typer.echo(f"Compile pass failed: {error}", err=True)
@@ -580,18 +606,11 @@ def update_tags(
 ):
     """Rebuild tag-registry.md from actual tag usage across all notes."""
     from collections import Counter
-    from pipeline.lint import _parse_frontmatter
+    from pipeline.utils import extract_tags
 
     cfg = _load_cfg(vault)
     registry_path = cfg.config_dir / "tag-registry.md"
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-
-    def _extract_tags(content: str) -> list[str]:
-        fm = _parse_frontmatter(content)
-        tags = fm.get("tags", [])
-        if isinstance(tags, list):
-            return [str(t).strip().strip('"').lower() for t in tags if str(t).strip()]
-        return []
 
     entry_tags = Counter()
     concept_tags = Counter()
@@ -601,7 +620,7 @@ def update_tags(
         for md in cfg.entries_dir.glob("*.md"):
             try:
                 content = md.read_text(encoding="utf-8", errors="replace")
-                entry_tags.update(_extract_tags(content))
+                entry_tags.update(extract_tags(content))
             except OSError:
                 continue
 
@@ -609,7 +628,7 @@ def update_tags(
         for md in cfg.concepts_dir.glob("*.md"):
             try:
                 content = md.read_text(encoding="utf-8", errors="replace")
-                concept_tags.update(_extract_tags(content))
+                concept_tags.update(extract_tags(content))
             except OSError:
                 continue
 
@@ -617,7 +636,7 @@ def update_tags(
         for md in cfg.mocs_dir.glob("*.md"):
             try:
                 content = md.read_text(encoding="utf-8", errors="replace")
-                moc_tags.update(_extract_tags(content))
+                moc_tags.update(extract_tags(content))
             except OSError:
                 continue
 

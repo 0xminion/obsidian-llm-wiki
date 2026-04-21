@@ -156,8 +156,8 @@ class ContentStore:
 
     @staticmethod
     def content_hash(content: str) -> str:
-        normalized = re.sub(r"\s+", " ", content.lower().strip())[:2000]
-        return hashlib.md5(normalized.encode()).hexdigest()[:16]
+        from pipeline.utils import content_hash
+        return content_hash(content)
 
     def is_url_extracted(self, url: str) -> bool:
         """Check if URL has been successfully extracted."""

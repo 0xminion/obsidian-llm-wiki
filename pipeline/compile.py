@@ -148,25 +148,22 @@ RETRY CONTEXT: Previous attempt failed. Try alternatives:
 Be resourceful. Find a way."""
 
 
-def _load_prompt(name: str, prompts_dir: Path) -> str:
-    """Load a prompt template from prompts/."""
-    prompt_file = prompts_dir / f"{name}.prompt"
-    if prompt_file.exists():
-        return prompt_file.read_text(encoding="utf-8")
-    log.warning("Prompt file not found: %s", prompt_file)
-    return ""
+from pipeline.utils import load_prompt as _load_prompt
 
 
 def _run_agent(cfg: Config, prompt: str, description: str, max_retries: int = 3) -> tuple[bool, str]:
     """Run the agent with retry logic. Returns (success, raw_output)."""
+    from pipeline.metrics import record_agent_call
+
     agent_cmd = cfg.agent_cmd or "hermes"
     delay = 5
     last_output = ""
 
     for attempt in range(1, max_retries + 1):
-        log.info("Attempt %d/%d: %s", attempt, max_retries, description)
+        log.info("Attempt %d/%d: %s (prompt: %d chars)", attempt, max_retries, description, len(prompt))
 
         try:
+            t0 = time.monotonic()
             result = subprocess.run(
                 [agent_cmd, "chat", "-q", prompt, "-Q"],
                 cwd=str(cfg.vault_path),
@@ -174,9 +171,12 @@ def _run_agent(cfg: Config, prompt: str, description: str, max_retries: int = 3)
                 text=True,
                 timeout=600,
             )
-            last_output = result.stdout
+            duration = time.monotonic() - t0
+            last_output = result.stdout or ""
+            record_agent_call(prompt_chars=len(prompt), output_chars=len(last_output))
+
             if result.returncode == 0:
-                log.info("SUCCESS: %s", description)
+                log.info("SUCCESS: %s (%.1fs)", description, duration)
                 return True, last_output
 
             log.warning("FAILED (exit %d): %s — attempt %d/%d",

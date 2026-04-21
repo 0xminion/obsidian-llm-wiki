@@ -57,20 +57,7 @@ _LINK_ONLY_PATTERNS = [
 ]
 
 
-def _parse_frontmatter(content: str) -> dict:
-    """Extract YAML frontmatter as a dict. Returns empty dict if invalid."""
-    try:
-        import yaml
-    except ImportError:
-        return {}
-    m = re.match(r"^---\s*\n(.*?)\n---", content, re.DOTALL)
-    if not m:
-        return {}
-    try:
-        fm = yaml.safe_load(m.group(1))
-        return fm if isinstance(fm, dict) else {}
-    except Exception:
-        return {}
+from pipeline.utils import parse_frontmatter as _parse_frontmatter
 
 
 def _get_required_sections(fm: dict, note_type: str) -> list[str]:
