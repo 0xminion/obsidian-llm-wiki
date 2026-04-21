@@ -19,6 +19,7 @@ from typing import Optional
 
 import typer
 
+from pipeline._common import VaultLock
 from pipeline.config import Config, load_config
 from pipeline.extract import extract_all
 from pipeline.plan import plan_sources
@@ -45,59 +46,11 @@ def check_dependencies(agent_cmd: str = "hermes") -> list[str]:
     return missing
 
 
-def _pid_running(pid: int) -> bool:
-    """Check if a process with given PID is running."""
-    try:
-        os.kill(pid, 0)
-        return True
-    except (OSError, ProcessLookupError):
-        return False
-
-
-class PipelineLock:
-    """Directory-based lock file for pipeline runs."""
+class PipelineLock(VaultLock):
+    """Directory-based lock file for pipeline runs (delegates to VaultLock)."""
 
     def __init__(self, vault_path: Path):
-        self.lock_dir = vault_path / "06-Config" / ".pipeline.lock"
-        self.acquired = False
-
-    def acquire(self) -> bool:
-        try:
-            self.lock_dir.mkdir(exist_ok=False)
-            self.acquired = True
-            (self.lock_dir / "pid").write_text(str(os.getpid()))
-            import atexit
-            atexit.register(self.release)
-            return True
-        except FileExistsError:
-            pid_file = self.lock_dir / "pid"
-            if pid_file.exists():
-                # Check lock age — stale after 30 minutes
-                try:
-                    lock_age = time.time() - self.lock_dir.stat().st_mtime
-                    if lock_age > 1800:
-                        log.warning("Stale lock detected (age: %.0fs), forcing release", lock_age)
-                        self._force_release()
-                        return self.acquire()
-                except OSError:
-                    pass
-                try:
-                    old_pid = int(pid_file.read_text().strip())
-                    if not _pid_running(old_pid):
-                        self._force_release()
-                        return self.acquire()
-                except ValueError:
-                    self._force_release()
-                    return self.acquire()
-            return False
-
-    def _force_release(self) -> None:
-        shutil.rmtree(self.lock_dir, ignore_errors=True)
-
-    def release(self) -> None:
-        if self.acquired:
-            shutil.rmtree(self.lock_dir, ignore_errors=True)
-            self.acquired = False
+        super().__init__(vault_path, name="pipeline")
 
 
 def _setup_logging(verbose: bool = False, log_file: Optional[Path] = None) -> None:

@@ -9,6 +9,7 @@ Ports common.sh utilities to Python:
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import shutil
@@ -17,14 +18,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional, TypeVar
 
-log = logging.getLogger(__name__)
-
 T = TypeVar("T")
 
 # Required CLI tools for the pipeline
 REQUIRED_TOOLS: list[str] = ["python3", "hermes", "curl"]
 # Optional but recommended tools
 OPTIONAL_TOOLS: list[str] = ["qmd", "yt-dlp", "ffmpeg"]
+
+log = logging.getLogger(__name__)
 
 
 def check_dependencies(
@@ -84,7 +85,7 @@ class VaultLock:
         self.vault_path = Path(vault_path)
         self.name = name
         # Hash-based lock dir in /tmp (mirrors common.sh approach)
-        vault_hash = hex(hash(str(self.vault_path.resolve())))[2:10]
+        vault_hash = hashlib.md5(str(self.vault_path.resolve()).encode()).hexdigest()[:8]
         self.lock_dir = Path(f"/tmp/obsidian-{name}-{vault_hash}.lock")
         self._acquired: bool = False
 

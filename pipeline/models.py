@@ -171,17 +171,22 @@ class Manifest:
         if not path.exists():
             return cls(entries=[])
         data = json.loads(path.read_text())
-        entries = [
-            ExtractedSource(
-                url=d["url"],
-                title=d["title"],
-                content=d.get("content", ""),
-                type=SourceType(d.get("type", "unknown")),
-                author=d.get("author", ""),
-                source_file=d.get("source_file", ""),
-            )
-            for d in data
-        ]
+        entries = []
+        for d in data:
+            try:
+                entries.append(
+                    ExtractedSource(
+                        url=d["url"],
+                        title=d["title"],
+                        content=d.get("content", ""),
+                        type=SourceType(d.get("type", "unknown")),
+                        author=d.get("author", ""),
+                        source_file=d.get("source_file", ""),
+                    )
+                )
+            except (ValueError, KeyError):
+                log.warning("Skipping malformed manifest entry: missing or invalid fields")
+                continue
         return cls(entries=entries)
 
     @property
@@ -273,6 +278,7 @@ class Edge:
 
     def to_tsv(self) -> str:
         def _escape(s: str) -> str:
+            # Order matters: backslash must be escaped first
             return s.replace("\\", "\\\\").replace("\t", "\\t").replace("\n", "\\n")
         return f"{_escape(self.source)}\t{_escape(self.target)}\t{_escape(self.type.value)}\t{_escape(self.description)}"
 
@@ -282,7 +288,26 @@ class Edge:
         if len(parts) < 3:
             return None
         def _unescape(s: str) -> str:
-            return s.replace("\\t", "\t").replace("\\n", "\n").replace("\\\\", "\\")
+            out = []
+            i = 0
+            while i < len(s):
+                if s[i] == "\\" and i + 1 < len(s):
+                    nxt = s[i + 1]
+                    if nxt == "t":
+                        out.append("\t")
+                        i += 2
+                        continue
+                    if nxt == "n":
+                        out.append("\n")
+                        i += 2
+                        continue
+                    if nxt == "\\":
+                        out.append("\\")
+                        i += 2
+                        continue
+                out.append(s[i])
+                i += 1
+            return "".join(out)
         try:
             return cls(
                 source=_unescape(parts[0]),

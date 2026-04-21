@@ -243,12 +243,7 @@ def extract_all(urls: list[str], cfg: Config, parallel: int = 4) -> Manifest:
             for future in as_completed(futures):
                 result = future.result()
                 if result:
-                    is_valid, reason = _validate_extraction(result.content)
-                    if is_valid:
-                        manifest.entries.append(result)
-                    else:
-                        url = futures[future]
-                        log.warning("Skipping invalid extraction for %s: %s", url, reason)
+                    manifest.entries.append(result)
     finally:
         store.close()
 

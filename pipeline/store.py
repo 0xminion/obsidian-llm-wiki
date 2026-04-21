@@ -65,8 +65,12 @@ class ContentStore:
         if hasattr(self, "_conn"):
             try:
                 self._conn.close()
-            except Exception:
-                pass
+            except Exception as e:
+                try:
+                    log.warning("Exception during ContentStore.__del__: %s", e)
+                except Exception:
+                    # Interpreter shutdown — logging may be torn down
+                    pass
 
     def _init_schema(self) -> None:
         self._conn.executescript("""

@@ -123,7 +123,17 @@ def create_batch(batch: list[Plan], batch_idx: int, cfg: Config) -> dict:
             filename = title_to_filename(plan.title)
             entry_file = cfg.entries_dir / f"{filename}.md"
             source_file = cfg.sources_dir / f"{filename}.md"
-            if entry_file.exists() or source_file.exists():
+            if (
+                entry_file.exists()
+                and entry_file.stat().st_size > 0
+                and "---" in entry_file.read_text(encoding="utf-8")
+            ):
+                created_any = True
+                break
+            if (
+                source_file.exists()
+                and source_file.stat().st_size > 0
+            ):
                 created_any = True
                 break
 

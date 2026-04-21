@@ -329,22 +329,19 @@ def create_all(plans: Plans, cfg: Config, parallel: int = 3) -> dict:
 
 def _sync_vault(cfg: Config) -> None:
     """Sync vault via ob CLI if available."""
-    try:
-        result = subprocess.run(
-            ["which", "ob"],
-            capture_output=True,
-            text=True,
-        )
-        if result.returncode != 0:
-            log.info("ob CLI not found, skipping vault sync")
-            return
+    import shutil
+    if not shutil.which("ob"):
+        log.info("ob CLI not found, skipping vault sync")
+        return
 
-        log.info("Syncing vault...")
+    log.info("Syncing vault...")
+    try:
         subprocess.run(
             ["ob", "sync", "--path", str(cfg.vault_path)],
             capture_output=True,
             text=True,
             timeout=120,
+            check=True,
         )
-    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
-        log.warning("Vault sync failed")
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError, subprocess.CalledProcessError) as e:
+        log.warning("Vault sync failed: %s", e)
