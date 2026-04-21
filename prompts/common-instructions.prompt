@@ -134,7 +134,7 @@ BATCH PROCESSING (10+ sources):
 5. Report: total processed, total failed, total concepts created/updated
 
 NAMING CONVENTIONS (critical — apply to ALL Source and Entry filenames):
-- Use title_to_filename() from lib/common.sh
+- Use title_to_filename() from pipeline.utils
 - Chinese titles → Chinese filenames (潮汕钱庄网络.md)
 - English titles → kebab-case (the-measles-market-on-kalshi.md)
 - Papers → actual paper title (How manipulable are prediction markets.md)
