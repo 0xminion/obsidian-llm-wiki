@@ -1,8 +1,11 @@
 """Podcast episode extraction.
 
-Chain: iTunes lookup → iTunes search → RSS parse → transcription.
-Handles Apple Podcasts store ID ≠ iTunes API ID mismatch.
-Falls back to RSS description if transcription unavailable.
+Supports: Apple Podcasts, Spotify, Overcast, Pocket Casts, Castbox, Podbean,
+Podchaser, Podcast Addict, direct RSS feeds, PodcastIndex.org, and any
+provider with an RSS link in the page.
+
+Chain: provider lookup → RSS parse → transcription.
+Fails loudly if transcript unavailable — never metadata-only.
 """
 
 from __future__ import annotations
@@ -14,7 +17,8 @@ import re
 import subprocess
 import tempfile
 import xml.etree.ElementTree as ET
-from urllib.parse import quote
+from typing import Optional
+from urllib.parse import quote, urlparse, parse_qs
 
 from pipeline.config import Config
 from pipeline.models import ExtractedSource, SourceType
@@ -29,11 +33,43 @@ from pipeline.extractors._shared import (
 log = logging.getLogger(__name__)
 
 
+# ─── Provider Patterns ──────────────────────────────────────────────────────
+
+# Direct RSS feed indicators
+_RSS_EXTENSIONS = (".xml", ".rss", "/feed", "/rss", "/podcast.xml")
+_RSS_HOSTS = (
+    "feeds.", "feed.", "buzzsprout.com", "libsyn.com", "megaphone.fm",
+    "anchor.fm", "podbean.com", "transistor.fm", "simplecast.com",
+    "captivate.fm", "fireside.fm", "rss.com", "podomatic.com",
+    "spreaker.com", "audioboom.com", "omnycontent.com", "chtbl.com",
+    "art19.com", "acast.com", "redcircle.com", "podigee.com",
+)
+
+# Platform-specific resolvers
+_KNOWN_PROVIDERS = {
+    "podcasts.apple.com": "apple",
+    "open.spotify.com": "spotify",
+    "spotify.com": "spotify",
+    "overcast.fm": "overcast",
+    "pocketcasts.com": "pocketcasts",
+    "castbox.fm": "castbox",
+    "podchaser.com": "podchaser",
+    "podcastaddict.com": "podcastaddict",
+    "pod.link": "podlink",
+    "podcastindex.org": "podcastindex",
+    "google.com/podcasts": "google",
+    "youtube.com": "youtube_music",
+    "music.youtube.com": "youtube_music",
+}
+
+
 def extract_podcast(url: str, cfg: Config) -> ExtractedSource:
     """Extract podcast episode via provider-specific lookup → RSS → transcription.
 
-    Supports: Apple Podcasts, Spotify, Google Podcasts, Overcast, Pocket Casts,
-    Castbox, Podbean, direct RSS feeds, and any provider with RSS link in page.
+    Supports any podcast platform that either:
+    1. Has a direct RSS feed URL
+    2. Can be resolved to RSS via platform-specific logic
+    3. Has an RSS link embedded in the page
 
     Chain: provider lookup → RSS parse → transcription.
     Falls back to RSS description if transcription unavailable.
@@ -97,6 +133,22 @@ def extract_podcast(url: str, cfg: Config) -> ExtractedSource:
     )
 
 
+def _detect_provider(url: str) -> str:
+    """Detect podcast provider from URL. Returns provider key or 'unknown'."""
+    url_lower = url.lower()
+    for pattern, provider in _KNOWN_PROVIDERS.items():
+        if pattern in url_lower:
+            return provider
+
+    # Check for direct RSS
+    if url.startswith("http") and any(ext in url_lower for ext in _RSS_EXTENSIONS):
+        return "direct_rss"
+    if url.startswith("http") and any(host in url_lower for host in _RSS_HOSTS):
+        return "direct_rss"
+
+    return "unknown"
+
+
 def _resolve_podcast_feed(
     url: str, timeout: int
 ) -> tuple[str, str, str, str, str]:
@@ -117,32 +169,58 @@ def _resolve_podcast_feed(
     feed_url = ""
     podcast_name = ""
     description = ""
+    provider = _detect_provider(url)
+
+    log.debug("Podcast provider detected: %s for %s", provider, url[:80])
 
     # ─── Apple Podcasts: iTunes API ───────────────────────────────────────
-    if "podcasts.apple.com" in url:
+    if provider == "apple":
         feed_url, podcast_name, description = _resolve_apple_podcast(
             podcast_id, episode_slug, timeout
         )
 
-    # ─── Spotify: search by show name ─────────────────────────────────────
-    elif "spotify.com" in url or "open.spotify.com" in url:
+    # ─── Spotify ──────────────────────────────────────────────────────────
+    elif provider == "spotify":
         feed_url, podcast_name = _resolve_spotify_podcast(url, timeout)
 
+    # ─── Overcast ─────────────────────────────────────────────────────────
+    elif provider == "overcast":
+        feed_url, podcast_name = _resolve_overcast_podcast(url, timeout)
+
+    # ─── Pocket Casts ─────────────────────────────────────────────────────
+    elif provider == "pocketcasts":
+        feed_url, podcast_name = _resolve_pocketcasts_podcast(url, timeout)
+
+    # ─── Castbox ──────────────────────────────────────────────────────────
+    elif provider == "castbox":
+        feed_url, podcast_name = _resolve_castbox_podcast(url, timeout)
+
+    # ─── Podchaser ────────────────────────────────────────────────────────
+    elif provider == "podchaser":
+        feed_url, podcast_name = _resolve_podchaser_podcast(url, timeout)
+
+    # ─── PodcastIndex.org ─────────────────────────────────────────────────
+    elif provider == "podcastindex":
+        feed_url, podcast_name = _resolve_podcastindex(url, timeout)
+
     # ─── Direct RSS feed URL ──────────────────────────────────────────────
-    elif url.startswith("http") and (
-        "/feed" in url or "/rss" in url or url.endswith(".xml")
-        or "feeds." in url or "buzzsprout.com" in url
-        or "libsyn.com" in url or "megaphone.fm" in url
-    ):
+    elif provider == "direct_rss":
         feed_url = url
         podcast_name = _guess_name_from_feed_url(url)
 
-    # ─── Other providers: fetch page, look for RSS link ───────────────────
+    # ─── Generic: fetch page, look for RSS link ───────────────────────────
     else:
         feed_url, podcast_name = _resolve_generic_podcast(url, timeout)
 
+    # Final fallback: try PodcastIndex search if still no feed
+    if not feed_url and podcast_name:
+        log.info("No feed from provider, trying PodcastIndex search for: %s", podcast_name)
+        feed_url, _ = _search_podcastindex(podcast_name, timeout)
+
     return feed_url, podcast_name, episode_id, episode_slug, description
 
+
+# ─── Provider-Specific Resolvers ────────────────────────────────────────────
 
 def _resolve_apple_podcast(
     podcast_id: str, episode_slug: str, timeout: int
@@ -214,7 +292,6 @@ def _resolve_apple_podcast(
 
 def _resolve_spotify_podcast(url: str, timeout: int) -> tuple[str, str]:
     """Resolve Spotify podcast to RSS feed via show/episode page scraping."""
-    # Fetch the Spotify page and look for show name
     content = _curl_get(url, timeout=timeout)
     podcast_name = ""
 
@@ -222,11 +299,16 @@ def _resolve_spotify_podcast(url: str, timeout: int) -> tuple[str, str]:
     title_match = re.search(r"<title>([^<]+)</title>", content)
     if title_match:
         title_text = title_match.group(1)
-        # Spotify titles: "Show Name | Podcast on Spotify" or "Episode Name - Podcast | Spotify"
         podcast_name = re.sub(r"\s*[|\-]\s*(?:Podcast\s+)?on\s+Spotify.*", "", title_text)
         podcast_name = re.sub(r"\s*[|\-]\s*Spotify.*", "", podcast_name).strip()
 
-    # Search for RSS feed by name using iTunes search
+    # Try PodcastIndex first (non-iTunes)
+    if podcast_name:
+        feed_url, _ = _search_podcastindex(podcast_name, timeout)
+        if feed_url:
+            return feed_url, podcast_name
+
+    # Fallback: iTunes search
     if podcast_name:
         search_json = _curl_get(
             f"https://itunes.apple.com/search?term={quote(podcast_name)}&media=podcast&limit=1",
@@ -245,26 +327,214 @@ def _resolve_spotify_podcast(url: str, timeout: int) -> tuple[str, str]:
     return "", podcast_name
 
 
-def _resolve_generic_podcast(url: str, timeout: int) -> tuple[str, str]:
-    """Resolve generic podcast URL by fetching page and looking for RSS feed link."""
+def _resolve_overcast_podcast(url: str, timeout: int) -> tuple[str, str]:
+    """Resolve Overcast.fm podcast/episode to RSS feed.
+
+    Overcast pages contain <link rel="alternate" type="application/rss+xml" href="...">
+    """
     content = _curl_get(url, timeout=timeout)
     podcast_name = ""
 
-    # Look for RSS feed link in HTML
-    # <link type="application/rss+xml" href="...">
+    # Extract show name from title
+    title_match = re.search(r"<title>([^<]+)</title>", content)
+    if title_match:
+        podcast_name = re.sub(r"\s*[–—\-|]\s*Overcast.*", "", title_match.group(1)).strip()
+
+    # Look for RSS link
+    rss_match = re.search(
+        r'<link[^>]+type=["\']application/rss\+xml["\'][^>]+href=["\']([^"\']+)["\']',
+        content, re.IGNORECASE,
+    )
+    if rss_match:
+        return rss_match.group(1), podcast_name
+
+    # Overcast also stores feed URL in meta
+    feed_match = re.search(r'data-feedurl="([^"]+)"', content)
+    if feed_match:
+        return feed_match.group(1), podcast_name
+
+    return "", podcast_name
+
+
+def _resolve_pocketcasts_podcast(url: str, timeout: int) -> tuple[str, str]:
+    """Resolve Pocket Casts podcast to RSS feed.
+
+    Pocket Casts URLs: pocketcasts.com/podcasts/SHOW_ID or /episodes/EP_ID
+    """
+    content = _curl_get(url, timeout=timeout)
+    podcast_name = ""
+
+    title_match = re.search(r"<title>([^<]+)</title>", content)
+    if title_match:
+        podcast_name = re.sub(r"\s*\|\s*Pocket Casts.*", "", title_match.group(1)).strip()
+
+    # Look for RSS link
+    rss_match = re.search(
+        r'<link[^>]+type=["\']application/rss\+xml["\'][^>]+href=["\']([^"\']+)["\']',
+        content, re.IGNORECASE,
+    )
+    if rss_match:
+        return rss_match.group(1), podcast_name
+
+    # Look for feed URL in page data
+    feed_match = re.search(r'"feedUrl"\s*:\s*"([^"]+)"', content)
+    if feed_match:
+        return feed_match.group(1), podcast_name
+
+    return "", podcast_name
+
+
+def _resolve_castbox_podcast(url: str, timeout: int) -> tuple[str, str]:
+    """Resolve Castbox.fm podcast to RSS feed.
+
+    Castbox URLs: castbox.fm/channel/... or /episode/...
+    """
+    content = _curl_get(url, timeout=timeout)
+    podcast_name = ""
+
+    title_match = re.search(r"<title>([^<]+)</title>", content)
+    if title_match:
+        podcast_name = re.sub(r"\s*[-|]\s*Castbox.*", "", title_match.group(1)).strip()
+
+    # Castbox embeds feed data in page
+    feed_match = re.search(r'"feedUrl"\s*:\s*"([^"]+)"', content)
+    if feed_match:
+        return feed_match.group(1), podcast_name
+
+    rss_match = re.search(
+        r'<link[^>]+type=["\']application/rss\+xml["\'][^>]+href=["\']([^"\']+)["\']',
+        content, re.IGNORECASE,
+    )
+    if rss_match:
+        return rss_match.group(1), podcast_name
+
+    return "", podcast_name
+
+
+def _resolve_podchaser_podcast(url: str, timeout: int) -> tuple[str, str]:
+    """Resolve Podchaser podcast to RSS feed.
+
+    Podchaser URLs: podchaser.com/podcasts/SLUG-ID or /episodes/SLUG-ID
+    """
+    content = _curl_get(url, timeout=timeout)
+    podcast_name = ""
+
+    title_match = re.search(r"<title>([^<]+)</title>", content)
+    if title_match:
+        podcast_name = re.sub(r"\s*[-|]\s*Podchaser.*", "", title_match.group(1)).strip()
+
+    # Look for RSS link
+    rss_match = re.search(
+        r'<link[^>]+type=["\']application/rss\+xml["\'][^>]+href=["\']([^"\']+)["\']',
+        content, re.IGNORECASE,
+    )
+    if rss_match:
+        return rss_match.group(1), podcast_name
+
+    # Podchaser embeds feed URL in JSON-LD or page data
+    feed_match = re.search(r'"url"\s*:\s*"(https?://[^"]*\.(xml|rss)[^"]*)"', content)
+    if feed_match:
+        return feed_match.group(1), podcast_name
+
+    return "", podcast_name
+
+
+def _resolve_podcastindex(url: str, timeout: int) -> tuple[str, str]:
+    """Resolve PodcastIndex.org URL to RSS feed.
+
+    PodcastIndex URLs: podcastindex.org/podcast/ID or /episode/ID
+    """
+    # Extract ID from URL
+    id_match = re.search(r"/(?:podcast|episode)/(\d+)", url)
+    if not id_match:
+        return "", ""
+
+    podcast_id = id_match.group(1)
+
+    # Use PodcastIndex API (public, no auth needed for lookups)
+    api_url = f"https://api.podcastindex.org/api/1.0/podcasts/byfeedid?id={podcast_id}"
+    response = _curl_get(api_url, timeout=timeout)
+    if response:
+        try:
+            data = json.loads(response)
+            feed = data.get("feed", {})
+            if feed:
+                return feed.get("url", ""), feed.get("title", "")
+        except (json.JSONDecodeError, KeyError):
+            pass
+
+    return "", ""
+
+
+# ─── PodcastIndex Search (non-iTunes fallback) ──────────────────────────────
+
+def _search_podcastindex(query: str, timeout: int) -> tuple[str, str]:
+    """Search PodcastIndex.org for a podcast by name. Returns (feed_url, title).
+
+    This is the primary non-iTunes search backend.
+    PodcastIndex is open, community-maintained, and includes podcasts
+    not listed in Apple's directory.
+    """
+    if not query or len(query.strip()) < 3:
+        return "", ""
+
+    api_url = f"https://api.podcastindex.org/api/1.0/search/byterm?q={quote(query)}&max=3"
+    response = _curl_get(api_url, timeout=timeout)
+    if not response:
+        return "", ""
+
+    try:
+        data = json.loads(response)
+        feeds = data.get("feeds", [])
+        if feeds:
+            best = feeds[0]
+            return best.get("url", ""), best.get("title", "")
+    except (json.JSONDecodeError, KeyError, IndexError):
+        pass
+
+    return "", ""
+
+
+# ─── Generic Resolver ───────────────────────────────────────────────────────
+
+def _resolve_generic_podcast(url: str, timeout: int) -> tuple[str, str]:
+    """Resolve generic podcast URL by fetching page and looking for RSS feed link.
+
+    Tries multiple strategies:
+    1. <link type="application/rss+xml"> tag
+    2. RSS URL patterns in page text
+    3. JSON-LD structured data with feed URL
+    4. og:audio or podcast metadata in meta tags
+    """
+    content = _curl_get(url, timeout=timeout)
+    if not content:
+        return "", ""
+
+    podcast_name = ""
+
+    # Extract name from title
+    title_match = re.search(r"<title>([^<]+)</title>", content)
+    if title_match:
+        podcast_name = title_match.group(1).strip()
+        # Clean common suffixes
+        for suffix in [" | Podcast", " - Podcast", " Podcast", " on Apple Podcasts",
+                       " on Spotify", " | Listen on", " - Listen Free"]:
+            podcast_name = podcast_name.replace(suffix, "").strip()
+
+    # Strategy 1: <link type="application/rss+xml" href="...">
     rss_match = re.search(
         r'<link[^>]+type=["\']application/rss\+xml["\'][^>]+href=["\']([^"\']+)["\']',
         content, re.IGNORECASE,
     )
     if rss_match:
         feed_url = rss_match.group(1)
-        # Extract name from title
-        title_match = re.search(r"<title>([^<]+)</title>", content)
-        if title_match:
-            podcast_name = title_match.group(1).strip()
+        # Make relative URLs absolute
+        if feed_url.startswith("/"):
+            parsed = urlparse(url)
+            feed_url = f"{parsed.scheme}://{parsed.netloc}{feed_url}"
         return feed_url, podcast_name
 
-    # Look for RSS URL in page text
+    # Strategy 2: RSS URL pattern in page
     rss_url_match = re.search(
         r'https?://[^\s"<>]+/(?:feed|rss|podcast\.xml)[^\s"<>]*',
         content, re.IGNORECASE,
@@ -272,12 +542,28 @@ def _resolve_generic_podcast(url: str, timeout: int) -> tuple[str, str]:
     if rss_url_match:
         return rss_url_match.group(0), podcast_name
 
+    # Strategy 3: JSON-LD structured data
+    jsonld_match = re.search(r'"url"\s*:\s*"(https?://[^"]*\.(xml|rss)[^"]*)"', content)
+    if jsonld_match:
+        return jsonld_match.group(1), podcast_name
+
+    # Strategy 4: feedUrl in JavaScript data
+    feed_match = re.search(r'"feedUrl"\s*:\s*"(https?://[^"]+)"', content)
+    if feed_match:
+        return feed_match.group(1), podcast_name
+
+    # Strategy 5: data-feed-url attribute
+    data_feed_match = re.search(r'data-feed-?url=["\']([^"\']+)["\']', content, re.IGNORECASE)
+    if data_feed_match:
+        return data_feed_match.group(1), podcast_name
+
     return "", podcast_name
 
 
+# ─── RSS Parsing ─────────────────────────────────────────────────────────────
+
 def _guess_name_from_feed_url(url: str) -> str:
     """Guess podcast name from feed URL path."""
-    from urllib.parse import urlparse
     parsed = urlparse(url)
     path = parsed.path.strip("/")
     if "/" in path:
@@ -382,6 +668,8 @@ def _parse_rss_episode(feed_url: str, episode_id: str, episode_slug: str = "",
 
     return audio_url, description, episode_title
 
+
+# ─── Transcription ───────────────────────────────────────────────────────────
 
 def _transcribe_podcast_audio(audio_url: str, cfg: Config) -> str:
     """Download podcast audio and transcribe with AssemblyAI.
