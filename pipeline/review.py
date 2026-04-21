@@ -39,6 +39,36 @@ def stage_for_review(
     store = ContentStore.open(cfg.resolved_extract_dir)
     extract_dir = cfg.resolved_extract_dir
     stats = {"staged": 0, "failed": 0}
+    reserved_paths = {Path(item["file_path"]) for item in store.review_get_pending()}
+
+    def _reserve_note_filename(base_filename: str) -> str:
+        candidate = base_filename
+        suffix = 0
+        while True:
+            source_path = cfg.sources_dir / f"{candidate}.md"
+            entry_path = cfg.entries_dir / f"{candidate}.md"
+            if (
+                not source_path.exists()
+                and not entry_path.exists()
+                and source_path not in reserved_paths
+                and entry_path not in reserved_paths
+            ):
+                reserved_paths.add(source_path)
+                reserved_paths.add(entry_path)
+                return candidate
+            suffix += 1
+            candidate = f"{base_filename}-{suffix}"
+
+    def _reserve_path(directory: Path, base_filename: str) -> tuple[str, Path]:
+        candidate = base_filename
+        suffix = 0
+        while True:
+            path = directory / f"{candidate}.md"
+            if not path.exists() and path not in reserved_paths:
+                reserved_paths.add(path)
+                return candidate, path
+            suffix += 1
+            candidate = f"{base_filename}-{suffix}"
 
     for plan in plans.plans:
         try:
@@ -52,13 +82,22 @@ def stage_for_review(
             filename = title_to_filename(plan.title)
 
             # 1. Stage Source
-            source_content = generate_source_content(plan, extracted)
-            source_path = str(cfg.sources_dir / f"{filename}.md")
+            note_filename = _reserve_note_filename(filename)
+            source_filename = note_filename
+            entry_filename = note_filename
+            note_suffix = note_filename[len(filename):] if note_filename.startswith(filename) else ""
+            entry_link_name = f"{plan.title}{note_suffix}"
+            source_content = generate_source_content(
+                plan,
+                extracted,
+                note_title=entry_link_name,
+            )
+            source_path = cfg.sources_dir / f"{source_filename}.md"
             store.review_add(
                 plan_hash=plan.hash,
                 plan_data=plan.to_dict(),
                 file_type="source",
-                file_path=source_path,
+                file_path=str(source_path),
                 file_content=source_content,
             )
 
@@ -67,26 +106,36 @@ def stage_for_review(
             if use_agent_insights:
                 insights = generate_entry_insights(plan, extracted, cfg)
 
-            entry_content = generate_entry_content(plan, extracted, filename, insights)
-            entry_path = str(cfg.entries_dir / f"{filename}.md")
+            entry_path = cfg.entries_dir / f"{entry_filename}.md"
+            entry_content = generate_entry_content(
+                plan,
+                extracted,
+                source_filename,
+                insights,
+                note_title=entry_link_name,
+            )
             store.review_add(
                 plan_hash=plan.hash,
                 plan_data=plan.to_dict(),
                 file_type="entry",
-                file_path=entry_path,
+                file_path=str(entry_path),
                 file_content=entry_content,
             )
 
             # 3. Stage Concepts (if new)
             for concept_name in plan.concept_new:
-                concept_content = _generate_concept_template(concept_name, plan)
+                concept_content = _generate_concept_template(
+                    concept_name,
+                    plan,
+                    source_note_title=entry_link_name,
+                )
                 concept_filename = title_to_filename(concept_name)
-                concept_path = str(cfg.concepts_dir / f"{concept_filename}.md")
+                _, concept_path = _reserve_path(cfg.concepts_dir, concept_filename)
                 store.review_add(
                     plan_hash=plan.hash,
                     plan_data=plan.to_dict(),
                     file_type="concept",
-                    file_path=concept_path,
+                    file_path=str(concept_path),
                     file_content=concept_content,
                 )
 
@@ -117,15 +166,18 @@ def approve_reviews(cfg: Config, review_ids: Optional[list[int]] = None) -> dict
     """
     store = ContentStore.open(cfg.resolved_extract_dir)
     try:
-        pending = store.review_get_pending()
+        all_pending = store.review_get_pending()
+        pending = all_pending
 
         if review_ids:
             pending = [r for r in pending if r["id"] in review_ids]
 
         stats = {"approved": 0, "written": 0, "failed": 0}
-        approved_hashes: set[str] = set()
+        plan_outcomes: dict[str, dict[str, int]] = {}
 
         for review in pending:
+            plan_hash = review["plan_hash"]
+            plan_outcomes.setdefault(plan_hash, {"written": 0, "failed": 0})
             try:
                 # Write file to vault
                 file_path = Path(review["file_path"])
@@ -136,21 +188,30 @@ def approve_reviews(cfg: Config, review_ids: Optional[list[int]] = None) -> dict
                 store.review_approve(review["id"])
                 stats["approved"] += 1
                 stats["written"] += 1
-                approved_hashes.add(review["plan_hash"])
+                plan_outcomes[plan_hash]["written"] += 1
                 log.info("Approved and wrote: %s", file_path.name)
 
             except Exception as e:
                 log.error("Failed to write %s: %s", review["file_path"], e)
                 stats["failed"] += 1
+                plan_outcomes[plan_hash]["failed"] += 1
     finally:
         store.close()
 
     # Post-processing: reindex + archive
     if stats["written"] > 0:
+        selected_pending_ids = {r["id"] for r in pending}
+        successful_hashes = {
+            plan_hash
+            for plan_hash, outcome in plan_outcomes.items()
+            if outcome["written"] > 0
+            and outcome["failed"] == 0
+            and all(r["id"] in selected_pending_ids for r in all_pending if r["plan_hash"] == plan_hash)
+        }
         try:
             from pipeline.vault import reindex as vault_reindex, archive_inbox
             vault_reindex(cfg)
-            archive_inbox(cfg, approved_hashes)
+            archive_inbox(cfg, successful_hashes)
         except Exception as e:
             log.warning("Post-approve reindex/archive failed: %s", e)
 

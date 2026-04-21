@@ -164,7 +164,7 @@ def write_source(cfg: Config, source: ExtractedSource) -> Path:
 
 # ─── Write Entry ──────────────────────────────────────────────────────────────
 
-def write_entry(cfg: Config, plan: Plan, content: str) -> Path:
+def write_entry(cfg: Config, plan: Plan, content: str, source_note_name: str | None = None) -> Path:
     """Write an entry note to cfg.entries_dir.
 
     Returns the Path of the created file.
@@ -175,8 +175,8 @@ def write_entry(cfg: Config, plan: Plan, content: str) -> Path:
     filename = resolve_collision(cfg.entries_dir, filename)
 
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    # Source note uses same filename as entry (per naming convention: match source filename)
-    source_link = f"[[{title_to_filename(plan.title)}]]"
+    source_name = source_note_name or title_to_filename(plan.title)
+    source_link = f"[[{source_name}]]"
 
     frontmatter = _build_frontmatter({
         "title": plan.title,

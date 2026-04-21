@@ -155,6 +155,86 @@ def _validate_batch_files(batch: list, cfg: Config) -> dict:
     }
 
 
+def postprocess_creation(
+    cfg: Config,
+    results: list[dict],
+    plan_count: int,
+    failed_count: int,
+    manifest_path: Path | None = None,
+) -> list[str]:
+    """Run shared post-processing for Stage 3 creation flows."""
+    log.info("Running global output validation...")
+    manifest_path = manifest_path or (cfg.resolved_extract_dir / "manifest.json")
+    violations = validate_output(cfg, manifest_path)
+    if violations:
+        log.warning("Global validation found %d violations:", len(violations))
+        for v in violations[:10]:
+            log.warning("  %s", v)
+
+        repaired = _repair_violations(cfg, violations)
+        if repaired:
+            log.info("Auto-repaired %d files", repaired)
+            remaining = validate_output(cfg, manifest_path)
+            if remaining:
+                log.warning("After repair, %d violations remain:", len(remaining))
+                for v in remaining[:5]:
+                    log.warning("  %s", v)
+                violations = remaining
+            else:
+                log.info("All violations repaired")
+                violations = []
+    else:
+        log.info("Global validation passed")
+
+    log.info("Rebuilding wiki-index...")
+    try:
+        reindex(cfg)
+    except Exception:
+        log.exception("Reindex failed")
+
+    log.info("Updating tag registry...")
+    try:
+        _update_tag_registry(cfg)
+    except Exception:
+        log.exception("Tag registry update failed")
+
+    try:
+        cfg.config_dir.mkdir(parents=True, exist_ok=True)
+        log_entry = (
+            f"## [{date.today().isoformat()}] ingest | batch ({plan_count} sources)\n"
+            f"- Pipeline: v2 (3-stage) — Python\n"
+            f"- Sources processed: {plan_count}\n"
+            f"- Failed agents: {failed_count}\n"
+            f"- Validation violations: {len(violations)}\n"
+        )
+        log_file = cfg.log_md
+        with log_file.open("a", encoding="utf-8") as f:
+            f.write(log_entry + "\n")
+    except OSError:
+        log.exception("Failed to write log entry")
+
+    successful_hashes: set[str] = set()
+    for result in results:
+        if result["status"] == "ok":
+            successful_hashes.update(result.get("hashes", []))
+
+    if violations:
+        log.warning(
+            "Skipping inbox archive because %d validation violations remain",
+            len(violations),
+        )
+    else:
+        log.info("Archiving inbox files (only successfully processed)...")
+        try:
+            archived = archive_inbox(cfg, successful_hashes)
+            log.info("Archived %d inbox files", archived)
+        except Exception:
+            log.exception("Archive inbox failed")
+
+    _sync_vault(cfg)
+    return violations
+
+
 def create_all(plans: Plans, cfg: Config, parallel: int = 3) -> dict:
     """Main entry point for Stage 3 creation.
 
@@ -228,74 +308,7 @@ def create_all(plans: Plans, cfg: Config, parallel: int = 3) -> dict:
 
     # ─── Post-processing ──────────────────────────────────────────────────
 
-    # 1. Global validate (catches cross-batch issues like broken links)
-    log.info("Running global output validation...")
-    manifest_path = cfg.resolved_extract_dir / "manifest.json"
-    violations = validate_output(cfg, manifest_path)
-    if violations:
-        log.warning("Global validation found %d violations:", len(violations))
-        for v in violations[:10]:
-            log.warning("  %s", v)
-
-        # Auto-repair missing sections (only if real content can be derived)
-        repaired = _repair_violations(cfg, violations)
-        if repaired:
-            log.info("Auto-repaired %d files", repaired)
-            remaining = validate_output(cfg, manifest_path)
-            if remaining:
-                log.warning("After repair, %d violations remain:", len(remaining))
-                for v in remaining[:5]:
-                    log.warning("  %s", v)
-            else:
-                log.info("All violations repaired")
-    else:
-        log.info("Global validation passed")
-
-    # 2. Reindex
-    log.info("Rebuilding wiki-index...")
-    try:
-        reindex(cfg)
-    except Exception:
-        log.exception("Reindex failed")
-
-    # 3. Update tag registry
-    log.info("Updating tag registry...")
-    try:
-        _update_tag_registry(cfg)
-    except Exception:
-        log.exception("Tag registry update failed")
-
-    # 4. Log to vault
-    try:
-        cfg.config_dir.mkdir(parents=True, exist_ok=True)
-        log_entry = (
-            f"## [{date.today().isoformat()}] ingest | batch ({plan_count} sources)\n"
-            f"- Pipeline: v2 (3-stage) — Python\n"
-            f"- Sources processed: {plan_count}\n"
-            f"- Failed agents: {failed_count}\n"
-            f"- Validation violations: {len(violations)}\n"
-        )
-        log_file = cfg.log_md
-        with log_file.open("a", encoding="utf-8") as f:
-            f.write(log_entry + "\n")
-    except OSError:
-        log.exception("Failed to write log entry")
-
-    # 4. Archive inbox (only for successfully processed hashes)
-    successful_hashes: set[str] = set()
-    for result in results:
-        if result["status"] == "ok":
-            successful_hashes.update(result.get("hashes", []))
-
-    log.info("Archiving inbox files (only successfully processed)...")
-    try:
-        archived = archive_inbox(cfg, successful_hashes)
-        log.info("Archived %d inbox files", archived)
-    except Exception:
-        log.exception("Archive inbox failed")
-
-    # 5. Sync vault (if ob CLI is available)
-    _sync_vault(cfg)
+    violations = postprocess_creation(cfg, results, plan_count, failed_count)
 
     # ─── Compute stats ────────────────────────────────────────────────────
     created = sum(1 for r in results if r["status"] == "ok")

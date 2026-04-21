@@ -7,7 +7,6 @@ import logging
 import re
 import subprocess
 from datetime import date
-from pathlib import Path
 
 from pipeline.config import Config
 from pipeline.models import Plan
@@ -19,18 +18,31 @@ log = logging.getLogger(__name__)
 def generate_source_content(
     plan: Plan,
     extracted: dict,
+    include_frontmatter: bool = True,
+    note_title: str | None = None,
 ) -> str:
     """Generate Source note content deterministically from extracted data.
 
     No LLM involved — pure template rendering.
     """
-    title = escape_yaml(plan.title)
+    rendered_title = note_title or plan.title
+    title = escape_yaml(rendered_title)
     url = extracted.get("url", "")
     source_type = extracted.get("type", "web")
     author = escape_yaml(extracted.get("author", ""))
     content = extracted.get("content", "")[:2000]
     tags_yaml = "\n".join(f"  - {t}" for t in plan.tags) if plan.tags else ""
     today = date.today().isoformat()
+
+    body = f"""# {rendered_title}
+
+## Original content
+
+{content}
+"""
+
+    if not include_frontmatter:
+        return body
 
     return f"""---
 title: "{title}"
@@ -43,12 +55,43 @@ tags:
 template: {plan.template.value}
 ---
 
-# {plan.title}
+{body}"""
 
-## Original Content
 
-{content}
-"""
+def _entry_sections(
+    plan: Plan,
+    summary_section: str,
+    core_insights_section: str,
+    linked_concepts: str,
+) -> list[tuple[str, str]]:
+    """Return ordered (heading, body) sections for an entry based on template/language."""
+    if plan.language.value == "zh" or plan.template.value == "chinese":
+        return [
+            ("摘要", summary_section),
+            ("核心发现", core_insights_section),
+            ("其他要点", "- 暂无额外要点"),
+            ("开放问题", "- 暂无开放问题"),
+            ("关联概念", linked_concepts),
+        ]
+
+    if plan.template.value == "technical":
+        return [
+            ("Summary", summary_section),
+            ("Key Findings", core_insights_section),
+            ("Data/Evidence", "- Evidence derived from the source content"),
+            ("Methodology", "- Methodology details should be drawn from the linked source"),
+            ("Limitations", "- No additional limitations identified from this source"),
+            ("Linked concepts", linked_concepts),
+        ]
+
+    return [
+        ("Summary", summary_section),
+        ("Core insights", core_insights_section),
+        ("Other takeaways", "- No additional takeaways identified from this source"),
+        ("Diagrams", "n/a"),
+        ("Open questions", "- No open questions from this source"),
+        ("Linked concepts", linked_concepts),
+    ]
 
 
 def generate_entry_content(
@@ -56,13 +99,16 @@ def generate_entry_content(
     extracted: dict,
     source_filename: str,
     insights: str = "",
+    include_frontmatter: bool = True,
+    note_title: str | None = None,
 ) -> str:
     """Generate Entry note content with template sections.
 
-    insights parameter fills Summary and Core insights.
+    insights parameter fills the sections that need actual synthesis.
     Everything else is template-generated.
     """
-    title = escape_yaml(plan.title)
+    rendered_title = note_title or plan.title
+    title = escape_yaml(rendered_title)
     url = extracted.get("url", "")
     source_type = extracted.get("type", "web")
     author = escape_yaml(extracted.get("author", ""))
@@ -70,42 +116,54 @@ def generate_entry_content(
     today = date.today().isoformat()
     content = extracted.get("content", "")
 
-    # Deterministic sections
     summary_section = ""
     core_insights_section = ""
 
     if insights:
-        # Parse agent output — look for ## Summary and ## Core insights markers
         parts = re.split(r"^## ", insights, flags=re.MULTILINE)
         for part in parts:
-            if part.startswith("Summary"):
-                summary_section = part.replace("Summary\n", "", 1).strip()
-            elif part.startswith("Core insights") or part.startswith("核心发现"):
+            if part.startswith("Summary") or part.startswith("摘要"):
+                summary_section = re.sub(r"^(Summary|摘要)\s*\n", "", part).strip()
+            elif part.startswith("Core insights") or part.startswith("核心发现") or part.startswith("Key Findings"):
                 core_insights_section = re.sub(
-                    r"^(Core insights|核心发现)\s*\n", "", part
+                    r"^(Core insights|核心发现|Key Findings)\s*\n",
+                    "",
+                    part,
                 ).strip()
 
     if not summary_section:
-        # Fallback: first paragraph of content
         paragraphs = [p.strip() for p in content.split("\n\n") if p.strip() and not p.startswith("#")]
         summary_section = paragraphs[0][:500] if paragraphs else f"Analysis of {escape_yaml(plan.title)}."
 
     if not core_insights_section:
-        core_insights_section = f"- Key themes and arguments from \"{escape_yaml(plan.title)}\""
+        if plan.language.value == "zh" or plan.template.value == "chinese":
+            core_insights_section = f"- 关于“{escape_yaml(plan.title)}”的关键观点与发现"
+        elif plan.template.value == "technical":
+            core_insights_section = f"- Key findings from \"{escape_yaml(plan.title)}\""
+        else:
+            core_insights_section = f"- Key themes and arguments from \"{escape_yaml(plan.title)}\""
 
-    # Linked concepts from plan
     if plan.concept_updates:
-        linked_concepts = "\n".join(
-            f"- [[{c}]]" for c in plan.concept_updates
-        )
+        linked_concepts = "\n".join(f"- [[{c}]]" for c in plan.concept_updates)
     elif plan.concept_new:
-        linked_concepts = "\n".join(
-            f"- [[{c}]] (new)" for c in plan.concept_new
-        )
+        linked_concepts = "\n".join(f"- [[{c}]] (new)" for c in plan.concept_new)
     else:
         linked_concepts = "- No linked concepts yet"
 
-    tags_line = f"\ntags:\n{tags_yaml}" if tags_yaml else ""
+    body_lines = [f"# {rendered_title}", ""]
+    for heading, section_body in _entry_sections(
+        plan, summary_section, core_insights_section, linked_concepts,
+    ):
+        body_lines.extend([f"## {heading}", "", section_body, ""])
+    body = "\n".join(body_lines).rstrip() + "\n"
+
+    if not include_frontmatter:
+        return body
+
+    language_line = ""
+    if plan.language.value != "en":
+        language_line = f"\nlanguage: {plan.language.value}"
+    tags_line = f"\ntags:\n{tags_yaml}" if tags_yaml else "\ntags: []"
 
     return f"""---
 title: "{title}"
@@ -114,36 +172,11 @@ source_url: "{url}"
 type: {source_type}
 author: "{author}"
 date_entry: {today}
-status: draft{tags_line}
+status: draft{language_line}{tags_line}
 template: {plan.template.value}
 ---
 
-# {plan.title}
-
-## Summary
-
-{summary_section}
-
-## Core insights
-
-{core_insights_section}
-
-## Other takeaways
-
-- No additional takeaways identified from this source
-
-## Diagrams
-
-n/a
-
-## Open questions
-
-- No open questions from this source
-
-## Linked concepts
-
-{linked_concepts}
-"""
+{body}"""
 
 
 def generate_entry_insights(
@@ -184,15 +217,14 @@ Output ONLY the two sections above. No preamble."""
     return ""
 
 
-def _generate_concept_template(name: str, plan: Plan) -> str:
+def _generate_concept_template(name: str, plan: Plan, source_note_title: str | None = None) -> str:
     """Generate a Concept note template with real skeleton content.
 
     Derives context from the plan's source rather than leaving stubs.
     """
     today = date.today().isoformat()
-    source_title = escape_yaml(plan.title) if plan.title else name
+    source_title = escape_yaml(source_note_title or plan.title) if (source_note_title or plan.title) else name
 
-    # Derive core concept from the plan title/source
     if plan.title and plan.title != name:
         core_concept = (
             f"{name} is a concept introduced or explored in "
@@ -205,7 +237,6 @@ def _generate_concept_template(name: str, plan: Plan) -> str:
             f"This note aggregates references and context from related entries."
         )
 
-    # Build context from linked concepts if available
     context_lines = []
     if plan.concept_updates:
         context_lines.append(
@@ -222,7 +253,6 @@ def _generate_concept_template(name: str, plan: Plan) -> str:
     )
     context = "\n\n".join(f"- {line}" for line in context_lines)
 
-    # Build links from plan targets
     links = ""
     if plan.moc_targets:
         links = "\n".join(f"- [[{moc}]] (MoC)" for moc in plan.moc_targets)
@@ -263,66 +293,132 @@ def create_file_templates(
     Deterministic for structure. Agent only for Summary + Core insights.
     Returns stats dict.
     """
-    from pipeline.vault import write_entry, write_concept, update_moc, title_to_filename
+    from pipeline.create.orchestrator import postprocess_creation
+    from pipeline.vault import (
+        resolve_collision,
+        title_to_filename,
+        update_moc,
+    )
 
     extract_dir = cfg.resolved_extract_dir
     stats = {"created": 0, "failed": 0, "sources": 0, "entries": 0}
+    results: list[dict] = []
+    manifest_path = extract_dir / ".template-postprocess-manifest"
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest_path.touch()
+
+    def _shared_note_filename(base_filename: str) -> str:
+        candidate = base_filename
+        suffix = 0
+        while True:
+            source_path = cfg.sources_dir / f"{candidate}.md"
+            entry_path = cfg.entries_dir / f"{candidate}.md"
+            if not source_path.exists() and not entry_path.exists():
+                return candidate
+            suffix += 1
+            candidate = f"{base_filename}-{suffix}"
 
     for plan in plans:
+        plan_ok = True
+        source_filename = title_to_filename(plan.title)
+        entry_filename = title_to_filename(plan.title)
+        entry_link_name = plan.title
         try:
             extract_file = extract_dir / f"{plan.hash}.json"
             if not extract_file.exists():
                 log.warning("Extract file missing for %s", plan.hash)
                 stats["failed"] += 1
+                results.append({"status": "failed", "hashes": [plan.hash], "plans": 1})
                 continue
 
             extracted = json.loads(extract_file.read_text(encoding="utf-8"))
             filename = title_to_filename(plan.title)
 
-            # 1. Create Source (deterministic — write directly)
             try:
-                source_content = generate_source_content(plan, extracted)
-                source_path = cfg.sources_dir / f"{filename}.md"
+                note_filename = _shared_note_filename(filename)
+                source_filename = note_filename
+                entry_filename = note_filename
+                note_suffix = note_filename[len(filename):] if note_filename.startswith(filename) else ""
+                source_note_title = f"{plan.title}{note_suffix}"
+                source_content = generate_source_content(
+                    plan,
+                    extracted,
+                    note_title=source_note_title,
+                )
+                source_path = cfg.sources_dir / f"{source_filename}.md"
                 source_path.parent.mkdir(parents=True, exist_ok=True)
                 source_path.write_text(source_content, encoding="utf-8")
                 stats["sources"] += 1
             except Exception as e:
                 log.error("Failed to write source for %s: %s", plan.title, e)
+                plan_ok = False
 
-            # 2. Generate insights (agent or empty)
             insights = ""
             if use_agent_insights:
                 insights = generate_entry_insights(plan, extracted, cfg)
 
-            # 3. Create Entry (template + insights)
             try:
+                entry_link_name = source_note_title
                 entry_content = generate_entry_content(
-                    plan, extracted, filename, insights,
+                    plan,
+                    extracted,
+                    source_filename,
+                    insights,
+                    include_frontmatter=True,
+                    note_title=entry_link_name,
                 )
-                write_entry(cfg, plan, entry_content)
+                entry_path = cfg.entries_dir / f"{entry_filename}.md"
+                entry_path.parent.mkdir(parents=True, exist_ok=True)
+                entry_path.write_text(entry_content, encoding="utf-8")
                 stats["entries"] += 1
             except Exception as e:
                 log.error("Failed to write entry for %s: %s", plan.title, e)
+                plan_ok = False
 
-            # 4. Create Concept (if new)
             for concept_name in plan.concept_new:
                 try:
-                    concept_content = _generate_concept_template(concept_name, plan)
-                    write_concept(cfg, concept_name, concept_content, [plan.title])
+                    concept_content = _generate_concept_template(
+                        concept_name,
+                        plan,
+                        source_note_title=entry_link_name,
+                    )
+                    concept_filename = resolve_collision(cfg.concepts_dir, title_to_filename(concept_name))
+                    concept_path = cfg.concepts_dir / f"{concept_filename}.md"
+                    concept_path.parent.mkdir(parents=True, exist_ok=True)
+                    concept_path.write_text(concept_content, encoding="utf-8")
                 except Exception as e:
                     log.error("Failed to write concept %s: %s", concept_name, e)
+                    plan_ok = False
 
-            # 5. Update MoCs
             for moc_name in plan.moc_targets:
                 try:
-                    update_moc(cfg, moc_name, plan.title, f"Related to [[{filename}]]")
+                    update_moc(
+                        cfg,
+                        moc_name,
+                        entry_link_name,
+                        f"Related to [[{entry_filename}]]",
+                    )
                 except Exception as e:
                     log.warning("Failed to update MoC %s: %s", moc_name, e)
+                    plan_ok = False
 
-            stats["created"] += 1
+            if plan_ok:
+                stats["created"] += 1
+                results.append({"status": "ok", "hashes": [plan.hash], "plans": 1})
+            else:
+                stats["failed"] += 1
+                results.append({"status": "failed", "hashes": [plan.hash], "plans": 1})
 
         except Exception as e:
             log.error("Template creation failed for %s: %s", plan.title, e)
             stats["failed"] += 1
+            results.append({"status": "failed", "hashes": [plan.hash], "plans": 1})
 
+    postprocess_creation(
+        cfg,
+        results,
+        len(plans),
+        stats["failed"],
+        manifest_path=manifest_path,
+    )
     return stats

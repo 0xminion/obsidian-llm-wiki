@@ -35,10 +35,11 @@ app = typer.Typer(
 log = logging.getLogger(__name__)
 
 
-def check_dependencies() -> list[str]:
+def check_dependencies(agent_cmd: str = "hermes") -> list[str]:
     """Check for required CLI tools. Returns list of missing commands."""
     missing = []
-    for cmd in ["curl", "jq", "python3", "hermes"]:
+    required_cmds = ["curl", "jq", "python3", agent_cmd]
+    for cmd in required_cmds:
         if not shutil.which(cmd):
             missing.append(cmd)
     return missing
@@ -234,7 +235,7 @@ def ingest(
         raise typer.Exit(code=1)
 
     # Check dependencies
-    missing = check_dependencies()
+    missing = check_dependencies(cfg.agent_cmd)
     if missing:
         typer.echo(f"ERROR: Missing required commands: {', '.join(missing)}", err=True)
         raise typer.Exit(code=1)

@@ -348,7 +348,7 @@ class TestGenerateSourceContent:
         content = generate_source_content(sample_plan, extracted)
         assert 'title: "Test Article"' in content
         assert 'source_url: "https://example.com/article"' in content
-        assert "## Original Content" in content
+        assert "## Original content" in content
 
     def test_tags_in_yaml(self, sample_plan: Plan):
         extracted = {"url": "https://example.com", "type": "web", "author": "", "content": "Content."}
