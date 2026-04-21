@@ -1,1 +1,1 @@
-"""obsidian-automation pipeline — Python rewrite."""
+"""obsidian-llm-wiki pipeline — Python rewrite."""

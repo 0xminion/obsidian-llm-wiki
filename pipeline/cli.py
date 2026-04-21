@@ -1,4 +1,4 @@
-"""CLI entry point for the obsidian-automation pipeline.
+"""CLI entry point for the obsidian-llm-wiki pipeline.
 
 Provides commands for the full 3-stage pipeline and vault maintenance:
   ingest  — extract → plan → create (full pipeline)

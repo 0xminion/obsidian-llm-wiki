@@ -124,7 +124,7 @@ def setup_vault(vault_path: Path, repo_root: Optional[Path] = None, quiet: bool 
 
     Args:
         vault_path: Target vault directory.
-        repo_root: Path to obsidian-automation repo (for copying prompts/templates).
+        repo_root: Path to obsidian-llm-wiki repo (for copying prompts/templates).
         quiet: If True, don't log individual actions.
 
     Returns:

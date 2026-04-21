@@ -1,4 +1,4 @@
-# System Architecture Document — obsidian-automation v0.1.0
+# System Architecture Document — obsidian-llm-wiki v0.1.0
 
 ## Table of Contents
 1. [System Overview](#1-system-overview)
@@ -22,7 +22,7 @@
 
 ## 1. System Overview
 
-obsidian-automation is a Python pipeline that transforms raw web URLs into a structured, interconnected Obsidian wiki. It implements Andrej Karpathy's LLM-Wiki pattern:
+obsidian-llm-wiki is a Python pipeline that transforms raw web URLs into a structured, interconnected Obsidian wiki. It implements Andrej Karpathy's LLM-Wiki pattern:
 
 ```
 URL → Source → Entry → Concept → MoC (Map of Content)

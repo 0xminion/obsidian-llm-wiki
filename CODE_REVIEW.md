@@ -1,4 +1,4 @@
-# Code Review: obsidian-automation v0.1.0
+# Code Review: obsidian-llm-wiki v0.1.0
 
 **Reviewers:** Agent1 (Codex — Bugs & Correctness) + Agent2 (Claude — Code Quality) + Agent3 (Codex — Architecture & Integration)
 **Date:** 2026-04-19

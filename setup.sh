@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================================
-# setup.sh — One-command setup for obsidian-automation
+# setup.sh — One-command setup for obsidian-llm-wiki
 # ============================================================================
 # Usage: ./setup.sh [VAULT_PATH]
 #   VAULT_PATH defaults to ~/MyVault
@@ -32,7 +32,7 @@ ERRORS=0
 
 echo ""
 echo -e "${BOLD}╔══════════════════════════════════════════════╗${NC}"
-echo -e "${BOLD}║  obsidian-automation setup                   ║${NC}"
+echo -e "${BOLD}║  obsidian-llm-wiki setup                   ║${NC}"
 echo -e "${BOLD}╚══════════════════════════════════════════════╝${NC}"
 echo ""
 echo "  Vault path: $VAULT_PATH"
@@ -224,7 +224,7 @@ if command -v pipeline &>/dev/null; then
 elif python3 -c "import pipeline.cli" 2>/dev/null; then
   exec python3 -m pipeline.cli ingest "$SCRIPT_DIR" "$@"
 else
-  echo "ERROR: Python pipeline not found. Install with: pip install -e /path/to/obsidian-automation" >&2
+  echo "ERROR: Python pipeline not found. Install with: pip install -e /path/to/obsidian-llm-wiki" >&2
   exit 1
 fi
 RUNEOF
