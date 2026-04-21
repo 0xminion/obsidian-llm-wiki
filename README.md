@@ -183,7 +183,7 @@ Uses [qmd](https://github.com/tobi/qmd) with Qwen3-Embedding-0.6B-Q8 for concept
 
 ```bash
 # One-time setup
-bash Meta/Scripts/setup-qmd.sh
+python3 -m pipeline.cli setup-qmd
 
 # Manual queries
 qmd query "prediction markets" --json -n 5 -c concepts

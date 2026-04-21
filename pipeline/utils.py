@@ -1,7 +1,15 @@
 """Shared utility functions used across pipeline modules."""
 
-from pathlib import Path
+from __future__ import annotations
+
+import logging
 import re
+from pathlib import Path
+
+log = logging.getLogger(__name__)
+
+# Regex matching CJK Unified Ideographs (Chinese characters)
+_CJK_RE = re.compile(r"[\u4e00-\u9fff]")
 
 
 def count_md(directory: Path) -> int:
@@ -44,3 +52,189 @@ def extract_body(content: str) -> str:
     """Extract body text (after YAML frontmatter) from a markdown file."""
     m = re.match(r"^---\n.*?\n---\n(.*)", content, re.DOTALL)
     return m.group(1) if m else content
+
+
+# ═══════════════════════════════════════════════════════════
+# TITLE CLEANING — Generate human-readable titles from content
+# Ported from lib/common.sh clean_title()
+# ═══════════════════════════════════════════════════════════
+
+# Platform-specific cleanup patterns (order matters)
+_TITLE_CLEANUP_PATTERNS: list[tuple[str, str]] = [
+    (r"^danny on X: \"", ""),
+    (r"^.*on X: \"", ""),
+    (r"\" \/\/ X$", ""),
+    (r" \| by .*$", ""),
+    (r" \| Medium$", ""),
+    (r"\s*—.*$", ""),
+    (r"^\s+", ""),
+    (r"\s+$", ""),
+]
+
+# Regex for bold text extraction
+_BOLD_RE = re.compile(r"\*\*[^*]+\*\*")
+
+# URL slug cleanup patterns
+_URL_SLUG_PATTERNS: list[tuple[str, str]] = [
+    (r"https?://", ""),
+    (r"www\.", ""),
+    (r"arxiv\.org/abs/", "arxiv-"),
+]
+
+
+def clean_title(content: str, url: str = "") -> str:
+    """Extract a clean, human-readable title from raw content.
+
+    Strategy (mirrors common.sh clean_title):
+      1. First markdown H1 heading
+      2. First bold text (**title**)
+      3. First line with > 20 chars
+      4. URL slug fallback (skipped for x.com/twitter.com)
+
+    Returns empty string if no usable title found.
+    """
+    if not content:
+        return _fallback_title_from_url(url)
+
+    lines = content.split("\n")
+
+    # 1. Try markdown H1
+    title = ""
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("# ") and len(stripped) > 2:
+            title = stripped[2:].strip()
+            break
+
+    # 2. Try first bold text
+    if not title:
+        for line in lines:
+            m = _BOLD_RE.search(line)
+            if m:
+                # Strip surrounding ** markers
+                title = m.group(0).strip("*")
+                break
+
+    # 3. Try first line with > 20 chars of substantial text
+    if not title:
+        for line in lines:
+            stripped = line.strip()
+            if len(stripped) > 20:
+                title = stripped
+                break
+
+    if title:
+        # Clean platform-specific prefixes/suffixes
+        for pattern, replacement in _TITLE_CLEANUP_PATTERNS:
+            title = re.sub(pattern, replacement, title)
+        title = title.strip()
+        # Truncate to 120 chars
+        title = title[:120]
+        return title
+
+    # 4. Fallback: derive from URL
+    return _fallback_title_from_url(url)
+
+
+def _fallback_title_from_url(url: str) -> str:
+    """Derive a title slug from a URL. Returns empty for X/Twitter or numeric slugs."""
+    if not url:
+        return ""
+    # Skip X/Twitter — force caller to extract content title
+    if re.search(r"x\.com|twitter\.com", url, re.IGNORECASE):
+        return ""
+
+    # Match shell script order: strip protocol, www, path, query, TLD
+    slug = url
+    slug = re.sub(r"https?://", "", slug)
+    slug = re.sub(r"www\.", "", slug)
+    # arxiv special case
+    slug = re.sub(r"arxiv\.org/abs/", "arxiv-", slug)
+    # Remove path after domain
+    slug = re.sub(r"/.*$", "", slug)
+    # Remove query strings and fragments
+    slug = re.sub(r"[?#].*$", "", slug)
+    # Remove TLD
+    slug = re.sub(r"\.[a-z]*$", "", slug)
+
+    # Reject pure numeric slugs (tweet IDs, short codes)
+    if re.match(r"^[0-9]+$", slug):
+        return ""
+
+    return slug
+
+
+# ═══════════════════════════════════════════════════════════
+# FILENAME FROM TITLE — Safe filesystem names
+# Ported from lib/common.sh title_to_filename()
+# ═══════════════════════════════════════════════════════════
+
+# Chinese title: replace punctuation, keep CJK chars
+_CN_COLON_RE = re.compile(r"[：:]")
+_CN_PUNCT_RE = re.compile(r"[？?！!，,。.、]")
+_CN_QUOTES_RE = re.compile(r"['\"《》「」（）()]")
+_MULTI_SPACE_RE = re.compile(r"\s+")
+
+# English title: kebab-case
+_APOSTROPHE_RE = re.compile(r"['']")
+_NON_ALNUM_RE = re.compile(r"[^a-zA-Z0-9]")
+_MULTI_DASH_RE = re.compile(r"-+")
+_TRIM_DASH_RE = re.compile(r"^-+|-+$")
+
+
+def title_to_filename(title: str, max_length: int = 120) -> str:
+    """Convert a title to a safe filename.
+
+    Rules (mirrors common.sh title_to_filename):
+      - Chinese titles → keep Chinese chars, replace punctuation
+      - English titles → kebab-case lowercase
+      - Truncate to max_length (default 120)
+    """
+    if not title:
+        return ""
+
+    if _CJK_RE.search(title):
+        # Chinese title: keep Chinese chars, replace specials
+        s = _CN_COLON_RE.sub("-", title)
+        s = _CN_PUNCT_RE.sub(" ", s)
+        s = _CN_QUOTES_RE.sub("", s)
+        s = _MULTI_SPACE_RE.sub(" ", s)
+        return s.strip()[:max_length]
+    else:
+        # English title: kebab-case
+        s = title.lower()
+        s = _APOSTROPHE_RE.sub("", s)
+        s = _NON_ALNUM_RE.sub("-", s)
+        s = _MULTI_DASH_RE.sub("-", s)
+        s = _TRIM_DASH_RE.sub("", s)
+        return s[:max_length]
+
+
+# ═══════════════════════════════════════════════════════════
+# PROMPT LOADING — Load .prompt template files
+# Ported from lib/common.sh load_prompt()
+# ═══════════════════════════════════════════════════════════
+
+def load_prompt(prompt_name: str, prompts_dir: str | Path | None = None) -> str:
+    """Load a .prompt template by name.
+
+    Args:
+        prompt_name: Name without .prompt extension.
+        prompts_dir: Directory containing .prompt files. If None, searches
+                     repo-relative prompts/ directory.
+
+    Returns:
+        File content as string, or empty string if not found.
+    """
+    if prompts_dir is None:
+        # Search repo-relative prompts dir
+        prompts_dir = Path(__file__).parent.parent / "prompts"
+    else:
+        prompts_dir = Path(prompts_dir)
+
+    prompt_file = prompts_dir / f"{prompt_name}.prompt"
+    if prompt_file.is_file():
+        return prompt_file.read_text(encoding="utf-8").strip()
+
+    log.warning("Prompt not found: %s", prompt_file)
+    return ""

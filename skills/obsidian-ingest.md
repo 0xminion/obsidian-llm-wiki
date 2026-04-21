@@ -67,15 +67,18 @@ Stage 3 spawns hermes agents with 900s internal timeout. Terminal calls need ≥
 
 Hermes MCP servers (chrome-devtools, composio) add ~647s overhead per agent. Disable unused MCP servers in `~/.hermes/profiles/<profile>/config.yaml` under `mcp_servers`. After removal, stage 3 drops from ~930s to ~100s per source.
 
-## Shell Scripts (supplementary)
+## CLI Commands
 
-The Python pipeline is canonical. Remaining shell scripts provide unique functionality:
+All operations are Python commands via `pipeline/cli.py`:
 
-| Script | Purpose |
+| Command | Purpose |
 |---|---|
-| `setup-qmd.sh` | One-time qmd semantic search setup |
-| `setup-git-hooks.sh` | Git initialization + hooks |
-| `migrate-vault.sh` | Adopt existing vaults (scan/dry-run/execute) |
+| `python3 -m pipeline.cli setup-qmd` | One-time qmd semantic search setup |
+| `python3 -m pipeline.cli setup-hooks` | Git initialization + hooks |
+| `python3 -m pipeline.cli ingest` | Full content ingestion pipeline |
+| `python3 -m pipeline.cli compile` | Compile pass (concept convergence, MoC updates) |
+| `python3 -m pipeline.cli lint` | Vault health check |
+| `python3 -m pipeline.cli reindex` | Rebuild wiki index |
 
 All pipeline operations (ingest, compile, lint, validate, reindex, stats, tags, query) are Python commands via `pipeline/cli.py`.
 

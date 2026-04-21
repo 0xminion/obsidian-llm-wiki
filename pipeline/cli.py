@@ -711,6 +711,32 @@ def query(
         raise typer.Exit(code=1)
 
 
+# ─── setup-qmd ────────────────────────────────────────────────────────────────
+
+@app.command(name="setup-qmd")
+def setup_qmd_cmd(
+    vault: Path = typer.Argument(None, help="Vault path (default: ~/MyVault)"),
+):
+    """Install and configure qmd for semantic concept search."""
+    from pipeline.setup import setup_qmd
+
+    vault_path = _resolve_vault(vault)
+    setup_qmd(vault_path)
+
+
+# ─── setup-hooks ──────────────────────────────────────────────────────────────
+
+@app.command(name="setup-hooks")
+def setup_hooks_cmd(
+    vault: Path = typer.Argument(None, help="Vault path (default: ~/MyVault)"),
+):
+    """Install git hooks (pre-commit, commit-msg) in the vault repo."""
+    from pipeline.setup import setup_git_hooks
+
+    vault_path = _resolve_vault(vault)
+    setup_git_hooks(vault_path)
+
+
 # ─── Entry point ───────────────────────────────────────────────────────────────
 
 def main():

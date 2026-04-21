@@ -56,7 +56,7 @@ When processing Chinese-language sources:
 - **Chinese sources stay Chinese in ALL 04-Wiki content** — Sources, Entries, Concepts all in Chinese. NEVER translate Chinese source content to English for wiki body text.
 - **Chinese content goes through full pipeline** — read Chinese source → write Chinese entry → create/update Chinese concepts. NOT translation from English output.
 - **Tags are always English** regardless of source language.
-- **File names match the content language** — Chinese titles get Chinese filenames (e.g. `潮汕钱庄网络.md`), English titles get English kebab-case (e.g. `the-measles-market-on-kalshi.md`). Use `title_to_filename()` from common.sh which handles both.
+- **File names match the content language** — Chinese titles get Chinese filenames (e.g. `潮汕钱庄网络.md`), English titles get English kebab-case (e.g. `the-measles-market-on-kalshi.md`). Use `title_to_filename()` from pipeline.utils which handles both.
 - **YAML frontmatter keys are always English** (`title:`, `source:`, `tags:`, `status:`).
 - **Wikilinks can be in either language** depending on the linked note's language.
 - **MoC headings use `English / 中文` format** consistently (e.g. `Overview / 概述`, `Market Manipulation / 市场操纵`).
@@ -67,7 +67,7 @@ When processing Chinese-language sources:
 
 ### File Naming Convention
 
-Use `title_to_filename()` from `lib/common.sh`:
+Use `title_to_filename()` from `pipeline.utils`:
 
 - **Papers**: actual paper title (e.g. `How manipulable are prediction markets.md`, NOT `arxiv-2503.03312.md`)
 - **Chinese articles**: Chinese title (e.g. `潮汕钱庄与东南亚黑金网络.md`, NOT `chaoshan-money-networks.md`)
@@ -382,7 +382,7 @@ Run health checks:
 
 ## Git Hooks
 
-When `setup-git-hooks.sh` is run on the vault:
+When `python3 -m pipeline.cli setup-hooks` is run on the vault:
 
 - **pre-commit**: Blocks any commit that includes files from `07-WIP/`. This protects user drafts from being committed by automated processes.
 - **commit-msg**: Warns if the commit message doesn't follow the `operation: description (date)` format.
