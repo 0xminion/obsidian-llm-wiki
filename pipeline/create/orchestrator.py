@@ -265,7 +265,7 @@ def create_all(plans: Plans, cfg: Config, parallel: int = 3) -> dict:
     except Exception:
         log.exception("Tag registry update failed")
 
-    # 3. Log to vault
+    # 4. Log to vault
     try:
         cfg.config_dir.mkdir(parents=True, exist_ok=True)
         log_entry = (

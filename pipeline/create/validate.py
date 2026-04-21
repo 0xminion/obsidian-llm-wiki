@@ -118,9 +118,9 @@ def validate_single_file(file_path: Path, note_type: str) -> list[str]:
     frontmatter_str = content[3:fm_end]
     fm = _parse_frontmatter(content)
 
-    # Check required frontmatter fields
+    # Check required frontmatter fields (use regex ^field: to avoid substring matches)
     for field_name in _REQUIRED_FM_FIELDS.get(note_type, []):
-        if f"{field_name}:" not in frontmatter_str:
+        if not re.search(rf"^{field_name}:\s", frontmatter_str, re.MULTILINE):
             violations.append(f"missing frontmatter field: {field_name}")
 
     # Check banned tags
@@ -238,7 +238,8 @@ def _derive_section_content(section: str, content: str, note_type: str) -> str:
         for line in lines:
             stripped = line.strip()
             if stripped.startswith(("- ", "* ", "1.")) and len(stripped) > 25:
-                insights.append(stripped if stripped.startswith("- ") else f"- {stripped.lstrip('0123456789. ')}")
+                clean = re.sub(r"^\d+\.\s*", "", stripped)
+                insights.append(stripped if stripped.startswith("- ") else f"- {clean}")
             if len(insights) >= 5:
                 break
         return "\n".join(insights) if insights else ""

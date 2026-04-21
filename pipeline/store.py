@@ -61,6 +61,13 @@ class ContentStore:
         self._conn.execute("PRAGMA busy_timeout=5000")
         self._init_schema()
 
+    def __del__(self):
+        if hasattr(self, "_conn"):
+            try:
+                self._conn.close()
+            except Exception:
+                pass
+
     def _init_schema(self) -> None:
         self._conn.executescript("""
             CREATE TABLE IF NOT EXISTS urls (

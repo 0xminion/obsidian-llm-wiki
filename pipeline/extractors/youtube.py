@@ -33,10 +33,13 @@ def extract_youtube(url: str, cfg: Config) -> ExtractedSource:
     """Extract YouTube video transcript.
 
     Chain: TranscriptAPI → Supadata → yt-dlp + faster-whisper.
-    Falls back to metadata-only on total failure.
+    FAILS LOUDLY if no transcript — never metadata-only.
     """
     video_id = _extract_youtube_video_id(url)
     timeout = cfg.extract_timeout
+
+    if not video_id:
+        raise ExtractionError(f"Could not extract video ID from URL: {url}")
 
     # Fetch metadata from YouTube oEmbed
     title = ""

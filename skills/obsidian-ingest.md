@@ -45,7 +45,7 @@ The repo root `run.sh` delegates to `python3 -m pipeline.cli`. The vault `run.sh
 ## Pipeline
 
 Three stages (all Python):
-- **Stage 1 — Extract** (`pipeline/extract.py`): Parallel extraction via defuddle/TranscriptAPI/AssemblyAI. No agent. Output: `/tmp/extracted/{hash}.json`
+- **Stage 1 — Extract** (`pipeline/extract.py`): Parallel extraction via defuddle/TranscriptAPI/AssemblyAI. No agent. Output: `/tmp/obsidian-extracted-{hash}/{hash}.json`
 - **Stage 2 — Plan** (`pipeline/plan.py`): Dedup + semantic concept matching via qmd + plan generation (1 agent). Output: `/tmp/extracted/plans.json`
 - **Stage 3 — Create** (`pipeline/create.py`): N parallel agents write Source → Entry → Concept → MoC files. Output: vault files + reindex + archive
 
@@ -73,16 +73,13 @@ The Python pipeline is canonical. Remaining shell scripts provide unique functio
 
 | Script | Purpose |
 |---|---|
-| `compile-pass.sh` | Cross-linking, concept merge, MoC rebuild, edges |
-| `review-pass.sh` | Interactive entry review |
-| `query-vault.sh` | Q&A with compound-back |
-| `lint-vault.sh` | 12 health checks |
-| `validate-output.sh` | Validate output + `--fix` auto-repair |
-| `vault-stats.sh` | Dashboard generation |
+| `setup-qmd.sh` | One-time qmd semantic search setup |
+| `setup-git-hooks.sh` | Git initialization + hooks |
+| `migrate-vault.sh` | Adopt existing vaults (scan/dry-run/execute) |
 
-These shell scripts use `lib/common.sh` for shared functions (logging, collision detection, edge management).
+All pipeline operations (ingest, compile, lint, validate, reindex, stats, tags, query) are Python commands via `pipeline/cli.py`.
 
-**Deleted** (replaced by Python pipeline): `process-inbox.sh`, `stage1-extract.sh`, `stage2-plan.sh`, `stage3-create.sh`, `reindex.sh`, `build_batch_prompt.py`, `extract-transcript.sh`.
+**Deleted** (replaced by Python pipeline): `compile-pass.sh`, `review-pass.sh`, `query-vault.sh`, `update-tag-registry.sh`, `lint-vault.sh`, `validate-output.sh`, `vault-stats.sh`, `process-inbox.sh`, `stage1-extract.sh`, `stage2-plan.sh`, `stage3-create.sh`, `reindex.sh`.
 
 ## Pitfalls
 
@@ -99,7 +96,7 @@ Apple Podcasts store IDs don't match iTunes lookup IDs. The code falls back to i
 
 ### X/Twitter extraction
 
-Defuddle uses FxTwitter API (`api.fxtwitter.com`). Some tweets return 404 (deleted, private, rate-limited). The extraction accepts short content (≥10 chars) since tweets are often brief.
+Defuddle uses FxTwitter API (`api.fxtwitter.com`). Some tweets return 404 (deleted, private, rate-limited). Defuddle accepts short content (≥100 chars) since some pages have minimal text.
 
 ## Note Structures
 

@@ -13,7 +13,7 @@ import re
 import subprocess
 from pathlib import Path
 from typing import Optional
-from urllib.parse import quote
+from urllib.parse import urlparse
 
 log = logging.getLogger(__name__)
 
@@ -181,7 +181,8 @@ def _is_challenge_page(content: str) -> bool:
     """Detect Cloudflare/anti-bot challenge pages masquerading as content."""
     if not content:
         return False
-    if not content.startswith("<!DOCTYPE") and not content.startswith("<html"):
+    content_lower = content[:20].lower()
+    if not content_lower.startswith("<!doctype") and not content_lower.startswith("<html"):
         return False
     for pattern in _CHALLENGE_PATTERNS:
         if pattern.search(content[:2000]):

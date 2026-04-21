@@ -54,12 +54,8 @@ _KNOWN_PROVIDERS = {
     "pocketcasts.com": "pocketcasts",
     "castbox.fm": "castbox",
     "podchaser.com": "podchaser",
-    "podcastaddict.com": "podcastaddict",
-    "pod.link": "podlink",
     "podcastindex.org": "podcastindex",
-    "google.com/podcasts": "google",
-    "youtube.com": "youtube_music",
-    "music.youtube.com": "youtube_music",
+    "pod.link": "podlink",
 }
 
 
@@ -583,7 +579,7 @@ def _episode_title_match(slug: str, title: str) -> bool:
     if not slug_words:
         return False
     overlap = slug_words & title_words
-    return len(overlap) / len(slug_words) >= 0.6
+    return len(overlap) / len(slug_words) >= 0.5
 
 
 def _parse_rss_episode(feed_url: str, episode_id: str, episode_slug: str = "",

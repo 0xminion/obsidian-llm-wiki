@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import re
 import subprocess
 import time
@@ -371,7 +370,6 @@ def _detect_duplicates(cfg: Config) -> int:
                     t_match = re.search(r"title:\s*[\"']?(.*?)[\"']?\s*$", fm_match.group(1), re.MULTILINE)
                     if t_match:
                         title = t_match.group(1).strip()
-                body = extract_body(content)
                 notes.append((md.stem, note_type, title))
             except OSError:
                 continue

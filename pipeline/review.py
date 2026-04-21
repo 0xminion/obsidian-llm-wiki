@@ -103,9 +103,10 @@ def stage_for_review(
 def show_pending(cfg: Config) -> list[dict]:
     """Show all pending reviews."""
     store = ContentStore.open(cfg.resolved_extract_dir)
-    pending = store.review_get_pending()
-    store.close()
-    return pending
+    try:
+        return store.review_get_pending()
+    finally:
+        store.close()
 
 
 def approve_reviews(cfg: Config, review_ids: Optional[list[int]] = None) -> dict:
@@ -115,33 +116,34 @@ def approve_reviews(cfg: Config, review_ids: Optional[list[int]] = None) -> dict
     After writing, runs reindex and archives inbox.
     """
     store = ContentStore.open(cfg.resolved_extract_dir)
-    pending = store.review_get_pending()
+    try:
+        pending = store.review_get_pending()
 
-    if review_ids:
-        pending = [r for r in pending if r["id"] in review_ids]
+        if review_ids:
+            pending = [r for r in pending if r["id"] in review_ids]
 
-    stats = {"approved": 0, "written": 0, "failed": 0}
-    approved_hashes: set[str] = set()
+        stats = {"approved": 0, "written": 0, "failed": 0}
+        approved_hashes: set[str] = set()
 
-    for review in pending:
-        try:
-            # Write file to vault
-            file_path = Path(review["file_path"])
-            file_path.parent.mkdir(parents=True, exist_ok=True)
-            file_path.write_text(review["file_content"], encoding="utf-8")
+        for review in pending:
+            try:
+                # Write file to vault
+                file_path = Path(review["file_path"])
+                file_path.parent.mkdir(parents=True, exist_ok=True)
+                file_path.write_text(review["file_content"], encoding="utf-8")
 
-            # Mark as approved
-            store.review_approve(review["id"])
-            stats["approved"] += 1
-            stats["written"] += 1
-            approved_hashes.add(review["plan_hash"])
-            log.info("Approved and wrote: %s", file_path.name)
+                # Mark as approved
+                store.review_approve(review["id"])
+                stats["approved"] += 1
+                stats["written"] += 1
+                approved_hashes.add(review["plan_hash"])
+                log.info("Approved and wrote: %s", file_path.name)
 
-        except Exception as e:
-            log.error("Failed to write %s: %s", review["file_path"], e)
-            stats["failed"] += 1
-
-    store.close()
+            except Exception as e:
+                log.error("Failed to write %s: %s", review["file_path"], e)
+                stats["failed"] += 1
+    finally:
+        store.close()
 
     # Post-processing: reindex + archive
     if stats["written"] > 0:
@@ -162,17 +164,17 @@ def reject_reviews(cfg: Config, review_ids: Optional[list[int]] = None) -> int:
     Returns count rejected.
     """
     store = ContentStore.open(cfg.resolved_extract_dir)
-
-    if review_ids:
-        count = 0
-        for rid in review_ids:
-            store.review_reject(rid)
-            count += 1
-    else:
-        pending = store.review_get_pending()
-        count = len(pending)
-        for r in pending:
-            store.review_reject(r["id"])
-
-    store.close()
-    return count
+    try:
+        if review_ids:
+            count = 0
+            for rid in review_ids:
+                store.review_reject(rid)
+                count += 1
+        else:
+            pending = store.review_get_pending()
+            count = len(pending)
+            for r in pending:
+                store.review_reject(r["id"])
+        return count
+    finally:
+        store.close()

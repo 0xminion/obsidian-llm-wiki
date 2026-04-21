@@ -112,7 +112,7 @@ def _extract_web_content(url: str, timeout: int = 45, attempt: int = 0) -> str:
 
     # Standard defuddle extraction
     content = _try_defuddle(url, timeout)
-    if content and len(content) > 10 and not _is_challenge_page(content):
+    if content and len(content) > 100 and not _is_challenge_page(content):
         return content
 
     # Fallback: curl + liteparse (rotates user-agent on retry)
