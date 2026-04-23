@@ -1,0 +1,142 @@
+CONCEPT NOTE STRUCTURE — follow EXACTLY for every note in 04-Wiki/concepts/:
+
+Check the `language:` field in frontmatter. If zh, use the Chinese template.
+
+FILE NAMING:
+- Chinese concept → Chinese filename (e.g. 潮汕钱庄网络.md, 做空权.md)
+- English concept → English kebab-case (e.g. prediction-markets.md)
+- NEVER use URL slugs or English translations for Chinese concepts
+
+=== ENGLISH Concept (default) — Evergreen Format ===
+
+Frontmatter:
+  - title: "<Concept Name>" — keep natural, descriptive (title IS the concept)
+  - type: concept
+  - status: evergreen
+  - reviewed: ""
+  - aliases: [] (plain text only, no wikilinks — raw [link] syntax fails in tags)
+  - sources: ["[[source-note-name]]"] — OPTIONAL, list of source notes this concept emerged from
+  - tags: minimum 3, maximum 8 topic-specific tags, always start with:
+      tags:
+        - concept
+        - core-idea
+        - topic-specific
+
+  - created: YYYY-MM-DD
+  - last_updated: YYYY-MM-DD
+
+BEFORE choosing tags: run 'obsidian tags sort=count counts' and reuse
+existing tags wherever a match exists. Only mint a new tag if nothing fits.
+
+FORMAT RULES (CRITICAL):
+- The first line of the body MUST be `# <Title>` (H1 heading matching frontmatter title)
+- There MUST be a blank line after the H1 heading
+- There MUST be a blank line after EVERY `##` or `###` sub-heading (before content)
+- There MUST be a blank line BEFORE every `##` or `###` sub-heading
+
+Example:
+```
+---
+title: "Example Concept"
+...
+---
+
+# Example Concept
+
+## Core concept
+
+Content here...
+
+## Context
+
+Content here...
+
+## Links
+
+- [[Related note]]
+```
+
+Body sections IN THIS ORDER (use ## headings):
+
+## Core concept
+A single overview paragraph defining the concept. Plain language — like
+explaining to a curious friend, NOT like writing a textbook. This is the
+one-sentence elevator pitch expanded to 2-3 sentences.
+
+## Context
+Flowing prose (2-4 paragraphs) covering:
+- How it works — mechanics, processes, algorithms
+- Why it matters — practical relevance, stakes
+- Evidence — real-world examples, data points, cases
+- Tensions — what's debated, what's uncertain, edge cases
+
+Do NOT use sub-headings within Context. Write naturally as connected
+paragraphs. If the concept is truly atomic, Context fits in 2-3 paragraphs.
+
+## Links
+Wikilinks to related Concept notes, Entry notes, and MoCs.
+Use a bulleted list (dash-prefixed).
+Use 'obsidian search' to find related existing notes.
+Link to entries in 04-Wiki/entries/, concepts in 04-Wiki/concepts/, and MoCs in 04-Wiki/mocs/.
+
+=== CHINESE Concept — Evergreen Format ===
+
+Frontmatter must include language: zh:
+  - title: "<中文概念名>"
+  - title_en: "<English name if applicable>"
+  - type: concept
+  - language: zh
+  - status: evergreen
+  - sources: ["[[source-note-name]]"] — 可选，此概念来源的笔记
+  - tags: English tag values (tags stay in English always)
+  - created: YYYY-MM-DD
+  - last_updated: YYYY-MM-DD
+
+Body sections IN THIS ORDER — ALL BODY TEXT IN CHINESE:
+
+FORMAT RULES (CRITICAL):
+- 正文第一行必须是 `# <标题>` （H1标题，与frontmatter的title一致）
+- H1标题后必须有空行
+- 每个 `##` 或 `###` 子标题后必须有空行（内容之前）
+- 每个 `##` 或 `###` 子标题前必须有空行
+
+```
+---
+title: "示例概念"
+...
+---
+
+# 示例概念
+
+## 核心概念
+
+内容...
+
+## 背景
+
+内容...
+
+## 关联
+
+- [[相关笔记]]
+```
+
+## 核心概念
+一段概述，定义这个概念。通俗易懂，像给好奇的朋友解释。2-3句。
+
+## 背景
+连贯的正文（2-4段），涵盖：
+- 运作机制——原理、流程、算法
+- 为什么重要——实际意义、利害关系
+- 实际案例——真实例子、数据、应用场景
+- 争议与不确定性——有争论的地方、边界情况
+
+不要在"背景"内使用子标题。自然连贯地书写。如果概念足够原子化，
+背景部分2-3段即可。
+
+## 关联
+Wikilinks到相关的概念笔记、条目笔记和MoC。
+用破折号列表。用 'obsidian search' 找现有相关笔记。
+链接到 04-Wiki/entries/、04-Wiki/concepts/ 和 04-Wiki/mocs/ 中的笔记。
+
+ALL prose must be humanized before writing.

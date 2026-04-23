@@ -1,0 +1,30 @@
+VAULT LOCATION: {VAULT_PATH}
+
+TASK: Update the entry '{ENTRY_NAME}' and related entries based on user feedback.
+
+USER FEEDBACK: {INSTRUCTIONS}
+
+INSTRUCTIONS:
+1. Read the entry at '{ENTRY_PATH}'
+2. Read the wiki index at '06-Config/wiki-index.md'
+3. Based on the feedback, make updates:
+   - If connections are mentioned, add wikilinks to both sides
+   - If contradictions are found, note them in both entries' Open questions
+   - If new insights emerged, add them to the appropriate sections
+4. For any other entry mentioned in the feedback (e.g., [[Other Entry]]):
+   - Read that entry
+   - Add reciprocal links/connections
+   - Update its 'Linked concepts' section if needed
+5. Update frontmatter: reviewed: {TODAY}, review_notes: [feedback summary]
+6. If typed edges are relevant, append to '06-Config/edges.tsv':
+   source<tab>target<tab>type<tab>description
+7. Humanize all new prose.
+8. Append to '06-Config/log.md':
+   ## [{TODAY}] review | {ENTRY_NAME} (connections updated)
+   - Feedback: {INSTRUCTIONS}
+   - Entries updated: [list]
+
+CRITICAL RULES:
+- Use [[wikilinks]] for all internal links
+- Quote wikilinks in YAML frontmatter
+- Do NOT modify 07-WIP/

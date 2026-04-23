@@ -1,0 +1,46 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Syntax check
+        run: |
+          python -m py_compile pipeline/utils.py
+          python -m py_compile pipeline/config.py
+          python -m py_compile pipeline/models.py
+          python -m py_compile pipeline/compile.py
+          python -m py_compile pipeline/stats.py
+          python -m py_compile pipeline/vault.py
+          python -m py_compile pipeline/create/__init__.py
+          python -m py_compile pipeline/create/prompts.py
+          python -m py_compile pipeline/create/agent.py
+          python -m py_compile pipeline/create/templates.py
+          python -m py_compile pipeline/create/validate.py
+          python -m py_compile pipeline/create/orchestrator.py
+
+      - name: Run tests
+        run: |
+          python -m pytest tests/ -v --tb=short --cov=pipeline --cov-report=term-missing

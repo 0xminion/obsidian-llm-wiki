@@ -1,0 +1,151 @@
+VAULT LOCATION: {VAULT_PATH}
+VAULT STRUCTURE (v2.1.0):
+  01-Raw/             — New sources to process (URLs, PDFs, files)
+  02-Clippings/       — Web clipper saves (already markdown)
+  03-Queries/         — Q&A questions (drop .md files here)
+  04-Wiki/
+  ├── sources/    — Source notes (full original content)
+  ├── entries/    — Entry notes (summary + insights + concepts + links)
+  ├── concepts/   — Shared concept notes (cross-source vocabulary)
+  └── mocs/        — Topic hubs with synthesized summaries
+  05-Outputs/         — Q&A responses, visualizations
+  06-Config/
+  ├── wiki-index.md     — Auto-maintained table of contents
+  ├── url-index.tsv     — URL → entry mapping for dedup
+  ├── edges.tsv         — Typed relationships between notes
+  ├── tag-registry.md   — Canonical tag list
+  ├── log.md            — Structured activity log
+  └── agents.md         — Schema: how to maintain the wiki
+  07-WIP/               — User drafts (untouched by automation)
+  08-Archive-Raw/       — Processed inbox items
+  09-Archive-Queries/   — Answered queries
+
+AGENT AVAILABLE: obsidian-markdown, humanizer, youtube-full (TranscriptAPI), liteparse, podcast (transcribe.sh)
+
+TRANSCRIPTION TOOLS (for podcast processing):
+- download_audio(url) → path to downloaded MP3
+- transcribe_audio(audio_path) → transcript text
+  Backends: AssemblyAI or local whisper (faster-whisper Python module)
+
+FILENAME COLLISION DETECTION:
+Before creating any Entry, Concept, or MoC file, CHECK if it already exists:
+  - Read the target file path first
+  - If it exists (non-empty), append -1, -2, etc. to get a unique name
+  - Do NOT overwrite existing notes — they may contain user edits
+
+CRITICAL RULES:
+1. NEVER touch anything in '07-WIP/'. Off-limits.
+2. NEVER overwrite existing notes — they may contain user edits.
+   Always check_collision() before writing. Use resolve_collision() if name taken.
+3. ALL AI-generated prose for 04-Wiki/entries/, 04-Wiki/concepts/, or 04-Wiki/mocs/
+   MUST be run through the Humanizer skill before writing to disk.
+   Draft the content → humanize it → write the final file.
+4. Use [[wikilinks]] for all internal vault links.
+5. Use Obsidian-flavored markdown (callouts, frontmatter, tags).
+6. ALL YAML frontmatter: wikilinks MUST be quoted
+   (e.g. source: "[[note]]").
+7. Entry notes go in '04-Wiki/entries/', Concept notes in '04-Wiki/concepts/',
+   MoC notes in '04-Wiki/mocs/'. Processed originals archived to '08-Archive-Raw/'.
+8. After creating any Entry or Concept, APPEND a line to
+   '06-Config/wiki-index.md' with a 1-sentence summary.
+9. APPEND a structured entry to '06-Config/log.md' after every ingest.
+10. When content reveals relationships between notes, APPEND to '06-Config/edges.tsv':
+   source<tab>target<tab>type<tab>description
+   Types: extends, contradicts, supports, supersedes, tested_by, depends_on, inspired_by
+
+BILINGUAL PIPELINE RULES (English + Chinese):
+
+11. LANGUAGE DETECTION: Before processing any source, detect its primary language.
+   - Chinese content (any CJK block) → BILINGUAL PIPELINE
+   - All other non-English languages → translate to English, process in English
+   - English content → process in English
+
+12. CHINESE PIPELINE: For Chinese-language sources, ALL 04-Wiki content stays Chinese:
+   - Sources: keep original Chinese content as-is
+   - Entries: write 摘要 (Summary), 核心发现 (Core Insights), 其他要点 (Other Takeaways), 关联概念 (Linked Concepts) — all Chinese body text
+   - Concepts: Chinese explanation body, Chinese section headers
+   - YAML frontmatter keys stay English, tag VALUES stay English
+   - File names match content language (Chinese titles → Chinese filenames, English titles → kebab-case)
+   - Wikilinks can be either language
+   Go through the full pipeline end-to-end in Chinese — NEVER translate to English then back.
+
+13. NEVER WRITE LAZY DISCLAIMERS: If content is too large to process in one pass,
+   break it into chunks and process each chunk properly.
+   Do NOT write "Content extracted via Tavily. Full article text available in raw extraction."
+   or any similar placeholder. Write the actual content or chunk it.
+
+14. MoC TOPIC SECTIONS: MoCs use topic-specific bilingual sections (e.g., "Funding Rates / 资金费率").
+   Group entries and concepts by subtopic, NOT by language. Entries of any language go
+   under the relevant topic section. Include bridge concepts that connect across subtopics.
+
+15. NON-CHINESE/NON-ENGLISH SOURCES: For sources in other languages (Japanese, Korean, etc.),
+   translate to English, store in English, integrate in English. Only Chinese gets
+   the bilingual pipeline — everything else routes through English.
+
+TAG CONSOLIDATION:
+Before creating new tags, ALWAYS search existing tags in the vault first:
+  grep -h '^tags:' "$VAULT_PATH"/04-Wiki/**/*.md | sort | uniq -c | sort -rn
+Reuse existing tags wherever possible. Only mint a new tag if nothing fits.
+
+EXTRACTION PRIORITY (content parsing from URLs/files):
+
+For URL/HTML/X-Twitter/any web source:
+  1. defuddle parse --markdown <url>     — clean markdown extraction (primary)
+  2. liteparse <downloaded html>          — fallback document parser
+  3. browser tools (navigate/screenshot)  — last resort for JS-heavy/blocked sites
+  Shell helper: source lib/extract.sh && extract_web "$url"
+
+For PDF/Word/PowerPoint/XLSX (local files):
+  1. liteparse parse --format text <file> — local document parser (primary)
+  2. liteparse with --dpi 300 (OCR)       — for scanned/image documents
+  3. ocr-and-documents skill              — final fallback
+  Shell helper: source lib/extract.sh && extract_document "$file"
+
+Auto-detect: source lib/extract.sh && extract_content "$url_or_path"
+  Routes to correct chain based on file type / URL pattern.
+
+lib/extract.sh is sourced by process-inbox.sh automatically.
+
+X/TWITTER EXTRACTION:
+Defuddle is the primary extractor for X/Twitter — it works well on tweet pages.
+NEVER use URL slugs as filenames. Extract the actual tweet content title.
+If defuddle fails, try liteparse, then browser screenshot as last resort.
+
+CONCEPT CONVERGENCE (critical — prevent duplicate concepts):
+Before creating ANY new concept note in 04-Wiki/concepts/:
+1. Check the CONCEPT_CONVERGENCE block in each source — semantic matches are pre-fetched.
+   Scores indicate similarity: >0.5 = likely same concept, 0.2-0.5 = tangential.
+2. If an existing concept has score >0.5, it likely covers the same idea — UPDATE it:
+   - Add the new entry to its 关联/Links section
+   - Refresh the body if the new source adds insight
+   - Do NOT create a duplicate
+3. Scores 0.2-0.5 are tangential — consider linking but don't merge unless substantively the same
+4. Only create new if the concept is truly novel (no existing concept covers it)
+
+BATCH PROCESSING (10+ sources):
+1. Process sources sequentially — never skip or summarize
+2. If extraction fails for one source, log it and continue to next
+3. After batch completes, run post-processing validation:
+   - Every processed source has a matching entry
+   - No stubs (> 待补充, > TODO) in any section
+   - No invalid tags (x.com, tweet, source alone)
+   - MoCs are updated if >10 sources processed
+4. If >20 sources, consider splitting across sub-agents by theme
+5. Report: total processed, total failed, total concepts created/updated
+
+NAMING CONVENTIONS (critical — apply to ALL Source and Entry filenames):
+- Use title_to_filename() from pipeline.utils
+- Chinese titles → Chinese filenames (潮汕钱庄网络.md)
+- English titles → kebab-case (the-measles-market-on-kalshi.md)
+- Papers → actual paper title (How manipulable are prediction markets.md)
+- Tweets → content topic/sentence (Skill Chaining - Why Skills Should Be Actions.md)
+- Blog posts → article title (Ruled by Precession.md)
+- YouTube → video title (Secret History #7 - Death by Meritocracy.md)
+- ❌ NEVER: "Tweet - username - tweetID.md", "Blog - slug.md", "YouTube - ID.md"
+- ❌ NEVER: URL slugs (X-functionspaceHQ-2039554933024776516) or domain prefixes
+- Source and Entry for same content should match filenames
+- MoC headings: always "English / 中文" format (Overview / 概述)
+
+RETRY BEHAVIOR:
+If any step fails (API call, file operation, parsing), try an alternative
+approach before giving up. Be resourceful.
