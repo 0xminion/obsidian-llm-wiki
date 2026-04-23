@@ -289,13 +289,49 @@ def is_filename_too_long(filename: str, max_bytes: int = 200) -> bool:
     return _byte_length(filename) > max_bytes
 
 
-def _llm_short_filename(title: str, content_preview: str = "", agent_cmd: str = "hermes") -> str | None:
+def _ollama_generate(
+    prompt: str,
+    model: str = "",
+    timeout: int = 30,
+) -> str:
+    """Send a prompt to Ollama /api/generate and return the response text.
+
+    Uses OLLAMA_HOST env var (default: http://localhost:11434).
+    Returns empty string on any failure.
+    """
+    ollama_url = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
+    if not model:
+        model = os.environ.get("OLLAMA_FILENAME_MODEL", "minimax-m2.7:cloud")
+
+    try:
+        req = urllib.request.Request(
+            f"{ollama_url}/api/generate",
+            data=json.dumps({
+                "model": model,
+                "prompt": prompt,
+                "stream": False,
+            }).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            return data.get("response", "").strip()
+    except Exception as e:
+        log.debug("Ollama generate failed: %s", e)
+        return ""
+
+
+def _llm_short_filename(
+    title: str,
+    content_preview: str = "",
+    model: str = "",
+) -> str | None:
     """Ask an LLM to generate a concise filename. Returns None on failure.
 
-    Uses Ollama directly (nemotron-3-super:cloud with num_predict=20) for speed.
-    Caches results per title.
+    Uses Ollama directly via _ollama_generate. Caches results per title.
     """
-    cache_key = f"{title}::{content_preview[:200]}"
+    cache_key = f"{title}::{content_preview[:200]}::{model}"
     if cache_key in _llm_filename_cache:
         return _llm_filename_cache[cache_key]
 
@@ -303,29 +339,17 @@ def _llm_short_filename(title: str, content_preview: str = "", agent_cmd: str = 
 {title[:200]}
 Output:"""
 
-    try:
-        req = urllib.request.Request(
-            f"{OLLAMA_URL}/api/generate",
-            data=json.dumps({
-                "model": "nemotron-3-super:cloud",
-                "prompt": prompt,
-                "stream": False,
-                "options": {"num_predict": 20, "temperature": 0.3},
-            }).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            raw = data.get("response", "").strip().splitlines()[0].strip()
-            raw = raw.strip('"').strip("'")
-            # Remove common prefixes the model sometimes adds
-            raw = re.sub(r"^(filename|file name|name)[\"'\"'\"\s]*[:：]?\s*", "", raw, flags=re.IGNORECASE)
-            if raw:
-                _llm_filename_cache[cache_key] = raw
-                return raw
-    except Exception:
-        pass
+    raw = _ollama_generate(prompt, model=model, timeout=15)
+    if raw:
+        # Take first non-empty line
+        for line in raw.splitlines():
+            line = line.strip().strip('"').strip("'")
+            if line:
+                # Remove common prefixes the model sometimes adds
+                line = re.sub(r"^(filename|file name|name)[\"'\"'\"\s]*[:：]?\s*", "", line, flags=re.IGNORECASE)
+                if line:
+                    _llm_filename_cache[cache_key] = line
+                    return line
     return None
 
 
@@ -368,7 +392,7 @@ def smart_filename(title: str, content_preview: str = "", agent_cmd: str = "herm
 
 def batch_smart_filenames(
     items: list[tuple[str, str]],
-    agent_cmd: str = "hermes",
+    model: str = "",
     timeout: int = 60,
 ) -> dict[str, str]:
     """Batch-generate filenames for multiple long titles via parallel LLM calls.
@@ -376,7 +400,7 @@ def batch_smart_filenames(
     Uses ThreadPoolExecutor to call _llm_short_filename for each item in parallel.
     Args:
         items: List of (title, content_preview) tuples.
-        agent_cmd: Ignored (kept for API compatibility).
+        model: Ollama model name. If empty, uses OLLAMA_FILENAME_MODEL env var.
         timeout: Max seconds to wait for all parallel calls.
 
     Returns:
@@ -391,7 +415,7 @@ def batch_smart_filenames(
     uncached_items: list[tuple[str, str]] = []
 
     for title, preview in items:
-        cache_key = f"{title}::{preview[:200]}"
+        cache_key = f"{title}::{preview[:200]}::{model}"
         if cache_key in _llm_filename_cache:
             results[title] = _llm_filename_cache[cache_key]
         else:
@@ -401,7 +425,7 @@ def batch_smart_filenames(
         return results
 
     def _generate_one(title: str, preview: str) -> tuple[str, str | None]:
-        return title, _llm_short_filename(title, preview)
+        return title, _llm_short_filename(title, preview, model=model)
 
     with ThreadPoolExecutor(max_workers=4) as executor:
         futures = {

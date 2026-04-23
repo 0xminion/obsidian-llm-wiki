@@ -185,9 +185,41 @@ def generate_entry_insights(
     extracted: dict,
     cfg: Config,
 ) -> str:
-    """Generate just the insights (Summary + Core insights) via agent.
+    """Generate just the insights (Summary + Core insights) via Ollama.
 
-    Minimal prompt — only asks for the two sections that need intelligence.
+    Replaces the previous Hermes subprocess call with a direct Ollama HTTP call
+    for speed. Uses the model configured via OLLAMA_INSIGHT_MODEL env var.
+    """
+    from pipeline.utils import _ollama_generate
+
+    content = extracted.get("content", "")[:cfg.max_content_insights]
+    prompt = f"""Analyze this content and produce exactly two sections:
+
+## Summary
+(1-2 sentence summary)
+
+## Core insights
+(3-5 bullet points of key insights)
+
+CONTENT:
+{content}
+
+Output ONLY the two sections above. No preamble."""
+
+    raw = _ollama_generate(prompt, model=cfg.ollama_insight_model, timeout=60)
+    if raw:
+        return raw
+    return ""
+
+
+def generate_entry_insights_legacy(
+    plan: Plan,
+    extracted: dict,
+    cfg: Config,
+) -> str:
+    """Legacy: Generate insights via Hermes subprocess (slow, kept for fallback).
+
+    Use generate_entry_insights() instead — it calls Ollama directly.
     """
     content = extracted.get("content", "")[:cfg.max_content_insights]
     prompt = f"""Analyze this content and produce exactly two sections:
@@ -344,7 +376,7 @@ def create_file_templates(
     llm_filenames: dict[str, str] = {}
     if long_title_items:
         log.info("Batch-generating filenames for %d long titles via LLM...", len(long_title_items))
-        llm_filenames = batch_smart_filenames(long_title_items, agent_cmd=cfg.agent_cmd)
+        llm_filenames = batch_smart_filenames(long_title_items, model=cfg.ollama_filename_model)
         log.info("LLM generated %d/%d filenames", len(llm_filenames), len(long_title_items))
 
     for plan in plans:

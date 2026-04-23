@@ -72,6 +72,11 @@ class Config:
     qmd_cmd: str = "qmd"
     qmd_collection: str = "concepts"
 
+    # Ollama (for fast local inference — insights + filenames)
+    ollama_host: str = "http://localhost:11434"
+    ollama_insight_model: str = "minimax-m2.7:cloud"
+    ollama_filename_model: str = "minimax-m2.7:cloud"
+
     # Extraction
     extract_timeout: int = 45
 
@@ -235,6 +240,9 @@ def load_config(
         assemblyai_api_key=_env("ASSEMBLYAI_API_KEY", ""),
         qmd_cmd=_env("QMD_CMD", "qmd"),
         qmd_collection=_env("QMD_COLLECTION", "concepts"),
+        ollama_host=_env("OLLAMA_HOST", "http://localhost:11434"),
+        ollama_insight_model=_env("OLLAMA_INSIGHT_MODEL", "minimax-m2.7:cloud"),
+        ollama_filename_model=_env("OLLAMA_FILENAME_MODEL", "minimax-m2.7:cloud"),
         extract_timeout=_int_env("EXTRACT_TIMEOUT", 45, env_values),
         agent_timeout=_int_env("AGENT_TIMEOUT", 900, env_values),
         plan_timeout=_int_env("PLAN_TIMEOUT", 600, env_values),
