@@ -207,6 +207,7 @@ def run_qmd_query(
     n_results: int = 5,
     min_score: float = 0.2,
     no_rerank: bool = False,
+    concepts_dir: Path | None = None,
 ) -> list[ConceptMatch]:
     """Semantic concept search using Ollama embeddings.
 
@@ -219,7 +220,7 @@ def run_qmd_query(
     if query_embedding is None:
         return []
 
-    concepts_dir = Path.home() / "MyVault" / "04-Wiki" / "concepts"
+    concepts_dir = concepts_dir or (Path.home() / "MyVault" / "04-Wiki" / "concepts")
     _load_concept_embeddings(concepts_dir)
 
     if not _concept_embedding_cache:
@@ -249,7 +250,10 @@ def run_qmd_concept_search(
     results: dict[str, list[ConceptMatch]] = {}
 
     def _search_one(h: str, query: str) -> tuple[str, list[ConceptMatch]]:
-        matches = run_qmd_query(query, "", "", n_results=5, min_score=0.2)
+        matches = run_qmd_query(
+            query, "", "", n_results=5, min_score=0.2,
+            concepts_dir=concepts_dir,
+        )
         return h, matches
 
     with ThreadPoolExecutor(max_workers=4) as executor:

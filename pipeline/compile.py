@@ -14,12 +14,15 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import re
 import subprocess
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+
+import math
 
 from pipeline.config import Config
 from pipeline.models import Edge, EdgeType
@@ -588,9 +591,9 @@ def _semantic_crosslink(cfg: Config, client, index: NoteIndex) -> int:
 
     prompt_lines = [
         "You are a knowledge base editor. Review these candidate note pairs and decide which should link to each other.",
-        "For each pair, respond with exactly one of these formats:",
-        "  LINK <note_a> <note_b> <brief reason>",
-        "  SKIP <note_a> <note_b>",
+        "For each pair, respond with exactly one of these formats (use pipe separators | ):",
+        "  LINK <note_a> | <note_b> | <brief reason>",
+        "  SKIP <note_a> | <note_b>",
         "",
         "Candidates:",
     ]
@@ -606,9 +609,12 @@ def _semantic_crosslink(cfg: Config, client, index: NoteIndex) -> int:
 
     links_added = 0
     for line in response.splitlines():
-        m = re.match(r"LINK\s+(\S+)\s+(\S+)\s+(.*)", line)
+        # Parse pipe-delimited format: LINK note_a | note_b | reason
+        m = re.match(r"LINK\s+(.+?)\s*\|\s*(.+?)\s*\|\s*(.*)", line)
         if m:
             a, b, reason = m.groups()
+            a = a.strip().strip('"').strip("'")
+            b = b.strip().strip('"').strip("'")
             if _add_wikilink(cfg, a, b, reason.strip()):
                 links_added += 1
             # Also add reverse link if appropriate
@@ -656,9 +662,9 @@ def _semantic_concept_merge(cfg: Config, client, index: NoteIndex) -> int:
 
     prompt_lines = [
         "You are a knowledge base editor. Review these concept pairs and decide if they should be merged.",
-        "For each pair, respond with exactly one of:",
-        "  MERGE <canonical_name> <duplicate_name> <reason>",
-        "  KEEP_BOTH <name_a> <name_b> <reason>",
+        "For each pair, respond with exactly one of (use pipe separators | ):",
+        "  MERGE <canonical_name> | <duplicate_name> | <reason>",
+        "  KEEP_BOTH <name_a> | <name_b> | <reason>",
         "",
         "Rules:",
         "- If two concepts cover the SAME idea (even in different languages), merge them.",
@@ -679,9 +685,12 @@ def _semantic_concept_merge(cfg: Config, client, index: NoteIndex) -> int:
 
     merged = 0
     for line in response.splitlines():
-        m = re.match(r"MERGE\s+(\S+)\s+(\S+)\s+(.*)", line)
+        # Parse pipe-delimited format: MERGE canonical | duplicate | reason
+        m = re.match(r"MERGE\s+(.+?)\s*\|\s*(.+?)\s*\|\s*(.*)", line)
         if m:
             canonical, duplicate, reason = m.groups()
+            canonical = canonical.strip()
+            duplicate = duplicate.strip()
             if _merge_concepts(cfg, canonical, duplicate, index):
                 merged += 1
 
@@ -690,7 +699,10 @@ def _semantic_concept_merge(cfg: Config, client, index: NoteIndex) -> int:
 
 
 def _merge_concepts(cfg: Config, canonical_name: str, duplicate_name: str, index: NoteIndex) -> bool:
-    """Merge duplicate concept into canonical. Returns True if merged."""
+    """Merge duplicate concept into canonical. Returns True if merged.
+
+    Updates all references to the duplicate across entries, concepts, MoCs, and edges.
+    """
     canonical_path = cfg.concepts_dir / f"{canonical_name}.md"
     duplicate_path = cfg.concepts_dir / f"{duplicate_name}.md"
     if not canonical_path.exists() or not duplicate_path.exists():
@@ -713,18 +725,45 @@ def _merge_concepts(cfg: Config, canonical_name: str, duplicate_name: str, index
     # Delete duplicate
     duplicate_path.unlink()
 
-    # Update entries that linked to duplicate
-    for entry_md in cfg.entries_dir.glob("*.md"):
-        try:
-            text = entry_md.read_text(encoding="utf-8", errors="replace")
-            if f"[[{duplicate_name}]]" in text:
-                text = text.replace(f"[[{duplicate_name}]]", f"[[{canonical_name}]]")
-                entry_md.write_text(text, encoding="utf-8")
-        except OSError:
+    # Update ALL notes that link to the duplicate (entries, concepts, MoCs, sources)
+    all_dirs = [cfg.entries_dir, cfg.concepts_dir, cfg.mocs_dir, cfg.sources_dir]
+    for directory in all_dirs:
+        if not directory.exists():
             continue
+        for note_md in directory.glob("*.md"):
+            # Skip the canonical file to avoid self-modifying the "Merged from" heading
+            if note_md.stem == canonical_name and directory == cfg.concepts_dir:
+                continue
+            try:
+                text = note_md.read_text(encoding="utf-8", errors="replace")
+                if f"[[{duplicate_name}]]" in text:
+                    text = text.replace(f"[[{duplicate_name}]]", f"[[{canonical_name}]]")
+                    note_md.write_text(text, encoding="utf-8")
+            except OSError:
+                continue
+
+    # Invalidate entry in index so stale data isn't reused
+    if duplicate_name in index.notes:
+        del index.notes[duplicate_name]
+    if duplicate_name in index.embeddings:
+        del index.embeddings[duplicate_name]
 
     log.info("Merged concept %s into %s", duplicate_name, canonical_name)
     return True
+
+
+def _replace_wikilink_in_dir(directory: Path, old_name: str, new_name: str) -> None:
+    """Replace [[old_name]] with [[new_name]] in all .md files under directory."""
+    if not directory.exists():
+        return
+    for md in directory.glob("*.md"):
+        try:
+            text = md.read_text(encoding="utf-8", errors="replace")
+            if f"[[{old_name}]]" in text:
+                text = text.replace(f"[[{old_name}]]", f"[[{new_name}]]")
+                md.write_text(text, encoding="utf-8")
+        except OSError:
+            continue
 
 
 def _semantic_moc_rebuild(cfg: Config, client, index: NoteIndex) -> int:
@@ -798,8 +837,9 @@ def _semantic_moc_rebuild(cfg: Config, client, index: NoteIndex) -> int:
             continue
 
         # Preserve frontmatter, replace body
-        fm_match = re.match(r"^(---\s*\n.*?\n---\s*\n)", current, re.DOTALL)
-        frontmatter = fm_match.group(1) if fm_match else ""
+        # Split on first \n---\n to avoid matching --- inside YAML values
+        parts = current.split("\n---\n", 1)
+        frontmatter = parts[0] + "\n---\n" if len(parts) > 1 else ""
         new_content = frontmatter + f"# {moc_info['title']}\n\n" + response + "\n"
         moc_path.write_text(new_content, encoding="utf-8")
         updated += 1
@@ -834,20 +874,35 @@ def _run_semantic_compile(cfg: Config, result: CompileResult) -> tuple[bool, str
     if len(index.notes) > 0:
         index.embed_all(client)
 
-    # Run semantic operations
-    result.crosslinks_added = _semantic_crosslink(cfg, client, index)
-    result.concepts_merged = _semantic_concept_merge(cfg, client, index)
-    result.mocs_updated = _semantic_moc_rebuild(cfg, client, index)
+    # Run semantic operations with exception tracking
+    all_ok = True
+    try:
+        result.crosslinks_added = _semantic_crosslink(cfg, client, index)
+    except Exception as e:
+        log.error("Semantic cross-linking failed: %s", e)
+        all_ok = False
+
+    try:
+        result.concepts_merged = _semantic_concept_merge(cfg, client, index)
+    except Exception as e:
+        log.error("Semantic concept merge failed: %s", e)
+        all_ok = False
+
+    try:
+        result.mocs_updated = _semantic_moc_rebuild(cfg, client, index)
+    except Exception as e:
+        log.error("Semantic MoC rebuild failed: %s", e)
+        all_ok = False
 
     result.agent_duration_s = time.time() - t0
-    result.agent_succeeded = True
+    result.agent_succeeded = all_ok
 
     summary = (
         f"cross-links added: {result.crosslinks_added}\n"
         f"concepts merged: {result.concepts_merged}\n"
         f"mocs updated: {result.mocs_updated}"
     )
-    return True, summary
+    return all_ok, summary
 
 
 # ─── Agent: Concept Merge + Cross-Linking (Legacy) ───────────────────────────

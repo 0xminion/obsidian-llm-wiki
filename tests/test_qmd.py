@@ -2,6 +2,7 @@
 
 import json
 import math
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -116,7 +117,10 @@ class TestRunQmdQuery:
             "forecasting": [0.5, 0.5, 0.0],
         }
 
-        matches = run_qmd_query("prediction markets", "qmd", "concepts")
+        matches = run_qmd_query(
+            "prediction markets", "qmd", "concepts",
+            concepts_dir=Path.home() / "MyVault" / "04-Wiki" / "concepts",
+        )
         assert len(matches) == 2
         assert matches[0].concept == "prediction-markets"
         assert matches[0].score > 0.8

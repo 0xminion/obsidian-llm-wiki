@@ -29,10 +29,31 @@ nano ~/MyVault/Meta/Scripts/.env
 # Drop a URL (.url files in plain text or Windows InternetShortcut format both work)
 echo 'https://example.com/article' > ~/MyVault/01-Raw/my-source.url
 
-# Run the pipeline — that's it
+# Run the pipeline — that's it (3.8 min for 18 URLs with Ollama local inference)
 pipeline ingest ~/MyVault
 # Or, without installing the console script:
 python3 -m pipeline.cli ingest ~/MyVault
+```
+
+### LLM Provider Configuration
+
+Choose your provider via environment variables (in `~/.MyVault/Meta/Scripts/.env`):
+
+```bash
+# Option 1: Ollama (default) — fast, private, local
+LLM_PROVIDER=ollama
+OLLAMA_HOST=http://localhost:11434
+OLLAMA_INSIGHT_MODEL=minimax-m2.7:cloud   # insights + filenames
+OLLAMA_FILENAME_MODEL=minimax-m2.7:cloud
+
+# Option 2: OpenRouter — access 200+ models (Claude, GPT, Qwen, etc.)
+LLM_PROVIDER=openrouter
+LLM_MODEL=anthropic/claude-sonnet-4
+LLM_API_KEY=sk-openrouter-...
+
+# Option 3: Hermes — full agent with tool access (slower, subprocess)
+LLM_PROVIDER=hermes
+AGENT_CMD=hermes
 ```
 
 `pipeline ingest` currently scans `01-Raw/*.url` as its inbox. Other raw assets can live in the vault, but they are not auto-ingested by this command yet.
@@ -41,11 +62,11 @@ python3 -m pipeline.cli ingest ~/MyVault
 
 ```bash
 pipeline ingest ~/MyVault           # full pipeline: extract → plan → create
-pipeline ingest --parallel 5        # more parallel agents
+pipeline ingest --parallel 5        # more parallel workers
 pipeline ingest --dry-run           # preview without executing
 pipeline ingest --review            # stage plans for human review
 pipeline ingest --resume            # continue from reviewed plans
-pipeline compile ~/MyVault          # concept convergence, MoC rebuild, edges
+pipeline compile ~/MyVault          # semantic cross-linking, MoC rebuild, edges
 pipeline lint ~/MyVault             # 15 health checks + synonym detection
 pipeline lint --fix                 # auto-fix safe issues
 pipeline validate ~/MyVault         # post-write quality gate
@@ -53,7 +74,8 @@ pipeline validate --fix             # auto-repair missing sections
 pipeline reindex ~/MyVault          # rebuild wiki-index.md
 pipeline stats ~/MyVault            # vault dashboard
 pipeline tags ~/MyVault             # rebuild tag registry
-pipeline query --ask "question"     # Q&A against your vault
+pipeline query --ask "question"     # Q&A against your vault (Hermes agent)
+pipeline query --ask "question" --fast  # fast direct LLM query (sub-5s)
 ```
 
 ## How It Works
@@ -98,11 +120,16 @@ N parallel agents write vault files. Each agent receives a batch with extracted 
 
 Runs after ingest or manually via `pipeline compile`:
 
-1. Agent: cross-link analysis + concept merging (semantic judgment)
-2. Python: wiki index rebuild (deterministic)
-3. Python: typed edges construction from wikilinks and metadata (deterministic)
-4. Python: duplicate detection by title similarity (deterministic)
-5. Structured metrics report + log entry
+**Semantic operations (direct LLM, no subprocess):**
+1. **Cross-link analysis** — embedding similarity + LLM validation adds missing `[[wikilinks]]`
+2. **Concept merging** — detects near-duplicates, merges with LLM approval, updates all references
+3. **MoC rebuild** — resynthesizes topic hubs from related notes via embeddings
+
+**Deterministic operations:**
+4. **Wiki index rebuild** — deterministic scan of all entries, concepts, MoCs
+5. **Typed edges** — `edges.tsv` from wikilinks, sources, tags (9 relationship types)
+6. **Duplicate detection** — title similarity report for human review
+7. **Structured metrics report + log entry**
 
 ### Lint System
 
@@ -240,34 +267,43 @@ python3 -m pytest tests/ -v
 
 **Monthly:** Check `pipeline stats` for growth trends
 
+## Testing
+
+```bash
+python3 -m pytest tests/ -v
+```
+
+**637 tests** covering: extraction, planning, creation, validation, lint, compile (semantic + deterministic), LLM client (multi-provider), vault operations, models, config, and integration.
+
 ## Architecture
 
-Python-first. The pipeline (`pipeline/cli.py`) is the canonical entry point. Shell scripts in `scripts/` are setup utilities only.
+Python-first with a unified LLM client supporting multiple providers:
 
 ```
 pipeline/
 ├── cli.py              # typer CLI — all commands
+├── llm_client.py       # Unified LLM client (Ollama/OpenRouter/Hermes)
 ├── extract.py          # Stage 1: URL routing, extraction, dedup
 ├── plan.py             # Stage 2: semantic search, agent planning
-├── compile.py          # Compile pass: snapshot/diff, edges, report
+├── create/             # Stage 3 creation
+│   ├── agent.py         # Agent execution (Hermes, legacy)
+│   ├── orchestrator.py  # Batch coordination + post-processing
+│   ├── prompts.py       # Prompt construction
+│   ├── templates.py     # Template mode (deterministic + fast LLM insights)
+│   └── validate.py      # Output validation + auto-repair
+├── compile.py          # Compile pass: semantic ops + deterministic ops
 ├── lint.py             # 15 lint checks with cache support
 ├── vault.py            # File operations, collision detection
 ├── store.py            # SQLite content store + vault cache
 ├── config.py           # Configuration and environment
 ├── models.py           # Data models (Manifest, Plan, Edge, etc.)
-├── qmd.py              # Semantic search integration
+├── qmd.py              # Semantic search via Ollama embeddings
 ├── utils.py            # Shared utilities
-├── extractors/         # Type-specific extractors
-│   ├── web.py
-│   ├── youtube.py
-│   ├── podcast.py
-│   └── _shared.py
-└── create/             # Stage 3 creation
-    ├── agent.py         # Agent execution
-    ├── orchestrator.py  # Batch coordination + post-processing
-    ├── prompts.py       # Prompt construction
-    ├── templates.py     # Note templates
-    └── validate.py      # Output validation + auto-repair
+└── extractors/         # Type-specific extractors
+    ├── web.py
+    ├── youtube.py
+    ├── podcast.py
+    └── _shared.py
 ```
 
-~10,800 lines of Python, 597 tests, 0 shell scripts in the critical path.
+~12,000 lines of Python, 637 tests, unified LLM client with 3 providers, 0 shell scripts in the critical path.

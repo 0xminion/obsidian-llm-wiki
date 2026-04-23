@@ -1,4 +1,11 @@
-"""Agent orchestration — subprocess execution, concept convergence, batch creation."""
+"""Agent orchestration — subprocess execution, concept convergence, batch creation.
+
+⚠️ DEPRECATED: This module uses Hermes subprocess for creation. It remains for
+backward compatibility but is superseded by template-based creation with direct
+LLM calls (pipeline/create/templates.py + pipeline/llm_client.py).
+
+Do NOT add new features here. Use templates.py for all new creation work.
+"""
 
 from __future__ import annotations
 

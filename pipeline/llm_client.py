@@ -31,6 +31,11 @@ from typing import Optional
 log = logging.getLogger(__name__)
 
 
+class LLMGenerationError(Exception):
+    """Raised when LLM generation fails and raise_on_error=True."""
+    pass
+
+
 @dataclass
 class LLMResponse:
     text: str = ""
@@ -309,8 +314,11 @@ class LLMClient:
         log.warning("Unknown provider '%s', falling back to ollama", p)
         return OllamaProvider()
 
-    def generate(self, prompt: str, model: Optional[str] = None, timeout: Optional[int] = None) -> str:
-        """Generate text. Returns empty string on any failure."""
+    def generate(self, prompt: str, model: Optional[str] = None, timeout: Optional[int] = None, raise_on_error: bool = False) -> str:
+        """Generate text. Returns empty string on any failure.
+
+        Set raise_on_error=True to raise LLMGenerationError instead of returning empty string.
+        """
         m = model or self.model
         t = timeout or self.timeout
         if not m and self.provider == "ollama":
@@ -318,8 +326,14 @@ class LLMClient:
         resp = self._provider_impl.generate(prompt, m, t, self.api_key, self.base_url)
         if resp.success:
             return resp.text
-        log.debug("LLM generate failed (%s): %s", self.provider, resp.error)
+        if raise_on_error:
+            raise LLMGenerationError(f"{self.provider} generation failed: {resp.error}")
+        log.warning("LLM generate failed (%s): %s", self.provider, resp.error)
         return ""
+
+    def generate_or_raise(self, prompt: str, model: Optional[str] = None, timeout: Optional[int] = None) -> str:
+        """Generate text, raising LLMGenerationError on failure."""
+        return self.generate(prompt, model=model, timeout=timeout, raise_on_error=True)
 
     def embed(self, text: str, model: Optional[str] = None, timeout: Optional[int] = None) -> list[float] | None:
         """Embed a single text. Returns None on failure."""

@@ -42,8 +42,48 @@ def _run(args: list[str], timeout: int = 45, check: bool = False,
     )
 
 
+def _validate_url(url: str) -> bool:
+    """Basic URL validation to prevent SSRF via malicious .url files.
+
+    Checks:
+      1. Well-formed URL with http/https scheme
+      2. Not targeting private/internal IP ranges
+      3. Not localhost
+    """
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return False
+
+    if parsed.scheme not in ("http", "https"):
+        return False
+
+    hostname = parsed.hostname or ""
+    if not hostname:
+        return False
+
+    # Block localhost and internal IPs
+    if hostname in ("localhost", "127.0.0.1", "0.0.0.0", "::1"):
+        return False
+
+    # Block private IP ranges
+    private_prefixes = (
+        "10.", "172.16.", "172.17.", "172.18.", "172.19.",
+        "172.20.", "172.21.", "172.22.", "172.23.", "172.24.",
+        "172.25.", "172.26.", "172.27.", "172.28.", "172.29.",
+        "172.30.", "172.31.", "192.168.", "169.254.",
+    )
+    if hostname.startswith(private_prefixes):
+        return False
+
+    return True
+
+
 def _curl_get(url: str, headers: Optional[dict] = None, timeout: int = 45) -> str:
     """GET via curl (not Python urllib — urllib gets 403)."""
+    if not _validate_url(url):
+        log.warning("Blocked potentially unsafe URL: %s", url[:80])
+        return ""
     args = ["curl", "-sL", "--max-time", str(timeout)]
     if headers:
         for k, v in headers.items():
@@ -56,6 +96,9 @@ def _curl_get(url: str, headers: Optional[dict] = None, timeout: int = 45) -> st
 def _curl_post_json(url: str, data: dict, headers: Optional[dict] = None,
                     timeout: int = 45) -> str:
     """POST JSON via curl."""
+    if not _validate_url(url):
+        log.warning("Blocked potentially unsafe URL: %s", url[:80])
+        return ""
     args = ["curl", "-sL", "--max-time", str(timeout), "-X", "POST",
             "-H", "Content-Type: application/json"]
     if headers:
