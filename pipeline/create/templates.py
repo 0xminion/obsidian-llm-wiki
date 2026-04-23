@@ -379,6 +379,36 @@ def create_file_templates(
         llm_filenames = batch_smart_filenames(long_title_items, model=cfg.ollama_filename_model)
         log.info("LLM generated %d/%d filenames", len(llm_filenames), len(long_title_items))
 
+    # ── Pre-generate insights in parallel (biggest speed win) ─────────────
+    insights_by_hash: dict[str, str] = {}
+    if use_agent_insights:
+        log.info("Pre-generating insights for %d plans in parallel...", len(plans))
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        def _generate_insight_for_plan(plan: Plan) -> tuple[str, str]:
+            """Return (hash, insights_text) for a single plan."""
+            extract_file = extract_dir / f"{plan.hash}.json"
+            if not extract_file.exists():
+                return plan.hash, ""
+            try:
+                extracted = json.loads(extract_file.read_text(encoding="utf-8"))
+                return plan.hash, generate_entry_insights(plan, extracted, cfg)
+            except Exception as e:
+                log.debug("Insight generation failed for %s: %s", plan.hash, e)
+                return plan.hash, ""
+
+        with ThreadPoolExecutor(max_workers=cfg.parallel) as executor:
+            futures = {
+                executor.submit(_generate_insight_for_plan, plan): plan.hash
+                for plan in plans
+            }
+            for future in as_completed(futures):
+                h, insights_text = future.result()
+                insights_by_hash[h] = insights_text
+
+        successful = sum(1 for v in insights_by_hash.values() if v)
+        log.info("Insights generated: %d/%d successful", successful, len(plans))
+
     for plan in plans:
         plan_ok = True
         # Use LLM filename if available, otherwise standard conversion with smart fallback
@@ -430,7 +460,7 @@ def create_file_templates(
 
             insights = ""
             if use_agent_insights:
-                insights = generate_entry_insights(plan, extracted, cfg)
+                insights = insights_by_hash.get(plan.hash, "")
 
             try:
                 entry_link_name = source_note_title
