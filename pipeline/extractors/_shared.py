@@ -123,14 +123,14 @@ _PODCAST_PATTERNS = re.compile(
     r"(?:podcasts\.apple\.com|open\.spotify\.com/(?:show|episode)|"
     r"spotify\.com/(?:show|episode)|podcasts\.google\.com|"
     r"pca\.st|podbay\.fm|overcast\.fm|pocketcasts\.com|"
-    r"castbox\.fm|podbean\.com|anchor\.fm|feeds\.|"
+    r"castbox\.fm|podbean\.com|anchor\.fm|feeds\.[a-z]+|"
     r"podlink\.com|pod\.link|buzzsprout\.com|libsyn\.com|"
     r"transistor\.fm|simplecast\.com|megaphone\.fm|acast\.com|"
     r"podchaser\.com|podcastaddict\.com|podcastindex\.org|"
     r"redcircle\.com|podigee\.com|spreaker\.com|audioboom\.com|"
     r"omnycontent\.com|chtbl\.com|art19\.com|captivate\.fm|"
     r"fireside\.fm|rss\.com|podomatic\.com|"
-    r"\.(?:xml|rss)(?:\?|$)|/(?:feed|rss)(?:\?|$))"
+    r"/(?:feed|rss|podcast)(?:\.|$))"
 )
 _TWITTER_PATTERNS = re.compile(
     r"(?:x\.com|twitter\.com)/"

@@ -186,41 +186,28 @@ from pipeline.qmd import run_qmd_query
 
 class TestRunQmd:
     def test_successful_query(self, monkeypatch):
-        """Mock qmd CLI returning valid JSON results."""
-        qmd_output = json.dumps([
-            {"concept": "ai-safety", "score": 0.85, "file": "/path/ai-safety.md", "snippet": "..."},
-            {"concept": "alignment", "score": 0.72, "file": "/path/alignment.md", "snippet": "..."},
-        ])
+        """Mock Ollama returning valid embeddings."""
+        import pipeline.qmd as qmd_module
+        qmd_module._cache_loaded = True
+        qmd_module._concept_embedding_cache = {
+            "ai-safety": [0.9] + [0.0] * 1023,
+            "alignment": [0.8] + [0.0] * 1023,
+        }
 
-        def mock_run(*args, **kwargs):
-            result = MagicMock()
-            result.stdout = qmd_output
-            result.returncode = 0
-            return result
-
-        monkeypatch.setattr("pipeline.qmd.subprocess.run", mock_run)
+        monkeypatch.setattr("pipeline.qmd._ollama_embed", lambda text: [1.0] + [0.0] * 1023)
         matches = run_qmd_query("artificial intelligence", "qmd", "/tmp/coll", timeout=5)
         assert len(matches) == 2
         assert matches[0].concept == "ai-safety"
-        assert matches[0].score == 0.85
+        assert matches[0].score > 0.5
         assert matches[1].concept == "alignment"
 
     def test_timeout_returns_empty(self, monkeypatch):
-        def mock_run(*args, **kwargs):
-            raise subprocess.TimeoutExpired(cmd="qmd", timeout=1)
-
-        monkeypatch.setattr("pipeline.qmd.subprocess.run", mock_run)
+        monkeypatch.setattr("pipeline.qmd._ollama_embed", lambda text: None)
         matches = run_qmd_query("query", "qmd", "/tmp/coll", timeout=1)
         assert matches == []
 
     def test_invalid_json_returns_empty(self, monkeypatch):
-        def mock_run(*args, **kwargs):
-            result = MagicMock()
-            result.stdout = "not valid json {{{"
-            result.returncode = 0
-            return result
-
-        monkeypatch.setattr("pipeline.qmd.subprocess.run", mock_run)
+        monkeypatch.setattr("pipeline.qmd._ollama_embed", lambda text: None)
         matches = run_qmd_query("query", "qmd", "/tmp/coll", timeout=5)
         assert matches == []
 
@@ -229,50 +216,36 @@ class TestRunQmd:
         assert run_qmd_query("   ", "qmd", "/tmp/coll") == []
 
     def test_noise_stripped(self, monkeypatch):
-        """qmd CLI outputs cmake/Vulkan noise before JSON."""
-        noise = "cmake error: something\nVulkan warning\n"
-        valid = json.dumps([{"concept": "test", "score": 0.5, "file": "/test.md"}])
-
-        def mock_run(*args, **kwargs):
-            result = MagicMock()
-            result.stdout = noise + valid
-            result.returncode = 0
-            return result
-
-        monkeypatch.setattr("pipeline.qmd.subprocess.run", mock_run)
+        """Ollama embed works regardless of noise."""
+        import pipeline.qmd as qmd_module
+        qmd_module._cache_loaded = True
+        qmd_module._concept_embedding_cache = {
+            "test": [0.9] + [0.0] * 1023,
+        }
+        monkeypatch.setattr("pipeline.qmd._ollama_embed", lambda text: [1.0] + [0.0] * 1023)
         matches = run_qmd_query("query", "qmd", "/tmp/coll", timeout=5)
         assert len(matches) == 1
 
     def test_low_score_filtered(self, monkeypatch):
-        qmd_output = json.dumps([
-            {"concept": "good", "score": 0.5, "file": "/good.md"},
-            {"concept": "low", "score": 0.1, "file": "/low.md"},
-        ])
-
-        def mock_run(*args, **kwargs):
-            result = MagicMock()
-            result.stdout = qmd_output
-            result.returncode = 0
-            return result
-
-        monkeypatch.setattr("pipeline.qmd.subprocess.run", mock_run)
+        import pipeline.qmd as qmd_module
+        qmd_module._cache_loaded = True
+        qmd_module._concept_embedding_cache = {
+            "good": [0.9] + [0.0] * 1023,
+            "low": [0.0] + [0.9] + [0.0] * 1022,
+        }
+        monkeypatch.setattr("pipeline.qmd._ollama_embed", lambda text: [1.0] + [0.0] * 1023)
         matches = run_qmd_query("query", "qmd", "/tmp/coll", timeout=5)
         assert len(matches) == 1
         assert matches[0].concept == "good"
 
     def test_file_path_parsed(self, monkeypatch):
-        """Concept name extracted from file path."""
-        qmd_output = json.dumps([
-            {"concept": "", "score": 0.8, "file": "/vault/concepts/prediction-markets.md"},
-        ])
-
-        def mock_run(*args, **kwargs):
-            result = MagicMock()
-            result.stdout = qmd_output
-            result.returncode = 0
-            return result
-
-        monkeypatch.setattr("pipeline.qmd.subprocess.run", mock_run)
+        """Concept name extracted from cache key."""
+        import pipeline.qmd as qmd_module
+        qmd_module._cache_loaded = True
+        qmd_module._concept_embedding_cache = {
+            "prediction-markets": [0.9] + [0.0] * 1023,
+        }
+        monkeypatch.setattr("pipeline.qmd._ollama_embed", lambda text: [1.0] + [0.0] * 1023)
         matches = run_qmd_query("query", "qmd", "/tmp/coll", timeout=5)
         assert matches[0].concept == "prediction-markets"
 
@@ -285,21 +258,18 @@ class TestQmdConceptSearch:
         cfg = _make_config(tmp_path)
         queries = {"hash1": "query one", "hash2": "query two", "hash3": "query three"}
 
-        call_count = 0
+        monkeypatch.setattr("pipeline.qmd._ollama_embed", lambda text: [1.0] + [0.0] * 1023)
+        import pipeline.qmd as qmd_module
+        qmd_module._cache_loaded = True
+        qmd_module._concept_embedding_cache = {
+            "c1": [0.9] + [0.0] * 1023,
+            "c2": [0.8] + [0.0] * 1023,
+            "c3": [0.7] + [0.0] * 1023,
+        }
 
-        def mock_run(*args, **kwargs):
-            nonlocal call_count
-            call_count += 1
-            result = MagicMock()
-            result.stdout = json.dumps([{"concept": f"c{call_count}", "score": 0.8, "file": f"/c{call_count}.md"}])
-            result.returncode = 0
-            return result
-
-        monkeypatch.setattr("pipeline.qmd.subprocess.run", mock_run)
         results = run_qmd_concept_search(queries, cfg)
         assert len(results) == 3
         assert all(h in results for h in queries)
-        assert call_count == 3
 
     def test_empty_queries_return_empty(self, tmp_path):
         from pipeline.qmd import run_qmd_concept_search
@@ -328,13 +298,13 @@ class TestQmdConvergence:
             Plan(hash="bbb222", title="Topic 1", concept_new=[], concept_updates=["Existing"]),
         ]
 
-        def mock_run(*args, **kwargs):
-            result = MagicMock()
-            result.stdout = json.dumps([{"concept": "test", "score": 0.6, "file": "/test.md"}])
-            result.returncode = 0
-            return result
+        monkeypatch.setattr("pipeline.qmd._ollama_embed", lambda text: [1.0] + [0.0] * 1023)
+        import pipeline.qmd as qmd_module
+        qmd_module._cache_loaded = True
+        qmd_module._concept_embedding_cache = {
+            "test": [0.9] + [0.1] * 1023,
+        }
 
-        monkeypatch.setattr("pipeline.qmd.subprocess.run", mock_run)
         convergence = run_qmd_convergence(plans, cfg)
         assert "aaa111" in convergence
         assert "bbb222" in convergence
