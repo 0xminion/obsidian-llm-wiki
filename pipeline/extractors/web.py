@@ -64,6 +64,12 @@ def extract_web(url: str, cfg: Config, source_type: SourceType = SourceType.WEB)
         if content:
             log.info("Archive.org extraction succeeded for %s", url)
 
+    # Final fallback: Camoufox headless browser
+    if not content or _is_challenge_page(content):
+        content = _try_camoufox(url, timeout)
+        if content:
+            log.info("Camoufox extraction succeeded for %s", url)
+
     if not content:
         log.warning("All web extraction methods failed for %s", url)
         content = f"URL: {url}\n\nNote: Content extraction failed (all methods exhausted)."
@@ -224,4 +230,37 @@ def _try_archive_extract(url: str, timeout: int = 45) -> str:
             return content
     except Exception as e:
         log.debug("Archive.org extract failed: %s", e)
+    return ""
+
+
+def _try_camoufox(url: str, timeout: int = 45) -> str:
+    """Try Camoufox headless browser for JS-heavy / anti-bot pages.
+
+    Final fallback in the extraction chain. Uses AsyncCamoufox to render
+    the page and extract visible text.
+    """
+    try:
+        from camoufox import AsyncCamoufox
+    except ImportError:
+        log.debug("Camoufox not installed, skipping browser fallback")
+        return ""
+
+    import asyncio
+
+    async def _fetch() -> str:
+        async with AsyncCamoufox(headless=True) as browser:
+            page = await browser.new_page()
+            await page.goto(url, wait_until="domcontentloaded", timeout=timeout * 1000)
+            # Wait for JS-rendered content
+            await asyncio.sleep(3)
+            text = await page.evaluate("() => document.body.innerText")
+            return text or ""
+
+    try:
+        text = asyncio.run(_fetch())
+        if text and len(text.strip()) > 200:
+            log.info("Camoufox extraction succeeded for %s (%d chars)", url, len(text))
+            return text
+    except Exception as e:
+        log.debug("Camoufox extract failed: %s", e)
     return ""

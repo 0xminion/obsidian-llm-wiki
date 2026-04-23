@@ -58,6 +58,7 @@ from pipeline.extractors.web import (  # noqa: F401
     _try_defuddle_json,
     _try_curl_extract,
     _try_archive_extract,
+    _try_camoufox,
 )
 
 __all__ = [
@@ -85,6 +86,7 @@ __all__ = [
     "_try_defuddle_json",
     "_try_curl_extract",
     "_try_archive_extract",
+    "_try_camoufox",
     "_ARXIV_PATTERN",
     "_YT_VIDEO_ID_PATTERNS",
     "_CHALLENGE_PATTERNS",
