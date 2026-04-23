@@ -4,10 +4,15 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
+import urllib.request
+import urllib.error
 from pathlib import Path
 
 log = logging.getLogger(__name__)
+
+OLLAMA_URL = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
 
 # Regex matching CJK Unified Ideographs (Chinese characters)
 _CJK_RE = re.compile(
@@ -268,6 +273,147 @@ def title_to_filename(title: str, max_length: int = 120) -> str:
         s = _MULTI_DASH_RE.sub("-", s)
         s = _TRIM_DASH_RE.sub("", s)
         return s[:max_length]
+
+
+# Module-level cache for LLM-generated filenames
+_llm_filename_cache: dict[str, str] = {}
+
+
+def _byte_length(s: str) -> int:
+    """Return byte length of string in UTF-8."""
+    return len(s.encode("utf-8"))
+
+
+def is_filename_too_long(filename: str, max_bytes: int = 200) -> bool:
+    """Check if a filename exceeds safe byte limit for ext4 (255 max, 200 buffer)."""
+    return _byte_length(filename) > max_bytes
+
+
+def _llm_short_filename(title: str, content_preview: str = "", agent_cmd: str = "hermes") -> str | None:
+    """Ask an LLM to generate a concise filename. Returns None on failure.
+
+    Uses Ollama directly (nemotron-3-super:cloud with num_predict=20) for speed.
+    Caches results per title.
+    """
+    cache_key = f"{title}::{content_preview[:200]}"
+    if cache_key in _llm_filename_cache:
+        return _llm_filename_cache[cache_key]
+
+    prompt = f"""Very short filename (max 30 chars, kebab-case for English, keep key Chinese chars for Chinese, no punctuation):
+{title[:200]}
+Output:"""
+
+    try:
+        req = urllib.request.Request(
+            f"{OLLAMA_URL}/api/generate",
+            data=json.dumps({
+                "model": "nemotron-3-super:cloud",
+                "prompt": prompt,
+                "stream": False,
+                "options": {"num_predict": 20, "temperature": 0.3},
+            }).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            raw = data.get("response", "").strip().splitlines()[0].strip()
+            raw = raw.strip('"').strip("'")
+            # Remove common prefixes the model sometimes adds
+            raw = re.sub(r"^(filename|file name|name)[\"'\"'\"\s]*[:：]?\s*", "", raw, flags=re.IGNORECASE)
+            if raw:
+                _llm_filename_cache[cache_key] = raw
+                return raw
+    except Exception:
+        pass
+    return None
+
+
+def smart_filename(title: str, content_preview: str = "", agent_cmd: str = "hermes") -> str:
+    """Generate a safe filename, using LLM for long titles instead of truncating.
+
+    1. Apply title_to_filename rules
+    2. If result > 200 bytes, ask LLM for a concise name
+    3. If LLM fails, fall back to intelligent truncation (not plain chop)
+    """
+    filename = title_to_filename(title)
+    if not is_filename_too_long(filename):
+        return filename
+
+    # Try LLM
+    llm_name = _llm_short_filename(title, content_preview, agent_cmd)
+    if llm_name and not is_filename_too_long(llm_name):
+        return llm_name
+
+    # Fallback: extract first sentence / clause, then truncate
+    # Split on sentence boundaries for cleaner truncation
+    cleaned = re.sub(r"[。！？\n]", "\n", title).strip()
+    first_line = cleaned.split("\n")[0].strip()
+    if first_line and len(first_line) < len(title):
+        candidate = title_to_filename(first_line)
+        if not is_filename_too_long(candidate):
+            return candidate
+
+    # Last resort: hard truncate at a word boundary
+    truncated = filename
+    while _byte_length(truncated) > 200:
+        # Remove last char
+        truncated = truncated[:-1]
+        # Try to stop at a word boundary
+        if truncated.endswith("-") or truncated.endswith(" "):
+            truncated = truncated.rstrip("- ")
+            break
+    return truncated
+
+
+def batch_smart_filenames(
+    items: list[tuple[str, str]],
+    agent_cmd: str = "hermes",
+    timeout: int = 60,
+) -> dict[str, str]:
+    """Batch-generate filenames for multiple long titles via parallel LLM calls.
+
+    Uses ThreadPoolExecutor to call _llm_short_filename for each item in parallel.
+    Args:
+        items: List of (title, content_preview) tuples.
+        agent_cmd: Ignored (kept for API compatibility).
+        timeout: Max seconds to wait for all parallel calls.
+
+    Returns:
+        Dict mapping title -> generated filename. Missing keys = LLM failed.
+    """
+    if not items:
+        return {}
+
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    results: dict[str, str] = {}
+    uncached_items: list[tuple[str, str]] = []
+
+    for title, preview in items:
+        cache_key = f"{title}::{preview[:200]}"
+        if cache_key in _llm_filename_cache:
+            results[title] = _llm_filename_cache[cache_key]
+        else:
+            uncached_items.append((title, preview))
+
+    if not uncached_items:
+        return results
+
+    def _generate_one(title: str, preview: str) -> tuple[str, str | None]:
+        return title, _llm_short_filename(title, preview)
+
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        futures = {
+            executor.submit(_generate_one, title, preview): title
+            for title, preview in uncached_items
+        }
+        for future in as_completed(futures, timeout=timeout):
+            title, fname = future.result()
+            if fname:
+                results[title] = fname
+
+    return results
 
 
 # ═══════════════════════════════════════════════════════════

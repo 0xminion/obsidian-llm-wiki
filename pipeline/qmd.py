@@ -32,6 +32,7 @@ log = logging.getLogger(__name__)
 OLLAMA_URL = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
 EMBED_MODEL = os.environ.get("QMD_EMBED_MODEL", "qwen3-embedding:0.6b")
 EMBED_DIM = 1024  # qwen3-embedding-0.6b output dimension
+BATCH_SIZE = 32   # Max texts per /api/embed batch call
 
 # Module-level cache: concept_name -> embedding vector
 _concept_embedding_cache: dict[str, list[float]] = {}
@@ -65,6 +66,122 @@ def _ollama_embed(text: str) -> list[float] | None:
         return None
 
 
+def _ollama_embed_batch(texts: list[str]) -> dict[str, list[float]]:
+    """Batch embed multiple texts via Ollama /api/embed.
+
+    Returns {text: embedding} for successful embeddings.
+    Falls back silently to empty dict on any failure.
+    """
+    if not texts:
+        return {}
+
+    # Ollama /api/embed accepts "input" as string or list of strings
+    payload = {
+        "model": EMBED_MODEL,
+        "input": [t[:4000] for t in texts],
+    }
+
+    try:
+        req = urllib.request.Request(
+            f"{OLLAMA_URL}/api/embed",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            embeddings = data.get("embeddings", [])
+            if not embeddings or len(embeddings) != len(texts):
+                log.warning(
+                    "Ollama /api/embed returned %d embeddings for %d texts",
+                    len(embeddings), len(texts),
+                )
+                return {}
+
+            results: dict[str, list[float]] = {}
+            for text, emb in zip(texts, embeddings):
+                if emb and len(emb) == EMBED_DIM:
+                    results[text] = emb
+                else:
+                    log.warning(
+                        "Ollama /api/embed returned wrong dim: %d",
+                        len(emb) if emb else 0,
+                    )
+            return results
+
+    except urllib.error.HTTPError as e:
+        # 404 = endpoint not supported by this Ollama version
+        if e.code == 404:
+            log.debug("Ollama /api/embed not available (404), will fallback")
+        else:
+            log.warning("Ollama /api/embed HTTP error: %s", e)
+        return {}
+    except Exception as e:
+        log.warning("Ollama /api/embed error: %s", e)
+        return {}
+
+
+def _embed_concepts_batch(md_files: list[Path]) -> dict[str, list[float]]:
+    """Embed concept files using batched /api/embed with ThreadPoolExecutor fallback.
+
+    Strategy:
+      1. Try Ollama /api/embed in batches of BATCH_SIZE
+      2. If batch fails, fallback to ThreadPoolExecutor with individual /api/embeddings
+    """
+    # Build (stem, text) pairs
+    items: list[tuple[str, str]] = []
+    for md in md_files:
+        try:
+            content = md.read_text(encoding="utf-8", errors="replace")
+            title_match = re.search(r"^title:\s*[\"']?(.+?)[\"']?\s*$", content, re.MULTILINE)
+            title = title_match.group(1).strip() if title_match else md.stem
+            body = re.sub(r"^---\s*\n.*?\n---\s*\n", "", content, flags=re.DOTALL)[:1000]
+            text = f"{title}\n{body}".strip()
+            items.append((md.stem, text))
+        except Exception as e:
+            log.debug("Failed to read %s: %s", md.name, e)
+
+    if not items:
+        return {}
+
+    # ── Strategy 1: Batched /api/embed ──────────────────────────────────────
+    batched_results: dict[str, list[float]] = {}
+    batch_worked = False
+
+    for i in range(0, len(items), BATCH_SIZE):
+        batch = items[i:i + BATCH_SIZE]
+        texts = [text for _, text in batch]
+        embeddings = _ollama_embed_batch(texts)
+        if embeddings:
+            batch_worked = True
+            for stem, text in batch:
+                if text in embeddings:
+                    batched_results[stem] = embeddings[text]
+        else:
+            # Batch failed — stop trying batched approach
+            break
+
+    if batch_worked and len(batched_results) == len(items):
+        log.info("Batch embedding: %d/%d concepts via /api/embed", len(batched_results), len(items))
+        return batched_results
+
+    # ── Strategy 2: ThreadPoolExecutor fallback ─────────────────────────────
+    log.info("Falling back to ThreadPoolExecutor for %d concepts", len(items))
+    fallback_results: dict[str, list[float]] = {}
+
+    def _embed_one(item: tuple[str, str]) -> tuple[str, list[float] | None]:
+        stem, text = item
+        emb = _ollama_embed(text)
+        return stem, emb
+
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        for stem, embedding in executor.map(_embed_one, items):
+            if embedding:
+                fallback_results[stem] = embedding
+
+    return fallback_results
+
+
 def _cosine_similarity(a: list[float], b: list[float]) -> float:
     """Cosine similarity between two vectors."""
     dot = sum(x * y for x, y in zip(a, b))
@@ -92,26 +209,9 @@ def _load_concept_embeddings(concepts_dir: Path) -> None:
 
     log.info("Generating embeddings for %d concepts via Ollama (%s)...", len(md_files), EMBED_MODEL)
 
-    def _embed_file(md: Path) -> tuple[str, list[float] | None]:
-        try:
-            content = md.read_text(encoding="utf-8", errors="replace")
-            # Extract title from frontmatter or filename
-            title_match = re.search(r"^title:\s*[\"']?(.+?)[\"']?\s*$", content, re.MULTILINE)
-            title = title_match.group(1).strip() if title_match else md.stem
-            # Use title + first 1000 chars of body
-            body = re.sub(r"^---\s*\n.*?\n---\s*\n", "", content, flags=re.DOTALL)[:1000]
-            text = f"{title}\n{body}".strip()
-            embedding = _ollama_embed(text)
-            return md.stem, embedding
-        except Exception as e:
-            log.debug("Failed to embed %s: %s", md.name, e)
-            return md.stem, None
-
     t0 = time.monotonic()
-    with ThreadPoolExecutor(max_workers=4) as executor:
-        for stem, embedding in executor.map(_embed_file, md_files):
-            if embedding:
-                _concept_embedding_cache[stem] = embedding
+    results = _embed_concepts_batch(md_files)
+    _concept_embedding_cache = results
 
     elapsed = time.monotonic() - t0
     log.info("Embedded %d/%d concepts in %.1fs", len(_concept_embedding_cache), len(md_files), elapsed)

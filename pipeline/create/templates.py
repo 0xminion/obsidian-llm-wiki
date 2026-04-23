@@ -302,9 +302,9 @@ def create_file_templates(
     Returns stats dict.
     """
     from pipeline.create.orchestrator import postprocess_creation
+    from pipeline.utils import batch_smart_filenames, is_filename_too_long, smart_filename, title_to_filename
     from pipeline.vault import (
         resolve_collision,
-        title_to_filename,
         update_moc,
     )
 
@@ -326,10 +326,43 @@ def create_file_templates(
             suffix += 1
             candidate = f"{base_filename}-{suffix}"
 
+    # ── Pre-generate filenames for long titles via LLM batch ──────────────
+    long_title_items: list[tuple[str, str]] = []
+    for plan in plans:
+        candidate = title_to_filename(plan.title)
+        if is_filename_too_long(candidate):
+            extract_file = extract_dir / f"{plan.hash}.json"
+            preview = ""
+            if extract_file.exists():
+                try:
+                    ext = json.loads(extract_file.read_text(encoding="utf-8"))
+                    preview = ext.get("content", "")[:500]
+                except (json.JSONDecodeError, OSError):
+                    pass
+            long_title_items.append((plan.title, preview))
+
+    llm_filenames: dict[str, str] = {}
+    if long_title_items:
+        log.info("Batch-generating filenames for %d long titles via LLM...", len(long_title_items))
+        llm_filenames = batch_smart_filenames(long_title_items, agent_cmd=cfg.agent_cmd)
+        log.info("LLM generated %d/%d filenames", len(llm_filenames), len(long_title_items))
+
     for plan in plans:
         plan_ok = True
-        source_filename = title_to_filename(plan.title)
-        entry_filename = title_to_filename(plan.title)
+        # Use LLM filename if available, otherwise standard conversion with smart fallback
+        base_filename = llm_filenames.get(plan.title)
+        if not base_filename:
+            extract_file = extract_dir / f"{plan.hash}.json"
+            preview = ""
+            if extract_file.exists():
+                try:
+                    ext = json.loads(extract_file.read_text(encoding="utf-8"))
+                    preview = ext.get("content", "")[:500]
+                except (json.JSONDecodeError, OSError):
+                    pass
+            base_filename = smart_filename(plan.title, preview)
+        source_filename = base_filename
+        entry_filename = base_filename
         entry_link_name = plan.title
         try:
             extract_file = extract_dir / f"{plan.hash}.json"
@@ -340,7 +373,7 @@ def create_file_templates(
                 continue
 
             extracted = json.loads(extract_file.read_text(encoding="utf-8"))
-            filename = title_to_filename(plan.title)
+            filename = base_filename
 
             # Initialize before inner try so entry block can use it even if source fails
             source_note_title = plan.title
