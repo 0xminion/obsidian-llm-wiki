@@ -281,7 +281,7 @@ def ingest(
     dry_run: bool = typer.Option(False, "--dry-run", help="Run pipeline without writing files"),
     review: bool = typer.Option(False, "--review", help="Stage files for review, skip Stage 3"),
     resume: bool = typer.Option(False, "--resume", help="Resume from saved plans (skip Stages 1+2)"),
-    template: bool = typer.Option(False, "--template", "-t", help="Use template-based creation (deterministic + insight agent)"),
+    agent: bool = typer.Option(False, "--agent", "-a", help="Use full agent mode for creation (slower, may timeout — not recommended)"),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose logging"),
 ):
     """Process inbox: extract → plan → create."""
@@ -453,11 +453,12 @@ def ingest(
         if dry_run:
             typer.echo("  [DRY RUN] Would create vault files for plans.")
             stats = {"created": 0, "failed": 0, "sources": 0, "entries": 0}
-        elif template:
+        elif agent:
+            typer.echo("  Using full agent mode (heavy — may timeout)")
+            stats = create_all(plans, cfg, parallel=parallel)
+        else:
             typer.echo("  Using template-based creation (deterministic + insight agent)")
             stats = create_file_templates(plans.plans, cfg, use_agent_insights=True)
-        else:
-            stats = create_all(plans, cfg, parallel=parallel)
         elapsed_3 = time.time() - t3
         end_stage("create")
         typer.echo(f"  Created: {stats['created']}, Failed: {stats['failed']} in {elapsed_3:.1f}s")

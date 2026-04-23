@@ -174,7 +174,7 @@ class TestFullPipelineIngest:
         plan = _make_plan(h)
         Plans(plans=[plan]).save(extract_dir)
 
-        with patch("pipeline.cli.create_all") as mock_create:
+        with patch("pipeline.cli.create_file_templates") as mock_create:
             mock_create.return_value = {"created": 1, "failed": 0, "sources": 1, "entries": 1}
 
             result = runner.invoke(app, [

@@ -243,7 +243,7 @@ class TestConceptConvergence:
             {"file": "04-Wiki/concepts/tangential.md", "score": 0.3},
         ])
 
-        with patch("pipeline.create.agent.subprocess.run") as mock_run:
+        with patch("pipeline.qmd.subprocess.run") as mock_run:
             mock_run.return_value = MagicMock(
                 returncode=0,
                 stdout=qmd_output,

@@ -126,9 +126,9 @@ class TestScalePipeline:
         manifest.save(cfg.resolved_extract_dir)
         plans.save(cfg.resolved_extract_dir)
 
-        # Mock create_all to only write files (no hermes subprocess)
-        def _mock_create_all(plans, cfg, **kwargs):
-            for plan in plans.plans:
+        # Mock create_file_templates to only write files (no hermes subprocess)
+        def _mock_create_file_templates(plans, cfg, use_agent_insights=True):
+            for plan in plans:
                 title = plan.title
                 fname = title.replace(" ", "-").lower()[:120]
                 source = cfg.sources_dir / f"{fname}.md"
@@ -142,10 +142,10 @@ class TestScalePipeline:
                 entry.write_text(
                     f"---\ntitle: {title}\nsource: [[{fname}]]\n---\n\n# {title}\n\n## Summary\n\nSummary.\n"
                 )
-            return {"created": len(plans.plans), "failed": 0}
+            return {"created": len(plans), "failed": 0, "sources": len(plans), "entries": len(plans)}
 
         t0 = time.monotonic()
-        with patch("pipeline.cli.create_all", side_effect=_mock_create_all):
+        with patch("pipeline.cli.create_file_templates", side_effect=_mock_create_file_templates):
             result = runner.invoke(app, [
                 "ingest", str(vault),
                 "--resume",  # skip Stage 1, 2
@@ -212,10 +212,9 @@ class TestScalePipeline:
         manifest.save(cfg.resolved_extract_dir)
         plans.save(cfg.resolved_extract_dir)
 
-        # Mock _run_agent to return immediately (simulates fast agents)
-        def _fast_agent(*args, **kwargs):
-            from pipeline.create.agent import AgentResult
-            return AgentResult("ok", 0)
+        # Mock agent insight generation to return immediately
+        def _fast_insights(*args, **kwargs):
+            return ""
 
         def _fast_convergence(*args, **kwargs):
             return {}
@@ -231,7 +230,7 @@ class TestScalePipeline:
         fds_before = len(os.listdir(f"/proc/{os.getpid()}/fd")) if Path(f"/proc/{os.getpid()}/fd").exists() else 0
 
         t0 = time.monotonic()
-        with patch("pipeline.create.agent._run_agent", side_effect=_fast_agent), \
+        with patch("pipeline.create.templates.generate_entry_insights", side_effect=_fast_insights), \
              patch("pipeline.create.agent.concept_convergence", side_effect=_fast_convergence):
             result = runner.invoke(app, [
                 "ingest", str(vault),
@@ -274,8 +273,8 @@ class TestScalePipeline:
         manifest.save(cfg.resolved_extract_dir)
         plans.save(cfg.resolved_extract_dir)
 
-        def _mock_create_all(plans, cfg, **kwargs):
-            for plan in plans.plans:
+        def _mock_create_file_templates(plans, cfg, use_agent_insights=True):
+            for plan in plans:
                 title = plan.title
                 fname = title.replace(" ", "-").lower()[:120]
                 source = cfg.sources_dir / f"{fname}.md"
@@ -285,9 +284,9 @@ class TestScalePipeline:
                 h = plan.hash
                 source.write_text(f"---\ntitle: {title}\n---\n\n# {title}\n")
                 entry.write_text(f"---\ntitle: {title}\n---\n\n# {title}\n")
-            return {"created": len(plans.plans), "failed": 0}
+            return {"created": len(plans), "failed": 0, "sources": len(plans), "entries": len(plans)}
 
-        with patch("pipeline.cli.create_all", side_effect=_mock_create_all):
+        with patch("pipeline.cli.create_file_templates", side_effect=_mock_create_file_templates):
             result = runner.invoke(app, ["ingest", str(vault), "--resume"])
 
         assert result.exit_code == 0
