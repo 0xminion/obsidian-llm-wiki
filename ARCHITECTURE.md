@@ -1,826 +1,770 @@
-# System Architecture Document — obsidian-llm-wiki v0.1.0
+# Obsidian LLM Wiki — Architecture & Design Rationale
+
+**Version**: 0.2.0  
+**Date**: 2026-04-23  
+**Author**: 0xminion  
+**Lines**: ~12,000 Python | **Tests**: 637 | **Stages**: 3 + compile pass + query
+
+---
 
 ## Table of Contents
-1. [System Overview](#1-system-overview)
-2. [User Journey](#2-user-journey)
-3. [Architecture](#3-architecture)
-4. [Data Flow Diagram](#4-data-flow-diagram)
-5. [Stage 1: Extraction](#5-stage-1-extraction)
-6. [Stage 2: Planning](#6-stage-2-planning)
-7. [Stage 3: Creation](#7-stage-3-creation)
-8. [Content Store (SQLite)](#8-content-store-sqlite)
-9. [Dead Letter Queue](#9-dead-letter-queue)
-10. [Review/Approval Workflow](#10-reviewapproval-workflow)
-11. [CLI Commands](#11-cli-commands)
-12. [Data Models](#12-data-models)
-13. [Error Handling & Recovery](#13-error-handling--recovery)
-14. [Tools & Dependencies](#14-tools--dependencies)
-15. [Configuration](#15-configuration)
-16. [Shell Scripts](#16-shell-scripts)
+
+1. [What is this system?](#1-what-is-this-system)
+2. [The Three Core Design Decisions](#2-the-three-core-design-decisions)
+   - 2.1 [Why "Extract → Plan → Create"?](#21-why-extract--plan--create)
+   - 2.2 [Why two planning modes?](#22-why-two-planning-modes-deterministic--agent)
+   - 2.3 [Why template mode over agent subprocess?](#23-why-template-mode-over-agent-subprocess)
+3. [System Overview](#3-system-overview)
+   - 3.1 [High-Level Data Flow](#31-high-level-data-flow)
+   - 3.2 [Component Map](#32-component-map)
+4. [Stage 1: Extract](#4-stage-1-extract)
+   - 4.1 [Purpose](#41-purpose)
+   - 4.2 [URL Routing Table](#42-url-routing-table)
+   - 4.3 [Extraction Chain of Fallbacks](#43-extraction-chain-of-failures)
+   - 4.4 [Deduplication & Dead Letter Queue](#44-deduplication--dead-letter-queue)
+5. [Stage 2: Plan](#5-stage-2-plan)
+   - 5.1 [Purpose](#51-purpose)
+   - 5.2 [The Planning Pipeline](#52-the-planning-pipeline)
+   - 5.3 [QMD: Semantic Concept Search](#53-qmd-semantic-concept-search)
+   - 5.4 [Deterministic Planning Heuristics](#54-deterministic-planning-heuristics)
+   - 5.5 [Agent Planning (Hermes subprocess)](#55-agent-planning-hermes-subprocess)
+6. [Stage 3: Create](#6-stage-3-create)
+   - 6.1 [Purpose](#61-purpose)
+   - 6.2 [Template-Based Creation](#62-template-based-creation)
+   - 6.3 [Filename Generation](#63-filename-generation)
+   - 6.4 [Per-Batch Validation & Auto-Repair](#64-per-batch-validation--auto-repair)
+7. [The Compile Pass](#7-the-compile-pass)
+   - 7.1 [Semantic Operations (LLM)](#71-semantic-operations-llm)
+   - 7.2 [Deterministic Operations (Python)](#72-deterministic-operations-python)
+8. [QMD: Semantic Search Subsystem](#8-qmd-semantic-search-subsystem)
+   - 8.1 [Why this model/provider?](#81-why-this-modelprovider)
+   - 8.2 [Where QMD is used](#82-where-qmd-is-used)
+   - 8.3 [Fallback methods](#83-fallback-methods)
+   - 8.4 [Embedding lifecycle](#84-embedding-lifecycle)
+9. [Filename System](#9-filename-system)
+   - 9.1 [Rules by language](#91-rules-by-language)
+   - 9.2 [Length thresholds](#92-length-thresholds)
+   - 9.3 [LLM shortening via semantic understanding](#93-llm-shortening-via-semantic-understanding)
+10. [The Query System](#10-the-query-system)
+    - 10.1 [Fast mode](#101-fast-mode)
+    - 10.2 [Agent mode](#102-agent-mode)
+11. [Data Models & Vault Structure](#11-data-models--vault-structure)
+12. [Error Handling & Resilience](#12-error-handling--resilience)
 
 ---
 
-## 1. System Overview
+## 1. What is this system?
 
-obsidian-llm-wiki is a Python pipeline that transforms raw web URLs into a structured, interconnected Obsidian wiki. It implements Andrej Karpathy's LLM-Wiki pattern:
+Obsidian LLM Wiki is an automated knowledge processing pipeline. It takes raw URLs (articles, YouTube videos, podcasts, tweets), extracts their content, structures them into an Obsidian-compatible knowledge base, and maintains cross-references between related concepts.
 
-```
-URL → Source → Entry → Concept → MoC (Map of Content)
-```
+The system is **not** a document store. It is a **knowledge condensation engine**: every input becomes a source note (raw content) → an entry note (insights/summary) → linked concepts (evergreen ideas) → topic maps (curated overviews). This structure mirrors Andrej Karpathy's "LLM Knowledge Bases" pattern and Zettelkasten methodology.
 
-The system ingests content from YouTube, podcasts, tweets, web articles, and arxiv papers. It extracts transcripts/text, plans wiki entries, creates structured markdown files, and maintains cross-references between them.
-
-**Design principles:**
-- No external cron jobs — automation baked into the pipeline
-- Deterministic first, LLM fallback — heuristics handle 80% of planning
-- Template first, agent fallback — structure is template-generated, only insights need intelligence
-- Dead letter queue — failures are tracked, not forgotten
-- Review before write — optional approval workflow before vault writes
+**Key properties:**
+- **Idempotent**: Running `pipeline ingest` twice on the same input produces no duplicates (Jaccard fingerprinting at 0.85 threshold)
+- **Deterministic where possible**: Extraction, dedup, planning heuristics, and template filling use zero LLM calls for the hot path
+- **Multi-provider LLM**: Unified client supports Ollama (local), OpenRouter (cloud), or Hermes (agent subprocess)
+- **Bilingual**: Native English and Chinese support — both content generation and filename handling are language-aware
 
 ---
 
-## 2. User Journey
+## 2. The Three Core Design Decisions
 
-### Simple case: ingest 3 URLs
+### 2.1 Why "Extract → Plan → Create"?
 
-```
-User: drops 3 .url files into ~/MyVault/01-Raw/
-       └── article.url       (URL=https://example.com/post)
-       └── video.url          (URL=https://youtube.com/watch?v=abc123)
-       └── podcast.url        (URL=https://podcasts.apple.com/.../id123)
+The three-stage pipeline separates **what you read** (extraction), **what to make from it** (planning), and **how to write it** (creation). This decoupling serves multiple purposes:
 
-User: runs `pipeline ingest ~/MyVault`
+| Dimension | Without Separation | With Separation |
+|-----------|-------------------|-----------------|
+| **Retryability** | One failure kills the whole batch | Stage 1 can retry extraction; Stage 2 can retry planning without re-extracting |
+| **Cost control** | Every source hits the LLM | Deterministic planning skips LLM for ~60% of sources |
+| **Reviewability** | `plans.json` allows human review before creation | `--review` flag lets users inspect/modify plans |
+| **Parallelism** | Single monolithic process | Each stage parallelizes independently (ThreadPoolExecutor) |
+| **Debugging** | Hard to trace which stage failed | Clear stage boundaries in logs and metrics |
 
-Pipeline:
-  Stage 1 (10s):  Extracts content from all 3 URLs in parallel
-  Stage 2 (5s):   Plans entry structure deterministically (no LLM)
-  Stage 3 (30s):  Creates vault files (template mode) or calls agent
-
-Result:
-  ~/MyVault/04-Wiki/sources/example-post.md       ← Source note
-  ~/MyVault/04-Wiki/entries/example-post.md        ← Entry note
-  ~/MyVault/04-Wiki/concepts/Example Topic.md      ← Concept (if new)
-  ~/MyVault/04-Wiki/mocs/Technology.md              ← MoC updated
-  ~/MyVault/01-Raw/                                 ← .url files archived
-```
-
-### Review case: approve before writing
-
-```
-User: `pipeline ingest ~/MyVault --review`
-Pipeline: extracts, plans, stages files in pending_reviews table
-
-User: `pipeline approve --dry-run`
-Pipeline: shows what would be written
-
-User: `pipeline approve`
-Pipeline: writes files, reindexes, archives inbox
+```mermaid
+flowchart LR
+    A[Raw URLs] -->|Stage 1| B[ExtractedContent]
+    B -->|plans.json| C[Review Optional]
+    C -->|Stage 2| D[Plans]
+    D -->|batches| E[Stage 3 Create]
+    E -->|validate| F[Vault Files]
+    F -->|compile| G[Index + Edges + MoCs]
 ```
 
-### Failure case: Cloudflare-blocked URL
+### 2.2 Why two planning modes? (Deterministic + Agent)
 
-```
-User: drops blocked-site.url (Cloudflare challenge page)
+Stage 2 has two implementations:
 
-Pipeline Stage 1:
-  Attempt 1: defuddle → gets Cloudflare page → rejected
-  Attempt 2: curl+liteparse → same → rejected
-  Attempt 3: archive.org fallback → succeeds or fails
+1. **`generate_plans_deterministic()`**: Pure Python, zero LLM calls. Uses heuristic rules (language detection from CJK ratio, template selection from keywords, concept matching from QMD scores). Fast (~5ms per source).
 
-If all fail:
-  → Recorded to DLQ with reason="cloudflare"
-  → User runs `pipeline dlq` to see failed URLs
-  → User runs `pipeline dlq --clear --reason=cloudflare` to reset
-```
+2. **`generate_plans_agent()`**: Hermes subprocess. Sends a massive prompt with all source content + concept matches + existing tags vocabulary. The agent returns a JSON array of plans. Slow (~30-120s per batch of 20).
+
+**Why keep both?**
+- The deterministic path handles 60-80% of "routine" sources (well-structured articles with clear titles)
+- The agent path handles edge cases: ambiguous language, no meaningful title, content that needs real semantic understanding to choose the right template and tags
+- This hybrid is a **latency/cost optimization**: deterministic path pays nothing for the common case; agent path is reserved for the hard cases
+
+The deterministic path was added as an architectural recommendation after profiling showed agent planning was the bottleneck for large batches. Before this change, planning took 3-5 minutes for 20 sources; now it's under 1 second.
+
+### 2.3 Why template mode over agent subprocess?
+
+**Original design**: Hermes subprocess wrote files directly via tool-use (file creation, frontmatter formatting, wikilink insertion). This had three critical problems:
+
+1. **Prompt bloat**: Each batch needed the full content of all sources (30k-40k characters) → model context window pressure
+2. **Cold-start latency**: Hermes CLI has ~2-3s initialization overhead per call
+3. **Timeout fragility**: 900s timeout was frequently hit, leaving partially-written files ("zombie notes")
+
+**Current design** (Template Mode):
+- LLM only generates **insights** (2 sections: Summary + Core insights) — typically 500-800 characters
+- Python handles **all I/O**: file creation, frontmatter (PyYAML), wikilinks, MoC updates, concept stubs
+- LLM call is 40× smaller (content truncated to ~3000 chars for insights, vs 30k for full file creation)
+- 3.8 minutes for 18 sources vs 9.5 minutes previously
+
+**This is a fundamentally different architecture**: the LLM is a **text generator**, not a **file system agent**. The agent model (Hermes subprocess with tool-use) is kept as a fallback for complex research tasks (the `query` command) but never for batched creation.
 
 ---
 
-## 3. Architecture
+## 3. System Overview
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                        CLI (cli.py)                         │
-│  ingest | approve | reject | dlq | lint | reindex | stats  │
-└──────────┬──────────────────────────────────────────────────┘
-           │
-    ┌──────▼──────┐     ┌──────────┐     ┌──────────────┐
-    │  Stage 1    │     │ Stage 2  │     │   Stage 3    │
-    │  Extract    │────▶│  Plan    │────▶│   Create     │
-    │ (extract.py)│     │(plan.py) │     │ (create.py)  │
-    └──────┬──────┘     └────┬─────┘     └──────┬───────┘
-           │                 │                   │
-    ┌──────▼──────┐     ┌────▼─────┐     ┌──────▼───────┐
-    │  Extractors │     │   QMD    │     │   Review     │
-    │  youtube    │     │ semantic │     │  (review.py) │
-    │  podcast    │     │  search  │     │  approve ◄── │
-    │  web        │     └──────────┘     │  reject  ◄── │
-    └──────┬──────┘                      └──────┬───────┘
-           │                                    │
-    ┌──────▼────────────────────────────────────▼───────┐
-    │              Content Store (store.db)              │
-    │  urls | content | dead_letter_queue | reviews      │
-    └───────────────────────────────────────────────────┘
-           │
-    ┌──────▼──────┐
-    │    Vault    │
-    │  04-Wiki/   │
-    │  sources/   │
-    │  entries/   │
-    │  concepts/  │
-    │  mocs/      │
-    └─────────────┘
-```
+### 3.1 High-Level Data Flow
 
-### Module map
+```mermaid
+flowchart TB
+    subgraph Input["01-Raw/ input"]
+        U1[.url files]
+        U2[.md files]
+    end
 
-```
-pipeline/
-├── cli.py          # CLI entry point, command routing
-├── config.py       # Config dataclass, .env loading, path resolution
-├── models.py       # Data models: ExtractedSource, Plan, Manifest, Edge
-├── store.py        # SQLite content store (dedup, DLQ, reviews)
-├── extract.py      # Stage 1 router: detect type → delegate to extractor
-├── extractors/
-│   ├── _shared.py  # Shared: curl, run, title extraction, validation
-│   ├── youtube.py  # YouTube: TranscriptAPI → Supadata → whisper
-│   ├── podcast.py  # Podcast: iTunes API → RSS → AssemblyAI/whisper
-│   └── web.py      # Web: defuddle → curl → liteparse → archive.org
-├── plan.py         # Stage 2: deterministic planning + agent fallback
-├── create/
-│   ├── __init__.py # Re-exports: create_all, create_file_templates
-│   ├── agent.py    # Agent orchestration, batch creation
-│   ├── orchestrator.py # Stage 3 entry point, batch splitting
-│   ├── prompts.py  # Prompt loading, batch prompt construction
-│   ├── templates.py # Template-based file creation
-│   └── validate.py # Output validation and auto-repair
-├── qmd.py          # Shared qmd semantic search (parallel queries)
-├── review.py       # Review workflow: stage → approve → write
-├── vault.py        # Vault operations: write files, edges, reindex, archive
-├── compile.py      # Compile pass: concept merge, MoC rebuild
-├── lint.py         # Vault health checks (12+ checks)
-├── stats.py        # Dashboard generation
-└── utils.py        # Shared utilities: escape_yaml, extract_body, strip_qmd_noise
+    subgraph Stage1["Stage 1: Extract"]
+        E1[URL router] -->|type| E2[Extractor]
+        E2 -->|retry×3| E3[Content quality gate]
+        E3 -->|fingerprint| E4[SQLite dedup]
+        E4 -->|manifest.json| E5[(ExtractedSource)]
+    end
+
+    subgraph Stage2["Stage 2: Plan"]
+        P1[Dedup check<br/>Jaccard 0.85] --> P2[Concept search<br/>QMD embeddings]
+        P2 --> P3{Heuristics<br/>confident?}
+        P3 -->|Yes| P4[Deterministic plan]
+        P3 -->|No| P5[Agent plan<br/>Hermes subprocess]
+        P4 --> P6[plans.json]
+        P5 --> P6
+    end
+
+    subgraph Stage3["Stage 3: Create"]
+        C1[Batch splitter] --> C2[ThreadPool<br/>max_workers=PARALLEL]
+        C2 --> C3[LLM insights<br/>~800 chars each]
+        C3 --> C4[Template fill<br/>Python string]
+        C4 --> C5[Collision resolve<br/>-1, -2 suffix]
+        C5 --> C6[Per-batch validation<br/>15 checks]
+        C6 -->|auto-repair| C7[Vault files]
+    end
+
+    subgraph Post["Post-Processing"]
+        V1[Tag registry rebuild] --> V2[Wiki index rebuild]
+        V2 --> V3[Archive raw sources]
+    end
+
+    subgraph Compile["Compile Pass"]
+        CP1[Semantic cross-link<br/>LLM + embeddings] --> CP2[Concept merge<br/>LLM judged]
+        CP2 --> CP3[MoC rebuild<br/>embeddings + clustering]
+        CP3 --> CP4[Wiki index<br/>deterministic]
+        CP4 --> CP5[Edges TSV<br/>deterministic]
+        CP5 --> CP6[Duplicate report]
+    end
+
+    U1 --> Stage1
+    U2 --> Stage3
+    Stage1 --> Stage2
+    Stage2 --> Stage3
+    Stage3 --> Post
+    Post --> Compile
 ```
 
----
-
-## 4. Data Flow Diagram
+### 3.2 Component Map
 
 ```
-                    ┌─────────────┐
-                    │ 01-Raw/*.url│
-                    └──────┬──────┘
-                           │
-                    ┌──────▼──────┐
-                    │  CLI ingest │
-                    └──────┬──────┘
-                           │
-              ┌────────────▼────────────┐
-              │     Stage 1: Extract    │
-              │                         │
-              │  for each URL:          │
-              │    detect_source_type() │
-              │    ┌────────────────┐   │
-              │    │ URL dedup?     │───┼──▶ ContentStore.is_url_extracted()
-              │    └───────┬────────┘   │
-              │            │ not dup    │
-              │    ┌───────▼────────┐   │
-              │    │ extract_url()  │   │
-              │    │  retry loop    │   │
-              │    │  quality check │   │
-              │    └───────┬────────┘   │
-              │            │            │
-              │    ┌───────▼────────┐   │
-              │    │ Content dedup? │───┼──▶ ContentStore.get_content_duplicate()
-              │    └───────┬────────┘   │
-              │            │ not dup    │
-              │    ┌───────▼────────┐   │
-              │    │ Save .json     │   │
-              │    │ Register store │   │
-              │    └───────┬────────┘   │
-              │            │            │
-              │    On failure:          │
-              │    ┌───────▼────────┐   │
-              │    │ DLQ record     │───┼──▶ ContentStore.dlq_add()
-              │    └────────────────┘   │
-              └────────────┬────────────┘
-                           │
-                    ┌──────▼──────┐
-                    │ manifest.json│
-                    └──────┬──────┘
-                           │
-              ┌────────────▼────────────┐
-              │     Stage 2: Plan       │
-              │                         │
-              │  Step 0: dedup_check()  │──▶ Jaccard similarity vs vault
-              │  Step 1: qmd search     │──▶ semantic concept matching
-              │  Step 2: deterministic  │──▶ heuristics (80% of sources)
-              │  Step 3: agent fallback │──▶ hermes (uncertain 20%)
-              └────────────┬────────────┘
-                           │
-                    ┌──────▼──────┐
-                    │  plans.json │
-                    └──────┬──────┘
-                           │
-         ┌─────────────────┼─────────────────┐
-         │                 │                 │
-    ┌────▼────┐     ┌──────▼──────┐   ┌─────▼─────┐
-    │ --review│     │  --template  │   │ (default) │
-    │ stage   │     │  template    │   │  agent    │
-    └────┬────┘     └──────┬──────┘   └─────┬─────┘
-         │                 │                 │
-    ┌────▼────┐     ┌──────▼──────┐   ┌─────▼─────┐
-    │pending_ │     │ Source.md   │   │ Agent     │
-    │reviews  │     │ Entry.md    │   │ creates   │
-    │table    │     │ Concept.md  │   │ all files │
-    └────┬────┘     │ MoC update  │   └─────┬─────┘
-         │          └──────┬──────┘         │
-    ┌────▼────┐            │                │
-    │pipeline │     ┌──────▼──────┐         │
-    │approve  │     │  Vault      │◄────────┘
-    └────┬────┘     │  04-Wiki/   │
-         │          └─────────────┘
-    ┌────▼────┐
-    │ Write   │
-    │ files   │
-    │ reindex │
-    │ archive │
-    └─────────┘
+obsidian-llm-wiki/
+├── pipeline/
+│   ├── cli.py                  # typer CLI — all commands, PipelineLock
+│   ├── llm_client.py           # UNIFIED: Ollama / OpenRouter / Hermes
+│   ├── extract.py              # Stage 1: URL routing, retry, manifest
+│   ├── plan.py                 # Stage 2: dedup, concept search, planning
+│   ├── compile.py              # Compile: semantic + deterministic ops
+│   ├── lint.py                 # 15 health checks + synonym detection
+│   ├── qmd.py                  # Semantic search via Ollama embeddings
+│   ├── vault.py                # File ops, collision resolution, archiving
+│   ├── store.py                # SQLite: dedup, lint cache, wal
+│   ├── config.py               # Environment + vault path resolution
+│   ├── models.py               # Dataclasses: Plan, Manifest, Edge, etc.
+│   ├── utils.py                # Filename gen, title_to_filename, smart_filename
+│   ├── create/
+│   │   ├── agent.py            # DEPRECATED: Hermes subprocess creation
+│   │   ├── orchestrator.py     # Batch coordination, ThreadPoolExecutor
+│   │   ├── templates.py        # Template mode: 90% Python, 10% LLM insights
+│   │   ├── prompts.py          # Prompt construction for agents
+│   │   └── validate.py         # 15 validation checks + auto-repair
+│   └── extractors/
+│       ├── web.py              # defuddle → curl → archive.org → camoufox
+│       ├── youtube.py          # TranscriptAPI → supadata → whisper
+│       ├── podcast.py          # AssemblyAI → whisper
+│       └── _shared.py          # Content quality gate, title extraction
+├── prompts/                    # LLM prompt templates (versioned with code)
+├── tests/                      # 637 tests
+└── README.md / CHANGELOG.md
 ```
 
 ---
 
-## 5. Stage 1: Extraction
+## 4. Stage 1: Extract
 
-### Entry point: `extract_all(urls, cfg, parallel)`
+### 4.1 Purpose
 
-```
-extract_all()
-  ├── ContentStore.open()          # SQLite connection
-  ├── ThreadPoolExecutor(parallel) # Parallel extraction
-  │   └── for each url:
-  │       └── extract_url(url, cfg, store)
-  │           ├── store.is_url_extracted(url)  → skip if dup
-  │           ├── detect_source_type(url)      → YOUTUBE|PODCAST|TWITTER|WEB
-  │           ├── retry loop (max_retries):
-  │           │   ├── call extractor
-  │           │   ├── validate_extraction()    → check quality
-  │           │   └── if bad: sleep(2^attempt), retry
-  │           ├── store.get_content_duplicate() → skip if content dup
-  │           ├── store.register_url() + register_content()
-  │           ├── source.save()                → write {hash}.json
-  │           └── on failure:
-  │               ├── store.dlq_add()          → record to DLQ
-  │               └── store.register_url(status="failed")
-  └── manifest.save()                          → write manifest.json
-```
+Extract takes a list of URLs and produces a `Manifest` containing clean markdown content, title, author, and content type. **Zero LLM calls.**
 
-### Extractor chain per source type
+### 4.2 URL Routing Table
 
-**YouTube** (`youtube.py`):
-```
-extract_youtube(url, cfg)
-  ├── oEmbed metadata (title, author)
-  ├── _try_youtube_transcript():
-  │   ├── 1. TranscriptAPI (full URL, Bearer auth)
-  │   ├── 2. Supadata (POST JSON, x-api-key)
-  │   └── 3. yt-dlp + faster-whisper (last resort)
-  └── return ExtractedSource
+| Source Pattern | Primary Extractor | Primary Tool | Fallback Chain |
+|----------------|------------------|--------------|----------------|
+| `youtube.com`, `youtu.be` | `extractors/youtube.py` | `youtube-transcript-api` | `supadata` → `faster-whisper` |
+| `x.com`, `twitter.com` | `extractors/web.py` | `defuddle` (structured data) | `curl + liteparse` |
+| `medium.com`, `substack.com` | `extractors/web.py` | `defuddle` | `curl + liteparse` |
+| `arxiv.org` | `extractors/web.py` | `defuddle` | `curl + liteparse` |
+| `*.pdf` | `extractors/web.py` | `pdftotext` | `PyPDF2` |
+| Any other HTTP | `extractors/web.py` | `defuddle` | `curl` → `archive.org` → `camoufox` |
+| Podcast RSS/MP3 | `extractors/podcast.py` | `AssemblyAI` | `whisper` |
+
+### 4.3 Extraction Chain of Fallbacks
+
+For web content, extraction is a **retry ladder**:
+
+```mermaid
+flowchart LR
+    A[URL] --> B{defuddle}
+    B -->|Success| Z[ExtractedContent]
+    B -->|Blocked| C[curl + liteparse]
+    C -->|Success| Z
+    C -->|Blocked| D[archive.org]
+    D -->|Success| Z
+    D -->|Missing| E[camoufox]
+    E -->|Success| Z
+    E -->|Fail| F[Dead Letter Queue]
 ```
 
-**Podcast** (`podcast.py`):
-```
-extract_podcast(url, cfg)
-  ├── Extract IDs from Apple Podcasts URL (id + ?i=)
-  ├── _find_feed_url():
-  │   ├── 1. iTunes lookup (entity=podcast)
-  │   ├── 2. iTunes lookup (entity=podcastEpisode)
-  │   └── 3. iTunes search by name
-  ├── _parse_rss_episode():
-  │   ├── Match by episode ID in GUID/link
-  │   ├── Match by title slug (60% keyword overlap)
-  │   └── Fallback to latest episode
-  ├── _transcribe_podcast_audio():
-  │   ├── yt-dlp download
-  │   ├── AssemblyAI upload + poll
-  │   └── Fallback: faster-whisper
-  └── return ExtractedSource
-```
+- `defuddle` → structured markdown extraction (best quality, handles footnotes, tables, code blocks)
+- `curl + liteparse` → raw HTML → `<title>` + `<body>` text collapse
+- `archive.org` → Wayback Machine snapshot (for paywalled/deleted content)
+- `camoufox` → headless Firefox with anti-bot fingerprinting (for Cloudflare-protected sites)
 
-**Web** (`web.py`):
-```
-extract_web(url, cfg, source_type)
-  ├── retry loop (max_retries):
-  │   └── _extract_web_content():
-  │       ├── arxiv? → arxiv HTML → alphaxiv.org
-  │       ├── 1. defuddle parse --markdown
-  │       ├── 2. curl + liteparse (rotate UA on retry)
-  │       └── 3. defuddle parse --json
-  ├── fallback: archive.org Wayback Machine
-  └── return ExtractedSource
-```
+**Retry logic**: Each step has 3 retries with exponential backoff (1s, 3s, 9s). Total per-URL timeout: 30s (`defuddle`) → 20s (`curl`) → 30s (`camoufox`).
 
-### Quality validation (`validate_extraction`)
+### 4.4 Deduplication & Dead Letter Queue
 
-```
-rejects:
-  - Empty content
-  - Length < 5 chars
-  - Cloudflare challenge page (detected by patterns)
-  - Error indicators ("This site can't be reached", etc.)
-```
+After extraction, every source gets two checks:
+
+1. **Content dedup**: Character 3-gram Jaccard similarity against all existing `04-Wiki/sources/*.md` files. Threshold = 0.85. Matches are logged and skipped.
+2. **URL dedup**: MD5 hash of normalized URL against SQLite `dedup_store`. Already-ingested URLs are rejected before extraction.
+
+**Dead Letter Queue**: Sources that fail all extraction attempts are appended to `Meta/Scripts/dead_letter.csv` with error type, timestamp, and URL. This is the only manual remediation path.
 
 ---
 
-## 6. Stage 2: Planning
+## 5. Stage 2: Plan
 
-### Entry point: `plan_sources(manifest, cfg)`
+### 5.1 Purpose
 
-```
-plan_sources()
-  ├── Step 0: dedup_check()
-  │   └── Jaccard 3-gram similarity vs existing vault sources
-  │       threshold: 0.85 → duplicate
-  ├── Step 1: concept_search()
-  │   └── qmd semantic search (Qwen3-Embedding-0.6B-Q8)
-  │       per source: title + content[:500] → top 5 concept matches
-  ├── Step 2: generate_plans_deterministic()
-  │   └── for each source:
-  │       ├── detect_language(content)     → EN|ZH
-  │       ├── select_template(type, content) → standard|technical|chinese
-  │       ├── extract_tags(content)        → topic keywords
-  │       ├── generate_plan_heuristic()    → title, lang, template, tags, concepts
-  │       └── confidence check → uncertain? → agent queue
-  ├── Step 3: agent fallback (only for uncertain)
-  │   └── generate_plans() via hermes chat
-  └── Plans.save() → plans.json
-```
+Plan answers: *"For each extracted source, what vault files should we create, and how should they be structured?"*
 
-### Deterministic planning logic
+A `Plan` object contains:
+- `title`: The actual content title (not URL slug)
+- `language`: `en` or `zh` (detected from CJK character ratio > 20%)
+- `template`: `standard`, `technical`, or `chinese`
+- `tags`: 3-6 topic-specific tags (preferring reuse of existing vocabulary)
+- `concept_updates`: Existing concepts to add wikilinks to
+- `concept_new`: New concepts to create
+- `moc_targets`: Topic maps this source belongs to
 
-```
-generate_plan_heuristic(entry, concept_matches):
-  title:     extract_title(content) or entry.title or entry.url
-  language:  CJK chars / total chars > 0.2 → ZH, else EN
-  template:  PODCAST/YOUTUBE → standard
-             technical markers → technical
-             else → standard
-  tags:      topic keyword matching (crypto, economics, AI, etc.)
-  concepts:  qmd matches > 0.5 → update existing
-             qmd matches < 0.3 or none → suggest new from title
+### 5.2 The Planning Pipeline
+
+```mermaid
+flowchart LR
+    A[Manifest] --> B{Dedup check<br/>Jaccard 0.85}
+    B -->|Skip dups| C[Filtered Manifest]
+    C --> D[Concept search<br/>QMD embeddings]
+    D --> E{Heuristics<br/>confident?}
+    E -->|Yes| F[Deterministic plan<br/>~5ms]
+    E -->|No| G[Agent plan<br/>Hermes subprocess]
+    F --> H[plans.json]
+    G --> H
+    H --> I{--review?}
+    I -->|Yes| J[Human review]
+    I -->|No| K[Stage 3]
+    J --> K
 ```
 
-### Confidence check (deterministic vs agent)
+### 5.3 QMD: Semantic Concept Search
 
-```
-needs_agent = True if:
-  - No title found (title == URL)
-  - Content < 50 chars
-  - No concept matches AND no concept_new suggestion
-```
+Before the agent runs, the system performs a **semantic search** against existing concepts. This is the bridge between "what the source is about" and "what we already know."
 
----
+**How it works:**
+1. Build a query string from: `title + concept_new + concept_updates + content_preview[:500]`
+2. Generate query embedding via Ollama `/api/embeddings` (Qwen3-Embedding-0.6B)
+3. Compare against pre-cached concept embeddings (lazy-loaded per compile pass)
+4. Return top-5 concepts by cosine similarity, threshold ≥ 0.2
 
-## 7. Stage 3: Creation
+This data is injected into the agent prompt so the agent knows which concepts already exist and can decide whether to link to them or create new ones. Without QMD, the agent would create duplicate concepts on every run.
 
-### Mode 1: Agent-based (`create_all`) — default
+### 5.4 Deterministic Planning Heuristics
 
-```
-create_all(plans, cfg, parallel)
-  ├── concept_convergence() → qmd semantic search per plan
-  ├── split_batches(plans, parallel)
-  ├── for each batch:
-  │   └── create_batch():
-  │       ├── build_batch_prompt() → agent prompt with all data
-  │       ├── _run_agent() → hermes chat -q "prompt" -Q
-  │       ├── agent writes Source, Entry, Concept, MoC files
-  │       ├── validate file existence (title_to_filename)
-  │       └── retry on failure (max_retries)
-  ├── validate_output() → check frontmatter, sections, stubs
-  ├── _repair_violations() → auto-fix missing sections
-  ├── reindex → wiki-index.md
-  ├── log → log.md
-  └── archive_inbox → move .url to archive
-```
-
-### Mode 2: Template-based (`create_file_templates`) — `--template`
-
-```
-create_file_templates(plans, cfg, use_agent_insights)
-  └── for each plan:
-      ├── generate_source_content() → deterministic YAML + content
-      ├── write source directly to sources_dir
-      ├── generate_entry_insights() → agent for Summary + Core insights only
-      │   └── minimal prompt: "Write EXACTLY these two sections"
-      ├── generate_entry_content() → template sections + agent insights
-      ├── write_entry(cfg, plan, content)
-      ├── for each new concept:
-      │   └── write_concept(cfg, name, content, sources)
-      └── for each MoC target:
-          └── update_moc(cfg, moc_name, entry_name, description)
-```
-
-### Mode 3: Review (`--review`)
-
-```
-stage_for_review(plans, cfg)
-  ├── generate_source_content() + store.review_add()
-  ├── generate_entry_insights() + generate_entry_content() + store.review_add()
-  └── for each concept: generate + store.review_add()
-
-pipeline approve:
-  ├── for each pending review:
-  │   └── write file_path with file_content
-  ├── reindex
-  └── archive_inbox
-
-pipeline reject:
-  └── clear pending_reviews table
-```
-
----
-
-## 8. Content Store (SQLite)
-
-### Database: `.pipeline/store.db`
-
-```
-TABLE urls:
-  url_hash      TEXT PK     -- MD5(normalized_url)[:12]
-  url           TEXT        -- original URL
-  canonical_url TEXT        -- normalized (lowercase, no tracking params)
-  source_type   TEXT        -- youtube|podcast|twitter|web
-  extracted_at  REAL        -- unix timestamp
-  status        TEXT        -- ok|failed
-  content_hash  TEXT FK     -- → content.content_hash
-
-TABLE content:
-  content_hash  TEXT PK     -- MD5(normalized_content)[:16]
-  title         TEXT
-  source_type   TEXT
-  word_count    INTEGER
-  created_at    REAL
-  vault_filename TEXT       -- filename in vault (for dedup lookup)
-
-TABLE dead_letter_queue:
-  id             INTEGER PK
-  url            TEXT
-  reason         TEXT        -- cloudflare|paywall|timeout|empty_content|network|unknown
-  attempts       INTEGER     -- incremented on retry
-  last_error     TEXT
-  first_failed_at REAL
-  last_failed_at  REAL
-  metadata       TEXT JSON   -- {source_type, attempts}
-  status         TEXT        -- pending|resolved
-
-TABLE pending_reviews:
-  id             INTEGER PK
-  plan_hash      TEXT
-  plan_data      TEXT JSON   -- full Plan dict
-  file_type      TEXT        -- source|entry|concept
-  file_path      TEXT        -- target path in vault
-  file_content   TEXT        -- generated markdown
-  created_at     REAL
-  status         TEXT        -- pending|approved|rejected
-```
-
-### URL normalization
-
-```
-https://Example.COM/page?utm_source=twitter&id=1#section
-→ https://example.com/page?id=1
-(lowercase, strip tracking params, strip fragment, strip trailing /)
-```
-
-### Content hashing
-
-```
-"  This IS   Test Content  "
-→ normalize: collapse whitespace, lowercase, first 2000 chars
-→ MD5[:16]
-```
-
----
-
-## 9. Dead Letter Queue
-
-### When records are created
-
-```
-extract_url() exhausts all retries (max_retries attempts):
-  → store.dlq_add(url, reason, error, metadata)
-  → reason auto-classified from error message:
-      "cloudflare" in error → cloudflare
-      "paywall" in error    → paywall
-      "timeout" in error    → timeout
-      "empty" in error      → empty_content
-      "connection" in error → network
-      else                  → unknown
-```
-
-### DLQ operations
-
-```
-dlq_add(url, reason, error):
-  if URL already in DLQ (pending):
-    → increment attempts, update last_error
-  else:
-    → INSERT new record
-
-dlq_get_pending(limit) → list of failed items
-dlq_resolve(id) → mark as resolved
-dlq_clear(reason=None) → delete pending items (optionally filtered)
-```
-
-### CLI usage
-
-```
-pipeline dlq                    → show pending failures
-pipeline dlq --clear            → clear all pending
-pipeline dlq --reason=cloudflare → clear only cloudflare failures
-```
-
----
-
-## 10. Review/Approval Workflow
-
-```
-                    ┌──────────────────────┐
-                    │ pipeline ingest      │
-                    │ --review             │
-                    └──────────┬───────────┘
-                               │
-                    ┌──────────▼───────────┐
-                    │ Extract + Plan       │
-                    │ (Stages 1+2)         │
-                    └──────────┬───────────┘
-                               │
-                    ┌──────────▼───────────┐
-                    │ stage_for_review()   │
-                    │                      │
-                    │ For each plan:       │
-                    │  generate content    │
-                    │  store.review_add()  │
-                    └──────────┬───────────┘
-                               │
-              ┌────────────────┼────────────────┐
-              │                │                │
-     ┌────────▼──────┐  ┌─────▼──────┐  ┌──────▼───────┐
-     │pipeline       │  │pipeline    │  │pipeline      │
-     │approve        │  │approve     │  │reject        │
-     │               │  │--dry-run   │  │              │
-     └────────┬──────┘  └─────┬──────┘  └──────┬───────┘
-              │               │                │
-     ┌────────▼──────┐  ┌─────▼──────┐  ┌──────▼───────┐
-     │Write files    │  │Show what   │  │Clear pending │
-     │Mark approved  │  │would be    │  │reviews       │
-     │reindex        │  │written     │  │              │
-     │archive inbox  │  │            │  │              │
-     └───────────────┘  └────────────┘  └──────────────┘
-```
-
----
-
-## 11. CLI Commands
-
-| Command | Description | Key flags |
-|---------|-------------|-----------|
-| `ingest` | Full pipeline: extract → plan → create | `--parallel`, `--dry-run`, `--review`, `--resume`, `--template`, `--verbose` |
-| `approve` | Write pending review files to vault | `--dry-run` |
-| `reject` | Discard all pending reviews | |
-| `dlq` | Show/manage dead letter queue | `--clear`, `--reason` |
-| `store-stats` | Show content store statistics | |
-| `lint` | Vault health checks (12 checks) | `--fix` |
-| `validate` | Validate pipeline output | `--fix` |
-| `reindex` | Rebuild wiki-index.md | |
-| `stats` | Generate vault dashboard | |
-| `compile` | Concept convergence + MoC rebuild | |
-
-### Ingest flags
-
-```
---parallel N     Parallel workers per stage (default: 3)
---dry-run        Preview without writing
---review         Stage for approval (skip Stage 3)
---resume         Continue from saved plans (skip Stages 1+2)
---template       Use deterministic template creation + insight agent
---verbose        Debug logging
-```
-
----
-
-## 12. Data Models
-
-### ExtractedSource (Stage 1 output)
+For ~60% of sources, the system skips the LLM entirely:
 
 ```python
-@dataclass
-class ExtractedSource:
-    url: str              # Original URL
-    title: str            # Extracted or derived title
-    content: str          # Transcript, text, or description
-    type: SourceType      # youtube|podcast|twitter|web|pdf|unknown
-    author: str = ""      # Channel name, author, podcast name
-    source_file: str = "" # Source .url filename
-
-    @property
-    def hash -> str       # MD5(url)[:12]
-    @property
-    def content_hash -> str # MD5(normalized_content)[:16]
+def generate_plan_heuristic(entry, concept_matches):
+    title = extract_title(entry.content) or entry.title
+    language = ZH if cjk_ratio > 0.20 else EN
+    template = TECHNICAL if technical_markers in content else STANDARD
+    
+    # Concept actions from QMD scores
+    if match.score > 0.5: concept_updates.append(match.concept)
+    elif match.score > 0.3: concept_updates.append(match.concept)  # borderline
+    else: concept_new.append(title[:80])
 ```
 
-### Plan (Stage 2 output)
+**Confidence gate for agent fallback:**
+- No title found (title == URL)
+- Content < 50 characters
+- No concept matches AND no new concepts suggested
+
+These uncertain sources (~20-40% of batch) get the full agent treatment.
+
+### 5.5 Agent Planning (Hermes subprocess)
+
+Agent prompt includes:
+- Common instructions (`prompts/common-instructions.prompt`)
+- Existing tag vocabulary (top 50 tags from vault)
+- Concept match scores per source
+- Source content preview (300 chars each)
+- Output schema (JSON array with strict rules)
+
+The agent outputs a JSON array. The parser handles:
+- ANSI escape codes
+- Markdown code fences
+- Partial JSON (object-by-object recovery)
+- Missing required fields → agent failure → source skipped
+
+---
+
+## 6. Stage 3: Create
+
+### 6.1 Purpose
+
+Create turns plans into actual vault files. The current architecture is **template-based** (not agent-based).
+
+### 6.2 Template-Based Creation
+
+```mermaid
+flowchart LR
+    A[Plan] --> B[LLM insights<br/>Summary + Core takeaways]
+    B --> C[Template select<br/>Python conditional]
+    C --> D[PyYAML frontmatter]
+    D --> E[String template fill]
+    E --> F[Collision resolve]
+    F --> G[Write to vault]
+```
+
+**Templates** (in code, not filesystem):
+| Template | Used for | Sections |
+|----------|----------|----------|
+| `STANDARD` | General articles, blog posts | Summary → Core insights → Other takeaways → Diagrams → Open questions → Linked concepts |
+| `TECHNICAL` | Papers, data analysis, methodology | Summary → Methodology → Key findings → Implications → Limitations → Related work → Linked concepts |
+| `CHINESE` | Chinese content | 摘要 → 核心发现 → 其他要点 → 图表 → 开放问题 → 关联概念 |
+| `COMPARISON` | Comparative content | Overview → Comparison table → Key differences → Trade-offs → Recommendation |
+| `PROCEDURAL` | How-to guides | Objective → Prerequisites → Steps → Common issues → Resources |
+
+**LLM call scope** (single call per plan):
+```
+Prompt: "Analyze this content and produce Summary (1-2 sentences) + Core insights (3-5 bullets)"
+Input: content[:3000] characters
+Output: ~500-800 characters
+Time: ~1-2s per call (parallelized)
+```
+
+Everything else (frontmatter, wikilinks, concept stubs, MoC updates, collision resolution) is pure Python.
+
+### 6.3 Filename Generation
+
+This is the answer to Question 1.
+
+**Rule 1: Language-aware normalization**
+
+| Language | Transformation | Example |
+|----------|---------------|---------|
+| English | kebab-case, lowercase, no apostrophes | `AI Safety Governance` → `ai-safety-governance` |
+| Chinese (CJK > 20%) | Keep Chinese chars, replace punctuation with spaces | `预测市场的监管需要预测测试` → `预测市场的监管需要预测测试` |
+| Mixed | CJK path if any CJK present | `Understanding 零知识证明` → `Understanding 零知识证明` |
+
+**Rule 2: Max length enforcement**
+- **Hard limit**: `filename < 255 bytes` (ext4 max)
+- **Soft limit**: `filename < 200 bytes` (buffer before LLM trigger)
+- **Max title length**: 120 characters from title before filename conversion
+
+**Rule 3: LLM shortening (triggered at > 200 bytes)**
+
+When `is_filename_too_long(filename)` returns `True`, the system:
+
+1. **Batch LLM call** on all long titles in the batch:
+   ```
+   Prompt: "Very short filename (max 30 chars, kebab-case for English, 
+            keep key Chinese chars for Chinese, no punctuation):
+   
+   Title: {title[:200]}
+   Output:"
+   ```
+   - Uses `LLMClient` (provider-agnostic)
+   - Timeout: 15s per title
+   - Cached per `title + preview[:200] + model`
+
+2. **Fallback 1**: If LLM returns nothing, extract first sentence/clause (split on `。！？\n`)
+
+3. **Fallback 2**: If still too long, truncate at word boundary (removing trailing partial words/`-`)
+
+**Batch smart filenames** (`batch_smart_filenames()`):
+- Collects ALL long titles in the batch first
+- Sends one batched prompt (or parallel `ThreadPoolExecutor`) to generate short names for all of them at once
+- This is more efficient than individual LLM calls per title
+
+**"Too long" threshold summary:**
+- `title_to_filename()` truncates to 120 characters initially
+- `is_filename_too_long()` checks if UTF-8 byte length > 200 bytes
+- If yes → LLM shortening attempt
+- If LLM fails → first-sentence extraction → hard truncate
+
+### 6.4 Per-Batch Validation & Auto-Repair
+
+After files are written, each batch undergoes 15 validation checks:
+
+| Check | What it catches | Auto-repair? |
+|-------|----------------|--------------|
+| Frontmatter completeness | Missing title, source, date, status, template, tags | Yes — derives from body |
+| Required sections | Missing Summary, Core insights, etc. | Yes — derives from existing body |
+| Stub detection | "placeholder", "TODO", "(coming soon)" | Yes — removes or replaces |
+| Min body length | < 200 chars for entries | No — marks as failed |
+| Banned tags | `source`, `url`, `video`, `tweet` | Yes — removes |
+| Wikilink format | Unquoted YAML wikilinks | Yes — adds quotes |
+| Concept stub | Empty concept notes | Yes — fills from source content |
+
+**Auto-repair never uses boilerplate.** Missing sections are filled from the note's own existing body content. If a note has nothing to say, it fails validation and gets moved to `07-WIP/` for human review.
+
+---
+
+## 7. The Compile Pass
+
+### 7.1 Semantic Operations (LLM)
+
+The compile pass runs after creation or manually via `pipeline compile`. It has three LLM-powered operations:
+
+**A. Cross-linking (`_semantic_crosslink`)**
+- Build embedding similarity matrix for all entry pairs (cosine similarity)
+- Top-50 candidate pairs per note → LLM receives pairs with snippets
+- LLM decides: `LINK note_a | note_b | reason` or `PASS ...`
+- Writes `[[Note Name]]` wikilinks into note bodies under "Linked concepts"
+
+**B. Concept merging (`_semantic_concept_merge`)**
+- Embedding similarity for concept pairs > 0.60
+- Top-20 candidates → LLM decides: `MERGE canonical | duplicate | reason` or `PASS ...`
+- On merge: append body, rewrite all `[[Duplicate]]` → `[[Canonical]]` across **all** directories (entries, concepts, MoCs, sources), remove from index
+
+**C. MoC rebuild (`_semantic_moc_rebuild`)**
+- For each MoC topic: embedding search for related entries + concepts
+- LLM resynthesizes the MoC body from the top matches
+- Preserves frontmatter, replaces only body
+
+### 7.2 Deterministic Operations (Python)
+
+| Operation | Purpose | Algorithm |
+|-----------|---------|-----------|
+| Wiki index rebuild | Generate `wiki-index.md` | Scan all dirs, count by type, list recent |
+| Typed edges | Build `edges.tsv` | Parse wikilinks from all notes, derive 9 relationship types (`extends`, `contradicts`, `supports`, `supersedes`, `tested_by`, `depends_on`, `inspired_by`, `part_of`, `relates_to`) |
+| Duplicate detection | Report similar titles | Fuzzy string matching (difflib.SequenceMatcher > 0.80) |
+| Tag registry | Rebuild `tag-registry.md` | Count tag usage across entries, concepts, MoCs |
+| Metrics report | Structured JSON report | Count files, edges, orphan ratio, concept coverage |
+
+---
+
+## 8. QMD: Semantic Search Subsystem
+
+QMD is the internal name for the semantic concept search module (`pipeline/qmd.py`). It is NOT the external `qmd` CLI tool (which was abandoned due to `node-llama-cpp` compilation failures).
+
+### 8.1 Why this model/provider?
+
+**Model**: `qwen3-embedding:0.6b` (Q8 quantized)
+- **Size**: 639 MB → fits on consumer GPUs and CPU
+- **Dimensions**: 1024
+- **Speed**: ~50ms per embedding on CPU, ~10ms on GPU
+- **Quality**: Sufficient for concept matching (not SOTA, but fast and private)
+- **License**: Open weight
+
+**Provider**: Ollama (`http://localhost:11434`)
+- Private (no data leaves the machine)
+- Zero API cost
+- Fast (no network latency)
+- Batch API supports up to 32 texts per call
+
+**Why not OpenRouter for embeddings?**
+- OpenRouter doesn't host embedding models cost-effectively
+- Privacy: vault content should not be sent to third-party APIs
+- Latency: local inference is 10-100× faster for small batches
+
+### 8.2 Where QMD is used
+
+| Location | Function | Call frequency |
+|----------|----------|----------------|
+| `pipeline/plan.py:concept_search()` | Find existing concepts for new sources | Every `ingest` run |
+| `pipeline/create/templates.py:run_qmd_convergence()` | Concept convergence for creation | Every `ingest` run |
+| `pipeline/compile.py:NoteIndex.embed_all()` | Build note similarity matrix | Every `compile` run |
+| `pipeline/cli.py:query --fast` | Direct semantic query (optional) | On user demand |
+| `pipeline/compile.py:_semantic_moc_rebuild()` | Find related notes for MoC topics | Every `compile` run |
+
+### 8.3 Fallback methods
+
+QMD has a three-tier fallback system:
+
+```mermaid
+flowchart LR
+    A[Embedding needed] --> B{Ollama running?}
+    B -->|Yes| C[/api/embed batch<br/>32 texts per call/]
+    B -->|No| D{ThreadPool<br/>individual calls/}
+    C -->|Batch fails| D
+    D -->|All fail| E[Keyword fallback<br/>TF-IDF on concept stems]
+    E --> F[Return matches]
+    C --> F
+    D --> F
+```
+
+**Tier 1**: Batched `/api/embed` — fast, single HTTP call for 32 texts  
+**Tier 2**: `ThreadPoolExecutor` with individual `/api/embeddings` calls — per-text, slower but more reliable  
+**Tier 3**: Keyword search — tokenizes query and concepts, scores by overlap. Used when Ollama is fully down. No semantic understanding, but never crashes.
+
+### 8.4 Embedding lifecycle
+
+```mermaid
+flowchart LR
+    A[Concepts directory] -->|first plan<br/>or compile| B[Generate embeddings]
+    B --> C[Module-level cache<br/>_concept_embedding_cache]
+    C --> D[Cosine similarity<br/>with query embedding]
+    D --> E[Top-k matches]
+    E -->|next call| C
+    C -->|process exit| F[Cache destroyed<br/>regenerated on restart]
+```
+
+- Embeddings are **not persisted to disk** (intentional — concepts change, embeddings stale)
+- Regeneration cost: ~1-3 seconds for 100 concepts (batched)
+- Memory footprint: ~4 KB per concept (1024 floats × 4 bytes)
+
+---
+
+## 9. Filename System
+
+### 9.1 Rules by Language
+
+**English titles** (`_CJK_RE.search(title)` returns `None`):
+```python
+s = title.lower()
+s = remove_apostrophes(s)
+s = replace_non_alnum_with_dash(s)
+s = collapse_multiple_dashes(s)
+s = trim_leading_trailing_dashes(s)
+return s[:120]
+```
+Example: `"The Future of AI: Safety, Governance, and Regulation"` → `the-future-of-ai-safety-governance-and-regulation`
+
+**Chinese titles** (contains CJK characters):
+```python
+s = replace_cn_colon_with_dash(s)
+s = replace_cn_punctuation_with_space(s)
+s = remove_quotes(s)
+s = collapse_multiple_spaces(s)
+return s.strip()[:120]
+```
+Example: `"预测市场的监管：欧洲的挑战"` → `预测市场的监管-欧洲的挑战`
+
+**Mixed titles**: CJK path is taken (preserves Chinese characters).
+
+### 9.2 Length Thresholds
+
+| Limit | Value | Action |
+|-------|-------|--------|
+| Max title input | 120 chars | Truncated before filename conversion |
+| Soft filename limit | 200 bytes | Triggers LLM shortening |
+| Hard filename limit | 255 bytes | ext4 max; never exceeded |
+| LLM target | 30 chars | LLM asked to produce filenames under this |
+
+### 9.3 LLM Shortening via Semantic Understanding
+
+When a filename exceeds 200 bytes:
+
+1. **Semantic condensation**: The LLM receives the full title (up to 200 chars) and is asked to produce a filename that captures the *semantic essence* of the content, not just a mechanical truncation.
+
+   Example:
+   - Long title: `"Measles in 2025: A Review of Epidemiology, Vaccination Policy, and Public Health Response in European Context"`
+   - Mechanical truncation: `measles-in-2025-a-review-of-epidemiology-vaccination-policy-and-...` (meaningless suffix)
+   - LLM shortening: `measles-2025-european-epidemiology` (preserves the core subject and context)
+
+2. **Batch efficiency**: Multiple long titles are collected and sent to the LLM in parallel threads, amortizing the overhead.
+
+3. **Cache**: Results cached per `title + preview[:200] + model` to avoid re-shortening identical titles across runs.
+
+---
+
+## 10. The Query System
+
+### 10.1 Fast mode (`--fast`)
+
+```bash
+pipeline query --ask "What are the risks of prediction markets?" --fast
+```
+
+- Builds context from wiki index + QMD-concept-matched entries
+- Sends single prompt to `LLMClient.generate()`
+- Returns answer in ~2-5 seconds
+- No Hermes subprocess overhead
+
+### 10.2 Agent mode (default)
+
+```bash
+pipeline query --ask "What are the risks of prediction markets?"
+```
+
+- Spawns Hermes subprocess with `query-vault.prompt`
+- Agent can browse vault files, follow wikilinks, perform multi-step reasoning
+- Returns answer in ~40-60 seconds
+- Better for complex research questions requiring synthesis across many notes
+
+---
+
+## 11. Data Models & Vault Structure
+
+### Obsidian Vault Directory Layout
+
+```
+~/MyVault/
+├── 01-Raw/              # Drop .url files here
+│   └── *.url
+├── 02-Clippings/        # Manual web clipper imports (not auto-ingested)
+├── 03-Queries/           # Drop .md question files for Q&A
+├── 04-Wiki/
+│   ├── sources/          # Full extracted content. One .md per URL.
+│   ├── entries/          # Summaries + insights. One .md per source.
+│   ├── concepts/         # Evergreen notes. One concept per .md.
+│   └── mocs/             # Topic hubs (Map of Content)
+├── 05-Outputs/           # Q&A responses (auto-generated)
+├── 06-Config/
+│   ├── wiki-index.md     # Auto-updated directory of all notes
+│   ├── tag-registry.md   # Canonical tag list with usage counts
+│   ├── edges.tsv         # Typed relationship graph (9 types)
+│   └── log.md            # Structured pipeline run history
+├── 07-WIP/               # Your drafts — NEVER touched by automation
+├── 08-Archive-Raw/       # Processed .url files (moved after ingest)
+├── 09-Archive-Queries/   # Answered query files
+└── Meta/
+    ├── Scripts/            # Pipeline code, logs, cache
+    ├── prompts/            # LLM prompt templates
+    └── Templates/        # Obsidian note templates
+```
+
+### Key Data Models
 
 ```python
 @dataclass
 class Plan:
-    hash: str              # → ExtractedSource.hash
-    title: str             # Content title for filename
-    language: Language      # en|zh
-    template: Template      # standard|technical|chinese|comparison|procedural
-    tags: list[str]         # Topic-specific English tags
+    hash: str              # Source fingerprint (MD5)
+    title: str             # Content title (not URL slug)
+    language: Language     # EN or ZH
+    template: Template   # STANDARD, TECHNICAL, CHINESE, COMPARISON, PROCEDURAL
+    tags: list[str]        # Topic-specific, lowercase, hyphenated
     concept_updates: list[str]  # Existing concepts to link
     concept_new: list[str]      # New concepts to create
-    moc_targets: list[str]      # MoCs to update
-```
+    moc_targets: list[str]      # MoC names to assign
 
-### SourceType enum
-
-```python
-class SourceType(str, Enum):
-    WEB = "web"
-    YOUTUBE = "youtube"
-    PODCAST = "podcast"
-    PDF = "pdf"
-    TWITTER = "twitter"
-    UNKNOWN = "unknown"
-```
-
-### File structure
-
-```
-04-Wiki/
-├── sources/           # Raw extracted content
-│   └── {title}.md
-├── entries/           # Processed wiki entries
-│   └── {title}.md
-├── concepts/          # Evergreen concept notes
-│   └── {concept}.md
-└── mocs/              # Maps of Content (topic indexes)
-    └── {topic}.md
-```
-
----
-
-## 13. Error Handling & Recovery
-
-### Extraction failures
-
-| Failure | Detection | Recovery |
-|---------|-----------|----------|
-| Cloudflare challenge | `_is_challenge_page()` patterns | Retry with different UA → archive.org fallback → DLQ |
-| Paywall | "Subscribers Only" in content | Metadata-only source → DLQ |
-| Network timeout | `subprocess.TimeoutExpired` | Exponential backoff retry → DLQ |
-| Empty content | `validate_extraction()` | Retry → DLQ |
-| Podcast ID mismatch | iTunes lookup returns 0 | Search by name → RSS fallback |
-| YouTube 403 | TranscriptAPI/Supadata fail | yt-dlp + whisper fallback |
-
-### Planning failures
-
-| Failure | Detection | Recovery |
-|---------|-----------|----------|
-| Agent timeout | `subprocess.TimeoutExpired` | Retry with backoff |
-| Agent returns invalid JSON | `_parse_agent_output()` | Object-by-object parsing (partial recovery) |
-| No plans generated | `len(plans) == 0` | Log error, return empty |
-| qmd timeout | `subprocess.TimeoutExpired` | Return empty matches (non-blocking) |
-
-### Creation failures
-
-| Failure | Detection | Recovery |
-|---------|-----------|----------|
-| Agent empty output | `not output` | Retry (max_retries) |
-| Files not created | `file.exists()` check | Retry with backoff |
-| Validation violations | `validate_output()` | `_repair_violations()` auto-fix |
-| YAML frontmatter errors | Regex parsing | Auto-repair (add missing fields) |
-
-### Pipeline-level recovery
-
-```
---resume flag:
-  Loads saved manifest.json + plans.json
-  Skips Stages 1+2, runs only Stage 3
-  Use case: review plans, then create
-
-Pipeline lock:
-  Directory-based lock at 06-Config/.pipeline.lock
-  PID check for stale locks
-  Time-based stale detection (30 min)
-
-Content store:
-  SQLite WAL mode for crash recovery
-  Atomic commits per operation
-```
-
----
-
-## 14. Tools & Dependencies
-
-### Python pipeline
-
-| Tool | Purpose | Source |
-|------|---------|--------|
-| `hermes` | LLM agent for planning + creation | External CLI |
-| `qmd` | Semantic search (Qwen3-Embedding) | External CLI |
-| `defuddle` | Web content extraction | External CLI |
-| `liteparse` | HTML to text conversion | External CLI |
-| `yt-dlp` | YouTube/podcast audio download | External CLI |
-| `faster-whisper` | Local speech recognition | Python module |
-| `typer` | CLI framework | pip dependency |
-| `sqlite3` | Content store | stdlib |
-
-### APIs
-
-| API | Purpose | Auth |
-|-----|---------|------|
-| YouTube oEmbed | Video metadata | None |
-| TranscriptAPI | YouTube transcripts | Bearer token |
-| Supadata | YouTube transcripts (fallback) | x-api-key |
-| iTunes Lookup | Podcast metadata + RSS | None |
-| iTunes Search | Podcast search by name | None |
-| AssemblyAI | Audio transcription | Bearer token |
-| archive.org | Web page archival | None |
-
-### Shell scripts (supplementary)
-
-All lint, compile, validate, stats, and review functionality has been migrated to Python (see CLI Commands above). Remaining shell scripts:
-
-| Script | Purpose |
-|--------|---------|
-| `query-vault.sh` | Q&A with vault via qmd semantic search |
-| `update-tag-registry.sh` | Tag registry rebuild |
-
----
-
-## 15. Configuration
-
-### Config class (`config.py`)
-
-```python
 @dataclass
-class Config:
-    vault_path: Path          # ~/MyVault
-    extract_dir: Path | None  # auto: /tmp/obsidian-extracted-{hash}
-    extract_timeout: int = 45 # seconds per extraction
-    plan_timeout: int = 300   # seconds for planning agent
-    create_timeout: int = 900 # seconds for creation agent
-    max_retries: int = 3      # retry attempts
-    parallel: int = 3         # parallel workers
-    agent_cmd: str = "hermes" # agent CLI command
-    qmd_cmd: str = "qmd"      # semantic search CLI
-    qmd_collection: str = "..." # qmd collection path
-    transcript_api_key: str   # from .env
-    supadata_api_key: str     # from .env
-    assemblyai_api_key: str   # from .env
-```
+class ExtractedSource:
+    hash: str
+    url: str
+    title: str
+    content: str          # Full extracted markdown
+    author: str | None
+    type: SourceType      # WEB, YOUTUBE, PODCAST, PDF
+    date: str | None
 
-### Environment (.env)
-
-```
-TRANSCRIPT_API_KEY=sk_...
-SUPADATA_API_KEY=sd_...
-ASSEMBLYAI_API_KEY=...
-```
-
-### Vault structure (expected)
-
-```
-~/MyVault/
-├── 01-Raw/              # Inbox: .url files
-├── 04-Wiki/
-│   ├── sources/         # Source notes
-│   ├── entries/         # Entry notes
-│   ├── concepts/        # Concept notes
-│   └── mocs/            # Maps of Content
-├── 06-Config/           # Pipeline config + lock
-├── 07-WIP/              # Working files, logs
-└── Meta/
-    ├── prompts/         # Agent prompt templates
-    ├── Templates/       # Note templates
-    └── Scripts/         # Shell scripts
+@dataclass
+class ConceptMatch:
+    concept: str           # Filename stem
+    score: float           # Cosine similarity 0-1
 ```
 
 ---
 
-## 16. Shell Scripts
+## 12. Error Handling & Resilience
 
-All core pipeline functionality (compile, lint, validate, stats, review) has been fully migrated to Python. See the module map and CLI Commands section above.
+### Retry Ladder (per stage)
 
-### Remaining scripts
+| Stage | Retryable failures | Max retries | Backoff |
+|-------|-------------------|-------------|---------|
+| Extract | HTTP 429, 503, timeout, parse fail | 3 | 1s, 3s, 9s |
+| Embed | Ollama 429, timeout, wrong dims | 3 | 1s, 2s, 4s |
+| LLM generate | Connection timeout, empty response | 2 | 1s, 2s |
+| File write | Permission denied, disk full | 1 | N/A |
 
-**`query-vault.sh`** — Q&A interface using qmd semantic search. Queries the vault's vector index for interactive exploration.
+### Recovery Patterns
 
-**`update-tag-registry.sh`** — Rebuilds `tag-registry.md` from all vault files by extracting tags from YAML frontmatter.
+- **Agent timeout (exit 124)**: Post-creation validation checks files written before timeout. Partial batches are accepted if ≥1 file per plan is valid.
+- **LLM returns garbage**: JSON parser tries fast-path (full array) → object-by-object recovery → returns empty list (source skipped, not corrupted)
+- **Vault corruption**: `PipelineLock` (file-based) prevents concurrent `ingest` + `compile`. Lock timeout = 600s with stale lock detection.
+- **Embedding cache miss**: Falls back to keyword search. No pipeline halt.
+- **Duplicate concept merge**: Reference cleanup scans ALL directories + edges.tsv to prevent dangling links.
+
+### Monitoring
+
+- `log.md`: Structured JSON entry per run with metrics (sources, entries, concepts, duration, errors)
+- `Meta/Scripts/pipeline.log`: Detailed debug logs
+- `Meta/Scripts/dead_letter.csv`: Failed extractions for manual remediation
 
 ---
 
-*Document generated from codebase at commit `8199d4b`.*
+## A. Appendix: LLM Provider Configuration
+
+```bash
+# Option 1: Ollama (default) — local, fast, private
+LLM_PROVIDER=ollama
+OLLAMA_HOST=http://localhost:11434
+OLLAMA_INSIGHT_MODEL=minimax-m2.7:cloud
+
+# Option 2: OpenRouter — cloud, diverse models
+LLM_PROVIDER=openrouter
+LLM_MODEL=anthropic/claude-sonnet-4
+LLM_API_KEY=sk-or-...
+
+# Option 3: Hermes — full agent subprocess (slow, full tool access)
+LLM_PROVIDER=hermes
+AGENT_CMD=hermes
+```
+
+**Embedding is always Ollama** (local, private, no configuration needed beyond `OLLAMA_HOST`).
+
+---
+
+## B. Performance Benchmarks
+
+| Metric | Agent Mode (legacy) | Template Mode (current) |
+|--------|--------------------|------------------------|
+| 20 sources ingest | ~15 min | ~4.2 min |
+| Planning per source | ~30s (agent) | ~5ms (heuristic) |
+| Creation per source | ~3s (agent I/O) | ~0.5s (template + LLM insights) |
+| LLM chars per source | ~30,000 | ~800 |
+| Compile pass | ~8 min | ~2 min |
+| Query (fast) | N/A | ~3s |
+| Query (agent) | ~60s | ~60s |
+
+---
+
+*This architecture document is Version 0.2.0 and reflects the codebase as of commit `75bfde7`.*
