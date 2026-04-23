@@ -54,8 +54,8 @@ class TestCountMd:
 
 
 class TestRunCompile:
-    @patch("pipeline.compile._run_agent", return_value=(True, "Cross-links added: 3"))
-    def test_success(self, mock_agent, cfg, prompts_dir, monkeypatch):
+    @patch("pipeline.compile._run_semantic_compile", return_value=(True, "cross-links added: 3"))
+    def test_success(self, mock_semantic, cfg, prompts_dir, monkeypatch):
         import pipeline.compile as compile_mod
         monkeypatch.setattr(compile_mod, "_load_prompt", lambda name, d: "Test prompt {VAULT_PATH}")
         result = run_compile(cfg)
@@ -64,24 +64,23 @@ class TestRunCompile:
         assert result["concepts"] == 0
         assert result["agent_succeeded"] is True
 
-    @patch("pipeline.compile._run_agent", return_value=(False, ""))
-    def test_failure(self, mock_agent, cfg, monkeypatch):
+    @patch("pipeline.compile._run_semantic_compile", return_value=(False, ""))
+    def test_failure(self, mock_semantic, cfg, monkeypatch):
         import pipeline.compile as compile_mod
         monkeypatch.setattr(compile_mod, "_load_prompt", lambda name, d: "Test prompt")
         result = run_compile(cfg)
-        # Semantic compile is required for overall success.
         assert result["agent_succeeded"] is False
         assert result["success"] is False
-        assert "semantic compile agent failed" in result["error"].lower()
+        assert "semantic compile failed" in result["error"].lower()
 
     def test_missing_prompt(self, cfg, monkeypatch):
         import pipeline.compile as compile_mod
         monkeypatch.setattr(compile_mod, "_load_prompt", lambda name, d: "")
         result = run_compile(cfg)
-        # Missing prompt means agent can't run, so compile is not successful.
-        assert result["agent_succeeded"] is False
-        assert result["success"] is False
-        assert "semantic compile agent failed" in result["error"].lower()
+        # Semantic compile no longer depends on compile-pass.prompt;
+        # missing prompt should not cause failure.
+        assert result["agent_succeeded"] is True
+        assert result["success"] is True
 
 
 class TestParseAgentMetrics:

@@ -72,7 +72,18 @@ class Config:
     qmd_cmd: str = "qmd"
     qmd_collection: str = "concepts"
 
-    # Ollama (for fast local inference — insights + filenames)
+    # LLM Provider (ollama | openrouter | hermes)
+    llm_provider: str = "ollama"
+    llm_model: str = ""  # e.g. "minimax-m2.7:cloud" or "qwen/qwen3-30b-a3b:free"
+    llm_api_key: str = ""  # required for openrouter
+    llm_base_url: str = ""  # override base URL for any provider
+    llm_timeout: int = 60
+
+    # Embedding (primarily Ollama; kept separate from generation provider)
+    embed_model: str = "qwen3-embedding:0.6b"
+    embed_base_url: str = ""  # falls back to ollama_host if empty
+
+    # Legacy Ollama settings (backward compat — used when llm_provider=ollama)
     ollama_host: str = "http://localhost:11434"
     ollama_insight_model: str = "minimax-m2.7:cloud"
     ollama_filename_model: str = "minimax-m2.7:cloud"
@@ -240,6 +251,13 @@ def load_config(
         assemblyai_api_key=_env("ASSEMBLYAI_API_KEY", ""),
         qmd_cmd=_env("QMD_CMD", "qmd"),
         qmd_collection=_env("QMD_COLLECTION", "concepts"),
+        llm_provider=_env("LLM_PROVIDER", "ollama"),
+        llm_model=_env("LLM_MODEL", ""),
+        llm_api_key=_env("LLM_API_KEY", ""),
+        llm_base_url=_env("LLM_BASE_URL", ""),
+        llm_timeout=_int_env("LLM_TIMEOUT", 60, env_values),
+        embed_model=_env("EMBED_MODEL", "qwen3-embedding:0.6b"),
+        embed_base_url=_env("EMBED_BASE_URL", ""),
         ollama_host=_env("OLLAMA_HOST", "http://localhost:11434"),
         ollama_insight_model=_env("OLLAMA_INSIGHT_MODEL", "minimax-m2.7:cloud"),
         ollama_filename_model=_env("OLLAMA_FILENAME_MODEL", "minimax-m2.7:cloud"),

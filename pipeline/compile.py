@@ -427,7 +427,430 @@ def _detect_duplicates(cfg: Config) -> int:
     return dup_count
 
 
-# ─── Agent: Concept Merge + Cross-Linking ─────────────────────────────────────
+# ─── Semantic Compile (Direct LLM) ───────────────────────────────────────────
+
+@dataclass
+class NoteIndex:
+    """In-memory index of vault notes for semantic operations."""
+    notes: dict[str, dict] = field(default_factory=dict)
+    embeddings: dict[str, list[float]] = field(default_factory=dict)
+
+    def load(self, cfg: Config) -> None:
+        """Load all notes from the vault."""
+        for note_dir, note_type in [
+            (cfg.entries_dir, "entry"),
+            (cfg.concepts_dir, "concept"),
+            (cfg.mocs_dir, "moc"),
+        ]:
+            if not note_dir.exists():
+                continue
+            for md in note_dir.glob("*.md"):
+                try:
+                    content = md.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    continue
+                name = md.stem
+                fm_match = re.match(r"^---\s*\n(.*?)\n---", content, re.DOTALL)
+                tags: set[str] = set()
+                title = name
+                if fm_match:
+                    fm = fm_match.group(1)
+                    t_match = re.search(r"title:\s*[\"']?(.*?)[\"']?\s*$", fm, re.MULTILINE)
+                    if t_match:
+                        title = t_match.group(1).strip()
+                    tags = {tag.lower() for tag in _frontmatter_list_items(fm, "tags") if tag}
+                links = set(re.findall(r"\[\[([^\]|#]+)(?:[|#][^\]]*)?\]\]", content))
+                preview = re.sub(r"^---\s*\n.*?\n---\s*\n", "", content, flags=re.DOTALL)[:500]
+                self.notes[name] = {
+                    "type": note_type,
+                    "title": title,
+                    "tags": tags,
+                    "links": links,
+                    "preview": preview,
+                    "path": str(md.relative_to(cfg.vault_path)),
+                }
+
+    def embed_all(self, client) -> None:
+        """Generate embeddings for all note previews."""
+        if not self.notes:
+            return
+        texts = [f"{n['title']}\n{n['preview']}" for n in self.notes.values()]
+        names = list(self.notes.keys())
+        batch = client.embed_batch(texts)
+        if batch:
+            for name, text in zip(names, texts):
+                if text in batch:
+                    self.embeddings[name] = batch[text]
+            log.info("Embedded %d/%d notes", len(self.embeddings), len(self.notes))
+        else:
+            log.warning("Embedding batch failed; semantic operations will use heuristics only")
+
+    def similarity(self, name_a: str, name_b: str) -> float:
+        """Cosine similarity between two notes (0.0 if no embeddings)."""
+        emb_a = self.embeddings.get(name_a)
+        emb_b = self.embeddings.get(name_b)
+        if not emb_a or not emb_b:
+            return 0.0
+        dot = sum(x * y for x, y in zip(emb_a, emb_b))
+        norm_a = math.sqrt(sum(x * x for x in emb_a))
+        norm_b = math.sqrt(sum(x * x for x in emb_b))
+        if norm_a == 0 or norm_b == 0:
+            return 0.0
+        return dot / (norm_a * norm_b)
+
+
+def _add_wikilink(cfg: Config, source_name: str, target_name: str, reason: str) -> bool:
+    """Add a wikilink from source to target in the appropriate section."""
+    source_dirs = [cfg.entries_dir, cfg.concepts_dir, cfg.mocs_dir]
+    source_path = None
+    for d in source_dirs:
+        candidate = d / f"{source_name}.md"
+        if candidate.exists():
+            source_path = candidate
+            break
+    if not source_path:
+        return False
+
+    try:
+        content = source_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+
+    # Skip if link already exists
+    if f"[[{target_name}]]" in content:
+        return False
+
+    # Find appropriate section to append link
+    sections = {
+        "entry": ["Linked concepts", "Links", "关联概念"],
+        "concept": ["Links", "Context", "链接"],
+        "moc": ["Related MoCs", "Cross-References", "关联图谱"],
+    }
+    note_type = "entry"  # default
+    for d, nt in [(cfg.entries_dir, "entry"), (cfg.concepts_dir, "concept"), (cfg.mocs_dir, "moc")]:
+        if (d / f"{source_name}.md").exists():
+            note_type = nt
+            break
+
+    target_sections = sections.get(note_type, ["Links"])
+    lines = content.splitlines()
+    insert_idx = len(lines)
+    for i, line in enumerate(lines):
+        for sec in target_sections:
+            if line.strip().startswith(f"## {sec}"):
+                insert_idx = i + 1
+                # Skip empty lines after heading
+                while insert_idx < len(lines) and lines[insert_idx].strip() == "":
+                    insert_idx += 1
+                break
+        if insert_idx < len(lines):
+            break
+
+    link_line = f"- [[{target_name}]]"
+    if reason:
+        link_line += f" — {reason}"
+    lines.insert(insert_idx, link_line)
+    source_path.write_text("\n".join(lines), encoding="utf-8")
+    log.debug("Added link: %s -> %s", source_name, target_name)
+    return True
+
+
+def _semantic_crosslink(cfg: Config, client, index: NoteIndex) -> int:
+    """Add missing semantic cross-links between related notes.
+
+    Uses embedding similarity + shared tags to find candidates,
+    then validates with an LLM prompt.
+    """
+    if len(index.notes) < 2:
+        return 0
+
+    candidates: list[tuple[str, str, float, set[str]]] = []
+    names = list(index.notes.keys())
+    for i, name_a in enumerate(names):
+        info_a = index.notes[name_a]
+        for name_b in names[i + 1:]:
+            info_b = index.notes[name_b]
+            # Skip if already linked
+            if name_b in info_a["links"] or name_a in info_b["links"]:
+                continue
+            sim = index.similarity(name_a, name_b)
+            shared_tags = info_a["tags"] & info_b["tags"]
+            score = sim + (len(shared_tags) * 0.1)
+            if score > 0.5 or len(shared_tags) >= 2:
+                candidates.append((name_a, name_b, score, shared_tags))
+
+    if not candidates:
+        return 0
+
+    # Sort by score and take top 30 to keep prompt size reasonable
+    candidates.sort(key=lambda x: x[2], reverse=True)
+    candidates = candidates[:30]
+
+    prompt_lines = [
+        "You are a knowledge base editor. Review these candidate note pairs and decide which should link to each other.",
+        "For each pair, respond with exactly one of these formats:",
+        "  LINK <note_a> <note_b> <brief reason>",
+        "  SKIP <note_a> <note_b>",
+        "",
+        "Candidates:",
+    ]
+    for a, b, score, tags in candidates:
+        prompt_lines.append(f"\n--- {a} ↔ {b} (score: {score:.2f}) ---")
+        prompt_lines.append(f"{a}: {index.notes[a]['title']} — {index.notes[a]['preview'][:200]}")
+        prompt_lines.append(f"{b}: {index.notes[b]['title']} — {index.notes[b]['preview'][:200]}")
+        if tags:
+            prompt_lines.append(f"shared tags: {', '.join(tags)}")
+
+    prompt = "\n".join(prompt_lines)
+    response = client.generate(prompt, timeout=120)
+
+    links_added = 0
+    for line in response.splitlines():
+        m = re.match(r"LINK\s+(\S+)\s+(\S+)\s+(.*)", line)
+        if m:
+            a, b, reason = m.groups()
+            if _add_wikilink(cfg, a, b, reason.strip()):
+                links_added += 1
+            # Also add reverse link if appropriate
+            if index.notes.get(b, {}).get("type") in ("concept", "moc"):
+                if _add_wikilink(cfg, b, a, reason.strip()):
+                    links_added += 1
+
+    log.info("Semantic cross-linking: %d links added", links_added)
+    return links_added
+
+
+def _semantic_concept_merge(cfg: Config, client, index: NoteIndex) -> int:
+    """Merge near-duplicate concepts using LLM validation.
+
+    Finds candidates via title similarity + embedding similarity,
+    asks LLM whether to merge, and performs the merge if approved.
+    """
+    concepts = {n: info for n, info in index.notes.items() if info["type"] == "concept"}
+    if len(concepts) < 2:
+        return 0
+
+    candidates: list[tuple[str, str, float]] = []
+    names = list(concepts.keys())
+    for i, name_a in enumerate(names):
+        for name_b in names[i + 1:]:
+            info_a = concepts[name_a]
+            info_b = concepts[name_b]
+            # Title word overlap
+            words_a = set(re.sub(r"[^a-zA-Z0-9\u4e00-\u9fff]", " ", info_a["title"].lower()).split())
+            words_b = set(re.sub(r"[^a-zA-Z0-9\u4e00-\u9fff]", " ", info_b["title"].lower()).split())
+            overlap = 0.0
+            if words_a and words_b:
+                overlap = len(words_a & words_b) / min(len(words_a), len(words_b))
+            sim = index.similarity(name_a, name_b)
+            score = max(overlap, sim)
+            if score > 0.75:
+                candidates.append((name_a, name_b, score))
+
+    if not candidates:
+        return 0
+
+    # Limit to top 10 pairs
+    candidates.sort(key=lambda x: x[2], reverse=True)
+    candidates = candidates[:10]
+
+    prompt_lines = [
+        "You are a knowledge base editor. Review these concept pairs and decide if they should be merged.",
+        "For each pair, respond with exactly one of:",
+        "  MERGE <canonical_name> <duplicate_name> <reason>",
+        "  KEEP_BOTH <name_a> <name_b> <reason>",
+        "",
+        "Rules:",
+        "- If two concepts cover the SAME idea (even in different languages), merge them.",
+        "- Choose the older/canonical concept as the first name.",
+        "- If they overlap only partially, keep both.",
+        "",
+        "Candidates:",
+    ]
+    for a, b, score in candidates:
+        prompt_lines.append(f"\n--- {a} ↔ {b} (similarity: {score:.2f}) ---")
+        prompt_lines.append(f"{a}: {concepts[a]['title']}")
+        prompt_lines.append(f"  {concepts[a]['preview'][:250]}")
+        prompt_lines.append(f"{b}: {concepts[b]['title']}")
+        prompt_lines.append(f"  {concepts[b]['preview'][:250]}")
+
+    prompt = "\n".join(prompt_lines)
+    response = client.generate(prompt, timeout=120)
+
+    merged = 0
+    for line in response.splitlines():
+        m = re.match(r"MERGE\s+(\S+)\s+(\S+)\s+(.*)", line)
+        if m:
+            canonical, duplicate, reason = m.groups()
+            if _merge_concepts(cfg, canonical, duplicate, index):
+                merged += 1
+
+    log.info("Semantic concept merge: %d concepts merged", merged)
+    return merged
+
+
+def _merge_concepts(cfg: Config, canonical_name: str, duplicate_name: str, index: NoteIndex) -> bool:
+    """Merge duplicate concept into canonical. Returns True if merged."""
+    canonical_path = cfg.concepts_dir / f"{canonical_name}.md"
+    duplicate_path = cfg.concepts_dir / f"{duplicate_name}.md"
+    if not canonical_path.exists() or not duplicate_path.exists():
+        return False
+
+    try:
+        canonical_content = canonical_path.read_text(encoding="utf-8", errors="replace")
+        duplicate_content = duplicate_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+
+    # Extract body from both
+    canonical_body = re.sub(r"^---\s*\n.*?\n---\s*\n", "", canonical_content, flags=re.DOTALL)
+    duplicate_body = re.sub(r"^---\s*\n.*?\n---\s*\n", "", duplicate_content, flags=re.DOTALL)
+
+    # Append duplicate body to canonical under a merged section
+    merged_content = canonical_content.rstrip() + f"\n\n## Merged from [[{duplicate_name}]]\n\n{duplicate_body.strip()}\n"
+    canonical_path.write_text(merged_content, encoding="utf-8")
+
+    # Delete duplicate
+    duplicate_path.unlink()
+
+    # Update entries that linked to duplicate
+    for entry_md in cfg.entries_dir.glob("*.md"):
+        try:
+            text = entry_md.read_text(encoding="utf-8", errors="replace")
+            if f"[[{duplicate_name}]]" in text:
+                text = text.replace(f"[[{duplicate_name}]]", f"[[{canonical_name}]]")
+                entry_md.write_text(text, encoding="utf-8")
+        except OSError:
+            continue
+
+    log.info("Merged concept %s into %s", duplicate_name, canonical_name)
+    return True
+
+
+def _semantic_moc_rebuild(cfg: Config, client, index: NoteIndex) -> int:
+    """Rebuild MoCs with related notes using LLM synthesis.
+
+    For each MoC, finds top related notes via embedding similarity,
+    asks LLM for an updated structure, and writes the result.
+    """
+    mocs = {n: info for n, info in index.notes.items() if info["type"] == "moc"}
+    if not mocs:
+        return 0
+
+    updated = 0
+    for moc_name, moc_info in mocs.items():
+        # Find top 10 related notes by embedding similarity
+        related: list[tuple[str, float]] = []
+        for name, info in index.notes.items():
+            if info["type"] == "moc" or name == moc_name:
+                continue
+            sim = index.similarity(moc_name, name)
+            # Boost if tag overlap
+            shared_tags = moc_info["tags"] & info["tags"]
+            sim += len(shared_tags) * 0.05
+            if sim > 0.3 or moc_name.lower() in info["preview"].lower():
+                related.append((name, sim))
+        related.sort(key=lambda x: x[1], reverse=True)
+        related = related[:10]
+
+        if not related:
+            continue
+
+        prompt_lines = [
+            f"You are updating a Map of Content (MoC) for the topic: {moc_info['title']}.",
+            "",
+            "Current MoC preview:",
+            moc_info["preview"][:400],
+            "",
+            "Related notes to include:",
+        ]
+        for name, score in related:
+            info = index.notes[name]
+            prompt_lines.append(f"- [[{name}]] ({info['type']}): {info['title']} — {info['preview'][:150]}")
+
+        prompt_lines.extend([
+            "",
+            "Write an updated MoC section (just the body, no frontmatter). Structure:",
+            "## Overview / 概述",
+            "<2-3 sentence synthesized summary>",
+            "",
+            "## <Topic Sections>",
+            "- [[Note]] — <1-sentence summary>",
+            "",
+            "## Bridge Concepts",
+            "- <concepts connecting subtopics>",
+            "",
+            "## Cross-References",
+            "- <relevant links>",
+            "",
+            "Use [[wikilinks]] for all internal links. Keep it concise.",
+        ])
+
+        prompt = "\n".join(prompt_lines)
+        response = client.generate(prompt, timeout=120)
+        if not response:
+            continue
+
+        moc_path = cfg.mocs_dir / f"{moc_name}.md"
+        try:
+            current = moc_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+
+        # Preserve frontmatter, replace body
+        fm_match = re.match(r"^(---\s*\n.*?\n---\s*\n)", current, re.DOTALL)
+        frontmatter = fm_match.group(1) if fm_match else ""
+        new_content = frontmatter + f"# {moc_info['title']}\n\n" + response + "\n"
+        moc_path.write_text(new_content, encoding="utf-8")
+        updated += 1
+
+    log.info("Semantic MoC rebuild: %d MoCs updated", updated)
+    return updated
+
+
+def _run_semantic_compile(cfg: Config, result: CompileResult) -> tuple[bool, str]:
+    """Run semantic compile operations via direct LLM calls (no subprocess).
+
+    Uses embedding similarity + LLM validation for:
+      - Cross-linking
+      - Concept merging
+      - MoC rebuilding
+
+    Falls back to Hermes agent if llm_provider == 'hermes'.
+    """
+    from pipeline.llm_client import get_llm_client
+
+    client = get_llm_client(cfg)
+
+    # If user explicitly chose hermes provider, use the legacy agent path
+    if cfg.llm_provider == "hermes":
+        return _run_agent_compile(cfg, result)
+
+    t0 = time.time()
+
+    # Build note index with embeddings
+    index = NoteIndex()
+    index.load(cfg)
+    if len(index.notes) > 0:
+        index.embed_all(client)
+
+    # Run semantic operations
+    result.crosslinks_added = _semantic_crosslink(cfg, client, index)
+    result.concepts_merged = _semantic_concept_merge(cfg, client, index)
+    result.mocs_updated = _semantic_moc_rebuild(cfg, client, index)
+
+    result.agent_duration_s = time.time() - t0
+    result.agent_succeeded = True
+
+    summary = (
+        f"cross-links added: {result.crosslinks_added}\n"
+        f"concepts merged: {result.concepts_merged}\n"
+        f"mocs updated: {result.mocs_updated}"
+    )
+    return True, summary
+
+
+# ─── Agent: Concept Merge + Cross-Linking (Legacy) ───────────────────────────
 
 def _run_agent_compile(cfg: Config, result: CompileResult) -> tuple[bool, str]:
     """Run the agent for cross-linking and concept merging.
@@ -611,11 +1034,12 @@ def run_compile(cfg: Config) -> dict:
     log.info("=== Compile pass: %d entries, %d concepts, %d MoCs ===",
              before.entries, before.concepts, before.mocs)
 
-    # 2. Agent: cross-linking + concept merging
-    agent_ok, agent_output = _run_agent_compile(cfg, result)
+    # 2. Semantic compile: cross-linking + concept merging + MoC rebuild
+    agent_ok, agent_output = _run_semantic_compile(cfg, result)
+    result.agent_succeeded = agent_ok
 
-    # Parse agent output for metrics (even if agent "failed" — partial results may exist)
-    if agent_output:
+    # Parse agent output for metrics (legacy compat)
+    if agent_output and result.crosslinks_added == 0:
         agent_metrics = _parse_agent_metrics(agent_output)
         result.crosslinks_added = agent_metrics["crosslinks_added"]
         result.concepts_merged = agent_metrics["concepts_merged"]
@@ -643,16 +1067,16 @@ def run_compile(cfg: Config) -> dict:
              diff["files_changed"], diff["new_wikilinks"],
              diff["entries_delta"], diff["concepts_delta"], diff["mocs_delta"])
 
-    # If agent claims 0 but vault actually changed, update from diff
+    # If metrics claim 0 but vault actually changed, update from diff
     if result.crosslinks_added == 0 and diff["new_wikilinks"] > 0:
         result.crosslinks_added = diff["new_wikilinks"]
     if result.concepts_merged == 0 and diff["concepts_delta"] < 0:
         result.concepts_merged = abs(diff["concepts_delta"])
 
-    # Determine overall success before writing artifacts so reports reflect reality.
+    # Determine overall success
     if not agent_ok:
         result.success = False
-        result.error = "Semantic compile agent failed; deterministic maintenance still ran"
+        result.error = "Semantic compile failed; deterministic maintenance still ran"
         if not result.wiki_index_rebuilt:
             result.error += "; wiki index rebuild also failed"
 

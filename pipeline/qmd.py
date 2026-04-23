@@ -26,10 +26,12 @@ import urllib.request
 import urllib.error
 
 from pipeline.models import ConceptMatch
+from pipeline.llm_client import LLMClient
 
 log = logging.getLogger(__name__)
 
-OLLAMA_URL = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
+# Legacy env vars (still respected if no explicit embed_base_url configured)
+_DEFAULT_OLLAMA_URL = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
 EMBED_MODEL = os.environ.get("QMD_EMBED_MODEL", "qwen3-embedding:0.6b")
 EMBED_DIM = 1024  # qwen3-embedding-0.6b output dimension
 BATCH_SIZE = 32   # Max texts per /api/embed batch call
@@ -39,86 +41,40 @@ _concept_embedding_cache: dict[str, list[float]] = {}
 _cache_loaded = False
 
 
+def _get_embed_client(base_url: str = "") -> LLMClient:
+    """Return an LLMClient configured for embeddings (defaults to Ollama)."""
+    url = base_url or _DEFAULT_OLLAMA_URL
+    return LLMClient(provider="ollama", embed_model=EMBED_MODEL, embed_base_url=url, timeout=120)
+
+
 def _ollama_embed(text: str) -> list[float] | None:
-    """Get embedding vector from Ollama. Returns None on failure."""
-    try:
-        req = urllib.request.Request(
-            f"{OLLAMA_URL}/api/embeddings",
-            data=json.dumps({
-                "model": EMBED_MODEL,
-                "prompt": text[:4000],  # truncate to avoid token limits
-            }).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            embedding = data.get("embedding")
-            if embedding and len(embedding) == EMBED_DIM:
-                return embedding
-            log.warning("Ollama returned embedding with wrong dims: %d", len(embedding) if embedding else 0)
-            return None
-    except urllib.error.URLError as e:
-        log.warning("Ollama connection failed: %s", e)
-        return None
-    except Exception as e:
-        log.warning("Ollama embed error: %s", e)
-        return None
+    """Get embedding vector from Ollama. Returns None on failure or wrong dims.
+
+    Backward-compatible wrapper; delegates to LLMClient then validates dimension.
+    """
+    client = _get_embed_client()
+    embedding = client.embed(text)
+    if embedding and len(embedding) == EMBED_DIM:
+        return embedding
+    if embedding:
+        log.warning("Ollama returned embedding with wrong dims: %d", len(embedding))
+    return None
 
 
 def _ollama_embed_batch(texts: list[str]) -> dict[str, list[float]]:
     """Batch embed multiple texts via Ollama /api/embed.
 
-    Returns {text: embedding} for successful embeddings.
-    Falls back silently to empty dict on any failure.
+    Backward-compatible wrapper; delegates to LLMClient then validates dimensions.
     """
-    if not texts:
-        return {}
-
-    # Ollama /api/embed accepts "input" as string or list of strings
-    payload = {
-        "model": EMBED_MODEL,
-        "input": [t[:4000] for t in texts],
-    }
-
-    try:
-        req = urllib.request.Request(
-            f"{OLLAMA_URL}/api/embed",
-            data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=120) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            embeddings = data.get("embeddings", [])
-            if not embeddings or len(embeddings) != len(texts):
-                log.warning(
-                    "Ollama /api/embed returned %d embeddings for %d texts",
-                    len(embeddings), len(texts),
-                )
-                return {}
-
-            results: dict[str, list[float]] = {}
-            for text, emb in zip(texts, embeddings):
-                if emb and len(emb) == EMBED_DIM:
-                    results[text] = emb
-                else:
-                    log.warning(
-                        "Ollama /api/embed returned wrong dim: %d",
-                        len(emb) if emb else 0,
-                    )
-            return results
-
-    except urllib.error.HTTPError as e:
-        # 404 = endpoint not supported by this Ollama version
-        if e.code == 404:
-            log.debug("Ollama /api/embed not available (404), will fallback")
-        else:
-            log.warning("Ollama /api/embed HTTP error: %s", e)
-        return {}
-    except Exception as e:
-        log.warning("Ollama /api/embed error: %s", e)
-        return {}
+    client = _get_embed_client()
+    batch = client.embed_batch(texts)
+    results: dict[str, list[float]] = {}
+    for text, emb in batch.items():
+        if emb and len(emb) == EMBED_DIM:
+            results[text] = emb
+        elif emb:
+            log.warning("Ollama /api/embed returned wrong dim: %d", len(emb))
+    return results
 
 
 def _embed_concepts_batch(md_files: list[Path]) -> dict[str, list[float]]:

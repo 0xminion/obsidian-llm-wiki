@@ -828,11 +828,15 @@ def query(
     vault: Path = typer.Argument(None, help="Vault path (default: ~/MyVault)"),
     question: str = typer.Option("", "--ask", "-q", help="Question to ask the vault"),
     all_queries: bool = typer.Option(False, "--all", "-a", help="Process all pending queries"),
+    fast: bool = typer.Option(False, "--fast", "-f", help="Fast mode: direct LLM call instead of Hermes agent"),
 ):
     """Query the vault wiki with a question (compound-back Q&A).
 
     Drop query .md files in 03-Queries/. Answers are written to 05-Outputs/
     and queries are archived to 09-Archive-Queries/.
+
+    Use --fast for simple lookups (sub-5s via direct LLM).
+    Omit --fast for complex research questions (Hermes agent with tool use).
     """
     import subprocess
 
@@ -869,16 +873,14 @@ def query(
 
         prompt = _build_query_prompt(cfg, qtext)
 
-        try:
-            result = subprocess.run(
-                [cfg.agent_cmd, "chat", "-q", prompt, "-Q"],
-                cwd=str(cfg.vault_path), capture_output=True, text=True, timeout=300,
-            )
-            if result.returncode == 0:
-                answer = result.stdout.strip()
+        if fast:
+            # Fast path: direct LLM call (no Hermes subprocess overhead)
+            from pipeline.llm_client import get_llm_client
+            client = get_llm_client(cfg)
+            answer = client.generate(prompt, timeout=120)
+            if answer:
                 typer.echo(f"\n--- Answer ({qname}) ---\n")
                 typer.echo(answer)
-                # Write to 05-Outputs/
                 out_file = outputs_dir / f"{qname}.md"
                 out_file.write_text(
                     f"# Query: {qname}\n\n"
@@ -887,23 +889,52 @@ def query(
                     encoding="utf-8",
                 )
                 typer.echo(f"\nWritten to: {out_file}")
-                # Archive original query
                 if str(qf) != "__command_line__":
                     archive_path = archive_dir / qf.name
                     if archive_path.exists():
-                        # Collision: append timestamp
                         archive_path = archive_dir / f"{qf.stem}-{int(time.time())}{qf.suffix}"
                     qf.rename(archive_path)
                     typer.echo(f"Archived to: {archive_path}")
             else:
                 had_failures = True
-                typer.echo(f"Agent failed for {qname}: {result.stderr[:200]}", err=True)
-        except subprocess.TimeoutExpired:
-            had_failures = True
-            typer.echo(f"Agent timed out for {qname}", err=True)
-        except FileNotFoundError:
-            typer.echo(f"Agent command not found: {cfg.agent_cmd}", err=True)
-            raise typer.Exit(code=127)
+                typer.echo(f"LLM failed for {qname} (empty response)", err=True)
+        else:
+            # Full agent path: Hermes subprocess with tool access
+            try:
+                result = subprocess.run(
+                    [cfg.agent_cmd, "chat", "-q", prompt, "-Q"],
+                    cwd=str(cfg.vault_path), capture_output=True, text=True, timeout=300,
+                )
+                if result.returncode == 0:
+                    answer = result.stdout.strip()
+                    typer.echo(f"\n--- Answer ({qname}) ---\n")
+                    typer.echo(answer)
+                    # Write to 05-Outputs/
+                    out_file = outputs_dir / f"{qname}.md"
+                    out_file.write_text(
+                        f"# Query: {qname}\n\n"
+                        f"**Question:**\n{qtext}\n\n"
+                        f"**Answer:**\n{answer}\n",
+                        encoding="utf-8",
+                    )
+                    typer.echo(f"\nWritten to: {out_file}")
+                    # Archive original query
+                    if str(qf) != "__command_line__":
+                        archive_path = archive_dir / qf.name
+                        if archive_path.exists():
+                            # Collision: append timestamp
+                            archive_path = archive_dir / f"{qf.stem}-{int(time.time())}{qf.suffix}"
+                        qf.rename(archive_path)
+                        typer.echo(f"Archived to: {archive_path}")
+                else:
+                    had_failures = True
+                    typer.echo(f"Agent failed for {qname}: {result.stderr[:200]}", err=True)
+            except subprocess.TimeoutExpired:
+                had_failures = True
+                typer.echo(f"Agent timed out for {qname}", err=True)
+            except FileNotFoundError:
+                typer.echo(f"Agent command not found: {cfg.agent_cmd}", err=True)
+                raise typer.Exit(code=127)
 
     if had_failures:
         raise typer.Exit(code=1)

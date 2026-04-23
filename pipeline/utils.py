@@ -289,47 +289,40 @@ def is_filename_too_long(filename: str, max_bytes: int = 200) -> bool:
     return _byte_length(filename) > max_bytes
 
 
+def _llm_generate(
+    prompt: str,
+    model: str = "",
+    timeout: int = 30,
+    provider: str = "ollama",
+) -> str:
+    """Send a prompt to the configured LLM provider and return the response text.
+
+    Defaults to Ollama for backward compatibility. Returns empty string on failure.
+    """
+    from pipeline.llm_client import LLMClient
+
+    client = LLMClient(provider=provider, model=model, timeout=timeout)
+    return client.generate(prompt)
+
+
 def _ollama_generate(
     prompt: str,
     model: str = "",
     timeout: int = 30,
 ) -> str:
-    """Send a prompt to Ollama /api/generate and return the response text.
-
-    Uses OLLAMA_HOST env var (default: http://localhost:11434).
-    Returns empty string on any failure.
-    """
-    ollama_url = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
-    if not model:
-        model = os.environ.get("OLLAMA_FILENAME_MODEL", "minimax-m2.7:cloud")
-
-    try:
-        req = urllib.request.Request(
-            f"{ollama_url}/api/generate",
-            data=json.dumps({
-                "model": model,
-                "prompt": prompt,
-                "stream": False,
-            }).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            return data.get("response", "").strip()
-    except Exception as e:
-        log.debug("Ollama generate failed: %s", e)
-        return ""
+    """Backward-compatible wrapper around _llm_generate (Ollama only)."""
+    return _llm_generate(prompt, model=model, timeout=timeout, provider="ollama")
 
 
 def _llm_short_filename(
     title: str,
     content_preview: str = "",
     model: str = "",
+    client=None,
 ) -> str | None:
     """Ask an LLM to generate a concise filename. Returns None on failure.
 
-    Uses Ollama directly via _ollama_generate. Caches results per title.
+    Uses the LLM client directly. Caches results per title.
     """
     cache_key = f"{title}::{content_preview[:200]}::{model}"
     if cache_key in _llm_filename_cache:
@@ -339,7 +332,10 @@ def _llm_short_filename(
 {title[:200]}
 Output:"""
 
-    raw = _ollama_generate(prompt, model=model, timeout=15)
+    if client is not None:
+        raw = client.generate(prompt, model=model, timeout=15)
+    else:
+        raw = _llm_generate(prompt, model=model, timeout=15)
     if raw:
         # Take first non-empty line
         for line in raw.splitlines():
@@ -365,7 +361,7 @@ def smart_filename(title: str, content_preview: str = "", agent_cmd: str = "herm
         return filename
 
     # Try LLM
-    llm_name = _llm_short_filename(title, content_preview, agent_cmd)
+    llm_name = _llm_short_filename(title, content_preview)
     if llm_name and not is_filename_too_long(llm_name):
         return llm_name
 
@@ -394,14 +390,15 @@ def batch_smart_filenames(
     items: list[tuple[str, str]],
     model: str = "",
     timeout: int = 60,
+    client=None,
 ) -> dict[str, str]:
     """Batch-generate filenames for multiple long titles via parallel LLM calls.
 
-    Uses ThreadPoolExecutor to call _llm_short_filename for each item in parallel.
     Args:
         items: List of (title, content_preview) tuples.
-        model: Ollama model name. If empty, uses OLLAMA_FILENAME_MODEL env var.
+        model: LLM model name. If empty, uses provider default.
         timeout: Max seconds to wait for all parallel calls.
+        client: Optional LLMClient instance. If None, creates a default Ollama client.
 
     Returns:
         Dict mapping title -> generated filename. Missing keys = LLM failed.
@@ -410,6 +407,7 @@ def batch_smart_filenames(
         return {}
 
     from concurrent.futures import ThreadPoolExecutor, as_completed
+    from pipeline.llm_client import LLMClient
 
     results: dict[str, str] = {}
     uncached_items: list[tuple[str, str]] = []
@@ -424,8 +422,10 @@ def batch_smart_filenames(
     if not uncached_items:
         return results
 
+    _client = client or LLMClient(model=model or "")
+
     def _generate_one(title: str, preview: str) -> tuple[str, str | None]:
-        return title, _llm_short_filename(title, preview, model=model)
+        return title, _llm_short_filename(title, preview, model=model, client=_client)
 
     with ThreadPoolExecutor(max_workers=4) as executor:
         futures = {
