@@ -1,11 +1,10 @@
 """Tests for pipeline.plan — Stage 2 planning module."""
 
 import json
-import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock
 
-
+import pytest
 from pipeline.config import Config
 from pipeline.models import ConceptMatch, ExtractedSource, Manifest, Plan, SourceType
 from pipeline.qmd import run_qmd_query
@@ -489,13 +488,10 @@ class TestGeneratePlans:
             }
         ])
 
-        def mock_run(*args, **kwargs):
-            result = MagicMock()
-            result.stdout = agent_output
-            result.returncode = 0
-            return result
+        def mock_generate(prompt, **kwargs):
+            return agent_output
 
-        monkeypatch.setattr("pipeline.plan.subprocess.run", mock_run)
+        monkeypatch.setattr("pipeline.plan.get_llm_client", lambda cfg: MagicMock(generate=mock_generate))
         plans = generate_plans(manifest, matches, cfg)
         assert len(plans.plans) == 1
         assert plans.plans[0].hash == src.hash
@@ -507,12 +503,12 @@ class TestGeneratePlans:
         manifest = _make_manifest()
         call_count = 0
 
-        def mock_run(*args, **kwargs):
+        def mock_generate(prompt, **kwargs):
             nonlocal call_count
             call_count += 1
-            raise subprocess.TimeoutExpired(cmd="hermes", timeout=5)
+            return ""
 
-        monkeypatch.setattr("pipeline.plan.subprocess.run", mock_run)
+        monkeypatch.setattr("pipeline.plan.get_llm_client", lambda cfg: MagicMock(generate=mock_generate))
         plans = generate_plans(manifest, {}, cfg)
         assert plans.plans == []
         assert call_count == cfg.max_retries  # retried per config
@@ -521,13 +517,10 @@ class TestGeneratePlans:
         cfg = _make_config(tmp_path)
         manifest = _make_manifest()
 
-        def mock_run(*args, **kwargs):
-            result = MagicMock()
-            result.stdout = ""
-            result.returncode = 1
-            return result
+        def mock_generate(prompt, **kwargs):
+            return ""
 
-        monkeypatch.setattr("pipeline.plan.subprocess.run", mock_run)
+        monkeypatch.setattr("pipeline.plan.get_llm_client", lambda cfg: MagicMock(generate=mock_generate))
         plans = generate_plans(manifest, {}, cfg)
         assert plans.plans == []
 
@@ -542,13 +535,10 @@ class TestGeneratePlans:
             {"hash": "unknown_hash", "title": "Unknown"},  # unknown hash
         ])
 
-        def mock_run(*args, **kwargs):
-            result = MagicMock()
-            result.stdout = agent_output
-            result.returncode = 0
-            return result
+        def mock_generate(prompt, **kwargs):
+            return agent_output
 
-        monkeypatch.setattr("pipeline.plan.subprocess.run", mock_run)
+        monkeypatch.setattr("pipeline.plan.get_llm_client", lambda cfg: MagicMock(generate=mock_generate))
         plans = generate_plans(manifest, {}, cfg)
         # Only the valid plan should be accepted
         assert len(plans.plans) == 1
@@ -562,13 +552,10 @@ class TestGeneratePlans:
             "template": "standard", "tags": [],
         }])
 
-        def mock_run(*args, **kwargs):
-            result = MagicMock()
-            result.stdout = agent_output
-            result.returncode = 0
-            return result
+        def mock_generate(prompt, **kwargs):
+            return agent_output
 
-        monkeypatch.setattr("pipeline.plan.subprocess.run", mock_run)
+        monkeypatch.setattr("pipeline.plan.get_llm_client", lambda cfg: MagicMock(generate=mock_generate))
         generate_plans(manifest, {}, cfg)
 
         plans_file = cfg.resolved_extract_dir / "plans.json"
@@ -595,14 +582,11 @@ class TestPlanSources:
         def mock_qmd_search(queries, cfg, no_rerank=False):
             return {h: [ConceptMatch(concept="test-concept", score=0.7)] for h in queries}
 
-        def mock_run_agent(*args, **kwargs):
-            result = MagicMock()
-            result.stdout = agent_output
-            result.returncode = 0
-            return result
+        def mock_generate(prompt, **kwargs):
+            return agent_output
 
         monkeypatch.setattr("pipeline.qmd.run_qmd_concept_search", mock_qmd_search)
-        monkeypatch.setattr("pipeline.plan.subprocess.run", mock_run_agent)
+        monkeypatch.setattr("pipeline.plan.get_llm_client", lambda cfg: MagicMock(generate=mock_generate))
 
         plans = plan_sources(manifest, cfg)
         assert len(plans.plans) == 2
@@ -638,20 +622,15 @@ class TestPlanSources:
             {"hash": src.hash, "title": "Article", "language": "en", "template": "standard", "tags": []},
         ])
 
-        call_count = [0]
+        def mock_qmd_concept_search(*args, **kwargs):
+            # Simulate qmd failure
+            return {}
 
-        def mock_run_subprocess(*args, **kwargs):
-            call_count[0] += 1
-            if call_count[0] == 1:
-                # qmd call fails
-                raise subprocess.TimeoutExpired(cmd="qmd", timeout=5)
-            # agent call succeeds
-            result = MagicMock()
-            result.stdout = agent_output
-            result.returncode = 0
-            return result
+        def mock_generate(prompt, **kwargs):
+            return agent_output
 
-        monkeypatch.setattr("pipeline.plan.subprocess.run", mock_run_subprocess)
+        monkeypatch.setattr("pipeline.qmd.run_qmd_concept_search", mock_qmd_concept_search)
+        monkeypatch.setattr("pipeline.plan.get_llm_client", lambda cfg: MagicMock(generate=mock_generate))
         plans = plan_sources(manifest, cfg)
         assert len(plans.plans) == 1
 

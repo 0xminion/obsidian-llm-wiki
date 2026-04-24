@@ -15,9 +15,9 @@ from __future__ import annotations
 import json
 import logging
 import re
-import subprocess
 import time
 
+from pipeline.llm_client import get_llm_client
 from pipeline.config import Config
 from pipeline.models import (
     ConceptMatch, ExtractedSource, Language, Manifest, Plan, Plans, Template, SourceType,
@@ -399,10 +399,11 @@ def generate_plans(
     concept_matches: dict[str, list[ConceptMatch]],
     cfg: Config,
 ) -> Plans:
-    """Generate creation plans via hermes agent.
+    """Generate creation plans via direct LLM call (Ollama by default).
 
-    Builds the planning prompt, calls hermes chat, parses the JSON response,
-    and validates each plan against the schema.
+    Builds the planning prompt, calls the LLM via pipeline.llm_client
+    (not a Hermes subprocess), parses the JSON response, and validates
+    each plan against the schema.
     """
     prompt = build_plan_prompt(manifest, concept_matches, cfg)
 
@@ -413,30 +414,23 @@ def generate_plans(
     prompt_file.write_text(prompt, encoding="utf-8")
     log.info("Plan prompt size: %d chars", len(prompt))
 
-    # Call hermes agent
-    cmd = [cfg.agent_cmd, "chat", "-q", prompt, "-Q"]
+    # Call LLM directly via llm_client (Ollama / OpenRouter / Hermes)
     plan_dicts: list[dict] = []
+    llm = get_llm_client(cfg)
 
-    for attempt in range(cfg.max_retries):  # configurable retries
+    for attempt in range(cfg.max_retries):
         try:
             log.info("Plan agent attempt %d/%d", attempt + 1, cfg.max_retries)
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=cfg.plan_timeout,
-            )
-            if result.returncode == 0 and result.stdout.strip():
-                plan_dicts = _parse_agent_output(result.stdout)
+            raw = llm.generate(prompt, timeout=cfg.plan_timeout)
+            if raw and raw.strip():
+                plan_dicts = _parse_agent_output(raw)
                 if plan_dicts:
                     break
-            log.warning("Plan agent attempt %d failed (exit %d): %s",
-                        attempt + 1, result.returncode,
-                        result.stderr[:200] if result.stderr else "no stderr")
+            log.warning("Plan agent attempt %d produced empty/invalid output", attempt + 1)
             if attempt < cfg.max_retries - 1:
                 time.sleep(2 ** attempt)
-        except subprocess.TimeoutExpired:
-            log.warning("Plan agent timeout on attempt %d", attempt + 1)
+        except Exception as e:
+            log.warning("Plan agent attempt %d failed: %s", attempt + 1, e)
             if attempt < cfg.max_retries - 1:
                 time.sleep(2 ** attempt)
 
@@ -475,7 +469,7 @@ def generate_plans(
             log.warning("Failed to validate plan: %s", e)
             continue
 
-    log.info("Parsed %d plans from %d agent outputs", len(plans), len(plan_dicts))
+    log.info("Parsed %d plans from %d outputs", len(plans), len(plan_dicts))
 
     # Save plans
     plans_collection = Plans(plans=plans)

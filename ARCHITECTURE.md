@@ -230,7 +230,7 @@ Extract takes a list of URLs and produces a `Manifest` containing clean markdown
 | `x.com`, `twitter.com` | `extractors/web.py` | `defuddle` (structured data) | `curl + liteparse` |
 | `medium.com`, `substack.com` | `extractors/web.py` | `defuddle` | `curl + liteparse` |
 | `arxiv.org` | `extractors/web.py` | `defuddle` | `curl + liteparse` |
-| `*.pdf` | `extractors/web.py` | `pdftotext` | `PyPDF2` |
+| `*.pdf` | `extractors/web.py` | `liteparse` (plain text) | `defuddle --json` → `archive.org` |
 | Any other HTTP | `extractors/web.py` | `defuddle` | `curl` → `archive.org` → `camoufox` |
 | Podcast RSS/MP3 | `extractors/podcast.py` | `AssemblyAI` | `whisper` |
 
@@ -306,13 +306,27 @@ flowchart LR
 
 Before the agent runs, the system performs a **semantic search** against existing concepts. This is the bridge between "what the source is about" and "what we already know."
 
-**How it works:**
-1. Build a query string from: `title + concept_new + concept_updates + content_preview[:500]`
-2. Generate query embedding via Ollama `/api/embeddings` (Qwen3-Embedding-0.6B)
-3. Compare against pre-cached concept embeddings (lazy-loaded per compile pass)
-4. Return top-5 concepts by cosine similarity, threshold ≥ 0.2
+**Mechanism:** QMD MCP (HTTP on localhost:8181)
 
-This data is injected into the agent prompt so the agent knows which concepts already exist and can decide whether to link to them or create new ones. Without QMD, the agent would create duplicate concepts on every run.
+The pipeline does **not** run local embedding models. Instead, it sends queries to the QMD MCP daemon via HTTP `POST /v1/query`. QMD handles embedding generation, vector indexing, BM25 keyword fallback, and reranking internally — the pipeline only receives search results.
+
+```mermaid
+flowchart LR
+    A[Plan hash] -->|query_text + collections| B[QMD MCP<br/>localhost:8181]
+    B -->|Hybrid vec+lex search| C{results > min_score?}
+    C -->|Yes| D[ConceptMatch list]
+    C -->|No / unreachable| E[Local keyword fallback]
+    E -->|filename stem matching| D
+```
+
+**Pipeline-side logic (in `pipeline/qmd.py`):**
+1. Build query string: `title + concept_new + concept_updates + content_preview[:500]`
+2. Check `_get_client()` health (connects to QMD MCP)
+3. Call `client.query(query_text, collections=["concepts"], n_results=5, min_score=0.2)`
+4. Convert `_qmd_results_to_concept_matches()` → `[ConceptMatch(...)]`
+5. If QMD is unreachable → `_keyword_fallback()` scans `*.md` filenames + body text
+
+**Key detail:** No local embedding model, no Ollama `/api/embeddings`. The QMD server owns the embedding lifecycle. The pipeline only sends text and receives scored file paths.
 
 ### 5.4 Deterministic Planning Heuristics
 
@@ -337,20 +351,37 @@ def generate_plan_heuristic(entry, concept_matches):
 
 These uncertain sources (~20-40% of batch) get the full agent treatment.
 
-### 5.5 Agent Planning (Hermes subprocess)
+### 5.5 Agent Planning (Direct LLM Calls)
 
-Agent prompt includes:
-- Common instructions (`prompts/common-instructions.prompt`)
-- Existing tag vocabulary (top 50 tags from vault)
-- Concept match scores per source
-- Source content preview (300 chars each)
-- Output schema (JSON array with strict rules)
+For uncertain sources (~20–40% of a batch), deterministic heuristics are insufficient. The pipeline calls an LLM directly via the unified client in `pipeline.llm_client` (Ollama by default, OpenRouter as fallback, Hermes as last resort). No subprocess spawn. No `hermes chat`. A plain HTTP `POST` to `/api/generate` (Ollama) or `/v1/chat/completions` (OpenRouter).
 
-The agent outputs a JSON array. The parser handles:
-- ANSI escape codes
-- Markdown code fences
-- Partial JSON (object-by-object recovery)
-- Missing required fields → agent failure → source skipped
+**Prompt structure (built in `pipeline.plan`):**
+1. Common instructions (`prompts/common-instructions.prompt`)
+2. Existing tag vocabulary (top 50 tags from vault)
+3. Concept match scores per source
+4. Source content preview (300 chars each)
+5. Output schema (JSON array with strict rules)
+
+**Retry policy:**
+- `cfg.max_retries` attempts (default 3)
+- Exponential backoff between attempts
+- `cfg.plan_timeout` per attempt (default 60s)
+
+**Output parsing (in `_parse_agent_output`):**
+- ANSI escape codes stripped
+- Box-drawing characters stripped
+- Fast path: regex for JSON array `\[.*?\]`
+- Fallback: object-by-object parse with `{...}` recovery
+- Missing required fields → skip, not crash
+
+**LLM selection priority:**
+| Provider | Model env var | Latency | Use when |
+|----------|--------------|---------|----------|
+| Ollama (default) | `OLLAMA_INSIGHT_MODEL=minimax-m2.7:cloud` | ~1-3s | Local GPU, batch work |
+| OpenRouter | `LLM_MODEL=...` | ~2-5s | Ollama unreachable |
+| Hermes (fallback) | N/A | ~10-30s | Both above fail |
+
+**No Hermes subprocess in the default path.** `pipeline.plan.generate_plans()` calls `get_llm_client(cfg).generate(prompt)` — a single Python thread, no shell exec, no cold-start overhead.
 
 ---
 
