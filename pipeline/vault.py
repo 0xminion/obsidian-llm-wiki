@@ -530,7 +530,7 @@ def archive_inbox(cfg: Config, hashes: set[str]) -> int:
         if not url:
             continue
 
-        file_hash = hashlib.md5(url.encode()).hexdigest()[:12]
+        file_hash = hashlib.md5(url.encode(), usedforsecurity=False).hexdigest()[:12]
 
         if file_hash in hashes:
             target = cfg.archive_dir / url_file.name

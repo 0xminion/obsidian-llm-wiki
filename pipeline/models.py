@@ -71,7 +71,7 @@ class ExtractedSource:
     @property
     def hash(self) -> str:
         """Deterministic 12-char hash of the URL."""
-        return hashlib.md5(self.url.encode()).hexdigest()[:12]
+        return hashlib.md5(self.url.encode(), usedforsecurity=False).hexdigest()[:12]
 
     @property
     def content_hash(self) -> str:

@@ -397,7 +397,7 @@ class TestArchiveInbox:
         import hashlib
         cfg.inbox_dir.mkdir(parents=True)
         url = "https://example.com/article"
-        url_hash = hashlib.md5(url.encode()).hexdigest()[:12]
+        url_hash = hashlib.md5(url.encode(), usedforsecurity=False).hexdigest()[:12]
 
         (cfg.inbox_dir / "article.url").write_text(f"[InternetShortcut]\nURL={url}\n")
 
@@ -410,7 +410,7 @@ class TestArchiveInbox:
         import hashlib
         cfg.inbox_dir.mkdir(parents=True, exist_ok=True)
         url = "https://example.com/plain"
-        url_hash = hashlib.md5(url.encode()).hexdigest()[:12]
+        url_hash = hashlib.md5(url.encode(), usedforsecurity=False).hexdigest()[:12]
         plain = cfg.inbox_dir / "plain.url"
         plain.write_text(f"{url}\n", encoding="utf-8")
 
@@ -440,7 +440,7 @@ class TestArchiveInbox:
         hashes = set()
         for i, url in enumerate(urls):
             (cfg.inbox_dir / f"file{i}.url").write_text(f"[InternetShortcut]\nURL={url}\n")
-            hashes.add(hashlib.md5(url.encode()).hexdigest()[:12])
+            hashes.add(hashlib.md5(url.encode(), usedforsecurity=False).hexdigest()[:12])
 
         count = archive_inbox(cfg, hashes)
         assert count == 2
@@ -451,7 +451,7 @@ class TestArchiveInbox:
 
         import hashlib
         url = "https://example.com/article"
-        url_hash = hashlib.md5(url.encode()).hexdigest()[:12]
+        url_hash = hashlib.md5(url.encode(), usedforsecurity=False).hexdigest()[:12]
         (cfg.inbox_dir / "good.url").write_text(f"[InternetShortcut]\nURL={url}\n")
 
         count = archive_inbox(cfg, {url_hash})

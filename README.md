@@ -98,7 +98,7 @@ Features: retry with exponential backoff, SSRF-resistant URL validation, content
 Single LLM agent batches planning for all extracted sources. Before the agent runs:
 
 1. **Dedup check** — Jaccard similarity against existing vault sources
-2. **Semantic concept search** — qmd embeddings (Qwen3-Embedding-0.6B-Q8) find related concepts
+2. **Semantic concept search** — QMD MCP (HTTP daemon on localhost:8181) finds related concepts via hybrid semantic+keyword search
 3. **Tag vocabulary injection** — existing tags passed to agent for reuse
 
 The agent produces creation plans: title, language (EN/ZH), template, tags, concept targets, MoC assignments.
@@ -210,7 +210,9 @@ Built automatically during `pipeline compile` from wikilinks, concept sources, s
 
 ## Semantic Search
 
-Uses [qmd](https://github.com/tobi/qmd) with Qwen3-Embedding-0.6B-Q8 for concept matching. Falls back to keyword search if not installed.
+Uses [QMD MCP](https://github.com/tobi/qmd) running as an HTTP daemon on `localhost:8181` for semantic concept matching. QMD handles embedding generation, indexing, and hybrid keyword+vector search internally. Falls back to local keyword search if QMD is unavailable.
+
+Legacy Ollama embedding (`qwen3-embedding:0.6b`) is still supported for other operations (e.g., compile pass) but concept search now prefers QMD MCP.
 
 `pipeline query` uses the wiki index plus retrieved snippets from relevant entries, sources, concepts, and MoCs before asking the agent.
 
@@ -257,7 +259,7 @@ PARALLEL=3
 python3 -m pytest tests/ -v
 ```
 
-656 tests covering: extraction, planning, creation, validation, lint, compile, vault operations, models, config, security regressions, and integration.
+666 tests covering: extraction, planning, creation, validation, lint, compile, vault operations, models, config, security regressions, and integration.
 
 ## Recommended Workflow
 
@@ -273,7 +275,7 @@ python3 -m pytest tests/ -v
 python3 -m pytest tests/ -v
 ```
 
-**656 tests** covering: extraction, planning, creation, validation, lint, compile (semantic + deterministic), LLM client (multi-provider), vault operations, models, config, security regressions, and integration.
+**666 tests** covering: extraction, planning, creation, validation, lint, compile (semantic + deterministic), LLM client (multi-provider), vault operations, models, config, security regressions, and integration.
 
 ## Architecture
 
@@ -297,7 +299,8 @@ pipeline/
 ├── store.py            # SQLite content store + vault cache
 ├── config.py           # Configuration and environment
 ├── models.py           # Data models (Manifest, Plan, Edge, etc.)
-├── qmd.py              # Semantic search via Ollama embeddings
+├── qmd.py              # Semantic search orchestrator (QMD MCP → keyword fallback)
+├── qmd_mcp.py          # QMD MCP HTTP client (JSON-RPC over HTTP)
 ├── utils.py            # Shared utilities
 └── extractors/         # Type-specific extractors
     ├── web.py
@@ -306,4 +309,4 @@ pipeline/
     └── _shared.py
 ```
 
-~12,300 lines of Python, 656 tests, unified LLM client with 3 providers, 0 shell scripts in the critical path.
+~2,900 lines of Python, 666 tests, unified LLM client with 3 providers, 0 shell scripts in the critical path.

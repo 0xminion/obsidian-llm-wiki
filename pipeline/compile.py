@@ -462,8 +462,8 @@ class NoteIndex:
         """
         if not self.notes:
             return
-        from pipeline.qmd_mcp import _get_qmd_client
-        if _get_qmd_client() is not None:
+        from pipeline.qmd import _get_client
+        if _get_client() is not None:
             log.info("QMD enabled — skipping local embed batch; relying on QMD semantic search")
             return
         texts = [f"{n['title']}\n{n['preview']}" for n in self.notes.values()]
@@ -704,7 +704,6 @@ def _merge_concepts(cfg: Config, canonical_name: str, duplicate_name: str, index
         return False
 
     # Extract body from both
-    re.sub(r"^---\s*\n.*?\n---\s*\n", "", canonical_content, flags=re.DOTALL)
     duplicate_body = re.sub(r"^---\s*\n.*?\n---\s*\n", "", duplicate_content, flags=re.DOTALL)
 
     # Append duplicate body to canonical under a plain-text merged section.

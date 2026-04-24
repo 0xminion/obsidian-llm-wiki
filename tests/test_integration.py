@@ -26,7 +26,7 @@ runner = CliRunner()
 # ─── Helpers ────────────────────────────────────────────────────────────────────
 
 def _url_hash(url: str) -> str:
-    return hashlib.md5(url.encode()).hexdigest()[:12]
+    return hashlib.md5(url.encode(), usedforsecurity=False).hexdigest()[:12]
 
 
 def _make_url_file(inbox: Path, url: str, name: str = "article.url") -> Path:

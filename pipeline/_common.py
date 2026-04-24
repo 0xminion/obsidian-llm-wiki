@@ -51,7 +51,7 @@ class VaultLock:
         # Per-user lock dir — avoids world-writable /tmp race conditions
         lock_root = Path.home() / ".local" / "obsidian-llm-wiki" / "locks"
         lock_root.mkdir(parents=True, exist_ok=True)
-        vault_hash = hashlib.md5(str(self.vault_path.resolve()).encode()).hexdigest()[:8]
+        vault_hash = hashlib.md5(str(self.vault_path.resolve()).encode(), usedforsecurity=False).hexdigest()[:8]
         self.lock_dir = lock_root / f"{name}-{vault_hash}.lock"
         self._acquired: bool = False
 

@@ -4,13 +4,14 @@ build-backend = "hatchling.build"
 
 [project]
 name = "obsidian-llm-wiki"
-version = "0.1.0"
+version = "0.2.1"
 description = "Automated PKM vault — Karpathy-style wiki pipeline"
 requires-python = ">=3.10"
 dependencies = [
     "typer>=0.9",
     "python-dotenv>=1.0",
     "pyyaml>=6.0",
+    "defusedxml>=0.7",
 ]
 
 [project.optional-dependencies]

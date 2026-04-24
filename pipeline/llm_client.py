@@ -164,7 +164,10 @@ class OllamaProvider(BaseProvider):
                     return {text: emb for text, emb in zip(texts, embeddings) if emb}
         except urllib.error.HTTPError as e:
             if e.code == 404:
-                log.debug("Ollama /api/embed not available (404)")
+                log.warning(
+                    "Ollama /api/embed not available (404). Your Ollama version may be too old. "
+                    "Upgrade Ollama to >=0.1.48 or switch to QMD MCP by setting USE_QMD_MCP=true."
+                )
             else:
                 log.warning("Ollama batch embed HTTP error: %s", e)
         except Exception as e:

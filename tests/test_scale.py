@@ -66,7 +66,7 @@ def _seed_inbox(vault: Path, n: int = 200) -> list[str]:
     urls = []
     for i in range(n):
         url = f"https://example.com/article-{i}"
-        name = f"article-{hashlib.md5(url.encode()).hexdigest()[:8]}.url"
+        name = f"article-{hashlib.md5(url.encode(), usedforsecurity=False).hexdigest()[:8]}.url"
         (inbox / name).write_text(f"[InternetShortcut]\nURL={url}\n")
         urls.append(url)
     return urls
@@ -77,7 +77,7 @@ def _seed_extract_dir(cfg: Config, urls: list[str]) -> None:
     ext_dir = cfg.resolved_extract_dir
     ext_dir.mkdir(parents=True, exist_ok=True)
     for url in urls:
-        h = hashlib.md5(url.encode()).hexdigest()[:12]
+        h = hashlib.md5(url.encode(), usedforsecurity=False).hexdigest()[:12]
         title = f"Article {h[:6]}"
         extracted = {
             "url": url,
@@ -111,7 +111,7 @@ class TestScalePipeline:
         # Pre-save manifest + plans so Stage 1+2 are skipped (we already "extracted")
         from pipeline.models import Plan, Plans, Language, Template
         plans = Plans(plans=[
-            Plan(hash=hashlib.md5(u.encode()).hexdigest()[:12], title=f"Article {i}",
+            Plan(hash=hashlib.md5(u.encode(), usedforsecurity=False).hexdigest()[:12], title=f"Article {i}",
                  language=Language.EN, template=Template.STANDARD, tags=["test"])
             for i, u in enumerate(urls)
         ])
@@ -203,7 +203,7 @@ class TestScalePipeline:
         ])
         from pipeline.models import Plan, Plans, Language, Template
         plans = Plans(plans=[
-            Plan(hash=hashlib.md5(u.encode()).hexdigest()[:12], title=f"Article {i}",
+            Plan(hash=hashlib.md5(u.encode(), usedforsecurity=False).hexdigest()[:12], title=f"Article {i}",
                  language=Language.EN, template=Template.STANDARD, tags=["test"])
             for i, u in enumerate(urls)
         ])
@@ -264,7 +264,7 @@ class TestScalePipeline:
         ])
         from pipeline.models import Plan, Plans, Language, Template
         plans = Plans(plans=[
-            Plan(hash=hashlib.md5(u.encode()).hexdigest()[:12], title=f"Article {i}",
+            Plan(hash=hashlib.md5(u.encode(), usedforsecurity=False).hexdigest()[:12], title=f"Article {i}",
                  language=Language.EN, template=Template.STANDARD, tags=["test"])
             for i, u in enumerate(urls)
         ])

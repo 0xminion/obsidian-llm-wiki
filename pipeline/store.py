@@ -178,7 +178,7 @@ class ContentStore:
 
     @staticmethod
     def url_hash(url: str) -> str:
-        return hashlib.md5(ContentStore.normalize_url(url).encode()).hexdigest()[:12]
+        return hashlib.md5(ContentStore.normalize_url(url).encode(), usedforsecurity=False).hexdigest()[:12]
 
     @staticmethod
     def content_hash(content: str) -> str:

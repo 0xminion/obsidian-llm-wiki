@@ -72,7 +72,7 @@ class TestNoteIndex:
 
     def test_embed_all_delegates_to_client(self, cfg, mock_client, monkeypatch):
         """When QMD is not available, NoteIndex falls back to client.embed_batch."""
-        monkeypatch.setattr("pipeline.qmd_mcp._get_qmd_client", lambda: None)
+        monkeypatch.setattr("pipeline.qmd._get_client", lambda base_url="": None)
         (cfg.entries_dir / "entry.md").write_text("---\ntitle: T\n---\n\nBody\n")
         index = NoteIndex()
         index.load(cfg)
@@ -168,7 +168,7 @@ class TestMergeConcepts:
 
     def test_embed_all_delegates_to_client(self, cfg, mock_client, monkeypatch):
         """When QMD is not available, NoteIndex falls back to client.embed_batch."""
-        monkeypatch.setattr("pipeline.qmd_mcp._get_qmd_client", lambda: None)
+        monkeypatch.setattr("pipeline.qmd._get_client", lambda base_url="": None)
         (cfg.entries_dir / "entry.md").write_text("---\ntitle: T\n---\n\nBody\n")
         index = NoteIndex()
         index.load(cfg)

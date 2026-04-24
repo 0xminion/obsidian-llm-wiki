@@ -114,7 +114,7 @@ def content_hash(content: str) -> str:
     """16-char hash of normalized content for dedup detection."""
     import hashlib
     normalized = re.sub(r"\s+", " ", content.lower().strip())[:2000]
-    return hashlib.md5(normalized.encode()).hexdigest()[:16]
+    return hashlib.md5(normalized.encode(), usedforsecurity=False).hexdigest()[:16]
 
 
 # ═══════════════════════════════════════════════════════════

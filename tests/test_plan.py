@@ -195,7 +195,7 @@ class TestRunQmd:
         monkeypatch.setattr(
             "pipeline.qmd._get_client", lambda base_url="": mock_client
         )
-        matches = run_qmd_query("artificial intelligence", "qmd", "/tmp/coll", timeout=5)
+        matches = run_qmd_query("artificial intelligence", "qmd", "concepts", timeout=5)
         assert len(matches) == 2
         assert matches[0].concept == "ai-safety"
         assert matches[0].score > 0.5
@@ -222,7 +222,7 @@ class TestRunQmd:
         monkeypatch.setattr(
             "pipeline.qmd._get_client", lambda base_url="": mock_client
         )
-        matches = run_qmd_query("query", "qmd", "/tmp/coll", timeout=5)
+        matches = run_qmd_query("query", "qmd", "concepts", timeout=5)
         assert len(matches) == 1
         assert matches[0].concept == "good"
 
@@ -239,7 +239,7 @@ class TestRunQmd:
         monkeypatch.setattr(
             "pipeline.qmd._get_client", lambda base_url="": mock_client
         )
-        matches = run_qmd_query("query", "qmd", "/tmp/coll", timeout=5)
+        matches = run_qmd_query("query", "qmd", "concepts", timeout=5)
         assert len(matches) == 1
         assert matches[0].concept == "prediction-markets"
 

@@ -52,7 +52,7 @@ def _write_extract(cfg: Config, plan: Plan, *, url: str | None = None, title: st
 
 
 def _url_file_hash(url: str) -> str:
-    return hashlib.md5(url.encode()).hexdigest()[:12]
+    return hashlib.md5(url.encode(), usedforsecurity=False).hexdigest()[:12]
 
 
 @pytest.mark.parametrize(

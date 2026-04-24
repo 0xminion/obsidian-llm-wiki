@@ -600,8 +600,12 @@ def _safe_xml_parse(xml_text: str):
         if "<!DOCTYPE" in upper_prefix or "<!ENTITY" in upper_prefix:
             log.warning("Refusing XML with DTD/entity declarations")
             return None
-        parser = ET.XMLParser()
-        root = ET.fromstring(xml_text, parser=parser)
+        try:
+            import defusedxml.ElementTree as DET
+            root = DET.fromstring(xml_text)
+        except ImportError:
+            parser = ET.XMLParser(resolve_entities=False)
+            root = ET.fromstring(xml_text, parser=parser)
         _strip_xml_ns(root)
         return root
     except (ET.ParseError, TypeError):

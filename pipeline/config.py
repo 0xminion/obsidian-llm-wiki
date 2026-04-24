@@ -25,7 +25,7 @@ except ImportError:
 def hashlib_md5_short(s: str) -> str:
     """Portable short MD5 hash (12 chars, consistent across modules)."""
     import hashlib
-    return hashlib.md5(s.encode()).hexdigest()[:12]
+    return hashlib.md5(s.encode(), usedforsecurity=False).hexdigest()[:12]
 
 
 def _find_env_file(vault_path: Optional[Path] = None) -> Optional[Path]:

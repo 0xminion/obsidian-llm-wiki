@@ -85,6 +85,8 @@ class TestQMDMCPIntegration:
         cfg = MagicMock()
         cfg.vault_path = Path.home() / "MyVault"
         cfg.resolved_extract_dir = extract_dir
+        cfg.parallel = 4
+        cfg.qmd_collection = "concepts"
 
         result = run_qmd_convergence([plan], cfg)
         assert "abc123" in result

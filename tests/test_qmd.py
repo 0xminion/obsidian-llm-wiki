@@ -91,19 +91,22 @@ class TestRunQmdConceptSearch:
     def test_empty_queries(self):
         cfg = MagicMock()
         cfg.vault_path = Path.home() / "MyVault"
+        cfg.parallel = 4
         result = run_qmd_concept_search({"h1": "   "}, cfg)
         assert result == {"h1": []}
 
     @patch("pipeline.qmd._get_client")
     def test_parallel_queries(self, mock_get_client):
-        client = MagicMock()
-        client.query.return_value = [
+        mock_client = MagicMock()
+        mock_client.query.return_value = [
             MagicMock(file="concepts/test.md", score=0.9, snippet="", collection="concepts"),
         ]
-        mock_get_client.return_value = client
+        mock_get_client.return_value = mock_client
 
         cfg = MagicMock()
         cfg.vault_path = Path.home() / "MyVault"
+        cfg.parallel = 4
+        cfg.qmd_collection = "concepts"
 
         queries = {
             "hash1": "query one",
@@ -121,6 +124,8 @@ class TestRunQmdConceptSearch:
         mock_get_client.return_value = None
         cfg = MagicMock()
         cfg.vault_path = Path.home() / "MyVault"
+        cfg.parallel = 4
+        cfg.qmd_collection = "concepts"
         result = run_qmd_concept_search({"h1": "alpha"}, cfg)
         assert result == {"h1": []}  # no concepts dir in test
 

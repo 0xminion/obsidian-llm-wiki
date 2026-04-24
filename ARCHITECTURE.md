@@ -1,9 +1,9 @@
 # Obsidian LLM Wiki — Architecture & Design Rationale
 
-**Version**: 0.2.0  
-**Date**: 2026-04-23  
+**Version**: 0.2.1  
+**Date**: 2026-04-24  
 **Author**: 0xminion  
-**Lines**: ~12,000 Python | **Tests**: 637 | **Stages**: 3 + compile pass + query
+**Lines**: ~2,900 Python | **Tests**: 666 | **Stages**: 3 + compile pass + query
 
 ---
 
@@ -493,73 +493,52 @@ The compile pass runs after creation or manually via `pipeline compile`. It has 
 
 ## 8. QMD: Semantic Search Subsystem
 
-QMD is the internal name for the semantic concept search module (`pipeline/qmd.py`). It is NOT the external `qmd` CLI tool (which was abandoned due to `node-llama-cpp` compilation failures).
+QMD is the semantic concept search interface (`pipeline/qmd.py`). It **replaced** the previous Ollama-local embedding path in v0.2.0 with a QMD MCP HTTP transport.
 
-### 8.1 Why this model/provider?
+### 8.1 Architecture
 
-**Model**: `qwen3-embedding:0.6b` (Q8 quantized)
-- **Size**: 639 MB → fits on consumer GPUs and CPU
-- **Dimensions**: 1024
-- **Speed**: ~50ms per embedding on CPU, ~10ms on GPU
-- **Quality**: Sufficient for concept matching (not SOTA, but fast and private)
-- **License**: Open weight
+**QMD MCP Server** (`http://localhost:8181`)
+- Long-lived daemon handles embedding generation, indexing, and search internally
+- JSON-RPC 2.0 over HTTP with session reuse via `mcp-session-id` header
+- Hybrid search: vector semantic + BM25 keyword + internal reranking
+- Benefits: no per-call model loading, no local embedding cache management, no Ollama version compatibility issues
 
-**Provider**: Ollama (`http://localhost:11434`)
-- Private (no data leaves the machine)
-- Zero API cost
-- Fast (no network latency)
-- Batch API supports up to 32 texts per call
-
-**Why not OpenRouter for embeddings?**
-- OpenRouter doesn't host embedding models cost-effectively
-- Privacy: vault content should not be sent to third-party APIs
-- Latency: local inference is 10-100× faster for small batches
+**Client** (`pipeline/qmd_mcp.py`)
+- `QMDMCPClient`: JSON-RPC POST to `/mcp`, automatic session lifecycle
+- Health check + auto-reinitialize on session expiry
+- Gracefully degrades to keyword fallback if server unreachable
 
 ### 8.2 Where QMD is used
 
 | Location | Function | Call frequency |
 |----------|----------|----------------|
 | `pipeline/plan.py:concept_search()` | Find existing concepts for new sources | Every `ingest` run |
-| `pipeline/create/templates.py:run_qmd_convergence()` | Concept convergence for creation | Every `ingest` run |
+| `pipeline/qmd.py:run_qmd_convergence()` | Concept convergence for creation | Every `ingest` run |
 | `pipeline/compile.py:NoteIndex.embed_all()` | Build note similarity matrix | Every `compile` run |
 | `pipeline/cli.py:query --fast` | Direct semantic query (optional) | On user demand |
 | `pipeline/compile.py:_semantic_moc_rebuild()` | Find related notes for MoC topics | Every `compile` run |
 
-### 8.3 Fallback methods
-
-QMD has a three-tier fallback system:
+### 8.3 Search priority
 
 ```mermaid
 flowchart LR
-    A[Embedding needed] --> B{Ollama running?}
-    B -->|Yes| C[/api/embed batch<br/>32 texts per call/]
-    B -->|No| D{ThreadPool<br/>individual calls/}
-    C -->|Batch fails| D
-    D -->|All fail| E[Keyword fallback<br/>TF-IDF on concept stems]
-    E --> F[Return matches]
-    C --> F
-    D --> F
+    A[Query] --> B{QMD MCP up?}
+    B -->|Yes| C[QMD hybrid<br/>vec + lex + rerank]
+    B -->|No| D[Local keyword fallback<br/>TF-IDF on concept stems]
+    C --> E[ConceptMatch list]
+    D --> E
 ```
 
-**Tier 1**: Batched `/api/embed` — fast, single HTTP call for 32 texts  
-**Tier 2**: `ThreadPoolExecutor` with individual `/api/embeddings` calls — per-text, slower but more reliable  
-**Tier 3**: Keyword search — tokenizes query and concepts, scores by overlap. Used when Ollama is fully down. No semantic understanding, but never crashes.
+**Tier 1 (default)**: QMD MCP `query()` — single HTTP call, hybrid vector+keyword  
+**Tier 2 (server down)**: Local keyword search — tokenizes query and concepts, scores by overlap. Never crashes.
 
-### 8.4 Embedding lifecycle
+### 8.4 Parallel queries
 
-```mermaid
-flowchart LR
-    A[Concepts directory] -->|first plan<br/>or compile| B[Generate embeddings]
-    B --> C[Module-level cache<br/>_concept_embedding_cache]
-    C --> D[Cosine similarity<br/>with query embedding]
-    D --> E[Top-k matches]
-    E -->|next call| C
-    C -->|process exit| F[Cache destroyed<br/>regenerated on restart]
-```
+`run_qmd_concept_search()` uses `ThreadPoolExecutor(max_workers=cfg.parallel)` to issue QMD HTTP calls concurrently. Each query is independent and stateless; speedup is linear up to `PARALLEL` workers.
 
-- Embeddings are **not persisted to disk** (intentional — concepts change, embeddings stale)
-- Regeneration cost: ~1-3 seconds for 100 concepts (batched)
-- Memory footprint: ~4 KB per concept (1024 floats × 4 bytes)
+### 8.5 Embedding lifecycle (legacy Ollama path)
+
+When QMD is available, `compile.py:NoteIndex.embed_all()` skips local Ollama batch embedding entirely and relies on QMD's server-side embeddings for similarity operations. If QMD is down, it falls back to Ollama `/api/embed` batch (Tier 1) → `/api/embeddings` per-text (Tier 2) → heuristics (Tier 3).
 
 ---
 

@@ -32,7 +32,7 @@ class TestExtractedSource:
         """Hash must match: echo -n URL | md5sum | cut -c1-12"""
         import hashlib
         url = "https://moontower.substack.com/p/market-maker-privilege"
-        expected = hashlib.md5(url.encode()).hexdigest()[:12]
+        expected = hashlib.md5(url.encode(), usedforsecurity=False).hexdigest()[:12]
         src = ExtractedSource(url=url, title="T", content="")
         assert src.hash == expected
 

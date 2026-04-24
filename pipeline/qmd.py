@@ -18,6 +18,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from pipeline.models import ConceptMatch
@@ -93,27 +94,17 @@ def run_qmd_query(
 
     client = _get_client()
     if client is not None:
-        # Default: QMD query (vec+rerank), fallback to lex
+        # client.query() already performs vec → lex fallback internally
         results = client.query(
             query_text=query.strip(),
             n_results=n_results,
             min_score=min_score,
-            collections=["concepts"],
+            collections=[collection or "concepts"],
         )
         if results:
-            return _qmd_results_to_concept_matches(results, collection_filter="concepts")
-        # Fallback 1: BM25 keyword via QMD
-        results = client._query_raw(
-            searches=[{"type": "lex", "query": query.strip()}],
-            n=n_results,
-            min_score=min_score,
-            collections=["concepts"],
-        )
-        matches = _qmd_results_to_concept_matches(results, collection_filter="concepts")
-        if matches:
-            return matches
+            return _qmd_results_to_concept_matches(results, collection_filter=collection or "concepts")
 
-    # Fallback 2: local keyword fallback
+    # Fallback: local keyword fallback
     if concepts_dir is not None:
         return _keyword_fallback(query, concepts_dir)
     return []
@@ -127,7 +118,7 @@ def run_qmd_concept_search(
     """Run semantic search for multiple sources in parallel.
 
     With QMD MCP, each query is a lightweight HTTP call to a pre-loaded model.
-    No local embedding cache or ThreadPoolExecutor is needed.
+    Queries are batched via ThreadPoolExecutor at PARALLEL workers.
     """
     concepts_dir = cfg.vault_path / "04-Wiki" / "concepts"
     client = _get_client()
@@ -139,20 +130,29 @@ def run_qmd_concept_search(
             results[h] = _keyword_fallback(q, concepts_dir) if q.strip() else []
         return results
 
-    for h, q in queries.items():
+    def _query_one(h: str, q: str) -> tuple[str, list[ConceptMatch]]:
         if not q.strip():
-            results[h] = []
-            continue
+            return h, []
         qmd_results = client.query(
             query_text=q.strip(),
             n_results=5,
             min_score=0.2,
-            collections=["concepts"],
+            collections=[cfg.qmd_collection or "concepts"],
         )
-        matches = _qmd_results_to_concept_matches(qmd_results, collection_filter="concepts")
+        matches = _qmd_results_to_concept_matches(
+            qmd_results, collection_filter=cfg.qmd_collection or "concepts"
+        )
         if not matches:
             matches = _keyword_fallback(q, concepts_dir)
-        results[h] = matches
+        return h, matches
+
+    with ThreadPoolExecutor(max_workers=cfg.parallel) as executor:
+        futures = [
+            executor.submit(_query_one, h, q) for h, q in queries.items()
+        ]
+        for future in as_completed(futures):
+            h, matches = future.result()
+            results[h] = matches
 
     return results
 

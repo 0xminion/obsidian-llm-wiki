@@ -81,9 +81,10 @@ class QMDMCPClient:
         t = timeout or self.timeout
         try:
             with urllib.request.urlopen(req, timeout=t) as resp:
-                hdrs = dict(resp.headers)
-                if "mcp-session-id" in hdrs:
-                    self._session_id = hdrs["mcp-session-id"]
+                hdrs = resp.headers
+                sid = hdrs.get("mcp-session-id") or hdrs.get("Mcp-Session-Id") or hdrs.get("MCP-SESSION-ID")
+                if sid:
+                    self._session_id = sid
                 return json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as e:
             body = e.read().decode("utf-8", errors="replace")
@@ -113,7 +114,7 @@ class QMDMCPClient:
         try:
             req = urllib.request.Request(f"{self.base_url}/health", method="GET")
             with urllib.request.urlopen(req, timeout=5) as resp:
-                return json.loads(resp.read().decode())
+                return json.loads(resp.read().decode("utf-8"))
         except Exception as e:
             return {"error": str(e)}
 
@@ -222,10 +223,21 @@ class QMDMCPClient:
         return res.get("result", {}).get("structuredContent", {})
 
 
-def _get_qmd_client(base_url: str = "") -> QMDMCPClient:
-    """Return a QMDMCPClient, respecting env overrides."""
+def _get_qmd_client(base_url: str = "") -> QMDMCPClient | None:
+    """Return a QMDMCPClient if the server is reachable and healthy, else None."""
     url = base_url or _DEFAULT_QMD_MCP_URL
-    return QMDMCPClient(base_url=url, timeout=60)
+    client = QMDMCPClient(base_url=url, timeout=60)
+    try:
+        h = client.health()
+        if h.get("status") != "ok":
+            log.debug("QMD MCP server not healthy at %s", url)
+            return None
+    except Exception:
+        log.debug("QMD MCP server unreachable at %s", url)
+        return None
+    if client.ensure_session():
+        return client
+    return None
 
 
 def _qmd_results_to_concept_matches(

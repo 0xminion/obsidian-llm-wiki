@@ -27,7 +27,7 @@ def make_extract_json(url: str, title: str, content: str,
 def write_extract_json(tmp_path: Path, url: str, title: str, content: str,
                        source_type: str = "web", author: str = "") -> Path:
     """Write an extracted JSON file and return its path."""
-    url_hash = hashlib.md5(url.encode()).hexdigest()[:12]
+    url_hash = hashlib.md5(url.encode(), usedforsecurity=False).hexdigest()[:12]
     data = make_extract_json(url, title, content, source_type, author)
     json_file = tmp_path / f"{url_hash}.json"
     json_file.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -162,7 +162,7 @@ class TestEmptyContent:
 class TestUnicodeUrls:
     def test_unicode_url_hash_doesnt_crash(self):
         url = "https://例え.jp/記事"
-        url_hash = hashlib.md5(url.encode()).hexdigest()[:12]
+        url_hash = hashlib.md5(url.encode(), usedforsecurity=False).hexdigest()[:12]
         assert len(url_hash) == 12
 
     def test_cjk_url_roundtrip(self, tmp_path):
@@ -217,7 +217,7 @@ class TestManifestStress:
             title = f"Article Number {i}"
             content = f"Content for article {i}."
             data = make_extract_json(url, title, content)
-            url_hash = hashlib.md5(url.encode()).hexdigest()[:12]
+            url_hash = hashlib.md5(url.encode(), usedforsecurity=False).hexdigest()[:12]
             json_file = tmp_path / f"{url_hash}.json"
             json_file.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
             entries.append(url_hash)
