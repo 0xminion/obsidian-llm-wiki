@@ -1,5 +1,5 @@
 """Tests for pipeline/llm_client.py — unified LLM client."""
-
+import io
 import json
 from unittest.mock import MagicMock, patch
 
@@ -105,7 +105,7 @@ class TestOpenRouterProvider:
         import urllib.error
         mock_urlopen.side_effect = urllib.error.HTTPError(
             "https://openrouter.ai/api/v1/chat/completions",
-            429, "Too Many Requests", {}, b'{"error":"rate limit"}'
+            429, "Too Many Requests", {}, io.BytesIO(b'{"error":"rate limit"}')
         )
 
         provider = OpenRouterProvider()

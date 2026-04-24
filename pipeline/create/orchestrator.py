@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timezone
@@ -136,8 +137,9 @@ def _validate_batch_files(batch: list, cfg: Config) -> dict:
             concept_filename = title_to_filename(concept_name)
             # Account for collision-resolved filenames (-1, -2, etc.)
             found = False
-            for candidate in cfg.entries_dir.glob(f"{concept_filename}*.md"):
-                if candidate.stem == concept_filename or candidate.stem.startswith(f"{concept_filename}-"):
+            suffix_re = re.compile(rf"^{re.escape(concept_filename)}-\d+$")
+            for candidate in cfg.concepts_dir.glob(f"{concept_filename}*.md"):
+                if candidate.stem == concept_filename or suffix_re.fullmatch(candidate.stem):
                     files_to_check.append((candidate, "concept"))
                     found = True
             if not found:
@@ -183,8 +185,13 @@ def postprocess_creation(
 ) -> list[str]:
     """Run shared post-processing for Stage 3 creation flows."""
     log.info("Running global output validation...")
+    from pipeline.telemetry import TelemetrySink, record_stage
+
+    telemetry = TelemetrySink(cfg.config_dir / "pipeline-events.jsonl")
     manifest_path = manifest_path or (cfg.resolved_extract_dir / "manifest.json")
-    violations = validate_output(cfg, manifest_path)
+    with record_stage(telemetry, "postprocess.validate", plan_count=plan_count, failed_count=failed_count) as event:
+        violations = validate_output(cfg, manifest_path)
+        event["violations"] = len(violations)
     if violations:
         log.warning("Global validation found %d violations:", len(violations))
         for v in violations[:10]:

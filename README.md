@@ -210,7 +210,13 @@ Built automatically during `pipeline compile` from wikilinks, concept sources, s
 
 ## Semantic Search
 
-Uses [QMD MCP](https://github.com/tobi/qmd) running as an HTTP daemon on `localhost:8181` for semantic concept matching. QMD handles embedding generation, indexing, and hybrid keyword+vector search internally. Falls back to local keyword search if QMD is unavailable.
+Uses [QMD MCP](https://github.com/tobi/qmd) running as an HTTP daemon on `localhost:8181` for semantic concept matching. QMD handles embedding generation, indexing, and keyword/vector search internally. Falls back to local keyword search if QMD is unavailable.
+
+QMD query modes are explicit in code so performance claims stay honest:
+
+- `auto` — default pipeline mode: try vector semantic search, then BM25 keyword fallback.
+- `vec` — vector semantic only; useful when meaning matters more than latency.
+- `lex` — BM25 keyword only; used by fast-path tests and operational checks where sub-second latency is the contract.
 
 Legacy Ollama embedding (`qwen3-embedding:0.6b`) is still supported for other operations (e.g., compile pass) but concept search now prefers QMD MCP.
 

@@ -58,6 +58,29 @@ class TestQMDMCPClient:
         assert results[0].collection == ""
 
     @patch.object(QMDMCPClient, "_call")
+    def test_query_lex_mode_skips_vector_search(self, mock_call):
+        mock_call.return_value = {
+            "result": {
+                "structuredContent": {
+                    "results": [
+                        {"file": "concepts/prediction-markets.md", "score": 0.91},
+                    ]
+                }
+            },
+            "jsonrpc": "2.0", "id": 2,
+        }
+        client = QMDMCPClient(base_url="http://test:8181")
+        client._session_id = "sess-789"
+
+        results = client.query("prediction", n_results=3, mode="lex")
+        assert len(results) == 1
+        assert results[0].file == "concepts/prediction-markets.md"
+        assert mock_call.call_count == 1
+        payload = mock_call.call_args.args[1]
+        assert payload["name"] == "query"
+        assert payload["arguments"]["searches"] == [{"type": "lex", "query": "prediction"}]
+
+    @patch.object(QMDMCPClient, "_call")
     def test_query_falls_back_to_lex(self, mock_call):
         # vec returns empty, lex returns result
         mock_call.side_effect = [
@@ -96,6 +119,11 @@ class TestQMDMCPClient:
         client = QMDMCPClient(base_url="http://localhost:99999")
         res = client.health()
         assert "error" in res
+
+    def test_query_rejects_invalid_mode(self):
+        client = QMDMCPClient(base_url="http://test:8181")
+        with pytest.raises(ValueError, match="Unsupported QMD query mode"):
+            client.query("prediction", mode="turbo")
 
 
 # ─── _qmd_results_to_concept_matches ───────────────────────────────────────

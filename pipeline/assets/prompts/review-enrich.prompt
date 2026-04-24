@@ -1,0 +1,26 @@
+VAULT LOCATION: {VAULT_PATH}
+
+TASK: Enrich the entry note '{ENTRY_NAME}' based on user feedback.
+
+USER FEEDBACK: {INSTRUCTIONS}
+
+INSTRUCTIONS:
+1. Read the full entry at '{ENTRY_PATH}'
+2. Read the wiki index at '06-Config/wiki-index.md' for context
+3. Enrich the entry based on the user's instructions:
+   - Add depth to specific sections
+   - Expand on insights that were mentioned
+   - Add new connections or context
+4. If the feedback reveals new connections to other entries, UPDATE those entries too with cross-references.
+5. Update the 'reviewed:' and 'review_notes:' frontmatter fields.
+6. Humanize all new prose using the Humanizer skill.
+7. Update '06-Config/wiki-index.md' if new concepts were created.
+8. Append to '06-Config/log.md':
+   ## [{TODAY}] review | {ENTRY_NAME} (enriched)
+   - Feedback: {INSTRUCTIONS}
+   - Sections updated: [list]
+
+CRITICAL RULES:
+- Use [[wikilinks]] for all internal links
+- Quote wikilinks in YAML frontmatter
+- Do NOT modify 07-WIP/

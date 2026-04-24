@@ -12,10 +12,12 @@ import logging
 import re
 import shutil
 import tarfile
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
+from importlib import resources
 from pathlib import Path
-from typing import Optional
+from typing import Iterator, Optional
 
 log = logging.getLogger(__name__)
 
@@ -67,6 +69,74 @@ _REPO_COPY_MAP = {
     "lib/": "Meta/lib/",
     "scripts/": "Meta/Scripts/",
 }
+
+
+def _copy_assets_from_root(
+    asset_root: Path,
+    vault_path: Path,
+    actions: list[str],
+    *,
+    only_missing: bool,
+) -> bool:
+    """Copy prompts/templates/scripts from an asset root into the vault."""
+    copied_any = False
+    for src_dir, dst_dir in _REPO_COPY_MAP.items():
+        src = asset_root / src_dir.rstrip("/")
+        dst = vault_path / dst_dir
+        if not src.is_dir():
+            continue
+        dst.mkdir(parents=True, exist_ok=True)
+        for src_file in src.glob("*"):
+            if not src_file.is_file():
+                continue
+            dst_file = dst / src_file.name
+            if only_missing and dst_file.exists():
+                continue
+            if (not dst_file.exists()) or dst_file.read_bytes() != src_file.read_bytes():
+                shutil.copy2(src_file, dst_file)
+                actions.append(f"Copied: {dst_dir}{src_file.name}")
+                copied_any = True
+    return copied_any
+
+
+@contextmanager
+def _bundled_asset_root() -> Iterator[Path | None]:
+    """Yield the packaged asset root when running from an installed wheel."""
+    try:
+        bundled = resources.files("pipeline").joinpath("assets")
+    except (FileNotFoundError, ModuleNotFoundError, AttributeError):
+        yield None
+        return
+
+    try:
+        with resources.as_file(bundled) as asset_root:
+            if asset_root.exists():
+                yield asset_root
+                return
+    except FileNotFoundError:
+        pass
+
+    yield None
+
+
+def _copy_available_assets(
+    vault_path: Path,
+    repo_root: Optional[Path],
+    actions: list[str],
+    *,
+    only_missing: bool,
+) -> None:
+    """Copy assets from the repo checkout first, then packaged wheel assets."""
+    copied = False
+    if repo_root and repo_root.is_dir():
+        copied = _copy_assets_from_root(repo_root, vault_path, actions, only_missing=only_missing)
+
+    if copied:
+        return
+
+    with _bundled_asset_root() as asset_root:
+        if asset_root is not None:
+            _copy_assets_from_root(asset_root, vault_path, actions, only_missing=only_missing)
 
 
 class VaultState:
@@ -150,20 +220,8 @@ def setup_vault(vault_path: Path, repo_root: Optional[Path] = None, quiet: bool 
             target.write_text(content, encoding="utf-8")
             actions.append(f"Created seed file: {relpath}")
 
-    # 3. Copy repo files if repo_root provided
-    if repo_root and repo_root.is_dir():
-        for src_dir, dst_dir in _REPO_COPY_MAP.items():
-            src = repo_root / src_dir
-            dst = vault_path / dst_dir
-            if not src.is_dir():
-                continue
-            for src_file in src.glob("*"):
-                if not src_file.is_file():
-                    continue
-                dst_file = dst / src_file.name
-                if not dst_file.exists() or dst_file.read_bytes() != src_file.read_bytes():
-                    shutil.copy2(src_file, dst_file)
-                    actions.append(f"Copied: {dst_dir}{src_file.name}")
+    # 3. Copy repo or packaged files
+    _copy_available_assets(vault_path, repo_root, actions, only_missing=False)
 
     # 4. Create .env if missing
     env_path = vault_path / "Meta/Scripts/.env"
@@ -234,21 +292,8 @@ def migrate_vault(vault_path: Path, state: VaultState, repo_root: Optional[Path]
             target.write_text(content, encoding="utf-8")
             actions.append(f"Created missing file: {relpath}")
 
-    # Copy repo files
-    if repo_root and repo_root.is_dir():
-        for src_dir, dst_dir in _REPO_COPY_MAP.items():
-            src = repo_root / src_dir
-            dst = vault_path / dst_dir
-            if not src.is_dir():
-                continue
-            dst.mkdir(parents=True, exist_ok=True)
-            for src_file in src.glob("*"):
-                if not src_file.is_file():
-                    continue
-                dst_file = dst / src_file.name
-                if not dst_file.exists():
-                    shutil.copy2(src_file, dst_file)
-                    actions.append(f"Copied: {dst_dir}{src_file.name}")
+    # Copy repo or packaged files
+    _copy_available_assets(vault_path, repo_root, actions, only_missing=True)
 
     for a in actions:
         log.info(a)

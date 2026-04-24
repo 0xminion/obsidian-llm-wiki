@@ -20,8 +20,8 @@ from pipeline.create import (
     create_batch,
     validate_output,
 )
-from pipeline.create.orchestrator import _update_tag_registry
-from pipeline.create.templates import generate_source_content
+from pipeline.create.orchestrator import _update_tag_registry, _validate_batch_files
+from pipeline.create.templates import generate_entry_content, generate_source_content
 from pipeline.create.agent import AgentResult
 
 
@@ -204,6 +204,58 @@ class TestGenerateSourceContent:
         assert "A" * 5000 in content
 
 
+class TestGenerateEntryContent:
+    def test_comparison_template_uses_required_sections(self):
+        plan = Plan(
+            hash="cmp123",
+            title="Comparison Note",
+            language=Language.EN,
+            template=Template.COMPARISON,
+        )
+
+        content = generate_entry_content(
+            plan,
+            {
+                "url": "https://example.com/comparison",
+                "type": "web",
+                "author": "Author",
+                "content": "Paragraph one.\n\nParagraph two.",
+            },
+            "comparison-source",
+        )
+
+        assert "## Summary" in content
+        assert "## Side-by-Side Comparison" in content
+        assert "## Pros and Cons" in content
+        assert "## Verdict" in content
+        assert "## Linked concepts" in content
+
+    def test_procedural_template_uses_required_sections(self):
+        plan = Plan(
+            hash="proc123",
+            title="Procedural Note",
+            language=Language.EN,
+            template=Template.PROCEDURAL,
+        )
+
+        content = generate_entry_content(
+            plan,
+            {
+                "url": "https://example.com/procedure",
+                "type": "web",
+                "author": "Author",
+                "content": "Step one.\n\nStep two.",
+            },
+            "procedural-source",
+        )
+
+        assert "## Summary" in content
+        assert "## Prerequisites" in content
+        assert "## Steps" in content
+        assert "## Gotchas" in content
+        assert "## Linked concepts" in content
+
+
 class TestUpdateTagRegistry:
     def test_includes_moc_tags(self, cfg: Config):
         (cfg.entries_dir / "entry.md").write_text("---\ntags:\n  - entry-tag\n---\n", encoding="utf-8")
@@ -215,6 +267,214 @@ class TestUpdateTagRegistry:
         registry = (cfg.config_dir / "tag-registry.md").read_text(encoding="utf-8")
         assert "MoC Tags" in registry
         assert "`moc-tag` (1 uses)" in registry
+
+
+class TestValidateBatchFiles:
+    def test_reports_missing_new_concept_file(self, cfg: Config):
+        entry_name = "my-note"
+        (cfg.entries_dir / f"{entry_name}.md").write_text(
+            """---
+title: "My Note"
+source: "[[source-note]]"
+source_url: "https://example.com"
+type: web
+author: "Author"
+date_entry: 2026-04-24
+status: draft
+tags: []
+template: standard
+---
+
+# My Note
+
+## Summary
+A sufficiently long summary for the validation path to evaluate without body-length noise.
+
+## Core insights
+- insight
+
+## Other takeaways
+- takeaway
+
+## Diagrams
+n/a
+
+## Open questions
+- question
+
+## Linked concepts
+- [[new-concept|New Concept]]
+""",
+            encoding="utf-8",
+        )
+
+        result = _validate_batch_files(
+            [Plan(hash="abc", title="My Note", concept_new=["New Concept"])],
+            cfg,
+        )
+
+        assert result["ok"] is False
+        assert "missing file: new-concept.md" in result["critical"]
+
+    def test_rejects_unrelated_concept_with_same_dash_prefix(self, cfg: Config):
+        entry_name = "ai-note"
+        (cfg.entries_dir / f"{entry_name}.md").write_text(
+            """---
+title: "AI Note"
+source: "[[source-note]]"
+source_url: "https://example.com"
+type: web
+author: "Author"
+date_entry: 2026-04-24
+status: draft
+tags: []
+template: standard
+---
+
+# AI Note
+
+## Summary
+A sufficiently long summary for the validation path to evaluate without body-length noise.
+
+## Core insights
+- insight
+
+## Other takeaways
+- takeaway
+
+## Diagrams
+n/a
+
+## Open questions
+- question
+
+## Linked concepts
+- [[ai|AI]]
+""",
+            encoding="utf-8",
+        )
+        (cfg.concepts_dir / "ai-safety.md").write_text(
+            """---
+title: "AI Safety"
+created: 2026-04-24
+type: concept
+status: draft
+tags: []
+sources:
+  - "[[ai-note]]"
+---
+
+# AI Safety
+
+## Core concept
+Safety for AI systems.
+
+## Context
+A different concept, not a collision-resolved filename for AI.
+
+## Links
+Links here.
+""",
+            encoding="utf-8",
+        )
+
+        result = _validate_batch_files(
+            [Plan(hash="abc", title="AI Note", concept_new=["AI"])],
+            cfg,
+        )
+
+        assert result["ok"] is False
+        assert "missing file: ai.md" in result["critical"]
+
+    def test_accepts_new_concepts_written_to_concepts_dir(self, cfg: Config):
+        entry_name = "my-note"
+        concept_name = "new-concept"
+        body = "x" * 250
+
+        (cfg.entries_dir / f"{entry_name}.md").write_text(
+            f"""---
+title: "My Note"
+source: "[[source-note]]"
+source_url: "https://example.com"
+type: web
+author: "Author"
+date_entry: 2026-04-24
+status: draft
+tags: []
+template: standard
+---
+
+# My Note
+
+## Summary
+{body}
+
+## Core insights
+- insight
+
+## Other takeaways
+- takeaway
+
+## Diagrams
+n/a
+
+## Open questions
+- question
+
+## Linked concepts
+- [[new-concept|New Concept]]
+""",
+            encoding="utf-8",
+        )
+        (cfg.sources_dir / f"{entry_name}.md").write_text(
+            """---
+title: "Source Note"
+source_url: "https://example.com"
+source_type: web
+author: "Author"
+date_captured: 2026-04-24
+tags: []
+template: standard
+---
+
+# Source Note
+
+## Original content
+""" + ("a" * 300),
+            encoding="utf-8",
+        )
+        (cfg.concepts_dir / f"{concept_name}.md").write_text(
+            """---
+title: "New Concept"
+created: 2026-04-24
+type: concept
+status: draft
+tags: []
+sources:
+  - "[[my-note]]"
+---
+
+# New Concept
+
+## Core concept
+A concept.
+
+## Context
+Context here.
+
+## Links
+Links here.
+""",
+            encoding="utf-8",
+        )
+
+        result = _validate_batch_files(
+            [Plan(hash="abc", title="My Note", concept_new=["New Concept"])],
+            cfg,
+        )
+
+        assert result["ok"] is True
+        assert "missing file: new-concept.md" not in result["violations"]
 
 
 # ─── concept_convergence ──────────────────────────────────────────────────────
@@ -854,7 +1114,7 @@ class TestCreateAll:
                 )
                 # Create concept files referenced by the plan
                 for concept in set(plan.concept_new + plan.concept_updates):
-                    cfile = config.entries_dir / f"{title_to_filename(concept)}.md"
+                    cfile = config.concepts_dir / f"{title_to_filename(concept)}.md"
                     cfile.write_text(
                         "---\ntitle: " + concept + "\n"
                         "date_entry: 2025-01-01\nstatus: review\n"

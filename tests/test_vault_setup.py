@@ -14,6 +14,7 @@ from pipeline.vault_setup import (
     MigrationResult,
     REQUIRED_DIRS,
     _SEED_FILES,
+    _bundled_asset_root,
 )
 from pipeline.utils import clean_title, title_to_filename, load_prompt
 
@@ -76,6 +77,20 @@ class TestSetupVault:
         setup_vault(vault, repo_root=tmp_path)
         for f in _SEED_FILES:
             assert (vault / f).exists(), f"Missing: {f}"
+
+    def test_copies_bundled_assets_when_repo_root_has_no_assets(self, tmp_path):
+        vault = tmp_path / "vault"
+        setup_vault(vault, repo_root=tmp_path)
+
+        with _bundled_asset_root() as asset_root:
+            assert asset_root is not None
+            bundled_prompts = sorted(p.name for p in (asset_root / "prompts").glob("*"))
+            bundled_templates = sorted(p.name for p in (asset_root / "templates").glob("*"))
+
+        assert bundled_prompts
+        assert bundled_templates
+        assert sorted(p.name for p in (vault / "Meta/prompts").glob("*")) == bundled_prompts
+        assert sorted(p.name for p in (vault / "Meta/Templates").glob("*")) == bundled_templates
 
     def test_idempotent(self, tmp_path):
         vault = tmp_path / "vault"

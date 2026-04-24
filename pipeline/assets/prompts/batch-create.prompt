@@ -1,0 +1,98 @@
+You are a wiki write agent. For each source below, create the vault files.
+
+VAULT: {VAULT_PATH}
+
+FILE NAMING: Use the title provided — it is already the correct content title.
+NEVER use URL slugs, platform prefixes, or tweet IDs.
+
+SOURCES:
+
+{SOURCES_BLOCK}
+
+---
+
+FOR EACH SOURCE, DO THESE STEPS:
+
+STEP 1 — CREATE SOURCE NOTE (MANDATORY: embed FULL content, never link)
+Write to: 04-Wiki/sources/[title].md
+Frontmatter: title, source_url, source_type, author, date_captured ({TODAY}), tags, status: processed
+
+The body MUST contain the FULL extracted text from the CONTENT block above, copied verbatim under ## Original content.
+Do NOT write just a link. Do NOT summarize. Copy the entire content text.
+
+Body format:
+# [Title]
+
+## Original content
+
+[copy EVERYTHING from the CONTENT block above — the full transcript, article text, or tweet thread. Not a summary. Not a link. The complete text.]
+
+STEP 2 — CREATE ENTRY NOTE
+Write to: 04-Wiki/entries/[title].md
+Use template from plan.
+{ENTRY_STRUCTURE}
+
+STEP 3 — CREATE/UPDATE CONCEPTS
+For each concept in CONCEPT_NEW:
+  Write to: 04-Wiki/concepts/[concept-name].md
+{CONCEPT_STRUCTURE}
+
+For each concept in CONCEPT_UPDATES:
+  Read the existing concept file, add the new source to its sources list and links.
+
+STEP 4 — CREATE/UPDATE MoCs (MANDATORY)
+For EVERY entry in this batch:
+  a) Determine which topic cluster it belongs to (e.g., "Prediction Markets / 预测市场",
+     "Crypto & DeFi / 加密与去中心化金融", "AI & The Economy / AI 与经济").
+  b) Check if a MoC file exists at 04-Wiki/mocs/[topic-name].md
+     - If YES: Read it, add the new entry wikilink with a 1-sentence summary under the appropriate section.
+     - If NO: CREATE a new MoC file with this structure:
+
+Write to: 04-Wiki/mocs/[topic-name].md
+---
+title: "[Topic Name / 中文标题]"
+type: moc
+status: active
+date_created: {TODAY}
+date_updated: {TODAY}
+tags:
+  - map-of-content
+  - "[topic-tag]"
+---
+
+# [Topic Name]
+
+## Overview / 概述
+
+[2-3 sentence synthesized summary of what this topic covers and how entries relate]
+
+## [Topic Section 1] / [中文标题]
+
+- [[Entry Title]] — 1-sentence summary
+- [[Entry Title]] — 1-sentence summary
+
+## [Topic Section 2] / [中文标题]
+
+- [[Entry Title]] — 1-sentence summary
+
+## Bridge Concepts / 桥接概念
+
+- [[Concept Name]] — how it connects entries across sections
+
+## Cross-References / 关联图谱
+
+[ASCII diagram or description of how notes connect]
+
+## Related MoCs / 相关图谱
+
+- [[Related MoC]] — how it connects
+
+  Do NOT skip MoC creation. Every batch MUST produce at least one MoC file (new or updated).
+
+STEP 5 — UPDATE INDEX
+Append entry and new concepts to 06-Config/wiki-index.md
+
+STEP 6 — UPDATE EDGES
+If relationships exist, append to 06-Config/edges.tsv
+
+Write all files now.

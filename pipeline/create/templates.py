@@ -10,6 +10,7 @@ from datetime import date
 
 from pipeline.config import Config
 from pipeline.models import Plan
+from pipeline.note_schema import effective_entry_schema
 from pipeline.utils import escape_yaml
 
 log = logging.getLogger(__name__)
@@ -76,33 +77,32 @@ def _entry_sections(
     linked_concepts: str,
 ) -> list[tuple[str, str]]:
     """Return ordered (heading, body) sections for an entry based on template/language."""
-    if plan.language.value == "zh" or plan.template.value == "chinese":
-        return [
-            ("摘要", summary_section),
-            ("核心发现", core_insights_section),
-            ("其他要点", "- 暂无额外要点"),
-            ("开放问题", "- 暂无开放问题"),
-            ("关联概念", linked_concepts),
-        ]
-
-    if plan.template.value == "technical":
-        return [
-            ("Summary", summary_section),
-            ("Key Findings", core_insights_section),
-            ("Data/Evidence", "- Evidence derived from the source content"),
-            ("Methodology", "- Methodology details should be drawn from the linked source"),
-            ("Limitations", "- No additional limitations identified from this source"),
-            ("Linked concepts", linked_concepts),
-        ]
-
-    return [
-        ("Summary", summary_section),
-        ("Core insights", core_insights_section),
-        ("Other takeaways", "- No additional takeaways identified from this source"),
-        ("Diagrams", "n/a"),
-        ("Open questions", "- No open questions from this source"),
-        ("Linked concepts", linked_concepts),
-    ]
+    schema = effective_entry_schema(plan.language.value, plan.template.value)
+    section_bodies = {
+        "Summary": summary_section,
+        "Core insights": core_insights_section,
+        "Other takeaways": "- No additional takeaways identified from this source",
+        "Diagrams": "n/a",
+        "Open questions": "- No open questions from this source",
+        "Linked concepts": linked_concepts,
+        "摘要": summary_section,
+        "核心发现": core_insights_section,
+        "其他要点": "- 暂无额外要点",
+        "图表": "n/a",
+        "开放问题": "- 暂无开放问题",
+        "关联概念": linked_concepts,
+        "Key Findings": core_insights_section,
+        "Data/Evidence": "- Evidence derived from the source content",
+        "Methodology": "- Methodology details should be drawn from the linked source",
+        "Limitations": "- No additional limitations identified from this source",
+        "Side-by-Side Comparison": core_insights_section,
+        "Pros and Cons": "- Pros and cons should be derived from the linked source",
+        "Verdict": "- No final verdict synthesized yet",
+        "Prerequisites": "- No prerequisites identified from this source",
+        "Steps": core_insights_section,
+        "Gotchas": "- No gotchas identified from this source",
+    }
+    return [(section, section_bodies[section]) for section in schema.required_sections]
 
 
 def generate_entry_content(

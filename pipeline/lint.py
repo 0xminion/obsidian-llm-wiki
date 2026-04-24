@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Optional
 
 import logging
+from pipeline.note_schema import concept_schema, effective_entry_schema, markdown_headings
 from pipeline.utils import (
     extract_body as _extract_body,
     parse_frontmatter as _parse_frontmatter,
@@ -298,10 +299,8 @@ def check_concept_structure(vault: Path) -> list[LintIssue]:
         fm = _parse_frontmatter(content)
         lang = str(fm.get("language", "en")).strip()
 
-        if lang == "zh":
-            required = ["## 核心概念", "## 背景", "## 关联"]
-        else:
-            required = ["## Core concept", "## Context", "## Links"]
+        schema = concept_schema(lang)
+        required = list(markdown_headings(schema))
 
         missing = [s for s in required if s not in content]
         if missing:
@@ -322,20 +321,13 @@ def check_entry_template_sections(vault: Path) -> list[LintIssue]:
     if not entries_dir.exists():
         return issues
 
-    template_sections = {
-        "standard": ["## Summary", "## Core insights", "## Other takeaways", "## Diagrams", "## Open questions", "## Linked concepts"],
-        "chinese": ["## 摘要", "## 核心发现", "## 其他要点", "## 图表", "## 开放问题", "## 关联概念"],
-        "technical": ["## Summary", "## Key Findings", "## Data/Evidence", "## Methodology", "## Limitations", "## Linked concepts"],
-        "comparison": ["## Summary", "## Side-by-Side Comparison", "## Pros and Cons", "## Verdict", "## Linked concepts"],
-        "procedural": ["## Summary", "## Prerequisites", "## Steps", "## Gotchas", "## Linked concepts"],
-    }
-
     for md in entries_dir.glob("*.md"):
         content = md.read_text(encoding="utf-8", errors="replace")
         fm = _parse_frontmatter(content)
         template = str(fm.get("template", "standard")).strip() or "standard"
+        language = str(fm.get("language", "en")).strip() or "en"
 
-        required = template_sections.get(template, template_sections["standard"])
+        required = list(markdown_headings(effective_entry_schema(language, template)))
         missing = [s for s in required if s not in content]
         if missing:
             issues.append(LintIssue(

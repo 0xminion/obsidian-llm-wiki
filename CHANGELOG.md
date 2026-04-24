@@ -2,6 +2,22 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Added
+- GitHub Actions CI for static checks, tests, wheel build, and installed CLI smoke test.
+- Central note schema definitions shared by template generation and lint validation.
+- Packaged vault assets under `pipeline/assets/` so wheel installs can initialize complete vault scaffolding.
+- QMD query mode contract: `auto`, `vec`, and `lex` modes.
+- Structured JSONL telemetry helper for machine-readable stage events.
+- Release checklist documenting artifact-based verification.
+
+### Fixed
+- Entry template generation now matches validator-required sections for comparison and procedural notes.
+- Batch validation checks new concept files in `04-Wiki/concepts/` instead of `04-Wiki/entries/`.
+- OpenRouter HTTP-error test now uses a file-like body, eliminating unraisable cleanup noise.
+- Static-check noise from an unused test import.
+
 ## [0.2.0] - 2026-04-23
 
 ### Added

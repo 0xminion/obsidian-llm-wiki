@@ -173,21 +173,32 @@ class QMDMCPClient:
         min_score: float = 0.2,
         intent: str = "",
         collections: list[str] | None = None,
+        mode: str = "auto",
     ) -> list[QMDSearchResult]:
-        """Semantic search via QMD.
+        """Search via QMD.
 
-        Strategy:
-          1. Try ``type: vec`` (semantic). On CPU-only this may take 30–60 s
-             on the very first query while the embedding model loads. After that,
-             the model stays resident and subsequent vec queries are ~1 s.
-          2. Fall back to ``type: lex`` (BM25 keyword) -- always sub-second.
-          3. Return empty list if QMD is unreachable (caller should use keyword
-             fallback).
+        Modes:
+          - ``auto`` (default): try vector semantic first, then fall back to lex.
+          - ``vec``: vector semantic only.
+          - ``lex``: BM25 keyword only.
 
         The vector attempt uses a 60-second timeout so that a cold embedding
         context on CPU can finish loading without stalling the pipeline
         indefinitely.
         """
+        mode = mode.lower().strip()
+        if mode not in {"auto", "vec", "lex"}:
+            raise ValueError(f"Unsupported QMD query mode: {mode}")
+
+        if mode == "lex":
+            return self._query_raw(
+                searches=[{"type": "lex", "query": query_text}],
+                n=n_results,
+                min_score=min_score,
+                intent=intent,
+                collections=collections,
+            )
+
         # Strategy 1: vector semantic (longer timeout for cold CPU load)
         orig_timeout = self.timeout
         try:
@@ -199,7 +210,7 @@ class QMDMCPClient:
                 intent=intent,
                 collections=collections,
             )
-            if vec:
+            if vec or mode == "vec":
                 return vec
         finally:
             self.timeout = orig_timeout

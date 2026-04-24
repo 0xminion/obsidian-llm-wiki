@@ -35,7 +35,7 @@ class TestQMDMCPIntegration:
     def test_lex_query_fast(self, qmd_client):
         """BM25 keyword search should be sub-second for a warm server."""
         t0 = time.monotonic()
-        results = qmd_client.query("prediction", n_results=5, min_score=0.01)
+        results = qmd_client.query("prediction", n_results=5, min_score=0.01, mode="lex")
         elapsed = time.monotonic() - t0
         assert elapsed < 1.0, f"Lex query took {elapsed:.2f}s, expected <1s"
         assert isinstance(results, list)
@@ -46,7 +46,7 @@ class TestQMDMCPIntegration:
     def test_vec_query_semantic(self, qmd_client):
         """Vector semantic search — may take longer if context is cold.
         We bump timeout because QMD can spend ~10s loading embedding model on first use."""
-        results = qmd_client.query("blockchain smart contracts", n_results=5, min_score=0.1)
+        results = qmd_client.query("blockchain smart contracts", n_results=5, min_score=0.1, mode="vec")
         assert isinstance(results, list)
 
     def test_pipeline_run_qmd_query_e2e(self):

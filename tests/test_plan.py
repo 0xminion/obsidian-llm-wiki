@@ -4,7 +4,6 @@ import json
 from pathlib import Path
 from unittest.mock import MagicMock
 
-import pytest
 from pipeline.config import Config
 from pipeline.models import ConceptMatch, ExtractedSource, Manifest, Plan, SourceType
 from pipeline.qmd import run_qmd_query
