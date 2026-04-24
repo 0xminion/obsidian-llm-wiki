@@ -27,28 +27,27 @@ log = logging.getLogger(__name__)
 
 _DEFAULT_MCP_URL = os.environ.get("QMD_MCP_URL", "http://localhost:8181")
 
-# Module-level QMD client (lazy init)
-_qmd_client: QMDMCPClient | None = None
-_qmd_available: bool | None = None
-
 
 def _get_client(base_url: str = "") -> QMDMCPClient | None:
-    """Return the module-level QMD client, or None if QMD is unavailable."""
-    global _qmd_client, _qmd_available
-    if _qmd_available is False:
-        return None
-    if _qmd_client is None:
-        url = base_url or _DEFAULT_MCP_URL
-        client = QMDMCPClient(base_url=url, timeout=60)
-        if client.ensure_session():
-            _qmd_client = client
-            _qmd_available = True
-            log.info("QMD MCP client connected to %s", url)
-        else:
-            _qmd_available = False
-            log.warning("QMD MCP server not reachable at %s", url)
+    """Return a fresh QMD client, checking server health each time.
+
+    The QMD *server* keeps embedding models loaded across requests,
+    so we don't need to cache the client object.  Re-checking health
+    each call means we automatically recover if the server restarts.
+    """
+    url = base_url or _DEFAULT_MCP_URL
+    client = QMDMCPClient(base_url=url, timeout=60)
+    try:
+        h = client.health()
+        if h.get("status") != "ok":
+            log.debug("QMD MCP server not healthy at %s", url)
             return None
-    return _qmd_client
+    except Exception:
+        log.debug("QMD MCP server unreachable at %s", url)
+        return None
+    if client.ensure_session():
+        return client
+    return None
 
 
 def _keyword_fallback(query: str, concepts_dir: Path) -> list[ConceptMatch]:
@@ -99,6 +98,7 @@ def run_qmd_query(
             query_text=query.strip(),
             n_results=n_results,
             min_score=min_score,
+            collections=["concepts"],
         )
         if results:
             return _qmd_results_to_concept_matches(results, collection_filter="concepts")
@@ -107,6 +107,7 @@ def run_qmd_query(
             searches=[{"type": "lex", "query": query.strip()}],
             n=n_results,
             min_score=min_score,
+            collections=["concepts"],
         )
         matches = _qmd_results_to_concept_matches(results, collection_filter="concepts")
         if matches:
@@ -146,6 +147,7 @@ def run_qmd_concept_search(
             query_text=q.strip(),
             n_results=5,
             min_score=0.2,
+            collections=["concepts"],
         )
         matches = _qmd_results_to_concept_matches(qmd_results, collection_filter="concepts")
         if not matches:

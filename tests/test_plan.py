@@ -257,7 +257,7 @@ class TestQmdConceptSearch:
 
         mock_client = MagicMock()
 
-        def mock_query(query_text, n_results, min_score):
+        def mock_query(query_text, n_results, min_score, **kwargs):
             # Return a deterministic concept per query
             idx = hash(query_text) % 3
             concepts = ["c1", "c2", "c3"]

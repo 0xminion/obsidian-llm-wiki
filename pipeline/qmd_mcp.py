@@ -124,21 +124,25 @@ class QMDMCPClient:
         min_score: float = 0.2,
         intent: str = "",
         timeout: int | None = None,
+        collections: list[str] | None = None,
     ) -> list[QMDSearchResult]:
         """Run a QMD query via MCP and parse structured results.
 
         Args:
             timeout: Override default timeout for this single call.
+            collections: QMD collection names to restrict search to (e.g. ["concepts"]).
         """
         if not self.ensure_session():
             return []
         arguments: dict = {
             "searches": searches,
-            "n": n,
+            "limit": n,
             "minScore": min_score,
         }
         if intent:
             arguments["intent"] = intent
+        if collections:
+            arguments["collections"] = collections
 
         call_timeout = timeout or self.timeout
         res = self._call(
@@ -167,6 +171,7 @@ class QMDMCPClient:
         n_results: int = 5,
         min_score: float = 0.2,
         intent: str = "",
+        collections: list[str] | None = None,
     ) -> list[QMDSearchResult]:
         """Semantic search via QMD.
 
@@ -174,7 +179,7 @@ class QMDMCPClient:
           1. Try ``type: vec`` (semantic). On CPU-only this may take 30–60 s
              on the very first query while the embedding model loads. After that,
              the model stays resident and subsequent vec queries are ~1 s.
-          2. Fall back to ``type: lex`` (BM25 keyword) — always sub-second.
+          2. Fall back to ``type: lex`` (BM25 keyword) -- always sub-second.
           3. Return empty list if QMD is unreachable (caller should use keyword
              fallback).
 
@@ -191,6 +196,7 @@ class QMDMCPClient:
                 n=n_results,
                 min_score=min_score,
                 intent=intent,
+                collections=collections,
             )
             if vec:
                 return vec
@@ -203,6 +209,7 @@ class QMDMCPClient:
             n=n_results,
             min_score=min_score,
             intent=intent,
+            collections=collections,
         )
 
     def status(self) -> dict:
