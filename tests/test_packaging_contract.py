@@ -15,14 +15,12 @@ def test_pyproject_includes_packaged_assets():
     assert "pipeline/assets/**/*" in wheel["include"]
 
 
-def test_packaged_asset_directories_match_source_assets():
+def test_packaged_asset_directories_are_canonical_and_populated():
     asset_root = Path("pipeline/assets")
-    for source_dir_name in ["prompts", "templates"]:
-        source_files = sorted(Path(source_dir_name).glob("*"))
-        packaged_files = sorted((asset_root / source_dir_name).glob("*"))
+    prompts = sorted((asset_root / "prompts").glob("*"))
+    templates = sorted((asset_root / "templates").glob("*"))
 
-        assert source_files
-        assert [p.name for p in packaged_files] == [p.name for p in source_files]
-        for source_file in source_files:
-            packaged_file = asset_root / source_dir_name / source_file.name
-            assert packaged_file.read_bytes() == source_file.read_bytes()
+    assert prompts
+    assert templates
+    assert (asset_root / "prompts" / "batch-create.prompt").read_text(encoding="utf-8")
+    assert (asset_root / "templates" / "Entry.md").read_text(encoding="utf-8")

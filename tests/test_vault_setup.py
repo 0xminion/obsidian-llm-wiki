@@ -114,6 +114,28 @@ class TestSetupVault:
         assert "TRANSCRIPT_API_KEY" in env.read_text()
 
 
+    def test_ensure_existing_vault_backfills_missing_assets(self, tmp_path):
+        vault = tmp_path / "vault"
+        vault.mkdir()
+        for d in REQUIRED_DIRS:
+            (vault / d).mkdir(parents=True, exist_ok=True)
+        for f, content in _SEED_FILES.items():
+            (vault / f).parent.mkdir(parents=True, exist_ok=True)
+            (vault / f).write_text(content, encoding="utf-8")
+
+        # Simulate an older vault with the directories but without copied prompt/template assets.
+        for child in (vault / "Meta/prompts").glob("*"):
+            child.unlink()
+        for child in (vault / "Meta/Templates").glob("*"):
+            child.unlink()
+
+        result = ensure_vault_ready(vault, repo_root=tmp_path)
+
+        assert result == "existing"
+        assert (vault / "Meta/prompts/batch-create.prompt").exists()
+        assert (vault / "Meta/Templates/Entry.md").exists()
+
+
 class TestMigrateVault:
     def test_migrate_adds_missing_dirs(self, tmp_path):
         vault = tmp_path / "vault"

@@ -22,7 +22,7 @@ from pipeline.config import Config
 from pipeline.models import (
     ConceptMatch, ExtractedSource, Language, Manifest, Plan, Plans, Template, SourceType,
 )
-from pipeline.utils import _CJK_RE, extract_body as _extract_body
+from pipeline.utils import _CJK_RE, extract_body as _extract_body, load_prompt
 from pipeline.lint import _parse_frontmatter
 
 log = logging.getLogger(__name__)
@@ -259,15 +259,13 @@ def build_plan_prompt(
     Includes rules for language detection, template selection, tag suggestions,
     and existing concept/MoC context.
     """
-    # Load common instructions if available
-    common_path = cfg.prompts_dir / "common-instructions.prompt"
+    # Load vault-customized common instructions first, packaged defaults second.
     common = ""
-    if common_path.exists():
-        try:
-            common = common_path.read_text(encoding="utf-8").strip()
-            common = common.replace("{VAULT_PATH}", str(cfg.vault_path))
-        except Exception:
-            pass
+    if cfg.prompts_dir.exists():
+        common = load_prompt("common-instructions", cfg.prompts_dir)
+    if not common:
+        common = load_prompt("common-instructions")
+    common = common.replace("{VAULT_PATH}", str(cfg.vault_path)) if common else ""
 
     # Count existing concepts
     concept_count = 0

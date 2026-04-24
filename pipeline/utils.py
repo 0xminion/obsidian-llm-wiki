@@ -449,14 +449,13 @@ def load_prompt(prompt_name: str, prompts_dir: str | Path | None = None) -> str:
     Args:
         prompt_name: Name without .prompt extension.
         prompts_dir: Directory containing .prompt files. If None, searches
-                     repo-relative prompts/ directory.
+                     packaged pipeline/assets/prompts directory.
 
     Returns:
         File content as string, or empty string if not found.
     """
     if prompts_dir is None:
-        # Search repo-relative prompts dir
-        prompts_dir = Path(__file__).parent.parent / "prompts"
+        prompts_dir = Path(__file__).parent / "assets" / "prompts"
     else:
         prompts_dir = Path(prompts_dir)
 

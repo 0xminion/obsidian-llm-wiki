@@ -192,7 +192,7 @@ Persistent at `Meta/Scripts/cache.db` across runs:
 - [x] Tags validated against blocklist + synonym detection
 - [x] Edges use 4-column TSV format
 - [x] Post-ingest auto-updates: tag-registry, wiki-index, edges, log
-- [x] Prompts externalized in prompts/*.prompt files
+- [x] Prompts externalized in `pipeline/assets/prompts/*.prompt` files
 - [x] Collision detection prevents note overwrites
 - [x] 15 lint checks with incremental caching
 - [x] Output validation with per-batch checking + auto-repair

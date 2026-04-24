@@ -171,8 +171,8 @@ Runs after ingest or manually via `pipeline compile`:
 09-Archive-Queries/  ← answered queries
 Meta/
 ├── Scripts/         ← pipeline code, logs, cache
-├── prompts/         ← agent prompt templates
-└── Templates/       ← note templates
+├── prompts/         ← runtime prompt templates seeded from packaged assets
+└── Templates/       ← runtime note templates seeded from packaged assets
 ```
 
 ## Note Structures
@@ -289,8 +289,9 @@ Python-first with a unified LLM client supporting multiple providers:
 
 ```
 pipeline/
-├── cli.py              # typer CLI — all commands
-├── llm_client.py       # Unified LLM client (Ollama/OpenRouter/Hermes)
+├── assets/            # Packaged prompt/note-template assets copied into vaults
+├── cli.py             # typer CLI — all commands
+├── llm_client.py      # Unified LLM client (Ollama/OpenRouter/Hermes)
 ├── extract.py          # Stage 1: URL routing, extraction, dedup
 ├── plan.py             # Stage 2: semantic search, agent planning
 ├── create/             # Stage 3 creation

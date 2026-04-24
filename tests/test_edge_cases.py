@@ -194,14 +194,14 @@ class TestLongTitleTruncation:
 
 class TestNoStubPolicy:
     def test_entry_template_mentions_no_stubs(self):
-        entry_prompt = Path(__file__).parent.parent / "prompts" / "entry-structure.prompt"
+        entry_prompt = Path(__file__).parent.parent / "pipeline" / "assets" / "prompts" / "entry-structure.prompt"
         if entry_prompt.exists():
             content = entry_prompt.read_text(encoding="utf-8").lower()
             # Entry prompt has naming rules and "NEVER use URL slugs" — that's anti-stub
             assert "never use" in content or "stub" in content or "todo" in content
 
     def test_common_instructions_mentions_no_stubs(self):
-        common_prompt = Path(__file__).parent.parent / "prompts" / "common-instructions.prompt"
+        common_prompt = Path(__file__).parent.parent / "pipeline" / "assets" / "prompts" / "common-instructions.prompt"
         if common_prompt.exists():
             content = common_prompt.read_text(encoding="utf-8").lower()
             assert "stub" in content

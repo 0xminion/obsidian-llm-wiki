@@ -62,8 +62,8 @@ _SEED_FILES: dict[str, str] = {
     "06-Config/tag-registry.md": "# Tag Registry\n\nCanonical tags used across the vault.\n",
 }
 
-# Files that setup.sh copies from repo → vault (Python replaces these)
-_REPO_COPY_MAP = {
+# Packaged assets copied into each vault during setup/migration.
+_ASSET_COPY_MAP = {
     "prompts/": "Meta/prompts/",
     "templates/": "Meta/Templates/",
     "lib/": "Meta/lib/",
@@ -80,7 +80,7 @@ def _copy_assets_from_root(
 ) -> bool:
     """Copy prompts/templates/scripts from an asset root into the vault."""
     copied_any = False
-    for src_dir, dst_dir in _REPO_COPY_MAP.items():
+    for src_dir, dst_dir in _ASSET_COPY_MAP.items():
         src = asset_root / src_dir.rstrip("/")
         dst = vault_path / dst_dir
         if not src.is_dir():
@@ -126,14 +126,12 @@ def _copy_available_assets(
     *,
     only_missing: bool,
 ) -> None:
-    """Copy assets from the repo checkout first, then packaged wheel assets."""
-    copied = False
-    if repo_root and repo_root.is_dir():
-        copied = _copy_assets_from_root(repo_root, vault_path, actions, only_missing=only_missing)
+    """Copy packaged assets into the vault.
 
-    if copied:
-        return
-
+    repo_root is accepted for CLI/API compatibility but no longer used as an
+    asset source. The canonical copies live under pipeline/assets so source
+    checkouts and wheel installs behave the same way.
+    """
     with _bundled_asset_root() as asset_root:
         if asset_root is not None:
             _copy_assets_from_root(asset_root, vault_path, actions, only_missing=only_missing)
@@ -198,7 +196,7 @@ def setup_vault(vault_path: Path, repo_root: Optional[Path] = None, quiet: bool 
 
     Args:
         vault_path: Target vault directory.
-        repo_root: Path to obsidian-llm-wiki repo (for copying prompts/templates).
+        repo_root: Deprecated compatibility parameter; assets are loaded from pipeline/assets.
         quiet: If True, don't log individual actions.
 
     Returns:
@@ -317,6 +315,10 @@ def ensure_vault_ready(vault_path: Path, repo_root: Optional[Path] = None, force
     state = detect_vault(vault_path)
 
     if state.state == "existing":
+        actions: list[str] = []
+        _copy_available_assets(vault_path, repo_root, actions, only_missing=True)
+        if actions:
+            log.info("Backfilled vault assets: %d actions", len(actions))
         log.info("Vault ready: %s", state.summary)
         return "existing"
 

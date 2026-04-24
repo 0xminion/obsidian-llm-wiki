@@ -209,7 +209,7 @@ obsidian-llm-wiki/
 │       ├── youtube.py          # TranscriptAPI → supadata → whisper
 │       ├── podcast.py          # AssemblyAI → whisper
 │       └── _shared.py          # Content quality gate, title extraction
-├── prompts/                    # LLM prompt templates (versioned with code)
+├── pipeline/assets/            # Canonical packaged prompts + vault templates
 ├── tests/                      # 637 tests
 └── README.md / CHANGELOG.md
 ```
@@ -356,7 +356,7 @@ These uncertain sources (~20-40% of batch) get the full agent treatment.
 For uncertain sources (~20–40% of a batch), deterministic heuristics are insufficient. The pipeline calls an LLM directly via the unified client in `pipeline.llm_client` (Ollama by default, OpenRouter as fallback, Hermes as last resort). No subprocess spawn. No `hermes chat`. A plain HTTP `POST` to `/api/generate` (Ollama) or `/v1/chat/completions` (OpenRouter).
 
 **Prompt structure (built in `pipeline.plan`):**
-1. Common instructions (`prompts/common-instructions.prompt`)
+1. Common instructions (`pipeline/assets/prompts/common-instructions.prompt`)
 2. Existing tag vocabulary (top 50 tags from vault)
 3. Concept match scores per source
 4. Source content preview (300 chars each)
@@ -678,8 +678,8 @@ pipeline query --ask "What are the risks of prediction markets?"
 ├── 09-Archive-Queries/   # Answered query files
 └── Meta/
     ├── Scripts/            # Pipeline code, logs, cache
-    ├── prompts/            # LLM prompt templates
-    └── Templates/        # Obsidian note templates
+    ├── prompts/          # Runtime copy seeded from pipeline/assets/prompts
+    └── Templates/        # Runtime copy seeded from pipeline/assets/templates
 ```
 
 ### Key Data Models

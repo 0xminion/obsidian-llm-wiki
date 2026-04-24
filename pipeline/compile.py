@@ -933,15 +933,17 @@ def _run_agent_compile(cfg: Config, result: CompileResult) -> tuple[bool, str]:
     Deterministic operations (reindex, edges, report, duplicate detection)
     are handled by Python code in this module.
     """
-    prompts_dir = cfg.prompts_dir if cfg.prompts_dir.exists() else Path(__file__).parent.parent / "prompts"
+    prompt = ""
+    if cfg.prompts_dir.exists():
+        prompt = _load_prompt("compile-pass", cfg.prompts_dir)
+    if not prompt:
+        prompt = _load_prompt("compile-pass", Path(__file__).parent / "assets" / "prompts")
+    if not prompt:
+        return False, ""
 
     entry_count = count_md(cfg.entries_dir)
     concept_count = count_md(cfg.concepts_dir)
     moc_count = count_md(cfg.mocs_dir)
-
-    prompt = _load_prompt("compile-pass", prompts_dir)
-    if not prompt:
-        return False, ""
 
     prompt = prompt.replace("{VAULT_PATH}", str(cfg.vault_path))
     prompt = prompt.replace("{ENTRY_COUNT}", str(entry_count))

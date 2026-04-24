@@ -15,7 +15,8 @@ log = logging.getLogger(__name__)
 
 def _load_prompt(name: str, cfg: Config) -> str:
     """Load a .prompt template by name. Delegates to utils.load_prompt."""
-    return load_prompt(name, cfg.prompts_dir)
+    text = load_prompt(name, cfg.prompts_dir) if cfg.prompts_dir.exists() else ""
+    return text or load_prompt(name)
 
 
 def build_batch_prompt(
