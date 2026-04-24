@@ -55,8 +55,10 @@ def test_golden_template_create_pipeline_outputs_validate(tmp_path):
     stats = create_file_templates([plan], cfg, use_agent_insights=False)
 
     assert stats["created"] == 1
-    assert (cfg.sources_dir / "golden-comparison.md").exists()
+    assert (cfg.sources_dir / "golden-comparison-source.md").exists()
     assert (cfg.entries_dir / "golden-comparison.md").exists()
+    entry_content = (cfg.entries_dir / "golden-comparison.md").read_text(encoding="utf-8")
+    assert "[[golden-comparison-source]]" in entry_content
     assert (cfg.concepts_dir / "market-resolution.md").exists()
     assert (cfg.mocs_dir / "prediction-markets.md").exists()
     assert run_validate(cfg.vault_path).total_issues == 0

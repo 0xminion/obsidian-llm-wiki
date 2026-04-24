@@ -187,7 +187,7 @@ def postprocess_creation(
     log.info("Running global output validation...")
     from pipeline.telemetry import TelemetrySink, record_stage
 
-    telemetry = TelemetrySink(cfg.config_dir / "pipeline-events.jsonl")
+    telemetry = TelemetrySink(cfg.telemetry_file)
     manifest_path = manifest_path or (cfg.resolved_extract_dir / "manifest.json")
     with record_stage(telemetry, "postprocess.validate", plan_count=plan_count, failed_count=failed_count) as event:
         violations = validate_output(cfg, manifest_path)

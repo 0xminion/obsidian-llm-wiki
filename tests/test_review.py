@@ -103,7 +103,7 @@ class TestApproveReviews:
 
         # Files exist on disk
         fname = title_to_filename(sample_plan.title)
-        assert (cfg.sources_dir / f"{fname}.md").exists()
+        assert (cfg.sources_dir / f"{fname}-source.md").exists()
         assert (cfg.entries_dir / f"{fname}.md").exists()
         assert (cfg.concepts_dir / "test-concept.md").exists()
 

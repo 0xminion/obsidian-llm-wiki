@@ -38,7 +38,7 @@ def generate_source_content(
     """
     rendered_title = note_title or plan.title
     title = escape_yaml(rendered_title)
-    url = extracted.get("url", "")
+    url = escape_yaml(extracted.get("url", ""))
     source_type = extracted.get("type", "web")
     author = escape_yaml(extracted.get("author", ""))
     content = extracted.get("content", "")
@@ -120,7 +120,7 @@ def generate_entry_content(
     """
     rendered_title = note_title or plan.title
     title = escape_yaml(rendered_title)
-    url = extracted.get("url", "")
+    url = escape_yaml(extracted.get("url", ""))
     source_type = extracted.get("type", "web")
     author = escape_yaml(extracted.get("author", ""))
     tags_yaml = "\n".join(f"  - {t}" for t in plan.tags) if plan.tags else ""
@@ -357,16 +357,19 @@ def create_file_templates(
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
     manifest_path.touch()
 
-    def _shared_note_filename(base_filename: str) -> str:
-        candidate = base_filename
+    def _paired_note_filenames(base_filename: str) -> tuple[str, str]:
+        """Return distinct (source, entry) stems for graph-unambiguous notes."""
         suffix = 0
         while True:
-            source_path = cfg.sources_dir / f"{candidate}.md"
-            entry_path = cfg.entries_dir / f"{candidate}.md"
-            if not source_path.exists() and not entry_path.exists():
-                return candidate
+            entry_candidate = base_filename if suffix == 0 else f"{base_filename}-{suffix}"
+            source_candidate = f"{entry_candidate}-source"
+            paths = (
+                cfg.sources_dir / f"{source_candidate}.md",
+                cfg.entries_dir / f"{entry_candidate}.md",
+            )
+            if not any(path.exists() for path in paths):
+                return source_candidate, entry_candidate
             suffix += 1
-            candidate = f"{base_filename}-{suffix}"
 
     # ── Pre-generate filenames for long titles via LLM batch ──────────────
     long_title_items: list[tuple[str, str]] = []
@@ -456,10 +459,8 @@ def create_file_templates(
             # Initialize before inner try so entry block can use it even if source fails
             source_note_title = plan.title
             try:
-                note_filename = _shared_note_filename(filename)
-                source_filename = note_filename
-                entry_filename = note_filename
-                note_suffix = note_filename[len(filename):] if note_filename.startswith(filename) else ""
+                source_filename, entry_filename = _paired_note_filenames(filename)
+                note_suffix = entry_filename[len(filename):] if entry_filename.startswith(filename) else ""
                 source_note_title = f"{plan.title}{note_suffix}"
                 source_content = generate_source_content(
                     plan,

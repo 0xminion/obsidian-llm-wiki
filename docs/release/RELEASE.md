@@ -6,7 +6,7 @@ initialize a fresh vault.
 
 ## Pre-release checklist
 
-1. Update `CHANGELOG.md` under `Unreleased` or the target version.
+1. Update [`CHANGELOG.md`](CHANGELOG.md) under `Unreleased` or the target version.
 2. Confirm `pyproject.toml` version matches the release tag.
 3. Run local verification:
 

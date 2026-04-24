@@ -203,8 +203,8 @@ def test_template_source_creation_uses_collision_resolution(cfg: Config):
     entry_texts = [p.read_text(encoding="utf-8") for p in entry_files]
     assert any('title: "Same Title"' in text and "# Same Title\n" in text for text in entry_texts)
     assert any('title: "Same Title-1"' in text and "# Same Title-1\n" in text for text in entry_texts)
-    assert any('source: "[[same-title]]"' in text for text in entry_texts)
-    assert any('source: "[[same-title-1]]"' in text for text in entry_texts)
+    assert any('source: "[[same-title-source]]"' in text for text in entry_texts)
+    assert any('source: "[[same-title-1-source]]"' in text for text in entry_texts)
 
     moc_text = (cfg.mocs_dir / "general.md").read_text(encoding="utf-8")
     assert "[[Same Title]]: Related to [[same-title]]" in moc_text
@@ -218,22 +218,22 @@ def test_template_source_creation_uses_collision_resolution(cfg: Config):
     assert '"Same Title-1"' in concept_b
 
 
-def test_template_mode_uses_shared_suffix_when_only_sources_collide(cfg: Config):
+def test_template_mode_keeps_entry_stem_when_legacy_source_stem_exists(cfg: Config):
     (cfg.sources_dir / "same-title.md").write_text("existing", encoding="utf-8")
     plan = Plan(hash="shared-suffix-1", title="Same Title", tags=["alpha"], concept_new=["Shared Concept"])
     _write_extract(cfg, plan, url="https://example.com/shared")
 
     create_file_templates([plan], cfg, use_agent_insights=False)
 
-    entry_text = (cfg.entries_dir / "same-title-1.md").read_text(encoding="utf-8")
-    source_text = (cfg.sources_dir / "same-title-1.md").read_text(encoding="utf-8")
+    entry_text = (cfg.entries_dir / "same-title.md").read_text(encoding="utf-8")
+    source_text = (cfg.sources_dir / "same-title-source.md").read_text(encoding="utf-8")
     concept_text = (cfg.concepts_dir / "shared-concept.md").read_text(encoding="utf-8")
-    assert 'source: "[[same-title-1]]"' in entry_text
-    assert 'title: "Same Title-1"' in entry_text
-    assert '# Same Title-1\n' in entry_text
-    assert 'title: "Same Title-1"' in source_text
-    assert '[[same-title-1]]' in concept_text
-    assert '"Same Title-1"' in concept_text
+    assert 'source: "[[same-title-source]]"' in entry_text
+    assert 'title: "Same Title"' in entry_text
+    assert '# Same Title\n' in entry_text
+    assert 'title: "Same Title"' in source_text
+    assert '[[same-title]]' in concept_text
+    assert '"Same Title"' in concept_text
 
 
 def test_approve_reviews_only_archives_fully_successful_plan_hashes(cfg: Config):

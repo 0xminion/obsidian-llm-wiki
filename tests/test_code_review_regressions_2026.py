@@ -177,7 +177,7 @@ def test_review_approval_collision_does_not_rewrite_source_link_to_entry(tmp_pat
     approve_reviews(cfg)
 
     entry = (cfg.entries_dir / "race-collision-article-1.md").read_text()
-    assert 'source: "[[race-collision-article]]"' in entry
+    assert 'source: "[[race-collision-article-source]]"' in entry
     assert 'source: "[[race-collision-article-1]]"' not in entry
 
 
@@ -212,6 +212,44 @@ def test_build_edges_rebuilds_generated_edges_and_drops_removed_links(tmp_path):
     _build_edges(cfg)
 
     assert "A\tB\trelates_to" not in cfg.edges_file.read_text()
+
+
+def test_template_escapes_source_url_and_validation_rejects_invalid_yaml(tmp_path):
+    from pipeline.create.templates import generate_entry_content, generate_source_content
+    from pipeline.create.validate import validate_single_file
+    from pipeline.utils import parse_frontmatter
+
+    plan = Plan(hash="abc123def456", title="Quoted URL")
+    extracted = {
+        "url": 'https://example.com/?q="quoted"',
+        "type": "web",
+        "content": "Long enough content. " * 50,
+    }
+
+    source_content = generate_source_content(plan, extracted)
+    entry_content = generate_entry_content(plan, extracted, "quoted-url")
+
+    assert parse_frontmatter(source_content)["source_url"] == extracted["url"]
+    assert parse_frontmatter(entry_content)["source_url"] == extracted["url"]
+
+    bad = tmp_path / "bad.md"
+    bad.write_text('---\ntitle: "Bad"\nsource_url: "https://example.com/?q="bad""\n---\n# Bad\n', encoding="utf-8")
+
+    assert any("invalid YAML frontmatter" in issue for issue in validate_single_file(bad, "source"))
+
+
+def test_build_edges_includes_source_note_wikilinks(tmp_path):
+    from pipeline.compile import _build_edges
+
+    cfg = _vault(tmp_path)
+    (cfg.sources_dir / "source-a.md").write_text("---\ntitle: Source A\n---\n# Source A\n")
+    (cfg.entries_dir / "entry-a.md").write_text(
+        '---\ntitle: Entry A\nsource: "[[source-a]]"\ntags: []\n---\n# Entry A\n\nSee [[source-a]].\n'
+    )
+
+    _build_edges(cfg)
+
+    assert "entry-a\tsource-a\trelates_to\tauto-detected wikilink" in cfg.edges_file.read_text()
 
 
 def test_shared_tags_generate_symmetric_relates_to_not_directional_extends(tmp_path):

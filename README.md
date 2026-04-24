@@ -78,6 +78,17 @@ pipeline query --ask "question"     # Q&A against your vault (Hermes agent)
 pipeline query --ask "question" --fast  # fast direct LLM query (sub-5s)
 ```
 
+## Documentation
+
+- [Documentation index](docs/README.md)
+- [Architecture](docs/architecture/ARCHITECTURE.md)
+- [Product requirements](docs/product/PRD.md)
+- [Changelog](docs/release/CHANGELOG.md)
+- [Release process](docs/release/RELEASE.md)
+- [Patch notes](docs/release/PATCH_NOTES.md)
+- [Latest audit](docs/audits/AUDIT_2026-04-24.md)
+- [Code reviews](docs/reviews/)
+
 ## How It Works
 
 ### Stage 1: Extract

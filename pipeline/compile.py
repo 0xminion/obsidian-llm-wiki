@@ -275,6 +275,7 @@ def _build_edges(cfg: Config) -> int:
 
     # Index all notes
     for note_dir, note_type in [
+        (cfg.sources_dir, "source"),
         (cfg.entries_dir, "entry"),
         (cfg.concepts_dir, "concept"),
         (cfg.mocs_dir, "moc"),

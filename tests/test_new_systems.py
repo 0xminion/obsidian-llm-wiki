@@ -506,4 +506,4 @@ class TestReviewWorkflow:
 
         assert stats["written"] >= 2
         entry = (cfg.entries_dir / "test-article.md").read_text(encoding="utf-8")
-        assert 'source: "[[test-article-1]]"' in entry
+        assert 'source: "[[test-article-source]]"' in entry

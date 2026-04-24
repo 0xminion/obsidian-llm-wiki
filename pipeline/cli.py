@@ -10,6 +10,7 @@ Provides commands for the full 3-stage pipeline and vault maintenance:
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import shutil
@@ -555,12 +556,17 @@ def reindex(
 @app.command()
 def stats(
     vault: Path = typer.Argument(None, help="Vault path (default: ~/MyVault)"),
+    json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON"),
 ):
     """Generate vault dashboard with growth, review status, and health metrics."""
     from pipeline.stats import run_stats
 
     cfg = _load_cfg(vault)
     summary = run_stats(cfg)
+
+    if json_output:
+        typer.echo(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True))
+        raise typer.Exit(code=0)
 
     typer.echo(f"Vault: {cfg.vault_path}")
     typer.echo(f"  Entries:  {summary['entries']}")
@@ -652,6 +658,7 @@ def compile_pass(
 def approve(
     vault: Path = typer.Argument(None, help="Vault path (default: ~/MyVault)"),
     dry_run: bool = typer.Option(False, "--dry-run", help="Show what would be written"),
+    json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON"),
 ):
     """Approve pending reviews and write files to the vault."""
     from pipeline.review import show_pending, approve_reviews
@@ -660,19 +667,33 @@ def approve(
     pending = show_pending(cfg)
 
     if not pending:
-        typer.echo("No pending reviews.")
+        if json_output:
+            typer.echo(json.dumps({"pending": 0, "approved": 0, "written": 0, "failed": 0}, ensure_ascii=False, sort_keys=True))
+        else:
+            typer.echo("No pending reviews.")
         raise typer.Exit(code=0)
 
-    typer.echo(f"Pending reviews: {len(pending)}")
-    for r in pending:
-        typer.echo(f"  [{r['file_type']}] {Path(r['file_path']).name}")
+    if json_output and dry_run:
+        typer.echo(json.dumps({"pending": len(pending), "items": pending}, ensure_ascii=False, indent=2, sort_keys=True, default=str))
+    elif not json_output:
+        typer.echo(f"Pending reviews: {len(pending)}")
+        for r in pending:
+            typer.echo(f"  [{r['file_type']}] {Path(r['file_path']).name}")
 
     if dry_run:
-        typer.echo("\nDry run — no files written.")
+        if not json_output:
+            typer.echo("\nDry run — no files written.")
         raise typer.Exit(code=0)
 
     stats = approve_reviews(cfg)
-    typer.echo(f"\nApproved: {stats['approved']}, Written: {stats['written']}, Failed: {stats['failed']}")
+    if json_output:
+        typer.echo(json.dumps({"pending": len(pending), **stats}, ensure_ascii=False, indent=2, sort_keys=True))
+    else:
+        typer.echo(f"\nApproved: {stats['approved']}, Written: {stats['written']}, Failed: {stats['failed']}")
+        if stats.get("written_paths"):
+            typer.echo("Written paths:")
+            for path in stats["written_paths"]:
+                typer.echo(f"  - {path}")
 
 
 # ─── reject ───────────────────────────────────────────────────────────────────
@@ -680,6 +701,7 @@ def approve(
 @app.command()
 def reject(
     vault: Path = typer.Argument(None, help="Vault path (default: ~/MyVault)"),
+    json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON"),
 ):
     """Reject and discard all pending reviews."""
     from pipeline.review import reject_reviews, show_pending
@@ -688,11 +710,17 @@ def reject(
     pending = show_pending(cfg)
 
     if not pending:
-        typer.echo("No pending reviews.")
+        if json_output:
+            typer.echo(json.dumps({"pending": 0, "rejected": 0}, ensure_ascii=False, sort_keys=True))
+        else:
+            typer.echo("No pending reviews.")
         raise typer.Exit(code=0)
 
     count = reject_reviews(cfg)
-    typer.echo(f"Rejected {count} pending reviews.")
+    if json_output:
+        typer.echo(json.dumps({"pending": len(pending), "rejected": count}, ensure_ascii=False, sort_keys=True))
+    else:
+        typer.echo(f"Rejected {count} pending reviews.")
 
 
 # ─── dlq ──────────────────────────────────────────────────────────────────────
@@ -961,6 +989,114 @@ def query(
 
     if had_failures:
         raise typer.Exit(code=1)
+
+
+# ─── diagnostics / fixture / release ─────────────────────────────────────────
+
+@app.command()
+def doctor(
+    vault: Path = typer.Argument(None, help="Vault path (default: ~/MyVault)"),
+    json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON"),
+):
+    """Run first-run and configuration diagnostics."""
+    from pipeline.doctor import run_doctor
+
+    cfg = _load_cfg(vault)
+    report = run_doctor(cfg)
+    if json_output:
+        typer.echo(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
+    else:
+        typer.echo(f"Doctor: {'ok' if report['ok'] else 'issues found'}")
+        for check in report["checks"]:
+            mark = "✓" if check["ok"] else "✗"
+            typer.echo(f"  {mark} {check['name']}: {check['detail']}")
+    raise typer.Exit(code=0 if report["ok"] else 1)
+
+
+@app.command(name="config-doctor")
+def config_doctor(
+    vault: Path = typer.Argument(None, help="Vault path (default: ~/MyVault)"),
+    json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON"),
+):
+    """Alias for doctor focused on redacted configuration diagnostics."""
+    doctor(vault=vault, json_output=json_output)
+
+
+@app.command(name="fixture")
+def fixture_cmd(
+    vault: Path = typer.Argument(..., help="Vault path to populate"),
+    overwrite: bool = typer.Option(False, "--overwrite", help="Overwrite existing fixture files"),
+    json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON"),
+):
+    """Create a deterministic example vault for demos and snapshot tests."""
+    from pipeline.fixtures import create_example_vault
+
+    summary = create_example_vault(vault, overwrite=overwrite)
+    if json_output:
+        typer.echo(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True))
+    else:
+        typer.echo(f"Fixture vault ready: {vault}")
+        typer.echo(f"  Files written: {summary['files_written']}")
+
+
+@app.command(name="review-status")
+def review_status(
+    vault: Path = typer.Argument(None, help="Vault path (default: ~/MyVault)"),
+    json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON"),
+):
+    """Show pending review queue status without approving/rejecting anything."""
+    from pipeline.review import show_pending
+
+    cfg = _load_cfg(vault)
+    pending = show_pending(cfg)
+    by_type: dict[str, int] = {}
+    for item in pending:
+        by_type[item["file_type"]] = by_type.get(item["file_type"], 0) + 1
+    report = {"pending": len(pending), "by_type": dict(sorted(by_type.items())), "items": pending}
+    if json_output:
+        typer.echo(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True, default=str))
+    else:
+        typer.echo(f"Pending reviews: {len(pending)}")
+        for file_type, count in report["by_type"].items():
+            typer.echo(f"  {file_type}: {count}")
+
+
+@app.command(name="telemetry")
+def telemetry_cmd(
+    vault: Path = typer.Argument(None, help="Vault path (default: ~/MyVault)"),
+    limit: int = typer.Option(20, "--limit", min=1, help="Number of recent events"),
+    json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON"),
+):
+    """Show recent structured pipeline telemetry events."""
+    from pipeline.telemetry import read_recent_events
+
+    cfg = _load_cfg(vault)
+    events = read_recent_events(cfg.telemetry_file, limit=limit)
+    if json_output:
+        typer.echo(json.dumps({"events": events}, ensure_ascii=False, indent=2, sort_keys=True))
+    else:
+        if not events:
+            typer.echo("No telemetry events found.")
+        for event in events:
+            typer.echo(f"{event.get('timestamp')} {event.get('stage')} {event.get('status')} {event.get('duration_s')}s")
+
+
+@app.command(name="release-check")
+def release_check(
+    json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON"),
+):
+    """Check release metadata, docs, and changelog alignment."""
+    from pipeline.release import check_release_hygiene
+
+    report = check_release_hygiene(Path(__file__).parent.parent)
+    if json_output:
+        typer.echo(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
+    else:
+        typer.echo(f"Release hygiene: {'ok' if report['ok'] else 'issues found'} ({report['version']})")
+        for check in report["checks"]:
+            mark = "✓" if check["ok"] else "✗"
+            typer.echo(f"  {mark} {check['name']}: {check['detail']}")
+    raise typer.Exit(code=0 if report["ok"] else 1)
 
 
 # ─── setup-qmd ────────────────────────────────────────────────────────────────

@@ -11,7 +11,6 @@ import re
 from pathlib import Path
 
 from pipeline.config import Config
-from pipeline.utils import parse_frontmatter as _parse_frontmatter
 
 log = logging.getLogger(__name__)
 
@@ -102,7 +101,17 @@ def validate_single_file(file_path: Path, note_type: str) -> list[str]:
         return violations
 
     frontmatter_str = fm_match.group(1)
-    fm = _parse_frontmatter(content)
+    try:
+        import yaml
+
+        parsed_fm = yaml.safe_load(frontmatter_str)
+        if parsed_fm is not None and not isinstance(parsed_fm, dict):
+            violations.append("invalid YAML frontmatter: expected mapping")
+            parsed_fm = {}
+    except Exception as e:
+        violations.append(f"invalid YAML frontmatter: {e}")
+        parsed_fm = {}
+    fm = parsed_fm if isinstance(parsed_fm, dict) else {}
     fm_end = fm_match.end()
 
     # Check required frontmatter fields (use regex ^field: to avoid substring matches)

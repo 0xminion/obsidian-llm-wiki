@@ -174,6 +174,10 @@ class Config:
     def log_md(self) -> Path:
         return self.config_dir / "log.md"
 
+    @property
+    def telemetry_file(self) -> Path:
+        return self.config_dir / "telemetry.jsonl"
+
     def validate(self) -> list[str]:
         """Check for missing required paths and invalid config. Returns list of errors."""
         errors = []

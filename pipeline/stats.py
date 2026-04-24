@@ -13,17 +13,50 @@ from pipeline.config import Config
 from pipeline.utils import count_md, extract_frontmatter_field
 
 
+def _edge_type_counts(cfg: Config) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    if not cfg.edges_file.exists():
+        return counts
+    for line in cfg.edges_file.read_text(encoding="utf-8", errors="replace").splitlines()[1:]:
+        parts = line.split("\t")
+        if len(parts) >= 3 and parts[2]:
+            counts[parts[2]] = counts.get(parts[2], 0) + 1
+    return dict(sorted(counts.items()))
+
+
+def collect_stats(cfg: Config) -> dict:
+    """Collect dashboard metrics in a stable JSON-serializable shape."""
+    entries = count_md(cfg.entries_dir)
+    concepts = count_md(cfg.concepts_dir)
+    mocs = count_md(cfg.mocs_dir)
+    sources = count_md(cfg.sources_dir)
+    return {
+        "vault_path": str(cfg.vault_path),
+        "entries": entries,
+        "concepts": concepts,
+        "mocs": mocs,
+        "sources": sources,
+        "total": entries + concepts + mocs + sources,
+        "graph": {
+            "node_types": ["concept", "entry", "moc", "source"],
+            "edge_types": _edge_type_counts(cfg),
+            "semantics": "source notes are first-class nodes; edges are wikilink-derived relationships between existing notes",
+        },
+    }
+
+
 def generate_dashboard(cfg: Config) -> str:
     """Generate the dashboard markdown content."""
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     lines = [f"# Wiki Dashboard — {today}", ""]
 
     # ─── Vault Size ────────────────────────────────────────────────────────────
-    entries = count_md(cfg.entries_dir)
-    concepts = count_md(cfg.concepts_dir)
-    mocs = count_md(cfg.mocs_dir)
-    sources = count_md(cfg.sources_dir)
-    total = entries + concepts + mocs + sources
+    stats = collect_stats(cfg)
+    entries = stats["entries"]
+    concepts = stats["concepts"]
+    mocs = stats["mocs"]
+    sources = stats["sources"]
+    total = stats["total"]
 
     lines.extend([
         "## Vault Size",
@@ -127,6 +160,23 @@ def generate_dashboard(cfg: Config) -> str:
         "",
     ])
 
+    # ─── Graph Semantics ───────────────────────────────────────────────────────
+    edge_types = stats["graph"]["edge_types"]
+    lines.extend([
+        "## Graph Semantics",
+        "",
+        "source notes are first-class nodes; edges are wikilink-derived relationships between existing notes.",
+        "",
+        "| Edge Type | Count |",
+        "|-----------|-------|",
+    ])
+    if edge_types:
+        for edge_type, count in edge_types.items():
+            lines.append(f"| {edge_type} | {count} |")
+    else:
+        lines.append("| (none) | 0 |")
+    lines.append("")
+
     # ─── Recent Activity ───────────────────────────────────────────────────────
     lines.extend(["## Recent Activity", ""])
     if log_file.exists():
@@ -151,18 +201,6 @@ def run_stats(cfg: Config) -> dict:
     cfg.config_dir.mkdir(parents=True, exist_ok=True)
     dashboard_path.write_text(content, encoding="utf-8")
 
-    # Parse counts for return
-    entries = count_md(cfg.entries_dir)
-    concepts = count_md(cfg.concepts_dir)
-    mocs = count_md(cfg.mocs_dir)
-    sources = count_md(cfg.sources_dir)
-    total = entries + concepts + mocs + sources
-
-    return {
-        "total": total,
-        "entries": entries,
-        "concepts": concepts,
-        "mocs": mocs,
-        "sources": sources,
-        "dashboard_path": str(dashboard_path),
-    }
+    summary = collect_stats(cfg)
+    summary["dashboard_path"] = str(dashboard_path)
+    return summary

@@ -210,8 +210,16 @@ obsidian-llm-wiki/
 │       ├── podcast.py          # AssemblyAI → whisper
 │       └── _shared.py          # Content quality gate, title extraction
 ├── pipeline/assets/            # Canonical packaged prompts + vault templates
-├── tests/                      # 637 tests
-└── README.md / CHANGELOG.md
+├── tests/                      # Test suite
+├── docs/
+│   ├── architecture/ARCHITECTURE.md
+│   ├── product/PRD.md
+│   ├── release/CHANGELOG.md
+│   ├── release/PATCH_NOTES.md
+│   ├── release/RELEASE.md
+│   ├── audits/
+│   └── reviews/
+└── README.md
 ```
 
 ---

@@ -17,6 +17,7 @@ from typing import Optional
 from pipeline.config import Config
 from pipeline.models import ExtractedSource, Manifest, SourceType
 from pipeline.store import ContentStore
+from pipeline.telemetry import StageEvent, TelemetrySink, redact_url
 
 # ─── Re-exports for backward compatibility (tests patch these names) ──────────
 from pipeline.extractors._shared import (  # noqa: F401
@@ -133,6 +134,7 @@ def extract_url(url: str, cfg: Config,
         )
 
     source_type = detect_source_type(url)
+    telemetry = TelemetrySink(cfg.telemetry_file)
     max_retries = cfg.max_retries
     last_error = ""
 
@@ -176,6 +178,18 @@ def extract_url(url: str, cfg: Config,
                         type=source_type,
                     )
             source.save(cfg.resolved_extract_dir)
+            telemetry.emit(StageEvent(
+                stage="extract",
+                status="ok",
+                duration_s=0,
+                details={
+                    "url": redact_url(url),
+                    "attempt": attempt + 1,
+                    "source_type": source_type.value,
+                    "title": source.title,
+                    "content_length": len(source.content),
+                },
+            ))
             if store:
                 store.register_url(url, source_type.value, chash)
                 store.register_content(
@@ -196,6 +210,12 @@ def extract_url(url: str, cfg: Config,
                 )
                 store.register_url(url, source_type.value, status="failed")
             # Do NOT return a stub — re-raise so caller treats this as a failure
+            telemetry.emit(StageEvent(
+                stage="extract",
+                status="error",
+                duration_s=0,
+                details={"url": redact_url(url), "attempt": attempt + 1, "source_type": source_type.value, "error": last_error[:500]},
+            ))
             raise
 
         except Exception as e:
@@ -215,6 +235,12 @@ def extract_url(url: str, cfg: Config,
             metadata={"source_type": source_type.value, "attempts": max_retries},
         )
         store.register_url(url, source_type.value, status="failed")
+    telemetry.emit(StageEvent(
+        stage="extract",
+        status="error",
+        duration_s=0,
+        details={"url": redact_url(url), "attempts": max_retries, "source_type": source_type.value, "error": last_error[:500]},
+    ))
 
     raise ExtractionError(
         f"Extraction failed after {max_retries} attempts for {url}: {last_error}"

@@ -11,13 +11,35 @@ from __future__ import annotations
 import json
 import logging
 import time
+from collections import deque
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 log = logging.getLogger(__name__)
+
+_SENSITIVE_QUERY_KEYS = {
+    "token", "access_token", "auth", "authorization", "signature", "sig",
+    "key", "api_key", "apikey", "password", "secret", "x-amz-signature",
+}
+
+
+def redact_url(url: str) -> str:
+    """Redact common sensitive query parameters while preserving correlation value."""
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return "[invalid-url]"
+    query = []
+    for key, value in parse_qsl(parsed.query, keep_blank_values=True):
+        if key.lower() in _SENSITIVE_QUERY_KEYS or "token" in key.lower() or "secret" in key.lower():
+            query.append((key, "[REDACTED]"))
+        else:
+            query.append((key, value))
+    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, urlencode(query, doseq=True), ""))
 
 
 @dataclass
@@ -84,3 +106,20 @@ def record_stage(
     else:
         status = str(stage_details.pop("status", "ok"))
         sink.emit(StageEvent(stage=stage, status=status, duration_s=time.monotonic() - started, details=stage_details))
+
+
+def read_recent_events(path: Path, limit: int = 20) -> list[dict[str, object]]:
+    """Read the most recent valid telemetry events from a JSONL file."""
+    if limit < 1 or not path.exists():
+        return []
+    events: deque[dict[str, object]] = deque(maxlen=limit)
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        if not line.strip():
+            continue
+        try:
+            parsed = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            events.append(parsed)
+    return list(events)

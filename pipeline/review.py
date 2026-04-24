@@ -41,12 +41,14 @@ def stage_for_review(
     stats = {"staged": 0, "failed": 0}
     reserved_paths = {Path(item["file_path"]) for item in store.review_get_pending()}
 
-    def _reserve_note_filename(base_filename: str) -> str:
-        candidate = base_filename
+    def _reserve_note_filenames(base_filename: str) -> tuple[str, str]:
+        """Reserve distinct (source, entry) stems for graph-unambiguous notes."""
         suffix = 0
         while True:
-            source_path = cfg.sources_dir / f"{candidate}.md"
-            entry_path = cfg.entries_dir / f"{candidate}.md"
+            entry_candidate = base_filename if suffix == 0 else f"{base_filename}-{suffix}"
+            source_candidate = f"{entry_candidate}-source"
+            source_path = cfg.sources_dir / f"{source_candidate}.md"
+            entry_path = cfg.entries_dir / f"{entry_candidate}.md"
             if (
                 not source_path.exists()
                 and not entry_path.exists()
@@ -55,9 +57,8 @@ def stage_for_review(
             ):
                 reserved_paths.add(source_path)
                 reserved_paths.add(entry_path)
-                return candidate
+                return source_candidate, entry_candidate
             suffix += 1
-            candidate = f"{base_filename}-{suffix}"
 
     def _reserve_path(directory: Path, base_filename: str) -> tuple[str, Path]:
         candidate = base_filename
@@ -82,10 +83,8 @@ def stage_for_review(
             filename = title_to_filename(plan.title)
 
             # 1. Stage Source
-            note_filename = _reserve_note_filename(filename)
-            source_filename = note_filename
-            entry_filename = note_filename
-            note_suffix = note_filename[len(filename):] if note_filename.startswith(filename) else ""
+            source_filename, entry_filename = _reserve_note_filenames(filename)
+            note_suffix = entry_filename[len(filename):] if entry_filename.startswith(filename) else ""
             entry_link_name = f"{plan.title}{note_suffix}"
             source_content = generate_source_content(
                 plan,
@@ -222,7 +221,7 @@ def approve_reviews(cfg: Config, review_ids: Optional[list[int]] = None) -> dict
         if review_ids:
             pending = [r for r in pending if r["id"] in review_ids]
 
-        stats = {"approved": 0, "written": 0, "failed": 0}
+        stats = {"approved": 0, "written": 0, "failed": 0, "written_paths": []}
         plan_outcomes: dict[str, dict[str, int]] = {}
         plan_targets: dict[str, dict[str, str]] = {}
         resolved_reviews: list[dict] = []
@@ -279,6 +278,7 @@ def approve_reviews(cfg: Config, review_ids: Optional[list[int]] = None) -> dict
                 store.review_approve(review["id"])
                 stats["approved"] += 1
                 stats["written"] += 1
+                stats["written_paths"].append(str(file_path))
                 plan_outcomes[plan_hash]["written"] += 1
                 log.info("Approved and wrote: %s", file_path.name)
 
