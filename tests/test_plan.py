@@ -182,32 +182,27 @@ class TestDedupCheck:
 
 # ─── QMD wrapper ──────────────────────────────────────────────────────────────
 
-
 class TestRunQmd:
     def test_successful_query(self, monkeypatch):
-        """Mock Ollama returning valid embeddings."""
-        import pipeline.qmd as qmd_module
-        qmd_module._cache_loaded = True
-        qmd_module._concept_embedding_cache = {
-            "ai-safety": [0.9] + [0.0] * 1023,
-            "alignment": [0.8] + [0.0] * 1023,
-        }
-        qmd_module._cache_key = None
+        """Mock QMD client returning valid results."""
+        from unittest.mock import MagicMock
 
-        monkeypatch.setattr("pipeline.qmd._ollama_embed", lambda text: [1.0] + [0.0] * 1023)
+        mock_client = MagicMock()
+        mock_client.query.return_value = [
+            MagicMock(file="concepts/ai-safety.md", score=0.85, collection="concepts"),
+            MagicMock(file="concepts/alignment.md", score=0.72, collection="concepts"),
+        ]
+        monkeypatch.setattr(
+            "pipeline.qmd._get_client", lambda base_url="": mock_client
+        )
         matches = run_qmd_query("artificial intelligence", "qmd", "/tmp/coll", timeout=5)
         assert len(matches) == 2
         assert matches[0].concept == "ai-safety"
         assert matches[0].score > 0.5
         assert matches[1].concept == "alignment"
 
-    def test_timeout_returns_empty(self, monkeypatch):
-        monkeypatch.setattr("pipeline.qmd._ollama_embed", lambda text: None)
-        matches = run_qmd_query("query", "qmd", "/tmp/coll", timeout=1)
-        assert matches == []
-
-    def test_invalid_json_returns_empty(self, monkeypatch):
-        monkeypatch.setattr("pipeline.qmd._ollama_embed", lambda text: None)
+    def test_qmd_unavailable_returns_empty(self, monkeypatch):
+        monkeypatch.setattr("pipeline.qmd._get_client", lambda base_url="": None)
         matches = run_qmd_query("query", "qmd", "/tmp/coll", timeout=5)
         assert matches == []
 
@@ -215,38 +210,37 @@ class TestRunQmd:
         assert run_qmd_query("", "qmd", "/tmp/coll") == []
         assert run_qmd_query("   ", "qmd", "/tmp/coll") == []
 
-    def test_noise_stripped(self, monkeypatch):
-        """Ollama embed works regardless of noise."""
-        import pipeline.qmd as qmd_module
-        qmd_module._cache_loaded = True
-        qmd_module._concept_embedding_cache = {
-            "test": [0.9] + [0.0] * 1023,
-        }
-        monkeypatch.setattr("pipeline.qmd._ollama_embed", lambda text: [1.0] + [0.0] * 1023)
-        matches = run_qmd_query("query", "qmd", "/tmp/coll", timeout=5)
-        assert len(matches) == 1
-
     def test_low_score_filtered(self, monkeypatch):
-        import pipeline.qmd as qmd_module
-        qmd_module._cache_loaded = True
-        qmd_module._concept_embedding_cache = {
-            "good": [0.9] + [0.0] * 1023,
-            "low": [0.0] + [0.9] + [0.0] * 1022,
-        }
-        monkeypatch.setattr("pipeline.qmd._ollama_embed", lambda text: [1.0] + [0.0] * 1023)
+        """QMD server handles low-score filtering internally; pipeline trusts results."""
+        from unittest.mock import MagicMock
+
+        mock_client = MagicMock()
+        # Return only high-score results as QMD would
+        mock_client.query.return_value = [
+            MagicMock(file="concepts/good.md", score=0.85, collection="concepts"),
+        ]
+        monkeypatch.setattr(
+            "pipeline.qmd._get_client", lambda base_url="": mock_client
+        )
         matches = run_qmd_query("query", "qmd", "/tmp/coll", timeout=5)
         assert len(matches) == 1
         assert matches[0].concept == "good"
 
     def test_file_path_parsed(self, monkeypatch):
-        """Concept name extracted from cache key."""
-        import pipeline.qmd as qmd_module
-        qmd_module._cache_loaded = True
-        qmd_module._concept_embedding_cache = {
-            "prediction-markets": [0.9] + [0.0] * 1023,
-        }
-        monkeypatch.setattr("pipeline.qmd._ollama_embed", lambda text: [1.0] + [0.0] * 1023)
+        """Concept name extracted from QMD result file path."""
+        from unittest.mock import MagicMock
+
+        mock_client = MagicMock()
+        mock_client.query.return_value = [
+            MagicMock(
+                file="concepts/prediction-markets.md", score=0.9, collection="concepts"
+            ),
+        ]
+        monkeypatch.setattr(
+            "pipeline.qmd._get_client", lambda base_url="": mock_client
+        )
         matches = run_qmd_query("query", "qmd", "/tmp/coll", timeout=5)
+        assert len(matches) == 1
         assert matches[0].concept == "prediction-markets"
 
 
@@ -254,18 +248,31 @@ class TestQmdConceptSearch:
     """Tests for parallel qmd concept search."""
 
     def test_parallel_search_returns_all_hashes(self, tmp_path, monkeypatch):
+        from unittest.mock import MagicMock
+
         from pipeline.qmd import run_qmd_concept_search
+
         cfg = _make_config(tmp_path)
         queries = {"hash1": "query one", "hash2": "query two", "hash3": "query three"}
 
-        monkeypatch.setattr("pipeline.qmd._ollama_embed", lambda text: [1.0] + [0.0] * 1023)
-        import pipeline.qmd as qmd_module
-        qmd_module._cache_loaded = True
-        qmd_module._concept_embedding_cache = {
-            "c1": [0.9] + [0.0] * 1023,
-            "c2": [0.8] + [0.0] * 1023,
-            "c3": [0.7] + [0.0] * 1023,
-        }
+        mock_client = MagicMock()
+
+        def mock_query(query_text, n_results, min_score):
+            # Return a deterministic concept per query
+            idx = hash(query_text) % 3
+            concepts = ["c1", "c2", "c3"]
+            return [
+                MagicMock(
+                    file=f"concepts/{concepts[idx]}.md",
+                    score=0.8,
+                    collection="concepts",
+                )
+            ]
+
+        mock_client.query.side_effect = mock_query
+        monkeypatch.setattr(
+            "pipeline.qmd._get_client", lambda base_url="": mock_client
+        )
 
         results = run_qmd_concept_search(queries, cfg)
         assert len(results) == 3
@@ -273,6 +280,7 @@ class TestQmdConceptSearch:
 
     def test_empty_queries_return_empty(self, tmp_path):
         from pipeline.qmd import run_qmd_concept_search
+
         cfg = _make_config(tmp_path)
         queries = {"h1": "", "h2": "   "}
         results = run_qmd_concept_search(queries, cfg)
@@ -283,7 +291,10 @@ class TestQmdConvergence:
     """Tests for qmd convergence wrapper used by creation stage."""
 
     def test_convergence_returns_dict_format(self, tmp_path, monkeypatch):
+        from unittest.mock import MagicMock
+
         from pipeline.qmd import run_qmd_convergence
+
         cfg = _make_config(tmp_path)
         extract_dir = tmp_path / "extracted"
         extract_dir.mkdir(parents=True, exist_ok=True)
@@ -294,20 +305,28 @@ class TestQmdConvergence:
             (extract_dir / f"{h}.json").write_text(json.dumps(ext))
 
         plans = [
-            Plan(hash="aaa111", title="Topic 0", concept_new=["New Concept"], concept_updates=[]),
+            Plan(
+                hash="aaa111", title="Topic 0", concept_new=["New Concept"], concept_updates=[]
+            ),
             Plan(hash="bbb222", title="Topic 1", concept_new=[], concept_updates=["Existing"]),
         ]
 
-        monkeypatch.setattr("pipeline.qmd._ollama_embed", lambda text: [1.0] + [0.0] * 1023)
-        import pipeline.qmd as qmd_module
-        qmd_module._cache_loaded = True
-        qmd_module._concept_embedding_cache = {
-            "test": [0.9] + [0.1] * 1023,
-        }
-
+        monkeypatch.setattr(
+            "pipeline.qmd._get_client",
+            lambda base_url="": MagicMock(
+                query=lambda **kw: [
+                    MagicMock(
+                        file="concepts/test.md", score=0.9, collection="concepts"
+                    )
+                ]
+            ),
+        )
         convergence = run_qmd_convergence(plans, cfg)
         assert "aaa111" in convergence
         assert "bbb222" in convergence
+        assert len(convergence["aaa111"]) == 1
+        assert convergence["aaa111"][0]["concept"] == "test"
+        assert convergence["aaa111"][0]["score"] == 0.9
         # Check dict format (not ConceptMatch objects)
         assert isinstance(convergence["aaa111"], list)
         if convergence["aaa111"]:

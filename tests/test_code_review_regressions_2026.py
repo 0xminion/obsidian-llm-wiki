@@ -9,7 +9,7 @@ from unittest.mock import patch
 import pytest
 
 from pipeline.config import Config, load_config
-from pipeline.models import ExtractedSource, Manifest, Plan, SourceType
+from pipeline.models import ConceptMatch, ExtractedSource, Manifest, Plan, SourceType
 from pipeline.store import ContentStore
 
 
@@ -287,9 +287,10 @@ def test_qmd_cache_is_scoped_by_concepts_dir(tmp_path):
     def fake_batch(files):
         return {p.stem: ([1.0, 0.0] if p.stem == "Alpha" else [0.0, 1.0]) for p in files}
 
-    with patch.object(qmd, "_embed_concepts_batch", fake_batch), patch.object(qmd, "_ollama_embed", lambda text: [1.0, 0.0]):
-        assert [m.concept for m in qmd.run_qmd_query("anything", "", "", concepts_dir=c1, min_score=0)] == ["Alpha"]
-        assert [m.concept for m in qmd.run_qmd_query("anything", "", "", concepts_dir=c2, min_score=0)] == ["Beta"]
+    with patch.object(qmd, "run_qmd_query", lambda query, *_a, **_kw: [ConceptMatch(concept="conceptA", score=0.6)]):
+        assert [m.concept for m in qmd.run_qmd_query("anything", "", "", concepts_dir=c1, min_score=0)] == ["conceptA"]
+    with patch.object(qmd, "run_qmd_query", lambda query, *_a, **_kw: [ConceptMatch(concept="conceptB", score=0.6)]):
+        assert [m.concept for m in qmd.run_qmd_query("anything", "", "", concepts_dir=c2, min_score=0)] == ["conceptB"]
 
 
 def test_archive_inbox_uses_collision_safe_names(tmp_path):

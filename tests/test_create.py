@@ -238,18 +238,21 @@ class TestConceptConvergence:
             json.dumps(ext_data), encoding="utf-8"
         )
 
-        json.dumps([
-            {"file": "04-Wiki/concepts/existing-concept.md", "score": 0.75},
-            {"file": "04-Wiki/concepts/tangential.md", "score": 0.3},
-        ])
-
-        with patch("pipeline.qmd._ollama_embed") as mock_embed:
-            mock_embed.return_value = [1.0] + [0.0] * 1023
+        with patch("pipeline.qmd._get_client") as mock_client:
+            mock_instance = MagicMock()
+            mock_instance.query.return_value = [
+                MagicMock(
+                    file="concepts/existing-concept.md",
+                    score=0.75,
+                    collection="concepts",
+                ),
+            ]
+            mock_client.return_value = mock_instance
             result = concept_convergence([sample_plan], cfg)
 
         assert sample_plan.hash in result
         matches = result[sample_plan.hash]
-        assert len(matches) >= 0  # May return empty if no concepts cached
+        assert len(matches) >= 0
 
 
 class TestCreateBatchRegression:
@@ -306,8 +309,7 @@ class TestConceptConvergenceFailures:
             json.dumps({"content": "test"}), encoding="utf-8"
         )
 
-        with patch("pipeline.create.agent.subprocess.run") as mock_run:
-            mock_run.side_effect = subprocess.TimeoutExpired(cmd="qmd", timeout=300)
+        with patch("pipeline.qmd._get_client", return_value=None):
             result = concept_convergence([sample_plan], cfg)
 
         assert result[sample_plan.hash] == []
@@ -318,8 +320,7 @@ class TestConceptConvergenceFailures:
             json.dumps({"content": "test"}), encoding="utf-8"
         )
 
-        with patch("pipeline.create.agent.subprocess.run") as mock_run:
-            mock_run.side_effect = FileNotFoundError("qmd not found")
+        with patch("pipeline.qmd._get_client", return_value=None):
             result = concept_convergence([sample_plan], cfg)
 
         assert result[sample_plan.hash] == []
@@ -332,12 +333,7 @@ class TestConceptConvergenceFailures:
 
     def test_handles_nonexistent_extract(self, cfg: Config, sample_plan: Plan):
         """If extract file doesn't exist, still searches with plan metadata."""
-        with patch("pipeline.create.agent.subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(
-                returncode=0,
-                stdout="[]",
-                stderr="",
-            )
+        with patch("pipeline.qmd._get_client", return_value=None):
             result = concept_convergence([sample_plan], cfg)
 
         assert sample_plan.hash in result

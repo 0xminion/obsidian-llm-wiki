@@ -455,8 +455,16 @@ class NoteIndex:
                 }
 
     def embed_all(self, client) -> None:
-        """Generate embeddings for all note previews."""
+        """Generate embeddings for all note previews.
+
+        If QMD MCP server is available, skips local Ollama batch embedding
+        because semantic similarity will be computed via QMD query instead.
+        """
         if not self.notes:
+            return
+        from pipeline.qmd_mcp import _get_qmd_client
+        if _get_qmd_client() is not None:
+            log.info("QMD enabled — skipping local embed batch; relying on QMD semantic search")
             return
         texts = [f"{n['title']}\n{n['preview']}" for n in self.notes.values()]
         names = list(self.notes.keys())

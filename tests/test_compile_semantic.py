@@ -70,7 +70,9 @@ class TestNoteIndex:
         index.embeddings["c"] = [0.0, 1.0]
         assert index.similarity("a", "c") == pytest.approx(0.0)
 
-    def test_embed_all_delegates_to_client(self, cfg, mock_client):
+    def test_embed_all_delegates_to_client(self, cfg, mock_client, monkeypatch):
+        """When QMD is not available, NoteIndex falls back to client.embed_batch."""
+        monkeypatch.setattr("pipeline.qmd_mcp._get_qmd_client", lambda: None)
         (cfg.entries_dir / "entry.md").write_text("---\ntitle: T\n---\n\nBody\n")
         index = NoteIndex()
         index.load(cfg)
@@ -164,7 +166,9 @@ class TestMergeConcepts:
         assert "[[canonical]]" in (cfg.mocs_dir / "moc.md").read_text()
         assert "[[canonical]]" in (cfg.concepts_dir / "other.md").read_text()
 
-    def test_embed_all_delegates_to_client(self, cfg, mock_client):
+    def test_embed_all_delegates_to_client(self, cfg, mock_client, monkeypatch):
+        """When QMD is not available, NoteIndex falls back to client.embed_batch."""
+        monkeypatch.setattr("pipeline.qmd_mcp._get_qmd_client", lambda: None)
         (cfg.entries_dir / "entry.md").write_text("---\ntitle: T\n---\n\nBody\n")
         index = NoteIndex()
         index.load(cfg)
