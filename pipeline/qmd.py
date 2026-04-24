@@ -20,10 +20,7 @@ import re
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Optional
 
-import urllib.request
-import urllib.error
 
 from pipeline.models import ConceptMatch
 from pipeline.llm_client import LLMClient
@@ -39,6 +36,7 @@ BATCH_SIZE = 32   # Max texts per /api/embed batch call
 # Module-level cache: concept_name -> embedding vector
 _concept_embedding_cache: dict[str, list[float]] = {}
 _cache_loaded = False
+_cache_key: str | None = None
 
 
 def _get_embed_client(base_url: str = "") -> LLMClient:
@@ -150,9 +148,15 @@ def _cosine_similarity(a: list[float], b: list[float]) -> float:
 
 def _load_concept_embeddings(concepts_dir: Path) -> None:
     """Load/generate embeddings for all concept files. Cached per process."""
-    global _cache_loaded, _concept_embedding_cache
-    if _cache_loaded:
+    global _cache_loaded, _concept_embedding_cache, _cache_key
+    key = str(concepts_dir.resolve())
+    if _cache_loaded and (_cache_key is None or _cache_key == key):
         return
+
+    if _cache_key is not None and _cache_key != key:
+        _concept_embedding_cache = {}
+        _cache_loaded = False
+    _cache_key = key
 
     if not concepts_dir.is_dir():
         _cache_loaded = True

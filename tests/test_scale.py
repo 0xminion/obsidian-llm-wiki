@@ -13,10 +13,8 @@ import hashlib
 import json
 import os
 import time
-import tempfile
 from pathlib import Path
 from unittest.mock import patch
-from concurrent.futures import ProcessPoolExecutor
 
 import pytest
 from typer.testing import CliRunner
@@ -219,7 +217,7 @@ class TestScalePipeline:
         def _fast_convergence(*args, **kwargs):
             return {}
 
-        soft_limit, hard_limit = 8192, 8192
+        soft_limit = 8192
         try:
             import resource
             soft_limit, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
@@ -227,7 +225,7 @@ class TestScalePipeline:
             pass
 
         # Count open FDs before
-        fds_before = len(os.listdir(f"/proc/{os.getpid()}/fd")) if Path(f"/proc/{os.getpid()}/fd").exists() else 0
+        len(os.listdir(f"/proc/{os.getpid()}/fd")) if Path(f"/proc/{os.getpid()}/fd").exists() else 0
 
         t0 = time.monotonic()
         with patch("pipeline.create.templates.generate_entry_insights", side_effect=_fast_insights), \
@@ -237,7 +235,7 @@ class TestScalePipeline:
                 "--resume",
                 "--parallel", "20",
             ])
-        wall_time = time.monotonic() - t0
+        time.monotonic() - t0
 
         fds_after = len(os.listdir(f"/proc/{os.getpid()}/fd")) if Path(f"/proc/{os.getpid()}/fd").exists() else 0
 
@@ -281,7 +279,6 @@ class TestScalePipeline:
                 entry = cfg.entries_dir / f"{fname}.md"
                 source.parent.mkdir(parents=True, exist_ok=True)
                 entry.parent.mkdir(parents=True, exist_ok=True)
-                h = plan.hash
                 source.write_text(f"---\ntitle: {title}\n---\n\n# {title}\n")
                 entry.write_text(f"---\ntitle: {title}\n---\n\n# {title}\n")
             return {"created": len(plans), "failed": 0, "sources": len(plans), "entries": len(plans)}

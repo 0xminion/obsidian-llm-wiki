@@ -37,7 +37,7 @@ python3 -m pipeline.cli ingest ~/MyVault
 
 ### LLM Provider Configuration
 
-Choose your provider via environment variables (in `~/.MyVault/Meta/Scripts/.env`):
+Choose your provider via environment variables (in `~/MyVault/Meta/Scripts/.env`):
 
 ```bash
 # Option 1: Ollama (default) — fast, private, local
@@ -82,7 +82,7 @@ pipeline query --ask "question" --fast  # fast direct LLM query (sub-5s)
 
 ### Stage 1: Extract
 
-Pure Python extraction — no LLM involved. Routes URLs to type-specific extractors with fallback chains:
+Pure Python extraction — no LLM involved. Routes URLs to type-specific extractors with hardened URL validation on each network boundary and fallback chains:
 
 | Source | Primary | Fallback |
 |--------|---------|----------|
@@ -91,7 +91,7 @@ Pure Python extraction — no LLM involved. Routes URLs to type-specific extract
 | YouTube | TranscriptAPI | Supadata → faster-whisper |
 | Podcasts | AssemblyAI | whisper |
 
-Features: retry with exponential backoff, content quality validation, SQLite dedup store, dead letter queue for failures.
+Features: retry with exponential backoff, SSRF-resistant URL validation, content quality validation, SQLite dedup store, dead letter queue for failures, and loud failure when every extraction fails.
 
 ### Stage 2: Plan
 
@@ -105,7 +105,7 @@ The agent produces creation plans: title, language (EN/ZH), template, tags, conc
 
 ### Stage 3: Create
 
-N parallel agents write vault files. Each agent receives a batch with extracted content and concept convergence data.
+Default mode writes deterministic templates, then uses the configured LLM only for bounded insights. `--agent` enables the heavier legacy batch-agent creation path.
 
 **Post-creation validation (per-batch):**
 - Frontmatter completeness (title, source, date, status, template, tags)
@@ -133,7 +133,7 @@ Runs after ingest or manually via `pipeline compile`:
 
 ### Lint System
 
-15 health checks with SQLite-backed caching for incremental scanning:
+15 health checks; graph-sensitive checks rebuild from disk to avoid stale reports:
 
 | Check | What it catches |
 |-------|----------------|
@@ -206,7 +206,7 @@ source	target	type	description
 
 Types: `extends`, `contradicts`, `supports`, `supersedes`, `tested_by`, `depends_on`, `inspired_by`, `part_of`, `relates_to`
 
-Built automatically during `pipeline compile` from wikilinks, concept sources, and MoC membership.
+Built automatically during `pipeline compile` from wikilinks, concept sources, shared concept tags, and MoC membership. Shared-tag relationships are emitted as symmetric `relates_to` edges, not directional claims.
 
 ## Semantic Search
 
@@ -257,7 +257,7 @@ PARALLEL=3
 python3 -m pytest tests/ -v
 ```
 
-597 tests covering: extraction, planning, creation, validation, lint, compile, vault operations, models, config, and integration.
+656 tests covering: extraction, planning, creation, validation, lint, compile, vault operations, models, config, security regressions, and integration.
 
 ## Recommended Workflow
 
@@ -273,7 +273,7 @@ python3 -m pytest tests/ -v
 python3 -m pytest tests/ -v
 ```
 
-**637 tests** covering: extraction, planning, creation, validation, lint, compile (semantic + deterministic), LLM client (multi-provider), vault operations, models, config, and integration.
+**656 tests** covering: extraction, planning, creation, validation, lint, compile (semantic + deterministic), LLM client (multi-provider), vault operations, models, config, security regressions, and integration.
 
 ## Architecture
 
@@ -306,4 +306,4 @@ pipeline/
     └── _shared.py
 ```
 
-~12,000 lines of Python, 637 tests, unified LLM client with 3 providers, 0 shell scripts in the critical path.
+~12,300 lines of Python, 656 tests, unified LLM client with 3 providers, 0 shell scripts in the critical path.

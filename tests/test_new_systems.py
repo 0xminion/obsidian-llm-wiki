@@ -2,7 +2,6 @@
 
 import json
 from pathlib import Path
-from unittest.mock import patch, MagicMock
 
 import pytest
 
@@ -98,7 +97,7 @@ class TestContentStore:
     def test_content_dedup(self, store: ContentStore):
         content = "This is test content for deduplication."
         assert store.get_content_duplicate(content) is None
-        chash = store.register_content(content, "Test", "web", "test-file")
+        store.register_content(content, "Test", "web", "test-file")
         assert store.get_content_duplicate(content) == "test-file"
         # Same content, different URL → still detects duplicate
         assert store.get_content_duplicate("  This   is test   content for deduplication.  ") == "test-file"
@@ -165,7 +164,7 @@ class TestContentStore:
         assert remaining[0]["reason"] == "timeout"
 
     def test_review_add_and_get(self, store: ContentStore):
-        rid = store.review_add(
+        store.review_add(
             plan_hash="abc123",
             plan_data={"title": "Test"},
             file_type="source",
@@ -248,7 +247,6 @@ class TestContentStore:
 
     def test_review_get_pending_ordering(self, store: ContentStore):
         """Reviews are returned in creation order (FIFO)."""
-        import time
         store.review_add("h1", {"t": 1}, "source", "/a.md", "a")
         # Small delay to ensure different timestamps
         store.review_add("h2", {"t": 2}, "entry", "/b.md", "b")

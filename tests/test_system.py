@@ -7,26 +7,20 @@ All external APIs (curl, hermes, defuddle, qmd) are mocked.
 from __future__ import annotations
 
 import hashlib
-import json
 import time
 from pathlib import Path
-from unittest.mock import patch, MagicMock
 
 import pytest
 from typer.testing import CliRunner
 
-from pipeline.cli import app
 from pipeline.config import Config
-from pipeline.extract import extract_all
-from pipeline.plan import plan_sources
-from pipeline.create import create_all
 from pipeline.models import (
-    ConceptMatch, ExtractedSource, Manifest, Plan, Plans,
+    ExtractedSource, Manifest, Plan, Plans,
     Language, Template, SourceType,
 )
 from pipeline.vault import (
     write_source, write_entry, write_concept, update_moc,
-    write_edge, reindex, archive_inbox,
+    reindex,
 )
 from pipeline.create import validate_output
 
@@ -94,7 +88,7 @@ def _write_vault_files(cfg: Config, sources: list[ExtractedSource], plans: list[
         write_entry(cfg, plan, entry_content)
 
         for concept_name in plan.concept_new:
-            concept_fname = concept_name.lower().replace(" ", "-")
+            concept_name.lower().replace(" ", "-")
             concept_content = (
                 f"## Core concept\n\n{concept_name} is a concept.\n\n"
                 f"## Context\n\nContext for {concept_name}.\n\n"

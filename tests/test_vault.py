@@ -4,7 +4,7 @@ import pytest
 from pathlib import Path
 
 from pipeline.config import Config
-from pipeline.models import Edge, EdgeType, ExtractedSource, Language, Plan, SourceType, Template
+from pipeline.models import Edge, EdgeType, ExtractedSource, Plan, SourceType, Template
 from pipeline.vault import (
     title_to_filename,
     check_collision,
@@ -19,7 +19,7 @@ from pipeline.vault import (
     url_exists,
     reindex,
     archive_inbox,
-    _normalize_url,
+    clear_edge_cache,
 )
 
 
@@ -461,7 +461,6 @@ class TestArchiveInbox:
 
 # ─── Edge Cache Tests ────────────────────────────────────────────────────────
 
-from pipeline.vault import clear_edge_cache
 
 class TestEdgeCache:
     def test_duplicate_edge_skipped(self, cfg: Config):

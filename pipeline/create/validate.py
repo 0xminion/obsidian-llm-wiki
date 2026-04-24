@@ -8,10 +8,10 @@ from __future__ import annotations
 
 import logging
 import re
-from datetime import datetime, timezone
 from pathlib import Path
 
 from pipeline.config import Config
+from pipeline.utils import parse_frontmatter as _parse_frontmatter
 
 log = logging.getLogger(__name__)
 
@@ -57,7 +57,6 @@ _LINK_ONLY_PATTERNS = [
 ]
 
 
-from pipeline.utils import parse_frontmatter as _parse_frontmatter
 
 
 def _get_required_sections(fm: dict, note_type: str) -> list[str]:
@@ -296,7 +295,7 @@ def _derive_section_content(section: str, content: str, note_type: str) -> str:
 
     if section == "Original content":
         # For sources, extract from the body itself
-        content_lines = [l for l in lines if l.strip() and not l.strip().startswith("#")]
+        content_lines = [line for line in lines if line.strip() and not line.strip().startswith("#")]
         return "\n".join(content_lines[:5]) if content_lines else ""
 
     # Fallback: try to find a relevant subsection in the body

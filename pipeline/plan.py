@@ -14,18 +14,15 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import re
 import subprocess
 import time
-from pathlib import Path
-from typing import Optional
 
 from pipeline.config import Config
 from pipeline.models import (
     ConceptMatch, ExtractedSource, Language, Manifest, Plan, Plans, Template, SourceType,
 )
-from pipeline.utils import extract_body as _extract_body
+from pipeline.utils import _CJK_RE, extract_body as _extract_body
 from pipeline.lint import _parse_frontmatter
 
 log = logging.getLogger(__name__)
@@ -127,7 +124,6 @@ def concept_search(manifest: Manifest, cfg: Config) -> dict[str, list[ConceptMat
 
 # ─── Deterministic Planning (Rec 3) ──────────────────────────────────────────
 
-from pipeline.utils import _CJK_RE
 
 
 def detect_language(content: str) -> Language:

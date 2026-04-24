@@ -5,7 +5,6 @@ import json
 import math
 from pathlib import Path
 
-import pytest
 
 from pipeline.vault import title_to_filename
 

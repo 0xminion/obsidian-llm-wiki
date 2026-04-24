@@ -22,11 +22,10 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
-import math
 
 from pipeline.config import Config
 from pipeline.models import Edge, EdgeType
-from pipeline.utils import count_md
+from pipeline.utils import count_md, load_prompt as _load_prompt
 
 log = logging.getLogger(__name__)
 
@@ -150,7 +149,6 @@ RETRY CONTEXT: Previous attempt failed. Try alternatives:
 Be resourceful. Find a way."""
 
 
-from pipeline.utils import load_prompt as _load_prompt
 
 
 def _run_agent(cfg: Config, prompt: str, description: str, max_retries: int = 3) -> tuple[bool, str]:
@@ -230,40 +228,49 @@ def _edge_key(source: str, target: str, edge_type: str) -> tuple[str, str, str]:
 
 def _frontmatter_list_items(frontmatter: str, field_name: str) -> list[str]:
     """Extract a YAML-style list field from raw frontmatter text."""
-    match = re.search(rf"^{re.escape(field_name)}:\s*\n((?:\s+-\s+.*\n?)*)", frontmatter, re.MULTILINE)
+    match = re.search(rf"^{re.escape(field_name)}:[ \t]*\n((?:[ \t]*-[ \t]+.*\n?)*)", frontmatter, re.MULTILINE)
     if not match:
         return []
     items = []
-    for item in re.finditer(r"^\s+-\s+(.+)$", match.group(1), re.MULTILINE):
+    for item in re.finditer(r"^[ \t]*-[ \t]+(.+)$", match.group(1), re.MULTILINE):
         items.append(item.group(1).strip().strip('"'))
     return items
 
 
 def _build_edges(cfg: Config) -> int:
-    """Scan vault for relationships and build edges.tsv.
+    """Rebuild deterministic graph edges from the current vault state.
 
-    Sources for edges:
-    1. Existing wikilinks between notes → RELATES_TO
-    2. Concept.source fields pointing to entries → tested_by
-    3. MoC links to entries/concepts → part_of
-    4. Cross-references between concepts with shared tags → extends/supports
+    Generated edges are derived data, so this command rewrites them instead of
+    appending. Manually-authored edges are preserved unless they point at notes
+    that no longer exist.
 
-    Returns number of edges added (not counting pre-existing).
+    Returns number of generated edges written.
     """
     edges_file = cfg.edges_file
     edges_file.parent.mkdir(parents=True, exist_ok=True)
+    previous_content = edges_file.read_text(encoding="utf-8", errors="replace") if edges_file.exists() else ""
 
-    # Load existing edges to avoid duplicates
-    existing_edges: set[tuple[str, str, str]] = set()
+    manual_edges: list[tuple[str, str, str, str]] = []
+    generated_descriptions = {
+        "auto-detected wikilink",
+        "entry provides evidence for concept",
+        "note belongs to MoC",
+    }
     if edges_file.exists():
-        for line in edges_file.read_text(encoding="utf-8", errors="replace").strip().split("\n"):
+        for line in edges_file.read_text(encoding="utf-8", errors="replace").splitlines():
             if line.startswith("#") or not line.strip() or line.startswith("source\t"):
                 continue
             parts = line.split("\t")
-            if len(parts) >= 3:
-                existing_edges.add(_edge_key(parts[0].strip(), parts[1].strip(), parts[2].strip()))
+            if len(parts) < 3:
+                continue
+            source, target, edge_type = parts[:3]
+            description = parts[3] if len(parts) > 3 else ""
+            if description in generated_descriptions or description.startswith("shared tags:"):
+                continue
+            manual_edges.append((source.strip(), target.strip(), edge_type.strip(), description.strip()))
 
     edges: list[Edge] = []
+    seen: set[tuple[str, str, str]] = set()
     notes: dict[str, dict] = {}  # name -> {path, type, tags, links, sources}
 
     # Index all notes
@@ -281,7 +288,6 @@ def _build_edges(cfg: Config) -> int:
             except OSError:
                 continue
 
-            # Parse frontmatter for tags and sources
             tags = set()
             sources = []
             fm_match = re.match(r"^---\s*\n(.*?)\n---", content, re.DOTALL)
@@ -290,9 +296,7 @@ def _build_edges(cfg: Config) -> int:
                 tags = {tag.lower() for tag in _frontmatter_list_items(fm, "tags") if tag}
                 sources = [source for source in _frontmatter_list_items(fm, "sources") if source]
 
-            # Extract wikilinks
             links = set(re.findall(r"\[\[([^\]|#]+)(?:[|#][^\]]*)?\]\]", content))
-
             notes[name] = {
                 "type": note_type,
                 "tags": tags,
@@ -300,75 +304,52 @@ def _build_edges(cfg: Config) -> int:
                 "sources": sources,
             }
 
-    # Build edges from relationships
+    def add_edge(source: str, target: str, edge_type: EdgeType, description: str) -> None:
+        key = _edge_key(source, target, edge_type.value)
+        if key in seen:
+            return
+        source_name, target_name, _ = key
+        edges.append(Edge(source=source_name, target=target_name, type=edge_type, description=description))
+        seen.add(key)
+
     for name, info in notes.items():
-        # 1. Wikilinks → RELATES_TO (bidirectional, only emit one direction)
         for linked in info["links"]:
             if linked in notes and linked != name:
-                edge_key = _edge_key(name, linked, EdgeType.RELATES_TO.value)
-                if edge_key not in existing_edges:
-                    source_name, target_name, _ = edge_key
-                    edges.append(Edge(
-                        source=source_name,
-                        target=target_name,
-                        type=EdgeType.RELATES_TO,
-                        description="auto-detected wikilink",
-                    ))
-                    existing_edges.add(edge_key)
+                add_edge(name, linked, EdgeType.RELATES_TO, "auto-detected wikilink")
 
-        # 2. Concept sources → tested_by (entry tests a concept)
         if info["type"] == "concept":
             for src in info["sources"]:
-                src_clean = re.sub(r"^\[\[|\]\]$", "", src)
+                src_clean = re.sub(r"^\[\[|\]\]$", "", src).split("|", 1)[0].split("#", 1)[0]
                 if src_clean in notes and notes[src_clean]["type"] == "entry":
-                    edge_key = _edge_key(src_clean, name, EdgeType.TESTED_BY.value)
-                    if edge_key not in existing_edges:
-                        edges.append(Edge(
-                            source=src_clean, target=name,
-                            type=EdgeType.TESTED_BY,
-                            description="entry provides evidence for concept",
-                        ))
-                        existing_edges.add(edge_key)
+                    add_edge(src_clean, name, EdgeType.TESTED_BY, "entry provides evidence for concept")
 
-        # 3. MoC → entries/concepts → part_of
         if info["type"] == "moc":
             for linked in info["links"]:
                 if linked in notes:
-                    edge_key = _edge_key(linked, name, EdgeType.PART_OF.value)
-                    if edge_key not in existing_edges:
-                        edges.append(Edge(
-                            source=linked, target=name,
-                            type=EdgeType.PART_OF,
-                            description="note belongs to MoC",
-                        ))
-                        existing_edges.add(edge_key)
+                    add_edge(linked, name, EdgeType.PART_OF, "note belongs to MoC")
 
-        # 4. Concepts sharing tags → extends/supports
-        if info["type"] == "concept":
-            for other_name, other_info in notes.items():
-                if other_name == name or other_info["type"] != "concept":
-                    continue
-                shared_tags = info["tags"] & other_info["tags"]
-                if len(shared_tags) >= 2:  # 2+ shared tags suggests relationship
-                    edge_key = _edge_key(name, other_name, EdgeType.EXTENDS.value)
-                    if edge_key not in existing_edges:
-                        edges.append(Edge(
-                            source=name, target=other_name,
-                            type=EdgeType.EXTENDS,
-                            description=f"shared tags: {', '.join(sorted(shared_tags)[:3])}",
-                        ))
-                        existing_edges.add(edge_key)
+    concept_names = sorted(name for name, info in notes.items() if info["type"] == "concept")
+    for i, name in enumerate(concept_names):
+        for other_name in concept_names[i + 1:]:
+            shared_tags = notes[name]["tags"] & notes[other_name]["tags"]
+            if len(shared_tags) >= 2:
+                add_edge(name, other_name, EdgeType.RELATES_TO, f"shared tags: {', '.join(sorted(shared_tags)[:3])}")
 
-    # Write edges
-    if edges:
-        if not edges_file.exists():
-            edges_file.write_text("source\ttarget\ttype\tdescription\n", encoding="utf-8")
-        with edges_file.open("a", encoding="utf-8") as f:
-            for edge in edges:
-                f.write(edge.to_tsv() + "\n")
-        log.info("Added %d edges to edges.tsv", len(edges))
-
-    return len(edges)
+    lines = ["source\ttarget\ttype\tdescription"]
+    valid_notes = set(notes)
+    written_edges: set[tuple[str, str, str]] = set()
+    for source, target, edge_type, description in manual_edges:
+        if source in valid_notes and target in valid_notes:
+            key = _edge_key(source, target, edge_type)
+            if key not in written_edges:
+                source_name, target_name, type_name = key
+                lines.append(f"{source_name}\t{target_name}\t{type_name}\t{description}")
+                written_edges.add(key)
+    lines.extend(edge.to_tsv() for edge in edges if _edge_key(edge.source, edge.target, edge.type.value) not in written_edges)
+    new_content = "\n".join(lines) + "\n"
+    edges_file.write_text(new_content, encoding="utf-8")
+    log.info("Rebuilt edges.tsv with %d generated edges", len(edges))
+    return 0 if previous_content == new_content else len(edges)
 
 
 # ─── Deterministic: Duplicate Detection ──────────────────────────────────────
@@ -715,11 +696,12 @@ def _merge_concepts(cfg: Config, canonical_name: str, duplicate_name: str, index
         return False
 
     # Extract body from both
-    canonical_body = re.sub(r"^---\s*\n.*?\n---\s*\n", "", canonical_content, flags=re.DOTALL)
+    re.sub(r"^---\s*\n.*?\n---\s*\n", "", canonical_content, flags=re.DOTALL)
     duplicate_body = re.sub(r"^---\s*\n.*?\n---\s*\n", "", duplicate_content, flags=re.DOTALL)
 
-    # Append duplicate body to canonical under a merged section
-    merged_content = canonical_content.rstrip() + f"\n\n## Merged from [[{duplicate_name}]]\n\n{duplicate_body.strip()}\n"
+    # Append duplicate body to canonical under a plain-text merged section.
+    # Do not leave a wikilink to the deleted duplicate.
+    merged_content = canonical_content.rstrip() + f"\n\n## Merged from {duplicate_name}\n\n{duplicate_body.strip()}\n"
     canonical_path.write_text(merged_content, encoding="utf-8")
 
     # Delete duplicate
@@ -731,16 +713,39 @@ def _merge_concepts(cfg: Config, canonical_name: str, duplicate_name: str, index
         if not directory.exists():
             continue
         for note_md in directory.glob("*.md"):
-            # Skip the canonical file to avoid self-modifying the "Merged from" heading
-            if note_md.stem == canonical_name and directory == cfg.concepts_dir:
-                continue
             try:
                 text = note_md.read_text(encoding="utf-8", errors="replace")
-                if f"[[{duplicate_name}]]" in text:
-                    text = text.replace(f"[[{duplicate_name}]]", f"[[{canonical_name}]]")
+                original = text
+                text = re.sub(
+                    rf"\[\[{re.escape(duplicate_name)}(?P<suffix>[|#][^\]]*)?\]\]",
+                    lambda m: f"[[{canonical_name}{m.group('suffix') or ''}]]",
+                    text,
+                )
+                if text != original:
                     note_md.write_text(text, encoding="utf-8")
             except OSError:
                 continue
+
+    if cfg.edges_file.exists():
+        rewritten: list[str] = []
+        seen_edges: set[tuple[str, str, str]] = set()
+        for line in cfg.edges_file.read_text(encoding="utf-8", errors="replace").splitlines():
+            if not line.strip() or line.startswith("source\t") or line.startswith("#"):
+                rewritten.append(line)
+                continue
+            parts = line.split("\t")
+            if len(parts) < 3:
+                continue
+            parts[0] = canonical_name if parts[0] == duplicate_name else parts[0]
+            parts[1] = canonical_name if parts[1] == duplicate_name else parts[1]
+            if parts[0] == parts[1]:
+                continue
+            key = (parts[0], parts[1], parts[2])
+            if key in seen_edges:
+                continue
+            seen_edges.add(key)
+            rewritten.append("\t".join(parts))
+        cfg.edges_file.write_text("\n".join(rewritten).rstrip() + "\n", encoding="utf-8")
 
     # Invalidate entry in index so stale data isn't reused
     if duplicate_name in index.notes:

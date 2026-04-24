@@ -3,12 +3,12 @@
 import json
 import subprocess
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
-import pytest
 
 from pipeline.config import Config
-from pipeline.models import ConceptMatch, ExtractedSource, Manifest, Plan, Plans, SourceType, Template
+from pipeline.models import ConceptMatch, ExtractedSource, Manifest, Plan, SourceType
+from pipeline.qmd import run_qmd_query
 from pipeline.plan import (
     _fingerprint,
     _jaccard_similarity,
@@ -182,7 +182,6 @@ class TestDedupCheck:
 
 # ─── QMD wrapper ──────────────────────────────────────────────────────────────
 
-from pipeline.qmd import run_qmd_query
 
 class TestRunQmd:
     def test_successful_query(self, monkeypatch):
@@ -193,6 +192,7 @@ class TestRunQmd:
             "ai-safety": [0.9] + [0.0] * 1023,
             "alignment": [0.8] + [0.0] * 1023,
         }
+        qmd_module._cache_key = None
 
         monkeypatch.setattr("pipeline.qmd._ollama_embed", lambda text: [1.0] + [0.0] * 1023)
         matches = run_qmd_query("artificial intelligence", "qmd", "/tmp/coll", timeout=5)

@@ -159,6 +159,19 @@ def show_pending(cfg: Config) -> list[dict]:
         store.close()
 
 
+def _replace_wikilink_target(content: str, old_stem: str, new_stem: str) -> str:
+    """Replace wikilink targets while preserving aliases/anchors."""
+    import re
+
+    pattern = re.compile(rf"\[\[{re.escape(old_stem)}(?P<suffix>[|#][^\]]*)?\]\]")
+    return pattern.sub(lambda m: f"[[{new_stem}{m.group('suffix') or ''}]]", content)
+
+
+def _review_content_is_valid(content: str) -> bool:
+    """Cheap pre-approval validation for staged generated notes."""
+    return "TODO" not in content
+
+
 def _rewrite_review_content(review: dict, plan_targets: dict[str, dict[str, str]], stem_map: dict[str, str]) -> str:
     """Rewrite staged content to match any collision-resolved filenames.
 
@@ -167,10 +180,30 @@ def _rewrite_review_content(review: dict, plan_targets: dict[str, dict[str, str]
     """
     content = review["file_content"]
 
-    for old_stem, new_stem in stem_map.items():
-        if old_stem == new_stem:
-            continue
-        content = content.replace(f"[[{old_stem}]]", f"[[{new_stem}]]")
+    targets = plan_targets.get(review["plan_hash"], {})
+    replacements: dict[str, str] = {}
+    if review["file_type"] == "entry":
+        # The source frontmatter in an entry points to the source note. Do not
+        # rewrite it to the entry's collision-resolved stem just because the
+        # source and entry shared an original basename.
+        old = targets.get("source_old")
+        new = targets.get("source_new")
+        if old and new:
+            replacements[old] = new
+    elif review["file_type"] == "concept":
+        old = targets.get("entry_old")
+        new = targets.get("entry_new")
+        if old and new:
+            replacements[old] = new
+    else:
+        old = targets.get("entry_old")
+        new = targets.get("entry_new")
+        if old and new and old != targets.get("source_old"):
+            replacements[old] = new
+
+    for old_stem, new_stem in replacements.items():
+        if old_stem != new_stem:
+            content = _replace_wikilink_target(content, old_stem, new_stem)
 
     return content
 
@@ -194,16 +227,22 @@ def approve_reviews(cfg: Config, review_ids: Optional[list[int]] = None) -> dict
         plan_targets: dict[str, dict[str, str]] = {}
         resolved_reviews: list[dict] = []
 
-        from pipeline.vault import resolve_collision
+        reserved_paths: set[Path] = set()
 
         for review in pending:
             file_path = Path(review["file_path"])
             file_path.parent.mkdir(parents=True, exist_ok=True)
             resolved_path = file_path
-            if resolved_path.exists():
-                unique = resolve_collision(resolved_path.parent, resolved_path.stem)
-                resolved_path = resolved_path.parent / f"{unique}.md"
+            if resolved_path.exists() or resolved_path in reserved_paths:
+                idx = 1
+                while True:
+                    candidate = resolved_path.parent / f"{file_path.stem}-{idx}.md"
+                    if not candidate.exists() and candidate not in reserved_paths:
+                        resolved_path = candidate
+                        break
+                    idx += 1
                 log.warning("Collision resolved: wrote %s instead", resolved_path.name)
+            reserved_paths.add(resolved_path)
 
             targets = plan_targets.setdefault(review["plan_hash"], {})
             if review["file_type"] == "source":
@@ -232,6 +271,8 @@ def approve_reviews(cfg: Config, review_ids: Optional[list[int]] = None) -> dict
                 file_path = review["resolved_path"]
                 file_path.parent.mkdir(parents=True, exist_ok=True)
                 file_content = _rewrite_review_content(review, plan_targets, stem_map)
+                if not _review_content_is_valid(file_content):
+                    raise ValueError("staged content failed validation")
                 file_path.write_text(file_content, encoding="utf-8")
 
                 # Mark as approved

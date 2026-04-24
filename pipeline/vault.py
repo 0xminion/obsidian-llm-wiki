@@ -11,12 +11,16 @@ Handles all filesystem interactions with the Obsidian vault:
 from __future__ import annotations
 
 import re
+import threading as _threading
+
+import yaml
+
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
 
 from pipeline.config import Config
-from pipeline.models import Edge, EdgeType, ExtractedSource, Plan
+from pipeline.models import Edge, ExtractedSource, Plan
+from pipeline.utils import extract_frontmatter_field as _extract_frontmatter_field
 from pipeline.utils import parse_url_file_content, title_to_filename
 
 
@@ -81,7 +85,6 @@ def _format_yaml_value(key: str, value) -> str:
     return f"{key}: {value}"
 
 
-import yaml
 
 def _build_frontmatter(fields: dict) -> str:
     """Build a YAML frontmatter block from a dict of fields using PyYAML.
@@ -213,7 +216,7 @@ def update_moc(cfg: Config, moc_name: str, entry_name: str, description: str) ->
 
     if not moc_path.exists():
         # Create new MoC with basic structure
-        now = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        datetime.now(timezone.utc).strftime("%Y-%m-%d")
         content = (
             f"---\ntitle: {moc_name}\ntype: moc\nstatus: draft\ntags: []\n---\n\n"
             f"# {moc_name}\n\n"
@@ -269,7 +272,6 @@ def update_moc(cfg: Config, moc_name: str, entry_name: str, description: str) ->
 
 # In-memory edge cache to avoid O(N²) reads on every write.
 # Thread-safe via lock for concurrent write_edge() calls.
-import threading as _threading
 
 _edge_cache: set[tuple[str, str, str]] | None = None
 _edge_cache_path: Path | None = None
@@ -398,8 +400,6 @@ to find relevant notes instead of using RAG.
 
 """
 
-
-from pipeline.utils import extract_frontmatter_field as _extract_frontmatter_field
 
 
 def _extract_summary(content: str) -> str:
@@ -534,6 +534,14 @@ def archive_inbox(cfg: Config, hashes: set[str]) -> int:
 
         if file_hash in hashes:
             target = cfg.archive_dir / url_file.name
+            if target.exists():
+                idx = 1
+                while True:
+                    candidate = cfg.archive_dir / f"{url_file.stem}-{idx}{url_file.suffix}"
+                    if not candidate.exists():
+                        target = candidate
+                        break
+                    idx += 1
             url_file.rename(target)
             count += 1
 

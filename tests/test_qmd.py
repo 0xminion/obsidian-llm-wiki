@@ -1,7 +1,6 @@
 """Tests for pipeline/qmd.py — Semantic Concept Search via Ollama."""
 
 import json
-import math
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -116,6 +115,7 @@ class TestRunQmdQuery:
             "prediction-markets": [0.9, 0.1, 0.0],
             "forecasting": [0.5, 0.5, 0.0],
         }
+        qmd_module._cache_key = None
 
         matches = run_qmd_query(
             "prediction markets", "qmd", "concepts",

@@ -8,10 +8,10 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import re
+import ipaddress
+import socket
 import subprocess
-from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse
 
@@ -43,12 +43,13 @@ def _run(args: list[str], timeout: int = 45, check: bool = False,
 
 
 def _validate_url(url: str) -> bool:
-    """Basic URL validation to prevent SSRF via malicious .url files.
+    """Validate externally fetched URLs to reduce SSRF exposure.
 
     Checks:
       1. Well-formed URL with http/https scheme
-      2. Not targeting private/internal IP ranges
-      3. Not localhost
+      2. No embedded credentials
+      3. Host is not localhost or an internal/reserved IP literal, including
+         alternate IPv4 encodings accepted by curl/yt-dlp (integer/octal/hex).
     """
     try:
         parsed = urlparse(url)
@@ -58,25 +59,100 @@ def _validate_url(url: str) -> bool:
     if parsed.scheme not in ("http", "https"):
         return False
 
+    if parsed.username or parsed.password:
+        return False
+
     hostname = parsed.hostname or ""
     if not hostname:
         return False
 
-    # Block localhost and internal IPs
-    if hostname in ("localhost", "127.0.0.1", "0.0.0.0", "::1"):
+    host = hostname.strip().lower().rstrip(".")
+    if host == "localhost" or host.endswith(".localhost"):
         return False
 
-    # Block private IP ranges
-    private_prefixes = (
-        "10.", "172.16.", "172.17.", "172.18.", "172.19.",
-        "172.20.", "172.21.", "172.22.", "172.23.", "172.24.",
-        "172.25.", "172.26.", "172.27.", "172.28.", "172.29.",
-        "172.30.", "172.31.", "192.168.", "169.254.",
-    )
-    if hostname.startswith(private_prefixes):
+    if _host_is_blocked_address(host):
+        return False
+
+    if _host_resolves_to_blocked_address(host):
         return False
 
     return True
+
+
+def _host_is_blocked_address(host: str) -> bool:
+    """Return True for non-public IP literals, including legacy IPv4 forms."""
+    candidates = {host}
+    parsed = _parse_ipv4_weird(host)
+    if parsed:
+        candidates.add(parsed)
+
+    for candidate in candidates:
+        try:
+            ip = ipaddress.ip_address(candidate)
+        except ValueError:
+            continue
+        if (
+            ip.is_private
+            or ip.is_loopback
+            or ip.is_link_local
+            or ip.is_multicast
+            or ip.is_reserved
+            or ip.is_unspecified
+        ):
+            return True
+    return False
+
+def _host_resolves_to_blocked_address(host: str) -> bool:
+    """Return True when DNS resolution exposes non-public addresses.
+
+    Hostname-only checks are not enough: public-looking names can resolve to
+    loopback, RFC1918, link-local, multicast, or otherwise non-public IPs. For
+    extraction we fail closed if DNS cannot be resolved.
+    """
+    if _host_is_blocked_address(host):
+        return True
+    try:
+        infos = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
+    except (socket.gaierror, OSError):
+        return True
+    if not infos:
+        return True
+    for info in infos:
+        sockaddr = info[4]
+        if not sockaddr or _host_is_blocked_address(sockaddr[0]):
+            return True
+    return False
+
+
+def _parse_ipv4_weird(host: str) -> str:
+    """Normalize IPv4 forms curl accepts: decimal int, hex/octal, short dotted."""
+    if ":" in host:
+        return ""
+    parts = host.split(".")
+    if not all(parts) or len(parts) > 4:
+        return ""
+    values: list[int] = []
+    try:
+        for part in parts:
+            base = 10
+            raw = part.lower()
+            if raw.startswith("0x"):
+                base = 16
+            elif len(raw) > 1 and raw.startswith("0"):
+                base = 8
+            values.append(int(raw, base))
+    except ValueError:
+        return ""
+    if len(values) == 1:
+        value = values[0]
+        if not 0 <= value <= 0xFFFFFFFF:
+            return ""
+        return str(ipaddress.IPv4Address(value))
+    if any(not 0 <= value <= 255 for value in values):
+        return ""
+    while len(values) < 4:
+        values.append(0)
+    return ".".join(str(v) for v in values)
 
 
 def _curl_get(url: str, headers: Optional[dict] = None, timeout: int = 45) -> str:
@@ -84,7 +160,7 @@ def _curl_get(url: str, headers: Optional[dict] = None, timeout: int = 45) -> st
     if not _validate_url(url):
         log.warning("Blocked potentially unsafe URL: %s", url[:80])
         return ""
-    args = ["curl", "-sL", "--max-time", str(timeout)]
+    args = ["curl", "-s", "--max-redirs", "0", "--proto", "=http,https", "--max-time", str(timeout)]
     if headers:
         for k, v in headers.items():
             args.extend(["-H", f"{k}: {v}"])
@@ -99,7 +175,7 @@ def _curl_post_json(url: str, data: dict, headers: Optional[dict] = None,
     if not _validate_url(url):
         log.warning("Blocked potentially unsafe URL: %s", url[:80])
         return ""
-    args = ["curl", "-sL", "--max-time", str(timeout), "-X", "POST",
+    args = ["curl", "-s", "--max-redirs", "0", "--proto", "=http,https", "--max-time", str(timeout), "-X", "POST",
             "-H", "Content-Type: application/json"]
     if headers:
         for k, v in headers.items():

@@ -9,7 +9,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import re
 import subprocess
 import tempfile
 from urllib.parse import quote
@@ -21,7 +20,6 @@ from pipeline.extractors._shared import (
     _curl_post_json,
     _run,
     _extract_youtube_video_id,
-    extract_title,
     transcribe_with_whisper,
     ExtractionError,
 )

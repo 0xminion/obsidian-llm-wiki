@@ -14,17 +14,16 @@ import json
 import logging
 import os
 import re
-import subprocess
 import tempfile
 import xml.etree.ElementTree as ET
-from typing import Optional
-from urllib.parse import quote, urlparse, parse_qs
+from urllib.parse import quote, urlparse
 
 from pipeline.config import Config
 from pipeline.models import ExtractedSource, SourceType
 from pipeline.extractors._shared import (
     _curl_get,
     _run,
+    _validate_url,
     transcribe_with_whisper,
     transcribe_assemblyai,
     ExtractionError,
@@ -597,11 +596,15 @@ def _safe_xml_parse(xml_text: str):
     Returns ElementTree root or None on parse failure.
     """
     try:
-        parser = ET.XMLParser(resolve_entities=False)
+        upper_prefix = xml_text[:2000].upper()
+        if "<!DOCTYPE" in upper_prefix or "<!ENTITY" in upper_prefix:
+            log.warning("Refusing XML with DTD/entity declarations")
+            return None
+        parser = ET.XMLParser()
         root = ET.fromstring(xml_text, parser=parser)
         _strip_xml_ns(root)
         return root
-    except ET.ParseError:
+    except (ET.ParseError, TypeError):
         return None
 
 
@@ -718,9 +721,8 @@ def _transcribe_podcast_audio(audio_url: str, cfg: Config) -> str:
 
     try:
         # Download audio
-        parsed = urlparse(audio_url)
-        if parsed.scheme not in ("http", "https"):
-            log.warning("Refusing to download audio with non-HTTP scheme: %s", audio_url)
+        if not _validate_url(audio_url):
+            log.warning("Refusing to download unsafe audio URL: %s", audio_url)
             return ""
         dl = _run(
             ["yt-dlp", "-x", "--audio-format", "mp3", "-o", tmp_audio, audio_url],

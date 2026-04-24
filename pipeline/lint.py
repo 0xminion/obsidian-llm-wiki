@@ -25,6 +25,10 @@ from pathlib import Path
 from typing import Optional
 
 import logging
+from pipeline.utils import (
+    extract_body as _extract_body,
+    parse_frontmatter as _parse_frontmatter,
+)
 
 log = logging.getLogger(__name__)
 
@@ -55,12 +59,6 @@ class LintResult:
 
 
 # ─── Shared Utilities ─────────────────────────────────────────────────────────
-
-from pipeline.utils import (
-    extract_body as _extract_body,
-    parse_frontmatter as _parse_frontmatter,
-    extract_tags as _extract_tags,
-)
 
 
 def _find_md_files(vault: Path, *dirs: str) -> list[Path]:
@@ -132,13 +130,13 @@ def _build_wikilink_index(vault: Path, cache=None) -> tuple[dict[str, Path], dic
             continue
         for md in dir_path.glob("*.md"):
             note_name = md.stem
-            note_paths[note_name] = md
+            note_paths.setdefault(note_name, md)
             try:
                 content = md.read_text(encoding="utf-8", errors="replace")
                 links = set(re.findall(r"\[\[([^|#\]]+)(?:[|#][^\]]*)?\]\]", content))
-                outgoing[note_name] = links
+                outgoing.setdefault(note_name, set()).update(links)
             except OSError:
-                outgoing[note_name] = set()
+                outgoing.setdefault(note_name, set())
 
     # Build incoming links from outgoing
     incoming: dict[str, set[str]] = {name: set() for name in note_paths}
@@ -648,7 +646,7 @@ def check_required_sections(vault: Path) -> list[LintIssue]:
     handled by check_entry_template_sections and check_concept_structure.
     """
     issues = []
-    concepts_dir = vault / "04-Wiki" / "concepts"
+    vault / "04-Wiki" / "concepts"
     mocs_dir = vault / "04-Wiki" / "mocs"
 
     # MoC checks
@@ -797,7 +795,6 @@ def fix_markdown_format(file_path: Path) -> bool:
 def fix_banned_tags(file_path: Path) -> bool:
     """Remove banned tags from YAML frontmatter."""
     content = file_path.read_text(encoding="utf-8", errors="replace")
-    original = content
 
     # Only apply within frontmatter block
     fm_match = re.match(r"^(---\n)(.*?)(---\n)", content, re.DOTALL)
@@ -866,8 +863,10 @@ class LintChecker:
                 if fix_banned_tags(md):
                     result.fixes_applied += 1
 
-        # Checks that support cache (pass _cache kwarg)
-        cache_enabled = {"orphaned_notes", "broken_wikilinks"}
+        # Rebuild link graph from disk for correctness. The cache is retained
+        # for future optimization, but lint must not report stale graph issues
+        # after a create/review operation has just modified files.
+        cache_enabled: set[str] = set()
 
         # Run all checks
         checks = [
@@ -923,10 +922,7 @@ class LintChecker:
         for check_name, count in sorted(result.issues_by_check.items()):
             lines.append(f"## {check_name}")
             lines.append("")
-            check_issues = [i for i in result.issues if i.check == check_name.split(". ", 1)[-1].lower().replace(" ", "_").replace("/", "_")]
-            if not count:
-                # Try matching by the numeric prefix
-                check_issues = [i for i in result.issues if _issue_matches_check(i, check_name)]
+            check_issues = [i for i in result.issues if _issue_matches_check(i, check_name)]
 
             if not check_issues:
                 lines.append("All clear.")

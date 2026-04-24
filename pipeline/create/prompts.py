@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import logging
 from datetime import date
-from pathlib import Path
 
 from pipeline.config import Config
 from pipeline.models import Plan

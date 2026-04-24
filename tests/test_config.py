@@ -1,10 +1,8 @@
 """Tests for pipeline.config."""
 
 import os
-import tempfile
 from pathlib import Path
 
-import pytest
 
 from pipeline.config import Config, hashlib_md5_short, load_config
 

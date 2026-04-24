@@ -1,14 +1,10 @@
 """Tests for pipeline.lint module."""
 
-import tempfile
-from pathlib import Path
 
 import pytest
 
 from pipeline.lint import (
     LintChecker,
-    LintIssue,
-    Severity,
     check_broken_wikilinks,
     check_concept_structure,
     check_edges_consistency,

@@ -1,11 +1,9 @@
 """Tests for pipeline/vault_setup.py."""
 
-import pytest
 from pathlib import Path
 
 from pipeline.vault_setup import (
     VaultState,
-    detect_vault,
     setup_vault,
     migrate_vault,
     ensure_vault_ready,
@@ -13,13 +11,8 @@ from pipeline.vault_setup import (
     fix_frontmatter,
     migrate_vault_full,
     ScanResult,
-    ScanIssue,
     MigrationResult,
-    _has_frontmatter,
-    _has_field,
-    _classify_note,
     REQUIRED_DIRS,
-    CRITICAL_DIRS,
     _SEED_FILES,
 )
 from pipeline.utils import clean_title, title_to_filename, load_prompt
@@ -74,7 +67,7 @@ class TestVaultState:
 class TestSetupVault:
     def test_creates_all_dirs(self, tmp_path):
         vault = tmp_path / "vault"
-        actions = setup_vault(vault, repo_root=tmp_path)  # no repo files, but dirs get created
+        setup_vault(vault, repo_root=tmp_path)  # no repo files, but dirs get created
         for d in REQUIRED_DIRS:
             assert (vault / d).is_dir(), f"Missing: {d}"
 
@@ -86,7 +79,7 @@ class TestSetupVault:
 
     def test_idempotent(self, tmp_path):
         vault = tmp_path / "vault"
-        actions1 = setup_vault(vault, repo_root=tmp_path)
+        setup_vault(vault, repo_root=tmp_path)
         actions2 = setup_vault(vault, repo_root=tmp_path)
         # Second run should do nothing (dirs/files already exist)
         assert len(actions2) == 0
@@ -118,7 +111,7 @@ class TestMigrateVault:
         state = VaultState(vault)
         assert state.state == "incomplete"
 
-        actions = migrate_vault(vault, state, repo_root=tmp_path)
+        migrate_vault(vault, state, repo_root=tmp_path)
 
         # All dirs should exist now
         for d in REQUIRED_DIRS:
@@ -334,8 +327,8 @@ Content.
         assert "reviewed: null" in content
         # Should appear after status line
         lines = content.split("\n")
-        status_idx = next(i for i, l in enumerate(lines) if l.startswith("status:"))
-        reviewed_idx = next(i for i, l in enumerate(lines) if l.startswith("reviewed:"))
+        status_idx = next(i for i, line in enumerate(lines) if line.startswith("status:"))
+        reviewed_idx = next(i for i, line in enumerate(lines) if line.startswith("reviewed:"))
         assert reviewed_idx == status_idx + 1
 
     def test_add_aliases_field(self, tmp_path):

@@ -157,7 +157,9 @@ def extract_url(url: str, cfg: Config,
                     time.sleep(wait_time)
                 continue
 
-            # Content-level dedup: check if extracted content already exists
+            # Content-level dedup: check if extracted content already exists.
+            # Persist the extraction artifact before registering URL/content so
+            # a disk failure cannot poison future dedup state.
             if store:
                 chash = store.content_hash(source.content)
                 dup_name = store.get_content_duplicate(source.content)
@@ -173,12 +175,12 @@ def extract_url(url: str, cfg: Config,
                         content="",
                         type=source_type,
                     )
+            source.save(cfg.resolved_extract_dir)
+            if store:
                 store.register_url(url, source_type.value, chash)
                 store.register_content(
                     source.content, source.title, source_type.value,
                 )
-
-            source.save(cfg.resolved_extract_dir)
             return source
 
         except ExtractionError as e:
@@ -274,6 +276,9 @@ def extract_all(urls: list[str], cfg: Config, parallel: int = 4) -> Manifest:
                     manifest.entries.append(result)
     finally:
         store.close()
+
+    if not manifest.entries:
+        raise ExtractionError("all extractions failed; no usable sources extracted")
 
     # Save manifest
     manifest.save(cfg.resolved_extract_dir)

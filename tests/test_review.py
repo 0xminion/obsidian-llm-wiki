@@ -120,7 +120,7 @@ class TestApproveReviews:
         stage_for_review(plans, cfg, use_agent_insights=False)
 
         # Approve
-        stats = approve_reviews(cfg)
+        approve_reviews(cfg)
 
         # Entry should be written — may have a suffix due to collision resolution
         pending = show_pending(cfg)

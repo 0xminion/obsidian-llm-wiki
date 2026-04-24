@@ -38,6 +38,25 @@ app = typer.Typer(
 log = logging.getLogger(__name__)
 
 
+def _collision_safe_path(path: Path) -> Path:
+    """Return path, or a numbered sibling if path already exists."""
+    if not path.exists():
+        return path
+    idx = 1
+    while True:
+        candidate = path.with_name(f"{path.stem}-{idx}{path.suffix}")
+        if not candidate.exists():
+            return candidate
+        idx += 1
+
+
+def query_vault_fast(cfg: Config, question: str) -> str:
+    """Fast direct-LLM query path. Kept separate for testability."""
+    from pipeline.llm_client import get_llm_client
+
+    return get_llm_client(cfg).generate(_build_query_prompt(cfg, question), timeout=120)
+
+
 def check_dependencies(agent_cmd: str = "hermes") -> list[str]:
     """Check for baseline CLI tools needed before ingest starts.
 
@@ -286,8 +305,8 @@ def ingest(
 ):
     """Process inbox: extract → plan → create."""
     cfg = _load_cfg(vault)
+    cfg.parallel = parallel
     t0 = time.time()
-
     if dry_run:
         from pipeline.vault_setup import detect_vault
 
@@ -886,13 +905,11 @@ def query(
 
         if fast:
             # Fast path: direct LLM call (no Hermes subprocess overhead)
-            from pipeline.llm_client import get_llm_client
-            client = get_llm_client(cfg)
-            answer = client.generate(prompt, timeout=120)
+            answer = query_vault_fast(cfg, qtext)
             if answer:
                 typer.echo(f"\n--- Answer ({qname}) ---\n")
                 typer.echo(answer)
-                out_file = outputs_dir / f"{qname}.md"
+                out_file = _collision_safe_path(outputs_dir / f"{qname}.md")
                 out_file.write_text(
                     f"# Query: {qname}\n\n"
                     f"**Question:**\n{qtext}\n\n"
@@ -901,9 +918,7 @@ def query(
                 )
                 typer.echo(f"\nWritten to: {out_file}")
                 if str(qf) != "__command_line__":
-                    archive_path = archive_dir / qf.name
-                    if archive_path.exists():
-                        archive_path = archive_dir / f"{qf.stem}-{int(time.time())}{qf.suffix}"
+                    archive_path = _collision_safe_path(archive_dir / qf.name)
                     qf.rename(archive_path)
                     typer.echo(f"Archived to: {archive_path}")
             else:
@@ -921,7 +936,7 @@ def query(
                     typer.echo(f"\n--- Answer ({qname}) ---\n")
                     typer.echo(answer)
                     # Write to 05-Outputs/
-                    out_file = outputs_dir / f"{qname}.md"
+                    out_file = _collision_safe_path(outputs_dir / f"{qname}.md")
                     out_file.write_text(
                         f"# Query: {qname}\n\n"
                         f"**Question:**\n{qtext}\n\n"
@@ -931,10 +946,7 @@ def query(
                     typer.echo(f"\nWritten to: {out_file}")
                     # Archive original query
                     if str(qf) != "__command_line__":
-                        archive_path = archive_dir / qf.name
-                        if archive_path.exists():
-                            # Collision: append timestamp
-                            archive_path = archive_dir / f"{qf.stem}-{int(time.time())}{qf.suffix}"
+                        archive_path = _collision_safe_path(archive_dir / qf.name)
                         qf.rename(archive_path)
                         typer.echo(f"Archived to: {archive_path}")
                 else:

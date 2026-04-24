@@ -1,6 +1,5 @@
 """Tests for pipeline.stats module."""
 
-from pathlib import Path
 
 import pytest
 

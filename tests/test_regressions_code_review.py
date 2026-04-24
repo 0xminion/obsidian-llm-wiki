@@ -13,7 +13,7 @@ These guard against backsliding on the following verified bugs:
 
 import re
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
@@ -65,11 +65,8 @@ class TestExtractErrorIsolation:
 
         with patch("pipeline.extract.extract_url") as mock_extract:
             mock_extract.side_effect = ExtractionError("quota exhausted")
-            manifest = extract_all(["https://example.com/article"], cfg, parallel=1)
-
-        assert len(manifest.entries) == 0
-        # Note: Manifest does not track failure counts; verify by log inspection
-        # (the separate ExtractionError branch is the key fix here)
+            with pytest.raises(ExtractionError, match="all extractions failed"):
+                extract_all(["https://example.com/article"], cfg, parallel=1)
 
 
 # ─── M4: vault_setup.py env template sanity ─────────────────────────────────

@@ -4,8 +4,7 @@ These tests cover the recently-added semantic cross-linking, concept merging,
 and MoC rebuild functionality that uses direct LLM calls instead of Hermes subprocess.
 """
 
-from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -142,7 +141,7 @@ class TestMergeConcepts:
 
         # Canonical file has merged content
         canonical_content = (cfg.concepts_dir / "canonical.md").read_text()
-        assert "Merged from [[duplicate]]" in canonical_content
+        assert "Merged from duplicate" in canonical_content
         assert "Duplicate body" in canonical_content
 
         # Entry updated

@@ -256,7 +256,7 @@ class HermesProvider(BaseProvider):
     ) -> LLMResponse:
         try:
             result = subprocess.run(
-                ["hermes", "chat", "-q", prompt, "-Q"],
+                [(base_url or "hermes"), "chat", "-q", prompt, "-Q"],
                 capture_output=True,
                 text=True,
                 timeout=timeout,
@@ -299,6 +299,7 @@ class LLMClient:
     timeout: int = 60
     embed_model: str = "qwen3-embedding:0.6b"
     embed_base_url: str = ""
+    agent_cmd: str = "hermes"
 
     def __post_init__(self):
         self._provider_impl = self._resolve_provider()
@@ -323,7 +324,8 @@ class LLMClient:
         t = timeout or self.timeout
         if not m and self.provider == "ollama":
             m = os.environ.get("OLLAMA_INSIGHT_MODEL", "minimax-m2.7:cloud")
-        resp = self._provider_impl.generate(prompt, m, t, self.api_key, self.base_url)
+        provider_base = self.agent_cmd if self.provider == "hermes" else self.base_url
+        resp = self._provider_impl.generate(prompt, m, t, self.api_key, provider_base)
         if resp.success:
             return resp.text
         if raise_on_error:
@@ -413,4 +415,5 @@ def get_llm_client(cfg) -> LLMClient:
         timeout=cfg.llm_timeout,
         embed_model=cfg.embed_model or "qwen3-embedding:0.6b",
         embed_base_url=embed_url,
+        agent_cmd=getattr(cfg, "agent_cmd", "hermes") or "hermes",
     )

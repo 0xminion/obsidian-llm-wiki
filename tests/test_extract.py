@@ -248,25 +248,34 @@ class TestTryDefuddle:
 # ─── _try_defuddle_json ─────────────────────────────────────────────────────
 
 class TestTryDefuddleJson:
+    @patch("os.path.getsize", return_value=100)
     @patch("pipeline.extractors.web._run")
-    def test_success(self, mock_run):
+    def test_success(self, mock_run, _mock_getsize):
         content_text = "Extracted content from defuddle JSON mode. " * 10
-        mock_run.return_value = MagicMock(
-            returncode=0,
-            stdout=json.dumps({"content": content_text})
-        )
+        mock_run.side_effect = [
+            MagicMock(returncode=0, stdout=""),
+            MagicMock(returncode=0, stdout=json.dumps({"content": content_text})),
+        ]
         result = _try_defuddle_json("https://example.com", timeout=30)
         assert "Extracted content" in result
 
+    @patch("os.path.getsize", return_value=100)
     @patch("pipeline.extractors.web._run")
-    def test_empty_content(self, mock_run):
-        mock_run.return_value = MagicMock(returncode=0, stdout='{"content": "short"}')
+    def test_empty_content(self, mock_run, _mock_getsize):
+        mock_run.side_effect = [
+            MagicMock(returncode=0, stdout=""),
+            MagicMock(returncode=0, stdout='{"content": "short"}'),
+        ]
         result = _try_defuddle_json("https://example.com", timeout=30)
         assert result == ""
 
+    @patch("os.path.getsize", return_value=100)
     @patch("pipeline.extractors.web._run")
-    def test_invalid_json(self, mock_run):
-        mock_run.return_value = MagicMock(returncode=0, stdout="not json")
+    def test_invalid_json(self, mock_run, _mock_getsize):
+        mock_run.side_effect = [
+            MagicMock(returncode=0, stdout=""),
+            MagicMock(returncode=0, stdout="not json"),
+        ]
         result = _try_defuddle_json("https://example.com", timeout=30)
         assert result == ""
 
@@ -556,12 +565,11 @@ class TestExtractAll:
     def test_failed_extraction_is_not_written_to_manifest(self, mock_web, cfg: Config):
         mock_web.side_effect = RuntimeError("broken extractor")
 
-        manifest = extract_all(["https://example.com/article"], cfg, parallel=1)
+        with pytest.raises(ExtractionError, match="all extractions failed"):
+            extract_all(["https://example.com/article"], cfg, parallel=1)
 
-        assert manifest.entries == []
         manifest_path = cfg.resolved_extract_dir / "manifest.json"
-        assert manifest_path.exists()
-        assert json.loads(manifest_path.read_text()) == []
+        assert not manifest_path.exists()
 
     @patch("pipeline.extract.extract_url")
     def test_parallel_execution(self, mock_extract, cfg: Config):
@@ -578,25 +586,30 @@ class TestExtractAll:
 # ─── _curl_get / _curl_post_json ────────────────────────────────────────────
 
 class TestCurlHelpers:
+    @patch("pipeline.extractors._shared._validate_url", return_value=True)
     @patch("pipeline.extractors._shared._run")
-    def test_curl_get(self, mock_run):
+    def test_curl_get(self, mock_run, _mock_validate):
         mock_run.return_value = MagicMock(stdout='{"key": "value"}', returncode=0)
         result = _curl_get("https://api.example.com/data", timeout=10)
         assert result == '{"key": "value"}'
         args = mock_run.call_args[0][0]
         assert "curl" in args
-        assert "-sL" in args
+        assert "-s" in args
+        assert "-sL" not in args
+        assert "--max-redirs" in args
 
+    @patch("pipeline.extractors._shared._validate_url", return_value=True)
     @patch("pipeline.extractors._shared._run")
-    def test_curl_get_with_headers(self, mock_run):
+    def test_curl_get_with_headers(self, mock_run, _mock_validate):
         mock_run.return_value = MagicMock(stdout="response", returncode=0)
         _curl_get("https://api.example.com", headers={"Authorization": "Bearer key"}, timeout=10)
         args = mock_run.call_args[0][0]
         assert "-H" in args
         assert "Authorization: Bearer key" in args
 
+    @patch("pipeline.extractors._shared._validate_url", return_value=True)
     @patch("pipeline.extractors._shared._run")
-    def test_curl_post_json(self, mock_run):
+    def test_curl_post_json(self, mock_run, _mock_validate):
         mock_run.return_value = MagicMock(stdout="ok", returncode=0)
         result = _curl_post_json(
             "https://api.example.com/submit",

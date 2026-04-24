@@ -131,8 +131,8 @@ def setup_qmd(vault_path: Path) -> None:
             print(line)
     # Show last 5 lines of filtered output
     filtered = [
-        l for l in embed_result.stdout.splitlines()
-        if not any(p in l for p in noisy_patterns)
+        line for line in embed_result.stdout.splitlines()
+        if not any(p in line for p in noisy_patterns)
     ]
     for line in filtered[-5:]:
         print(line)

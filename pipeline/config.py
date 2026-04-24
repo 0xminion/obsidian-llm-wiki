@@ -270,8 +270,9 @@ def load_config(
         whisper_language=_env("WHISPER_LANGUAGE", ""),
     )
 
-    # Override extract dir if PIPELINE_TMPDIR is set
-    if os.environ.get("PIPELINE_TMPDIR"):
-        cfg.extract_dir = Path(os.environ["PIPELINE_TMPDIR"])
+    # Override extract dir if PIPELINE_TMPDIR is set in environment or .env.
+    pipeline_tmpdir = _env("PIPELINE_TMPDIR", "")
+    if pipeline_tmpdir:
+        cfg.extract_dir = Path(pipeline_tmpdir)
 
     return cfg

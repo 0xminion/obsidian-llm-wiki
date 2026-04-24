@@ -6,23 +6,18 @@ calls (curl, hermes, defuddle). No live network or real agents.
 
 from __future__ import annotations
 
-import json
 import hashlib
 from pathlib import Path
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 
 import pytest
 from typer.testing import CliRunner
 
 from pipeline.cli import app
-from pipeline.config import Config, load_config
-from pipeline.extract import extract_all, extract_url
-from pipeline.plan import plan_sources
-from pipeline.create import create_all
+from pipeline.config import Config
 from pipeline.models import (
     ExtractedSource, Manifest, Plan, Plans, Language, Template, SourceType,
 )
-from pipeline.vault import reindex, archive_inbox
 
 
 runner = CliRunner()

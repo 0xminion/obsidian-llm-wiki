@@ -10,7 +10,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import re
 import subprocess
 import tempfile
 from pathlib import Path
@@ -23,6 +22,7 @@ from pipeline.extractors._shared import (
     _ARXIV_PATTERN,
     _extract_arxiv_paper_id,
     _is_challenge_page,
+    _validate_url,
     extract_title,
 )
 
@@ -135,37 +135,66 @@ def _extract_web_content(url: str, timeout: int = 45, attempt: int = 0) -> str:
 
 
 def _try_defuddle(url: str, timeout: int = 45) -> str:
-    """Try defuddle parse --markdown URL -o tmpfile."""
+    """Try defuddle against safely downloaded HTML, not a live URL."""
+    if not _validate_url(url):
+        log.warning("Blocked potentially unsafe URL: %s", url[:80])
+        return ""
     try:
-        with tempfile.NamedTemporaryFile(suffix=".md", delete=False) as f:
-            tmpfile = f.name
+        with tempfile.NamedTemporaryFile(suffix=".html", delete=False) as src, \
+             tempfile.NamedTemporaryFile(suffix=".md", delete=False) as out:
+            srcfile = src.name
+            tmpfile = out.name
         try:
+            dl = _run(
+                ["curl", "-s", "--max-redirs", "0", "--proto", "=http,https",
+                 "--max-time", str(timeout), url, "-o", srcfile],
+                timeout=timeout + 5,
+            )
+            if dl.returncode != 0 or not os.path.exists(srcfile) or os.path.getsize(srcfile) == 0:
+                return ""
             result = _run(
-                ["defuddle", "parse", "--markdown", url, "-o", tmpfile],
+                ["defuddle", "parse", "--markdown", srcfile, "-o", tmpfile],
                 timeout=timeout,
             )
             if result.returncode == 0 and os.path.exists(tmpfile) and os.path.getsize(tmpfile) > 0:
                 return Path(tmpfile).read_text(encoding="utf-8", errors="replace")
         finally:
-            if os.path.exists(tmpfile):
-                os.unlink(tmpfile)
+            for path in (srcfile, tmpfile):
+                if os.path.exists(path):
+                    os.unlink(path)
     except (subprocess.TimeoutExpired, FileNotFoundError):
         pass
     return ""
 
 
 def _try_defuddle_json(url: str, timeout: int = 45) -> str:
-    """Try defuddle parse --json URL."""
+    """Try defuddle JSON output against safely downloaded HTML."""
+    if not _validate_url(url):
+        log.warning("Blocked potentially unsafe URL: %s", url[:80])
+        return ""
     try:
-        result = _run(
-            ["defuddle", "parse", "--json", url],
-            timeout=timeout,
-        )
-        if result.returncode == 0 and result.stdout:
-            data = json.loads(result.stdout)
-            content = data.get("content", "")
-            if content and len(content) > 200:
-                return content
+        with tempfile.NamedTemporaryFile(suffix=".html", delete=False) as f:
+            srcfile = f.name
+        try:
+            dl = _run(
+                ["curl", "-s", "--max-redirs", "0", "--proto", "=http,https",
+                 "--max-time", str(timeout), url, "-o", srcfile],
+                timeout=timeout + 5,
+            )
+            if dl.returncode != 0 or not os.path.exists(srcfile) or os.path.getsize(srcfile) == 0:
+                return ""
+            result = _run(
+                ["defuddle", "parse", "--json", srcfile],
+                timeout=timeout,
+            )
+            if result.returncode == 0 and result.stdout:
+                data = json.loads(result.stdout)
+                content = data.get("content", "")
+                if content and len(content) > 200:
+                    return content
+        finally:
+            if os.path.exists(srcfile):
+                os.unlink(srcfile)
     except (subprocess.TimeoutExpired, FileNotFoundError, json.JSONDecodeError):
         pass
     return ""
@@ -176,6 +205,9 @@ def _try_curl_extract(url: str, timeout: int = 45, attempt: int = 0) -> str:
 
     Rotates user-agents on retry to bypass simple bot detection.
     """
+    if not _validate_url(url):
+        log.warning("Blocked potentially unsafe URL: %s", url[:80])
+        return ""
     user_agents = [
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
@@ -188,7 +220,7 @@ def _try_curl_extract(url: str, timeout: int = 45, attempt: int = 0) -> str:
             tmpfile = f.name
         try:
             dl = _run(
-                ["curl", "-sL", "--max-time", str(timeout),
+                ["curl", "-s", "--max-redirs", "0", "--proto", "=http,https", "--max-time", str(timeout),
                  "-H", f"User-Agent: {ua}",
                  "-H", "Accept: text/html,application/xhtml+xml",
                  "-H", "Accept-Language: en-US,en;q=0.9",
@@ -215,6 +247,9 @@ def _try_archive_extract(url: str, timeout: int = 45) -> str:
 
     Fetches the most recent archived version of the page.
     """
+    if not _validate_url(url):
+        log.warning("Blocked potentially unsafe URL: %s", url[:80])
+        return ""
     from datetime import datetime
     archive_url = f"https://web.archive.org/web/{datetime.now().year}/{url}"
     try:
@@ -239,6 +274,9 @@ def _try_camoufox(url: str, timeout: int = 45) -> str:
     Final fallback in the extraction chain. Uses AsyncCamoufox to render
     the page and extract visible text.
     """
+    if not _validate_url(url):
+        log.warning("Blocked potentially unsafe URL: %s", url[:80])
+        return ""
     try:
         from camoufox import AsyncCamoufox
     except ImportError:
@@ -250,7 +288,19 @@ def _try_camoufox(url: str, timeout: int = 45) -> str:
     async def _fetch() -> str:
         async with AsyncCamoufox(headless=True) as browser:
             page = await browser.new_page()
+
+            async def _guard_route(route, request):
+                if _validate_url(request.url):
+                    await route.continue_()
+                else:
+                    log.warning("Blocked browser request to potentially unsafe URL: %s", request.url[:80])
+                    await route.abort()
+
+            await page.route("**/*", _guard_route)
             await page.goto(url, wait_until="domcontentloaded", timeout=timeout * 1000)
+            if not _validate_url(page.url):
+                log.warning("Blocked browser redirect to potentially unsafe URL: %s", page.url[:80])
+                return ""
             # Wait for JS-rendered content
             await asyncio.sleep(3)
             text = await page.evaluate("() => document.body.innerText")

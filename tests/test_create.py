@@ -238,7 +238,7 @@ class TestConceptConvergence:
             json.dumps(ext_data), encoding="utf-8"
         )
 
-        qmd_output = json.dumps([
+        json.dumps([
             {"file": "04-Wiki/concepts/existing-concept.md", "score": 0.75},
             {"file": "04-Wiki/concepts/tangential.md", "score": 0.3},
         ])

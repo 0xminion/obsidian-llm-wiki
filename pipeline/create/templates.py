@@ -15,6 +15,16 @@ from pipeline.utils import escape_yaml
 log = logging.getLogger(__name__)
 
 
+def _wikilink_for_concept(name: str) -> str:
+    """Return a wikilink using the canonical concept filename with display alias."""
+    from pipeline.vault import title_to_filename
+
+    stem = title_to_filename(name)
+    if stem == name:
+        return f"[[{name}]]"
+    return f"[[{stem}|{name}]]"
+
+
 def generate_source_content(
     plan: Plan,
     extracted: dict,
@@ -145,9 +155,9 @@ def generate_entry_content(
             core_insights_section = f"- Key themes and arguments from \"{escape_yaml(plan.title)}\""
 
     if plan.concept_updates:
-        linked_concepts = "\n".join(f"- [[{c}]]" for c in plan.concept_updates)
+        linked_concepts = "\n".join(f"- {_wikilink_for_concept(c)}" for c in plan.concept_updates)
     elif plan.concept_new:
-        linked_concepts = "\n".join(f"- [[{c}]] (new)" for c in plan.concept_new)
+        linked_concepts = "\n".join(f"- {_wikilink_for_concept(c)} (new)" for c in plan.concept_new)
     else:
         linked_concepts = "- No linked concepts yet"
 
