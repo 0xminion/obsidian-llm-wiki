@@ -279,9 +279,30 @@ python3 -m pytest tests/ -v
 
 666 tests covering: extraction, planning, creation, validation, lint, compile, vault operations, models, config, security regressions, and integration.
 
+## Clippings Workflow (02-Clippings)
+
+For content already extracted by other tools (Readwise, Obsidian Web Clipper, etc.):
+
+```bash
+# Drop markdown clippings here
+cp my-article.md ~/MyVault/02-Clippings/
+
+# Run pipeline — skips Stage 1 extraction, goes straight to Plan → Create
+pipeline ingest ~/MyVault
+```
+
+**Key differences from URL flow:**
+- Content already extracted (no HTTP calls)
+- `_strip_quotes()` helper for titles with wrapping quotes
+- Source URL regex strips trailing punctuation (prevents `url:` field contamination)
+- `\b` word boundaries for type detection (prevents `fakeyoutube.com` matching as YouTube)
+- Skips `source.save()` — no orphaned `.json` sidecars
+- `collect_clipping_files()` called directly (no `_collect_clipping_files` wrapper)
+- `vault.py` imports: `json`, `hashlib`, `logging` — watch for F821 (undefined name) lint
+
 ## Recommended Workflow
 
-**Daily:** Drop sources in `01-Raw/`, run `pipeline ingest ~/MyVault`
+**Daily:** Drop URLs in `01-Raw/` or clippings in `02-Clippings/`, run `pipeline ingest ~/MyVault`
 
 **Weekly:** `pipeline compile` → review entries → `pipeline lint --fix`
 
@@ -302,30 +323,46 @@ Python-first with a unified LLM client supporting multiple providers:
 ```
 pipeline/
 ├── assets/            # Packaged prompt/note-template assets copied into vaults
-├── cli.py             # typer CLI — all commands
-├── llm_client.py      # Unified LLM client (Ollama/OpenRouter/Hermes)
-├── extract.py          # Stage 1: URL routing, extraction, dedup
-├── plan.py             # Stage 2: semantic search, agent planning
-├── create/             # Stage 3 creation
-│   ├── agent.py         # Agent execution (Hermes, legacy)
-│   ├── orchestrator.py  # Batch coordination + post-processing
-│   ├── prompts.py       # Prompt construction
-│   ├── templates.py     # Template mode (deterministic + fast LLM insights)
-│   └── validate.py      # Output validation + auto-repair
-├── compile.py          # Compile pass: semantic ops + deterministic ops
-├── lint.py             # 15 lint checks with cache support
-├── vault.py            # File operations, collision detection
-├── store.py            # SQLite content store + vault cache
-├── config.py           # Configuration and environment
-├── models.py           # Data models (Manifest, Plan, Edge, etc.)
-├── qmd.py              # Semantic search orchestrator (QMD MCP → keyword fallback)
-├── qmd_mcp.py          # QMD MCP HTTP client (JSON-RPC over HTTP)
-├── utils.py            # Shared utilities
+├── cli/               # Typer CLI — all commands
+├── llm_client/        # Unified LLM client (Ollama/OpenRouter/Hermes)
+├── extract/           # Stage 1: URL routing, extraction, dedup
+├── plan/              # Stage 2: semantic search, agent planning
+├── create/            # Stage 3 creation
+│   ├── agent/         # Agent execution (Hermes, legacy)
+│   ├── orchestrator/   # Batch coordination + post-processing
+│   ├── prompts/       # Prompt construction
+│   ├── templates/     # Template mode (deterministic + fast LLM insights)
+│   └── validate/      # Output validation + auto-repair
+├── compile/           # Compile pass: semantic ops + deterministic ops
+├── lint/              # 15 lint checks with cache support
+├── vault/             # File operations, collision detection
+├── store/             # SQLite content store + vault cache
+├── config/            # Configuration and environment
+├── models/            # Data models (Manifest, Plan, Edge, etc.)
+├── qdrant/            # Semantic search orchestrator (Qdrant → keyword fallback)
+├── qdrant_mcp/        # Qdrant MCP HTTP client (JSON-RPC over HTTP)
+├── utils/             # Shared utilities
 └── extractors/         # Type-specific extractors
-    ├── web.py
-    ├── youtube.py
-    ├── podcast.py
-    └── _shared.py
+    ├── web/
+    ├── youtube/
+    ├── podcast/
+    └── _shared/
 ```
 
 ~2,900 lines of Python, 666 tests, unified LLM client with 3 providers, 0 shell scripts in the critical path.
+
+## Agentic Usage
+
+**For AI agents:** Load the `obsidian-ingest` skill for canonical ingestion commands.
+
+**Trigger phrases:** "obsidian", "vault", "clip", "ingest", "save to obsidian", "wiki", "knowledge base", or any URL pattern.
+
+**Skill location:** `~/.hermes/skills/obsidian-ingest/SKILL.md`
+
+**Key commands for agents:**
+- `pipeline ingest ~/MyVault` — full pipeline
+- `pipeline ingest --parallel 3 ~/MyVault` — parallel workers
+- `pipeline ingest --dry-run ~/MyVault` — preview mode
+- `pipeline compile ~/MyVault` — cross-link and index rebuild
+- `pipeline lint --fix ~/MyVault` — auto-fix vault issues
+- `pipeline query --ask "question" ~/MyVault` — Q&A against vault
