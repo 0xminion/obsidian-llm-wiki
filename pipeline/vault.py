@@ -546,3 +546,98 @@ def archive_inbox(cfg: Config, hashes: set[str]) -> int:
             count += 1
 
     return count
+
+
+# ─── Clippings Archive ─────────────────────────────────────────────────────
+
+def archive_clippings(
+    cfg: Config,
+    archived_hashes: set[str],
+    extract_dir: Path | None = None,
+) -> int:
+    """Move processed clipping files from 02-Clippings to archive.
+
+    Each clipping's URL-derived hash is checked against `archived_hashes`.
+    Matching files are moved to cfg.clippings_archive_dir.
+
+    Returns the count of files archived.
+    """
+    clippings_dir = cfg.clippings_dir
+    if not clippings_dir.exists():
+        return 0
+
+    cfg.clippings_archive_dir.mkdir(parents=True, exist_ok=True)
+    extract_dir = extract_dir or cfg.resolved_extract_dir
+
+    # Build a map of URL hash -> source .json filename for fallback lookup.
+    # This handles defuddle-produced clippings whose body may still contain
+    # the original URL in frontmatter or first markdown link.
+    _hash_to_json_file: dict[str, str] = {}
+    if extract_dir.exists():
+        for json_file in extract_dir.glob("*.json"):
+            try:
+                data = json.loads(json_file.read_text(encoding="utf-8"))
+                u = str(data.get("url", "")).strip()
+                if u:
+                    _hash_to_json_file[
+                        hashlib.md5(u.encode(), usedforsecurity=False).hexdigest()[:12]
+                    ] = json_file.stem
+            except (OSError, json.JSONDecodeError):
+                continue
+
+    count = 0
+    for md_file in clippings_dir.glob("*.md"):
+        h = _clipping_hash(md_file)
+        if not h:
+            continue
+        if h not in archived_hashes:
+            continue
+
+        target = cfg.clippings_archive_dir / md_file.name
+        if target.exists():
+            idx = 1
+            while True:
+                candidate = cfg.clippings_archive_dir / f"{md_file.stem}-{idx}{md_file.suffix}"
+                if not candidate.exists():
+                    target = candidate
+                    break
+                idx += 1
+
+        try:
+            md_file.rename(target)
+            count += 1
+        except OSError:
+            log.exception("Failed to archive clipping %s", md_file.name)
+
+    return count
+
+
+def _clipping_hash(md_file: Path) -> str | None:
+    """Compute the source URL hash for a clipping markdown file.
+
+    Reads frontmatter & body from the file, resolves the URL the same way
+    parse_clipping_file does, then returns its 12-char MD5 hash.
+    """
+    from pipeline.utils import extract_body, parse_frontmatter
+    import hashlib
+
+    try:
+        text = md_file.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+
+    fm = parse_frontmatter(text)
+    body = extract_body(text)
+
+    url = ""
+    for key in ("source_url", "url", "source"):
+        if fm.get(key):
+            url = str(fm[key]).strip()
+            break
+    if not url:
+        m = re.search(r"https?://\S+", body)
+        url = m.group(0) if m else ""
+    if not url:
+        return None
+
+    return hashlib.md5(url.encode(), usedforsecurity=False).hexdigest()[:12]

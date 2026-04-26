@@ -85,6 +85,76 @@ def parse_url_file_content(content: str) -> str:
     return ""
 
 
+def parse_clipping_file(file_path: Path) -> dict | None:
+    """Parse a markdown clipping file into an extraction-compatible dict.
+
+    Clipping files (e.g. from Obsidian Web Clipper or Defuddle) are markdown
+    notes placed in 02-Clippings/.  Their frontmatter is expected to contain
+    URL metadata under one of: url, source_url, source.
+
+    Returns a dict compatible with ExtractedSource.to_dict() / Plan generation.
+    Returns None if no URL can be resolved.
+    """
+    try:
+        text = file_path.read_text(encoding="utf-8", errors="replace")
+    except (OSError, UnicodeDecodeError):
+        return None
+
+    fm = parse_frontmatter(text)
+    body = extract_body(text)
+
+    # Resolve URL from frontmatter (preferred) or first link in body
+    url = ""
+    for key in ("source_url", "url", "source"):
+        if fm.get(key):
+            url = str(fm[key]).strip().strip('"').strip("'")
+            break
+    if not url:
+        # Try to find the first http link in the body
+        m = re.search(r"https?://\S+", body)
+        url = m.group(0) if m else ""
+    if not url:
+        return None
+
+    # Resolve title
+    title = str(fm.get("title", file_path.stem)).strip().strip('"').strip("'") or file_path.stem
+
+    # Resolve author
+    author = str(fm.get("author", "")).strip().strip('"').strip("'")
+
+    # Resolve source type from URL heuristics
+    source_type = "web"
+    if re.search(r"youtu\.be|youtube\.com", url):
+        source_type = "youtube"
+    elif re.search(r"twitter\.com|x\.com", url):
+        source_type = "twitter"
+
+    return {
+        "url": url,
+        "title": title,
+        "content": body.strip(),
+        "type": source_type,
+        "author": author,
+        "source_file": str(file_path.name),
+    }
+
+
+def collect_clipping_files(clippings_dir: Path) -> list[tuple[Path, dict]]:
+    """Scan 02-Clippings for markdown files, parse each into a dict.
+
+    Returns a list of (file_path, clipped_dict) tuples for files that could
+    be parsed successfully (have a resolvable URL).
+    """
+    results: list[tuple[Path, dict]] = []
+    if not clippings_dir.exists():
+        return results
+    for md_file in sorted(clippings_dir.glob("*.md")):
+        clipped = parse_clipping_file(md_file)
+        if clipped:
+            results.append((md_file, clipped))
+    return results
+
+
 def parse_frontmatter(content: str) -> dict:
     """Extract YAML frontmatter as a dict. Returns empty dict if invalid."""
     try:

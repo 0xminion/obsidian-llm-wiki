@@ -300,9 +300,10 @@ def approve_reviews(cfg: Config, review_ids: Optional[list[int]] = None) -> dict
             and all(r["id"] in selected_pending_ids for r in all_pending if r["plan_hash"] == plan_hash)
         }
         try:
-            from pipeline.vault import reindex as vault_reindex, archive_inbox
+            from pipeline.vault import reindex as vault_reindex, archive_inbox, archive_clippings
             vault_reindex(cfg)
             archive_inbox(cfg, successful_hashes)
+            archive_clippings(cfg, successful_hashes)
         except Exception as e:
             log.warning("Post-approve reindex/archive failed: %s", e)
 

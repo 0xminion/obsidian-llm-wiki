@@ -151,6 +151,14 @@ class Config:
         return self.vault_path / "01-Raw"
 
     @property
+    def clippings_dir(self) -> Path:
+        return self.vault_path / "02-Clippings"
+
+    @property
+    def clippings_archive_dir(self) -> Path:
+        return self.vault_path / "10-Archive-Clippings"
+
+    @property
     def archive_dir(self) -> Path:
         return self.vault_path / "08-Archive-Raw"
 

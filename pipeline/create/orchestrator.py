@@ -11,7 +11,7 @@ from pathlib import Path
 
 from pipeline.config import Config
 from pipeline.models import Plans
-from pipeline.vault import archive_inbox, reindex
+from pipeline.vault import archive_clippings, archive_inbox, reindex
 
 from pipeline.create import agent as _create_agent
 from pipeline.create.validate import validate_batch, validate_output, _repair_violations
@@ -246,7 +246,7 @@ def postprocess_creation(
 
     if violations:
         log.warning(
-            "Skipping inbox archive because %d validation violations remain",
+            "Skipping archive because %d validation violations remain",
             len(violations),
         )
     else:
@@ -256,6 +256,13 @@ def postprocess_creation(
             log.info("Archived %d inbox files", archived)
         except Exception:
             log.exception("Archive inbox failed")
+
+        # Also archive processed clippings (02-Clippings -> 10-Archive-Clippings)
+        try:
+            archived_clips = archive_clippings(cfg, successful_hashes)
+            log.info("Archived %d clipping files", archived_clips)
+        except Exception:
+            log.exception("Archive clippings failed")
 
     _sync_vault(cfg)
     return violations

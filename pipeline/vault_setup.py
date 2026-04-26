@@ -36,6 +36,7 @@ REQUIRED_DIRS = [
     "07-WIP",
     "08-Archive-Raw",
     "09-Archive-Queries",
+    "10-Archive-Clippings",
     "Meta/Scripts",
     "Meta/Templates",
     "Meta/lib",
@@ -396,6 +397,7 @@ _EXPECTED_DIRS = [
     "07-WIP",
     "08-Archive-Raw",
     "09-Archive-Queries",
+    "10-Archive-Clippings",
 ]
 
 

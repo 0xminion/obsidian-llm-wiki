@@ -228,7 +228,9 @@ obsidian-llm-wiki/
 
 ### 4.1 Purpose
 
-Extract takes a list of URLs and produces a `Manifest` containing clean markdown content, title, author, and content type. **Zero LLM calls.**
+Extract takes a list of URLs (and optional pre-extracted clippings from `02-Clippings/`) and produces a `Manifest` containing clean markdown content, title, author, and content type. **Zero LLM calls.**
+
+Clippings placed in `02-Clippings/*.md` bypass the entire Stage 1 extraction chain — they are assumed to already contain quality markdown (e.g. from Obsidian Web Clipper or Defuddle).  The pipeline reads their frontmatter for `url`, `title`, and `author`, treats the body as pre-extracted content, and appends them directly to the manifest before Stage 2 planning.
 
 ### 4.2 URL Routing Table
 
@@ -668,7 +670,7 @@ pipeline query --ask "What are the risks of prediction markets?"
 ~/MyVault/
 ├── 01-Raw/              # Drop .url files here
 │   └── *.url
-├── 02-Clippings/        # Manual web clipper imports (not auto-ingested)
+├── 02-Clippings/        # Manual web clipper imports (auto-ingested; bypass Stage 1)
 ├── 03-Queries/           # Drop .md question files for Q&A
 ├── 04-Wiki/
 │   ├── sources/          # Full extracted content. One .md per URL.
@@ -684,10 +686,11 @@ pipeline query --ask "What are the risks of prediction markets?"
 ├── 07-WIP/               # Your drafts — NEVER touched by automation
 ├── 08-Archive-Raw/       # Processed .url files (moved after ingest)
 ├── 09-Archive-Queries/   # Answered query files
-└── Meta/
-    ├── Scripts/            # Pipeline code, logs, cache
-    ├── prompts/          # Runtime copy seeded from pipeline/assets/prompts
-    └── Templates/        # Runtime copy seeded from pipeline/assets/templates
+└── 10-Archive-Clippings/   # Processed clippings (moved after ingest)
+    └── Meta/
+        ├── Scripts/            # Pipeline code, logs, cache
+        ├── prompts/          # Runtime copy seeded from pipeline/assets/prompts
+        └── Templates/        # Runtime copy seeded from pipeline/assets/templates
 ```
 
 ### Key Data Models

@@ -56,7 +56,7 @@ LLM_PROVIDER=hermes
 AGENT_CMD=hermes
 ```
 
-`pipeline ingest` currently scans `01-Raw/*.url` as its inbox. Other raw assets can live in the vault, but they are not auto-ingested by this command yet.
+`pipeline ingest` scans `01-Raw/*.url` and `02-Clippings/*.md` as its inbox. Files in `02-Clippings/` are assumed already extracted by defuddle or other web-clipper tools — they bypass Stage 1 extraction and go straight to Stage 2 planning + Stage 3 creation.
 
 ### Pipeline Commands
 
@@ -167,8 +167,8 @@ Runs after ingest or manually via `pipeline compile`:
 ## Vault Structure
 
 ```
-01-Raw/              ← drop .url inbox items here
-02-Clippings/        ← reserved for manual web clipper imports (not ingested by `pipeline ingest`)
+01-Raw/              ← drop .url inbox items here (Stage 1 extracted)
+02-Clippings/        ← drop defuddle'd markdown clippings (bypass Stage 1, auto-ingested)
 03-Queries/          ← drop .md files with questions for Q&A
 04-Wiki/
 ├── sources/         ← full original content
@@ -180,6 +180,7 @@ Runs after ingest or manually via `pipeline compile`:
 07-WIP/              ← your drafts (untouched by automation)
 08-Archive-Raw/      ← processed inbox items
 09-Archive-Queries/  ← answered queries
+10-Archive-Clippings/ ← processed clippings
 Meta/
 ├── Scripts/         ← pipeline code, logs, cache
 ├── prompts/         ← runtime prompt templates seeded from packaged assets

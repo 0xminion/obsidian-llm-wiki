@@ -26,7 +26,7 @@ from pipeline.config import Config, load_config
 from pipeline.extract import extract_all
 from pipeline.plan import plan_sources
 from pipeline.create import create_all, create_file_templates
-from pipeline.models import Manifest, Plans
+from pipeline.models import ExtractedSource, Manifest, Plans, SourceType
 from pipeline.utils import extract_body, parse_url_file_content
 from pipeline.vault import reindex as vault_reindex
 
@@ -123,6 +123,15 @@ def _collect_url_files(inbox_dir: Path) -> list[tuple[Path, str]]:
         if url:
             results.append((url_file, url))
     return results
+
+
+def _collect_clipping_files(clippings_dir: Path) -> list[tuple[Path, dict]]:
+    """Scan 02-Clippings for markdown files, return list of (filepath, data_dict)."""
+    from pipeline.utils import collect_clipping_files
+
+    if not clippings_dir.exists():
+        return []
+    return collect_clipping_files(clippings_dir)
 
 
 def _query_keywords(question: str) -> set[str]:
@@ -386,17 +395,24 @@ def ingest(
         from pipeline.metrics import reset_metrics, start_stage, end_stage, get_metrics
         reset_metrics()
 
-        # ─── Collect URLs ──────────────────────────────────────────────────
+        # ─── Collect URLs + Clippings ────────────────────────────────────────
         url_entries = _collect_url_files(cfg.inbox_dir)
         urls = [u for _, u in url_entries]
+        clipping_entries = _collect_clipping_files(cfg.clippings_dir)
 
-        if not urls and not resume:
-            typer.echo("No .url files found in inbox.")
+        has_work = bool(urls or clipping_entries)
+        if not has_work and not resume:
+            typer.echo("No .url files in inbox and no .md clippings found.")
             raise typer.Exit(code=0)
 
-        typer.echo(f"Found {len(urls)} URL(s) in inbox.")
+        inbox_msg_parts: list[str] = []
+        if urls:
+            inbox_msg_parts.append(f"{len(urls)} URL(s)")
+        if clipping_entries:
+            inbox_msg_parts.append(f"{len(clipping_entries)} clipping(s)")
+        typer.echo(f"Found {' + '.join(inbox_msg_parts)} in inbox.")
 
-        # ─── Stage 1: Extract ──────────────────────────────────────────────
+        # ─── Stage 1: Extract ─────────────────────────────────────────────────
         t1 = time.time()
         if resume:
             typer.echo("Stage 1: SKIPPED (--resume)")
@@ -410,12 +426,30 @@ def ingest(
             typer.echo("Stage 1: Extracting...")
             start_stage("extract")
             if dry_run:
-                typer.echo("  [DRY RUN] Would extract the following URLs:")
-                for url in urls:
-                    typer.echo(f"    - {url}")
+                if urls:
+                    typer.echo("  [DRY RUN] Would extract the following URLs:")
+                    for url in urls:
+                        typer.echo(f"    - {url}")
+                if clipping_entries:
+                    typer.echo("  [DRY RUN] Would ingest clippings (skip Stage 1):")
+                    for _, clipped in clipping_entries:
+                        typer.echo(f"    - {clipped.get('title', 'untitled')}")
                 manifest = Manifest(entries=[])
             else:
                 manifest = extract_all(urls, cfg, parallel=parallel)
+                # ── Clippings bypass Stage 1 (already processed / defuddled)
+                for _fp, clipped in clipping_entries:
+                    source = ExtractedSource(
+                        url=clipped["url"],
+                        title=clipped["title"],
+                        content=clipped["content"],
+                        type=SourceType(clipped.get("type", "web")),
+                        author=clipped.get("author", ""),
+                        source_file=clipped.get("source_file", ""),
+                    )
+                    manifest.entries.append(source)
+                    source.save(extract_dir)
+                manifest.save(extract_dir)
             elapsed_1 = time.time() - t1
             end_stage("extract")
             typer.echo(f"  Extracted {len(manifest.entries)} sources in {elapsed_1:.1f}s")
