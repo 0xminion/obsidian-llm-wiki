@@ -27,7 +27,7 @@ from pipeline.extract import extract_all
 from pipeline.plan import plan_sources
 from pipeline.create import create_all, create_file_templates
 from pipeline.models import ExtractedSource, Manifest, Plans, SourceType
-from pipeline.utils import extract_body, parse_url_file_content
+from pipeline.utils import collect_clipping_files, extract_body, parse_url_file_content
 from pipeline.vault import reindex as vault_reindex
 
 app = typer.Typer(
@@ -123,15 +123,6 @@ def _collect_url_files(inbox_dir: Path) -> list[tuple[Path, str]]:
         if url:
             results.append((url_file, url))
     return results
-
-
-def _collect_clipping_files(clippings_dir: Path) -> list[tuple[Path, dict]]:
-    """Scan 02-Clippings for markdown files, return list of (filepath, data_dict)."""
-    from pipeline.utils import collect_clipping_files
-
-    if not clippings_dir.exists():
-        return []
-    return collect_clipping_files(clippings_dir)
 
 
 def _query_keywords(question: str) -> set[str]:
@@ -398,7 +389,7 @@ def ingest(
         # ─── Collect URLs + Clippings ────────────────────────────────────────
         url_entries = _collect_url_files(cfg.inbox_dir)
         urls = [u for _, u in url_entries]
-        clipping_entries = _collect_clipping_files(cfg.clippings_dir)
+        clipping_entries = collect_clipping_files(cfg.clippings_dir)
 
         has_work = bool(urls or clipping_entries)
         if not has_work and not resume:
@@ -448,7 +439,8 @@ def ingest(
                         source_file=clipped.get("source_file", ""),
                     )
                     manifest.entries.append(source)
-                    source.save(extract_dir)
+                    # Clippings already have canonical data in 02-Clippings/*.md;
+                    # skip redundant .json sidecar to keep extract_dir clean.
                 manifest.save(extract_dir)
             elapsed_1 = time.time() - t1
             end_stage("extract")

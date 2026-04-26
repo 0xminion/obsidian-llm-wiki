@@ -11,7 +11,6 @@ Handles all filesystem interactions with the Obsidian vault:
 from __future__ import annotations
 
 import hashlib
-import json
 import logging
 import re
 import threading as _threading
@@ -572,23 +571,6 @@ def archive_clippings(
         return 0
 
     cfg.clippings_archive_dir.mkdir(parents=True, exist_ok=True)
-    extract_dir = extract_dir or cfg.resolved_extract_dir
-
-    # Build a map of URL hash -> source .json filename for fallback lookup.
-    # This handles defuddle-produced clippings whose body may still contain
-    # the original URL in frontmatter or first markdown link.
-    _hash_to_json_file: dict[str, str] = {}
-    if extract_dir.exists():
-        for json_file in extract_dir.glob("*.json"):
-            try:
-                data = json.loads(json_file.read_text(encoding="utf-8"))
-                u = str(data.get("url", "")).strip()
-                if u:
-                    _hash_to_json_file[
-                        hashlib.md5(u.encode(), usedforsecurity=False).hexdigest()[:12]
-                    ] = json_file.stem
-            except (OSError, json.JSONDecodeError):
-                continue
 
     count = 0
     for md_file in clippings_dir.glob("*.md"):
@@ -601,12 +583,16 @@ def archive_clippings(
         target = cfg.clippings_archive_dir / md_file.name
         if target.exists():
             idx = 1
-            while True:
+            max_attempts = 100
+            while idx <= max_attempts:
                 candidate = cfg.clippings_archive_dir / f"{md_file.stem}-{idx}{md_file.suffix}"
                 if not candidate.exists():
                     target = candidate
                     break
                 idx += 1
+            else:
+                log.warning("Too many archive collisions for %s — skipping", md_file.name)
+                continue
 
         try:
             md_file.rename(target)

@@ -22,9 +22,9 @@ from pipeline.vault import archive_clippings, _clipping_hash
 
 # ── Fixtures ──────────────────────────────────────────────────────────────
 
-@ pytest.fixture
+@pytest.fixture
 def make_clipping(tmp_path: Path):
-    def _maker(**kwargs) -> Path:
+    def _maker(dir: Path | None = None, **kwargs) -> Path:
         url = kwargs.get("url", "https://example.com/article")
         title = kwargs.get("title", "Test Article")
         author = kwargs.get("author", "Alice")
@@ -41,7 +41,8 @@ def make_clipping(tmp_path: Path):
             f"\n"
             f"{body}\n"
         )
-        p = tmp_path / f"{kwargs.get('name', 'test')}.md"
+        target_dir = dir or tmp_path
+        p = target_dir / f"{kwargs.get('name', 'test')}.md"
         p.write_text(content, encoding="utf-8")
         return p
 
@@ -124,13 +125,8 @@ class TestArchiveClippings:
         clippings.mkdir()
         archive.mkdir()
 
-        path = make_clipping(name="article", url="https://example.com/article")
+        path = make_clipping(name="article", url="https://example.com/article", dir=clippings)
         h = _clipping_hash(path)
-
-        # Move into the clippings dir so archive_clippings can find it
-        target = clippings / path.name
-        path.rename(target)
-        path = target
 
         cfg = Config(vault_path=tmp_path)
 
@@ -145,9 +141,7 @@ class TestArchiveClippings:
         clippings.mkdir()
         archive.mkdir()
 
-        make_clipping(name="keep", url="https://example.com/keep")
-        clip = tmp_path / "keep.md"
-        clip.rename(clippings / clip.name)
+        make_clipping(name="keep", url="https://example.com/keep", dir=clippings)
 
         cfg = Config(vault_path=tmp_path)
 
@@ -161,13 +155,8 @@ class TestArchiveClippings:
         clippings.mkdir()
         archive.mkdir()
 
-        path = make_clipping(name="dup", url="https://example.com/dup")
+        path = make_clipping(name="dup", url="https://example.com/dup", dir=clippings)
         (archive / "dup.md").write_text("old")
-
-        # Move into the clippings dir so archive_clippings can find it
-        target = clippings / path.name
-        path.rename(target)
-        path = target
 
         cfg = Config(vault_path=tmp_path)
 
@@ -199,7 +188,8 @@ class TestClippingHash:
 
 class TestCliClippingWiring:
     def test_collect_url_files_and_clipping_files_combined(self, tmp_path: Path, make_clipping):
-        from pipeline.cli import _collect_url_files, _collect_clipping_files
+        from pipeline.cli import _collect_url_files
+        from pipeline.utils import collect_clipping_files
 
         # Simulate vault structure
         raw = tmp_path / "01-Raw"
@@ -209,13 +199,12 @@ class TestCliClippingWiring:
 
         url_file = raw / "site.url"
         url_file.write_text("https://example.com/raw-url\n")
-        clip = make_clipping(name="clip", url="https://example.com/clip-url")
-        clip.rename(clips / "clip.md")
+        make_clipping(name="clip", url="https://example.com/clip-url", dir=clips)
 
         urls = _collect_url_files(raw)
         assert len(urls) == 1
 
-        clippings = _collect_clipping_files(clips)
+        clippings = collect_clipping_files(clips)
         assert len(clippings) == 1
         assert clippings[0][1]["url"] == "https://example.com/clip-url"
 

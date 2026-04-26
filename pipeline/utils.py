@@ -85,6 +85,13 @@ def parse_url_file_content(content: str) -> str:
     return ""
 
 
+def _strip_quotes(value: str) -> str:
+    """Strip surrounding quotes (straight and curly) from a string value."""
+    for q in ('"', "'", '“', '”', '‘', '’', '`'):
+        value = value.strip(q)
+    return value
+
+
 def parse_clipping_file(file_path: Path) -> dict | None:
     """Parse a markdown clipping file into an extraction-compatible dict.
 
@@ -107,26 +114,26 @@ def parse_clipping_file(file_path: Path) -> dict | None:
     url = ""
     for key in ("source_url", "url", "source"):
         if fm.get(key):
-            url = str(fm[key]).strip().strip('"').strip("'")
+            url = _strip_quotes(str(fm[key]).strip())
             break
     if not url:
         # Try to find the first http link in the body
         m = re.search(r"https?://\S+", body)
-        url = m.group(0) if m else ""
+        url = m.group(0).rstrip(".,;:!?)\">'") if m else ""
     if not url:
         return None
 
     # Resolve title
-    title = str(fm.get("title", file_path.stem)).strip().strip('"').strip("'") or file_path.stem
+    title = _strip_quotes(str(fm.get("title", file_path.stem)).strip()) or file_path.stem
 
     # Resolve author
-    author = str(fm.get("author", "")).strip().strip('"').strip("'")
+    author = _strip_quotes(str(fm.get("author", "")).strip())
 
     # Resolve source type from URL heuristics
     source_type = "web"
-    if re.search(r"youtu\.be|youtube\.com", url):
+    if re.search(r"\byoutu\.be\b|\byoutube\.com\b", url):
         source_type = "youtube"
-    elif re.search(r"twitter\.com|x\.com", url):
+    elif re.search(r"\btwitter\.com\b|\bx\.com\b", url):
         source_type = "twitter"
 
     return {
