@@ -129,10 +129,12 @@ class TestArchiveClippings:
         path = make_clipping(name="article", url="https://example.com/article")
         h = _clipping_hash(path)
 
+        # Move into the clippings dir so archive_clippings can find it
+        target = clippings / path.name
+        path.rename(target)
+        path = target
+
         cfg = Config(vault_path=tmp_path)
-        # monkeypatch dirs onto tmp paths
-        cfg.clippings_dir = clippings
-        cfg.clippings_archive_dir = archive
 
         count = archive_clippings(cfg, {h})
         assert count == 1
@@ -146,10 +148,10 @@ class TestArchiveClippings:
         archive.mkdir()
 
         make_clipping(name="keep", url="https://example.com/keep")
+        clip = tmp_path / "keep.md"
+        clip.rename(clippings / clip.name)
 
         cfg = Config(vault_path=tmp_path)
-        cfg.clippings_dir = clippings
-        cfg.clippings_archive_dir = archive
 
         count = archive_clippings(cfg, {"no-match-hash"})
         assert count == 0
@@ -164,9 +166,12 @@ class TestArchiveClippings:
         path = make_clipping(name="dup", url="https://example.com/dup")
         (archive / "dup.md").write_text("old")
 
+        # Move into the clippings dir so archive_clippings can find it
+        target = clippings / path.name
+        path.rename(target)
+        path = target
+
         cfg = Config(vault_path=tmp_path)
-        cfg.clippings_dir = clippings
-        cfg.clippings_archive_dir = archive
 
         h = _clipping_hash(path)
         count = archive_clippings(cfg, {h})
@@ -229,7 +234,5 @@ class TestCliClippingWiring:
             source_file=d.get("source_file", ""),
         )
         assert src.url == "https://ex.com/a"
-        assert src.hash == "a" * 12  # not a hash test — just structure
-        # Actually MD5; just verify non-empty
         assert len(src.hash) == 12
         assert src.content == d["content"]
