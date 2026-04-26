@@ -1,6 +1,10 @@
 # Secrets
 .env
 
+# Coverage
+.coverage
+*.lcov
+
 # OS
 .DS_Store
 Thumbs.db
