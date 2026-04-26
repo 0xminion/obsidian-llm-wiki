@@ -10,8 +10,6 @@ Ensures that:
 
 from __future__ import annotations
 
-import json
-import textwrap
 from pathlib import Path
 
 import pytest
@@ -100,7 +98,7 @@ class TestCollectClippingFiles:
         assert collect_clipping_files(tmp_path / "missing") == []
 
     def test_collects_valid_and_skips_invalid(self, tmp_path: Path, make_clipping):
-        good = make_clipping(name="good", url="https://example.com/g")
+        make_clipping(name="good", url="https://example.com/g")
         bad = tmp_path / "bad.md"
         bad.write_text("No url here.\n")
         results = collect_clipping_files(tmp_path)
@@ -202,7 +200,6 @@ class TestClippingHash:
 class TestCliClippingWiring:
     def test_collect_url_files_and_clipping_files_combined(self, tmp_path: Path, make_clipping):
         from pipeline.cli import _collect_url_files, _collect_clipping_files
-        from pipeline.utils import parse_url_file_content
 
         # Simulate vault structure
         raw = tmp_path / "01-Raw"

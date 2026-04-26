@@ -10,6 +10,9 @@ Handles all filesystem interactions with the Obsidian vault:
 
 from __future__ import annotations
 
+import hashlib
+import json
+import logging
 import re
 import threading as _threading
 
@@ -22,6 +25,8 @@ from pipeline.config import Config
 from pipeline.models import Edge, ExtractedSource, Plan
 from pipeline.utils import extract_frontmatter_field as _extract_frontmatter_field
 from pipeline.utils import parse_url_file_content, title_to_filename
+
+log = logging.getLogger(__name__)
 
 
 # ─── Collision Detection ─────────────────────────────────────────────────────
@@ -619,7 +624,6 @@ def _clipping_hash(md_file: Path) -> str | None:
     parse_clipping_file does, then returns its 12-char MD5 hash.
     """
     from pipeline.utils import extract_body, parse_frontmatter
-    import hashlib
 
     try:
         text = md_file.read_text(encoding="utf-8", errors="replace")
