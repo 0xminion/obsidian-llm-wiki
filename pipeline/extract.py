@@ -251,7 +251,7 @@ def extract_url(url: str, cfg: Config,
             ))
             raise
 
-        except Exception as e:
+        except (ConnectionError, TimeoutError, OSError, ValueError) as e:
             last_error = str(e)
             log.error("Extraction failed (attempt %d/%d) for %s: %s",
                       attempt + 1, max_retries, url, e)
@@ -313,9 +313,12 @@ def extract_all(urls: list[str], cfg: Config, parallel: int = 4) -> Manifest:
     try:
 
         def _extract_one(url: str) -> Optional[ExtractedSource]:
+            from pipeline.log import set_correlation
+            import hashlib
+            url_hash = hashlib.md5(url.encode(), usedforsecurity=False).hexdigest()[:8]
+            set_correlation(source_hash=url_hash)
             try:
                 source = extract_url(url, cfg, store=store)
-                # Skip dedup stubs (empty content, title starts with [dedup:)
                 if not source.content or source.title.startswith("[dedup:"):
                     log.info("Skipping deduplicated or empty source: %s", url)
                     return None
@@ -323,7 +326,7 @@ def extract_all(urls: list[str], cfg: Config, parallel: int = 4) -> Manifest:
             except ExtractionError as e:
                 log.error("Extraction failed for %s: %s", url, e)
                 return None
-            except Exception as e:
+            except (ConnectionError, TimeoutError, OSError, ValueError) as e:
                 log.error("Unexpected failure extracting %s: %s", url, e)
                 return None
 

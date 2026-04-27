@@ -51,12 +51,6 @@ def resolve_collision(directory: Path, filename: str) -> str:
 
 # ─── YAML Frontmatter Helpers ─────────────────────────────────────────────────
 
-def _quote_wikilink(value: str) -> str:
-    """Wrap a wikilink value in quotes for YAML safety: [[note]] -> \"[[note]]\"."""
-    if value.startswith("[[") and value.endswith("]]"):
-        return f'"{value}"'
-    return value
-
 
 def _format_yaml_value(key: str, value) -> str:
     """Format a single YAML key-value pair."""

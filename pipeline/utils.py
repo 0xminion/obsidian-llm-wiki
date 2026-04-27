@@ -6,11 +6,77 @@ import json
 import logging
 import os
 import re
+import threading
+import time as _time
 from pathlib import Path
 
 log = logging.getLogger(__name__)
 
+
+class CircuitBreaker:
+    """Trip after *threshold* consecutive failures; auto-reset after *reset_seconds*.
+
+    Usage::
+
+        breaker = CircuitBreaker(threshold=5, reset_seconds=60)
+        if breaker.is_open():
+            log.warning("Circuit open — skipping LLM call")
+            return None
+        try:
+            result = call_llm(...)
+            breaker.record_success()
+            return result
+        except Exception:
+            breaker.record_failure()
+            raise
+    """
+
+    def __init__(self, threshold: int = 5, reset_seconds: float = 60.0) -> None:
+        self._threshold = threshold
+        self._reset_seconds = reset_seconds
+        self._consecutive_failures = 0
+        self._last_failure_time = 0.0
+        self._lock = threading.Lock()
+
+    def record_failure(self) -> None:
+        with self._lock:
+            self._consecutive_failures += 1
+            self._last_failure_time = _time.monotonic()
+
+    def record_success(self) -> None:
+        with self._lock:
+            self._consecutive_failures = 0
+
+    def is_open(self) -> bool:
+        with self._lock:
+            if self._consecutive_failures < self._threshold:
+                return False
+            if _time.monotonic() - self._last_failure_time > self._reset_seconds:
+                self._consecutive_failures = 0
+                return False
+            return True
+
+    @property
+    def failure_count(self) -> int:
+        return self._consecutive_failures
+
 OLLAMA_URL = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
+
+
+def frontmatter_list_items(frontmatter: str, field_name: str) -> list[str]:
+    """Extract a YAML-style list field from raw frontmatter text.
+
+    Parses indented ``- value`` items under a top-level key without loading
+    a full YAML parser, which keeps it fast and tolerant of malformed documents.
+    """
+    match = re.search(rf"^{re.escape(field_name)}:[ \t]*\n((?:[ \t]*-[ \t]+.*\n?)*)", frontmatter, re.MULTILINE)
+    if not match:
+        return []
+    items = []
+    for item in re.finditer(r"^[ \t]*-[ \t]+(.+)$", match.group(1), re.MULTILINE):
+        items.append(item.group(1).strip().strip('"'))
+    return items
+
 
 # Regex matching CJK Unified Ideographs (Chinese characters)
 _CJK_RE = re.compile(
@@ -466,6 +532,7 @@ def batch_smart_filenames(
     model: str = "",
     timeout: int = 60,
     client=None,
+    max_workers: int = 4,
 ) -> dict[str, str]:
     """Batch-generate filenames for multiple long titles via parallel LLM calls.
 
@@ -474,6 +541,7 @@ def batch_smart_filenames(
         model: LLM model name. If empty, uses provider default.
         timeout: Max seconds to wait for all parallel calls.
         client: Optional LLMClient instance. If None, creates a default Ollama client.
+        max_workers: Maximum concurrent LLM requests.
 
     Returns:
         Dict mapping title -> generated filename. Missing keys = LLM failed.
@@ -481,6 +549,7 @@ def batch_smart_filenames(
     if not items:
         return {}
 
+    import threading
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
     from pipeline.llm_client import LLMClient
@@ -499,19 +568,33 @@ def batch_smart_filenames(
         return results
 
     _client = client or LLMClient(model=model or "")
+    semaphore = threading.Semaphore(max_workers)
+    breaker = CircuitBreaker(threshold=5, reset_seconds=60)
 
     def _generate_one(title: str, preview: str) -> tuple[str, str | None]:
-        return title, _llm_short_filename(title, preview, model=model, client=_client)
+        if breaker.is_open():
+            return title, None
+        with semaphore:
+            try:
+                result = title, _llm_short_filename(title, preview, model=model, client=_client)
+                breaker.record_success()
+                return result
+            except Exception:
+                breaker.record_failure()
+                raise
 
-    with ThreadPoolExecutor(max_workers=4) as executor:
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {
             executor.submit(_generate_one, title, preview): title
             for title, preview in uncached_items
         }
         for future in as_completed(futures, timeout=timeout):
-            title, fname = future.result()
-            if fname:
-                results[title] = fname
+            try:
+                title, fname = future.result()
+                if fname:
+                    results[title] = fname
+            except Exception:
+                pass
 
     return results
 

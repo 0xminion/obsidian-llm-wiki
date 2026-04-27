@@ -110,6 +110,9 @@ class Config:
     # Whisper
     whisper_language: str = ""  # empty = auto-detect, "en", "zh", etc.
 
+    # Merge queue
+    max_merge_queue_size: int = 500
+
     # Staleness thresholds (days)
     default_staleness_days: int = 3 * 365  # default = 3 years
     high_volatility_tags: list[str] = field(default_factory=
@@ -138,8 +141,12 @@ class Config:
     def resolved_extract_dir(self) -> Path:
         if self.extract_dir:
             return self.extract_dir
+        import tempfile
         vault_hash = hashlib_md5_short(str(self.vault_path))
-        return Path(f"/tmp/obsidian-extracted-{vault_hash}")
+        base = Path(tempfile.gettempdir()) / f"obsidian-extracted-{vault_hash}"
+        if not base.exists():
+            base.mkdir(mode=0o700, parents=True, exist_ok=True)
+        return base
 
     @property
     def prompts_dir(self) -> Path:

@@ -87,7 +87,7 @@ def extract_podcast(url: str, cfg: Config) -> ExtractedSource:
             audio_url, rss_description, episode_title = _parse_rss_episode(
                 feed_url, episode_id, episode_slug, timeout
             )
-        except Exception as e:
+        except (ConnectionError, TimeoutError, OSError, ValueError, KeyError) as e:
             log.debug("RSS parse failed: %s", e)
 
     if not description:
@@ -591,7 +591,7 @@ def _strip_xml_ns(elem):
 
 
 def _safe_xml_parse(xml_text: str):
-    """Parse XML with disabled entity expansion to mitigate XML bomb attacks.
+    """Parse XML with XXE/billion-laughs mitigation.
 
     Returns ElementTree root or None on parse failure.
     """
@@ -604,8 +604,10 @@ def _safe_xml_parse(xml_text: str):
             import defusedxml.ElementTree as DET
             root = DET.fromstring(xml_text)
         except ImportError:
-            parser = ET.XMLParser(resolve_entities=False)
-            root = ET.fromstring(xml_text, parser=parser)
+            import re as _re
+            sanitized = _re.sub(r"<!DOCTYPE[^>]*>", "", xml_text, count=1)
+            sanitized = _re.sub(r"<!ENTITY[^>]*>", "", sanitized)
+            root = ET.fromstring(sanitized)
         _strip_xml_ns(root)
         return root
     except (ET.ParseError, TypeError):

@@ -9,8 +9,9 @@ from pipeline.store import ContentStore
 from pipeline.models import (
     ExtractedSource, Language, Manifest, Plan, Plans, SourceType, Template, ConceptMatch,
 )
+from pipeline.language import detect_language
 from pipeline.plan import (
-    detect_language, select_template,
+    select_template,
     generate_plan_heuristic, generate_plans_deterministic,
 )
 from pipeline.create import (

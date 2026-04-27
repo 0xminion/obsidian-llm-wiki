@@ -72,11 +72,20 @@ class _LockedConnection:
         return getattr(self._conn, name)
 
 
-class ContentStore:
-    """SQLite-backed content store for dedup, history, and stats.
+SCHEMA_VERSION = 2
 
-    Replaces ContentIndex. Single file at .pipeline/store.db.
-    Thread-safe via per-instance RLock (shared connections across threads).
+_MIGRATIONS: list[str] = [
+    # v0 → v1: initial schema (applied as baseline for new databases)
+    "",
+    # v1 → v2: add max_queue_size enforcement column
+    "ALTER TABLE merge_queue ADD COLUMN priority REAL DEFAULT 0.0;",
+]
+
+
+class ContentStore:
+    """SQLite-backed store (WAL mode) for URL/content dedup, extraction history, DLQ,
+    pending reviews, compile state, pipeline runs, embeddings, merge queue, and vault
+    cache (10 tables). Thread-safe via RLock-wrapped connection; usable as context manager.
     """
 
     def __init__(self, db_path: Path):
@@ -93,6 +102,42 @@ class ContentStore:
         raw_conn.execute("PRAGMA busy_timeout=5000")
         self._conn = _LockedConnection(raw_conn, self._lock)
         self._init_schema()
+        self._run_migrations()
+
+    def _get_schema_version(self) -> int:
+        try:
+            row = self._conn.execute(
+                "SELECT version FROM schema_version ORDER BY version DESC LIMIT 1"
+            ).fetchone()
+            return row["version"] if row else 0
+        except sqlite3.OperationalError:
+            return 0
+
+    def _run_migrations(self) -> None:
+        self._conn.execute(
+            "CREATE TABLE IF NOT EXISTS schema_version "
+            "(version INTEGER PRIMARY KEY, applied_at REAL NOT NULL)"
+        )
+        self._conn.commit()
+        current = self._get_schema_version()
+        if current >= SCHEMA_VERSION:
+            return
+        for version in range(current + 1, SCHEMA_VERSION + 1):
+            sql = _MIGRATIONS[version - 1] if version - 1 < len(_MIGRATIONS) else ""
+            if sql:
+                for stmt in sql.strip().split(";"):
+                    stmt = stmt.strip()
+                    if stmt:
+                        try:
+                            self._conn.execute(stmt)
+                        except sqlite3.OperationalError:
+                            pass
+            self._conn.execute(
+                "INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (?, ?)",
+                (version, time.time()),
+            )
+            self._conn.commit()
+            log.info("Applied schema migration v%d", version)
 
     def _init_schema(self) -> None:
         self._conn.executescript("""
@@ -723,8 +768,18 @@ class ContentStore:
 
     # ─── Merge Queue ──────────────────────────────────────────────────────────
 
-    def merge_queue_add(self, new_concept: str, existing_concept: str, similarity: float) -> int:
-        """Add a proposed concept merge to the queue. Returns the queue id."""
+    def merge_queue_add(
+        self,
+        new_concept: str,
+        existing_concept: str,
+        similarity: float,
+        max_size: int = 500,
+    ) -> int:
+        """Add a proposed concept merge to the queue. Returns the queue id.
+
+        When the queue exceeds max_size, the lowest-similarity pending item is
+        evicted to keep memory bounded.
+        """
         now = time.time()
         cursor = self._conn.execute(
             """INSERT INTO merge_queue
@@ -733,7 +788,28 @@ class ContentStore:
             (new_concept, existing_concept, similarity, now),
         )
         self._conn.commit()
-        return cursor.lastrowid
+        queue_id = cursor.lastrowid
+
+        if not isinstance(max_size, int) or max_size <= 0:
+            max_size = 500
+        pending_count = self._conn.execute(
+            "SELECT COUNT(*) as cnt FROM merge_queue WHERE status = 'pending'"
+        ).fetchone()["cnt"]
+        if pending_count > max_size:
+            overflow = pending_count - max_size
+            self._conn.execute(
+                """DELETE FROM merge_queue WHERE id IN (
+                    SELECT id FROM merge_queue
+                    WHERE status = 'pending'
+                    ORDER BY similarity ASC
+                    LIMIT ?
+                )""",
+                (overflow,),
+            )
+            self._conn.commit()
+            log.warning("Merge queue exceeded %d; evicted %d low-similarity items", max_size, overflow)
+
+        return queue_id
 
     def merge_queue_get_pending(self, limit: int = 50) -> list[dict]:
         """Get pending merge proposals."""

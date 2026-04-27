@@ -263,7 +263,7 @@ def _try_archive_extract(url: str, timeout: int = 45) -> str:
                         content = content[idx:]
                         break
             return content
-    except Exception as e:
+    except (subprocess.SubprocessError, ConnectionError, TimeoutError, OSError) as e:
         log.debug("Archive.org extract failed: %s", e)
     return ""
 
@@ -311,6 +311,6 @@ def _try_camoufox(url: str, timeout: int = 45) -> str:
         if text and len(text.strip()) > 200:
             log.info("Camoufox extraction succeeded for %s (%d chars)", url, len(text))
             return text
-    except Exception as e:
+    except (ConnectionError, TimeoutError, OSError, RuntimeError) as e:
         log.debug("Camoufox extract failed: %s", e)
     return ""

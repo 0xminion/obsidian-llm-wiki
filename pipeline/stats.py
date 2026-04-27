@@ -163,7 +163,7 @@ def generate_dashboard(cfg: Config) -> str:
     # ─── Knowledge Staleness ───────────────────────────────────────────────────
     try:
         from pipeline.lint import check_staleness
-    except Exception:
+    except ImportError:
         check_staleness = None  # type: ignore[misc]
 
     if check_staleness is not None:

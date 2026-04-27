@@ -215,13 +215,13 @@ def postprocess_creation(
     log.info("Rebuilding wiki-index...")
     try:
         reindex(cfg)
-    except Exception:
+    except OSError:
         log.exception("Reindex failed")
 
     log.info("Updating tag registry...")
     try:
         _update_tag_registry(cfg)
-    except Exception:
+    except OSError:
         log.exception("Tag registry update failed")
 
     try:
@@ -254,14 +254,14 @@ def postprocess_creation(
         try:
             archived = archive_inbox(cfg, successful_hashes)
             log.info("Archived %d inbox files", archived)
-        except Exception:
+        except OSError:
             log.exception("Archive inbox failed")
 
         # Also archive processed clippings (02-Clippings -> 10-Archive-Clippings)
         try:
             archived_clips = archive_clippings(cfg, successful_hashes)
             log.info("Archived %d clipping files", archived_clips)
-        except Exception:
+        except OSError:
             log.exception("Archive clippings failed")
 
     _sync_vault(cfg)

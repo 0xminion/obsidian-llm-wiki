@@ -28,6 +28,19 @@ def stage_for_review(
     Uses the template-based creator to generate all files, then stores them
     in the pending_reviews table for approval.
     """
+    store = ContentStore.open(cfg.resolved_extract_dir)
+    try:
+        return _stage_for_review_impl(store, plans, cfg, use_agent_insights)
+    finally:
+        store.close()
+
+
+def _stage_for_review_impl(
+    store: ContentStore,
+    plans: Plans,
+    cfg: Config,
+    use_agent_insights: bool,
+) -> dict:
     from pipeline.create import (
         _generate_concept_template,
         generate_entry_content,
@@ -36,7 +49,6 @@ def stage_for_review(
     )
     from pipeline.vault import title_to_filename
 
-    store = ContentStore.open(cfg.resolved_extract_dir)
     extract_dir = cfg.resolved_extract_dir
     stats = {"staged": 0, "failed": 0}
     reserved_paths = {Path(item["file_path"]) for item in store.review_get_pending()}
@@ -147,11 +159,10 @@ def stage_for_review(
 
             stats["staged"] += 1
 
-        except Exception as e:
+        except (OSError, json.JSONDecodeError, ValueError, KeyError) as e:
             log.error("Failed to stage %s: %s", plan.title, e)
             stats["failed"] += 1
 
-    store.close()
     return stats
 
 
@@ -291,7 +302,7 @@ def approve_reviews(cfg: Config, review_ids: Optional[list[int]] = None) -> dict
                 plan_outcomes[plan_hash]["written"] += 1
                 log.info("Approved and wrote: %s", file_path.name)
 
-            except Exception as e:
+            except (OSError, ValueError) as e:
                 log.error("Failed to write %s: %s", review["file_path"], e)
                 stats["failed"] += 1
                 plan_outcomes[plan_hash]["failed"] += 1
@@ -314,7 +325,7 @@ def approve_reviews(cfg: Config, review_ids: Optional[list[int]] = None) -> dict
             vault_reindex(cfg)
             archive_inbox(cfg, successful_hashes)
             archive_clippings(cfg, successful_hashes)
-        except Exception as e:
+        except OSError as e:
             log.warning("Post-approve reindex/archive failed: %s", e)
 
     return stats

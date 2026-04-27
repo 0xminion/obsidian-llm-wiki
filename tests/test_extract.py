@@ -521,7 +521,7 @@ class TestExtractUrl:
 
     @patch("pipeline.extract._extract_web")
     def test_raises_after_retries_exhausted(self, mock_web, cfg: Config):
-        mock_web.side_effect = RuntimeError("something broke")
+        mock_web.side_effect = OSError("something broke")
         with pytest.raises(ExtractionError, match="Extraction failed after"):
             extract_url("https://example.com", cfg)
 
@@ -555,7 +555,7 @@ class TestExtractAll:
     def test_handles_failures(self, mock_extract, cfg: Config):
         mock_extract.side_effect = [
             ExtractedSource(url="https://a.com", title="A", content="a" * 100, type=SourceType.WEB),
-            RuntimeError("failed"),
+            OSError("failed"),
         ]
         manifest = extract_all(["https://a.com", "https://b.com"], cfg, parallel=2)
         assert len(manifest.entries) == 1
@@ -563,7 +563,7 @@ class TestExtractAll:
 
     @patch("pipeline.extract._extract_web")
     def test_failed_extraction_is_not_written_to_manifest(self, mock_web, cfg: Config):
-        mock_web.side_effect = RuntimeError("broken extractor")
+        mock_web.side_effect = OSError("broken extractor")
 
         with pytest.raises(ExtractionError, match="all extractions failed"):
             extract_all(["https://example.com/article"], cfg, parallel=1)

@@ -356,3 +356,111 @@ class TestValidateCommand:
         result = runner.invoke(app, ["validate", str(vault)])
         assert result.exit_code == 1
         assert result.output
+
+
+# ─── test_ingest_smoke ────────────────────────────────────────────────────────
+
+class TestIngestSmoke:
+    """End-to-end smoke tests: ingest CLI drives extract → plan → create."""
+
+    def test_full_ingest_single_url(self, vault: Path):
+        """A single URL should flow through all three stages and produce vault files."""
+        _make_url_file(vault / "01-Raw", "https://example.com/smoke", "smoke.url")
+
+        url = "https://example.com/smoke"
+        h = _url_hash(url)
+        source = _make_extracted_source(url, "Smoke Test Article")
+        plan = _make_plan(h, "Smoke Test Article")
+
+        with patch("pipeline.cli.extract_all") as mock_extract, \
+             patch("pipeline.cli.plan_sources") as mock_plan, \
+             patch("pipeline.cli.create_file_templates") as mock_create:
+            mock_extract.return_value = Manifest(entries=[source])
+            mock_plan.return_value = Plans(plans=[plan])
+            mock_create.return_value = {"created": 1, "failed": 0, "sources": 1, "entries": 1}
+
+            result = runner.invoke(app, ["ingest", str(vault)])
+
+        assert result.exit_code == 0, f"ingest failed: {result.output}"
+        mock_extract.assert_called_once()
+        mock_plan.assert_called_once()
+        mock_create.assert_called_once()
+
+    def test_full_ingest_multiple_urls(self, vault: Path):
+        """Multiple URLs should all flow through the pipeline."""
+        inbox = vault / "01-Raw"
+        for i in range(3):
+            _make_url_file(inbox, f"https://example.com/art{i}", f"art{i}.url")
+
+        sources = [
+            _make_extracted_source(f"https://example.com/art{i}", f"Article {i}")
+            for i in range(3)
+        ]
+        plans = [
+            _make_plan(_url_hash(f"https://example.com/art{i}"), f"Article {i}")
+            for i in range(3)
+        ]
+
+        with patch("pipeline.cli.extract_all") as mock_extract, \
+             patch("pipeline.cli.plan_sources") as mock_plan, \
+             patch("pipeline.cli.create_file_templates") as mock_create:
+            mock_extract.return_value = Manifest(entries=sources)
+            mock_plan.return_value = Plans(plans=plans)
+            mock_create.return_value = {"created": 3, "failed": 0, "sources": 3, "entries": 3}
+
+            result = runner.invoke(app, ["ingest", str(vault)])
+
+        assert result.exit_code == 0, f"ingest failed: {result.output}"
+        args_sources = mock_extract.call_args
+        assert args_sources is not None
+        plans_arg = mock_plan.call_args
+        assert plans_arg is not None
+
+    def test_ingest_extract_failure_propagates(self, vault: Path):
+        """If extract_all raises, ingest should report the error."""
+        _make_url_file(vault / "01-Raw", "https://example.com/fail", "fail.url")
+
+        with patch("pipeline.cli.extract_all", side_effect=RuntimeError("network down")):
+            result = runner.invoke(app, ["ingest", str(vault)])
+
+        assert result.exit_code != 0
+
+    def test_ingest_creates_vault_files_e2e(self, vault: Path):
+        """Full ingest with a mock create that writes real files verifies the vault is populated."""
+        _make_url_file(vault / "01-Raw", "https://example.com/e2e", "e2e.url")
+
+        url = "https://example.com/e2e"
+        h = _url_hash(url)
+        source = _make_extracted_source(url, "E2E Article")
+        plan = _make_plan(h, "E2E Article")
+
+        def _create_side_effect(plans, cfg, **kwargs):
+            _mock_hermes_create_side_effect(cfg, [source])
+            return {"created": 1, "failed": 0, "sources": 1, "entries": 1}
+
+        with patch("pipeline.cli.extract_all") as mock_extract, \
+             patch("pipeline.cli.plan_sources") as mock_plan, \
+             patch("pipeline.cli.create_file_templates", side_effect=_create_side_effect):
+            mock_extract.return_value = Manifest(entries=[source])
+            mock_plan.return_value = Plans(plans=[plan])
+
+            result = runner.invoke(app, ["ingest", str(vault)])
+
+        assert result.exit_code == 0, f"ingest failed: {result.output}"
+        entries = list((vault / "04-Wiki" / "entries").glob("*.md"))
+        sources_dir = list((vault / "04-Wiki" / "sources").glob("*.md"))
+        concepts = list((vault / "04-Wiki" / "concepts").glob("*.md"))
+        assert len(entries) >= 1, "Expected at least one entry file"
+        assert len(sources_dir) >= 1, "Expected at least one source file"
+        assert len(concepts) >= 1, "Expected at least one concept file"
+
+    def test_compile_dry_run_cli(self, vault: Path):
+        """compile --dry-run should exit 0 and not modify vault."""
+        entries = vault / "04-Wiki" / "entries"
+        entries.mkdir(parents=True, exist_ok=True)
+        (entries / "existing.md").write_text("---\ntitle: Existing\n---\n# Existing\n")
+
+        result = runner.invoke(app, ["compile", str(vault), "--dry-run"])
+        assert result.exit_code == 0
+        assert "DRY RUN" in result.output
+        assert (entries / "existing.md").read_text().startswith("---")

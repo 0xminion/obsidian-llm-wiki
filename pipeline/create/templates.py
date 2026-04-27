@@ -361,6 +361,8 @@ def create_file_templates(
     Deterministic for structure. Agent only for Summary + Core insights.
     Returns stats dict.
     """
+    from pipeline.log import set_correlation
+    set_correlation(stage="create")
     from pipeline.create.orchestrator import postprocess_creation
     from pipeline.utils import (
         batch_smart_filenames,
@@ -425,19 +427,30 @@ def create_file_templates(
     insights_by_hash: dict[str, str] = {}
     if use_agent_insights:
         log.info("Pre-generating insights for %d plans in parallel...", len(plans))
+        import threading
         from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        from pipeline.utils import CircuitBreaker
+        semaphore = threading.Semaphore(cfg.parallel)
+        _insight_breaker = CircuitBreaker(threshold=5, reset_seconds=60)
 
         def _generate_insight_for_plan(plan: Plan) -> tuple[str, str]:
             """Return (hash, insights_text) for a single plan."""
-            extract_file = extract_dir / f"{plan.hash}.json"
-            if not extract_file.exists():
+            if _insight_breaker.is_open():
                 return plan.hash, ""
-            try:
-                extracted = json.loads(extract_file.read_text(encoding="utf-8"))
-                return plan.hash, generate_entry_insights(plan, extracted, cfg)
-            except Exception as e:
-                log.debug("Insight generation failed for %s: %s", plan.hash, e)
-                return plan.hash, ""
+            with semaphore:
+                extract_file = extract_dir / f"{plan.hash}.json"
+                if not extract_file.exists():
+                    return plan.hash, ""
+                try:
+                    extracted = json.loads(extract_file.read_text(encoding="utf-8"))
+                    result = plan.hash, generate_entry_insights(plan, extracted, cfg)
+                    _insight_breaker.record_success()
+                    return result
+                except Exception as e:
+                    _insight_breaker.record_failure()
+                    log.debug("Insight generation failed for %s: %s", plan.hash, e)
+                    return plan.hash, ""
 
         with ThreadPoolExecutor(max_workers=cfg.parallel) as executor:
             futures = {
@@ -445,8 +458,11 @@ def create_file_templates(
                 for plan in plans
             }
             for future in as_completed(futures):
-                h, insights_text = future.result()
-                insights_by_hash[h] = insights_text
+                try:
+                    h, insights_text = future.result()
+                    insights_by_hash[h] = insights_text
+                except Exception:
+                    pass
 
         successful = sum(1 for v in insights_by_hash.values() if v)
         log.info("Insights generated: %d/%d successful", successful, len(plans))
@@ -494,7 +510,7 @@ def create_file_templates(
                 source_path.parent.mkdir(parents=True, exist_ok=True)
                 source_path.write_text(source_content, encoding="utf-8")
                 stats["sources"] += 1
-            except Exception as e:
+            except OSError as e:
                 log.error("Failed to write source for %s: %s", plan.title, e)
                 plan_ok = False
 
@@ -516,7 +532,7 @@ def create_file_templates(
                 entry_path.parent.mkdir(parents=True, exist_ok=True)
                 entry_path.write_text(entry_content, encoding="utf-8")
                 stats["entries"] += 1
-            except Exception as e:
+            except OSError as e:
                 log.error("Failed to write entry for %s: %s", plan.title, e)
                 plan_ok = False
 
@@ -532,7 +548,7 @@ def create_file_templates(
                     concept_path = cfg.concepts_dir / f"{concept_filename}.md"
                     concept_path.parent.mkdir(parents=True, exist_ok=True)
                     concept_path.write_text(concept_content, encoding="utf-8")
-                except Exception as e:
+                except OSError as e:
                     log.error("Failed to write concept %s: %s", concept_name, e)
                     plan_ok = False
 
@@ -544,7 +560,7 @@ def create_file_templates(
                         entry_link_name,
                         f"Related to [[{entry_filename}]]",
                     )
-                except Exception as e:
+                except OSError as e:
                     log.warning("Failed to update MoC %s: %s", moc_name, e)
                     plan_ok = False
 
@@ -555,7 +571,7 @@ def create_file_templates(
                 stats["failed"] += 1
                 results.append({"status": "failed", "hashes": [plan.hash], "plans": 1})
 
-        except Exception as e:
+        except (OSError, json.JSONDecodeError, ValueError, KeyError) as e:
             log.error("Template creation failed for %s: %s", plan.title, e)
             stats["failed"] += 1
             results.append({"status": "failed", "hashes": [plan.hash], "plans": 1})

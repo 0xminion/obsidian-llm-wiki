@@ -33,7 +33,8 @@ from pipeline.models import (
 )
 from pipeline.qmd import batch_embed
 from pipeline.store import ContentStore
-from pipeline.utils import _CJK_RE, load_prompt
+from pipeline.language import detect_language, template_for_language
+from pipeline.utils import load_prompt
 from pipeline.utils import extract_body as _extract_body
 
 log = logging.getLogger(__name__)
@@ -84,7 +85,7 @@ def dedup_check(manifest: Manifest, cfg: Config) -> Manifest:
                 fp = _fingerprint(body)
                 if len(fp) > 100:  # Skip empty/stub sources
                     existing_fps.append({"name": fpath.stem, "fp": fp})
-            except Exception:
+            except OSError:
                 continue
 
     # Check each manifest entry against existing sources
@@ -169,8 +170,8 @@ def _semantic_dedup(
             key = src.content[:1000]
             if key in emb_map:
                 embeddings[src.hash] = emb_map[key]
-    except Exception:
-        log.debug("QMD batch embed failed for dedup")
+    except (ImportError, ConnectionError, TimeoutError, OSError, ValueError) as e:
+        log.debug("QMD batch embed failed for dedup: %s", e)
 
     if embeddings:
         filtered: list[ExtractedSource] = []
@@ -265,7 +266,7 @@ def _process_concept_merge_queue(
             for ex_name, ex_emb in existing_embs.items():
                 sim = _cosine_similarity(new_emb, ex_emb)
                 if sim > 0.88:
-                    store.merge_queue_add(new_name, ex_name, sim)
+                    store.merge_queue_add(new_name, ex_name, sim, max_size=cfg.max_merge_queue_size)
                     log.info("Merge queue: %s -> %s (sim=%.3f)", new_name, ex_name, sim)
                     matched = True
                     break
@@ -295,21 +296,6 @@ def concept_search(manifest: Manifest, cfg: Config) -> dict[str, list[ConceptMat
 
 # ─── Deterministic Planning (Rec 3) ──────────────────────────────────────────
 
-
-
-def detect_language(content: str) -> Language:
-    """Detect content language from character distribution."""
-    if not content:
-        return Language.EN
-    sample = content[:2000]
-    cjk_chars = len(_CJK_RE.findall(sample))
-    total_chars = len(re.sub(r"\s", "", sample))
-    if total_chars == 0:
-        return Language.EN
-    # If >20% CJK characters, treat as Chinese
-    if cjk_chars / total_chars > 0.2:
-        return Language.ZH
-    return Language.EN
 
 
 def select_template(source_type: SourceType, content: str) -> Template:
@@ -345,7 +331,8 @@ def generate_plan_heuristic(
     title = extract_title(entry.content) or entry.title or entry.url
     language = detect_language(entry.content)
     template = (
-        Template.CHINESE if language == Language.ZH
+        template_for_language(language)
+        if language != Language.EN
         else select_template(entry.type, entry.content)
     )
     tags: list[str] = []  # Tags assigned by agent, not heuristics
@@ -636,7 +623,7 @@ def generate_plans(
             log.warning("Plan agent attempt %d produced empty/invalid structured output", attempt + 1)
             if attempt < cfg.max_retries - 1:
                 time.sleep(2 ** attempt)
-        except Exception as e:
+        except (ImportError, ValueError, TypeError, AttributeError) as e:
             log.warning("Plan agent attempt %d failed: %s", attempt + 1, e)
             if attempt < cfg.max_retries - 1:
                 time.sleep(2 ** attempt)
@@ -656,7 +643,7 @@ def generate_plans(
                     elif isinstance(data, dict):
                         plan_dicts = [data]
                         break
-            except Exception:
+            except (json.JSONDecodeError, ValueError, TypeError):
                 pass
             if attempt < cfg.max_retries - 1:
                 time.sleep(2 ** attempt)
@@ -717,62 +704,63 @@ def plan_sources(manifest: Manifest, cfg: Config) -> Plans:
 
     Returns Plans object (possibly empty on total failure).
     """
+    from pipeline.log import set_correlation
+    set_correlation(stage="plan")
     log.info("=== Stage 2: Plan Batch (%d sources) ===", len(manifest.entries))
 
     if not manifest.entries:
         log.info("No sources to plan, returning empty Plans")
         return Plans(plans=[])
 
-    store = ContentStore.open(cfg.resolved_extract_dir)
+    with ContentStore.open(cfg.resolved_extract_dir) as store:
 
-    # Step 0: Semantic dedup
-    log.info("Running semantic dedup check against existing sources...")
-    deduped_entries = _semantic_dedup(manifest.entries, cfg, store)
-    filtered_manifest = Manifest(entries=deduped_entries)
-    removed = len(manifest.entries) - len(filtered_manifest.entries)
-    if removed > 0:
-        log.info("Found %d semantic duplicates — removed from pipeline", removed)
-    else:
-        log.info("No semantic duplicates found")
+        # Step 0: Semantic dedup
+        log.info("Running semantic dedup check against existing sources...")
+        deduped_entries = _semantic_dedup(manifest.entries, cfg, store)
+        filtered_manifest = Manifest(entries=deduped_entries)
+        removed = len(manifest.entries) - len(filtered_manifest.entries)
+        if removed > 0:
+            log.info("Found %d semantic duplicates — removed from pipeline", removed)
+        else:
+            log.info("No semantic duplicates found")
 
-    if not filtered_manifest.entries:
-        log.info("All sources were duplicates, returning empty Plans")
-        return Plans(plans=[])
+        if not filtered_manifest.entries:
+            log.info("All sources were duplicates, returning empty Plans")
+            return Plans(plans=[])
 
-    # Step 1: Concept pre-search
-    log.info("Pre-searching concept matches via qmd (semantic)...")
-    concept_matches = concept_search(filtered_manifest, cfg)
-    matched_count = sum(len(v) for v in concept_matches.values())
-    log.info(
-        "Concept matching complete: %d total matches across %d sources",
-        matched_count,
-        len(filtered_manifest.entries),
-    )
+        # Step 1: Concept pre-search
+        log.info("Pre-searching concept matches via qmd (semantic)...")
+        concept_matches = concept_search(filtered_manifest, cfg)
+        matched_count = sum(len(v) for v in concept_matches.values())
+        log.info(
+            "Concept matching complete: %d total matches across %d sources",
+            matched_count,
+            len(filtered_manifest.entries),
+        )
 
-    # Step 2: Deterministic planning
-    log.info("Generating plans deterministically...")
-    deterministic_plans, uncertain = generate_plans_deterministic(
-        filtered_manifest, concept_matches,
-    )
-    log.info("Deterministic: %d plans, %d uncertain (need agent)",
-             len(deterministic_plans.plans), len(uncertain))
+        # Step 2: Deterministic planning
+        log.info("Generating plans deterministically...")
+        deterministic_plans, uncertain = generate_plans_deterministic(
+            filtered_manifest, concept_matches,
+        )
+        log.info("Deterministic: %d plans, %d uncertain (need agent)",
+                 len(deterministic_plans.plans), len(uncertain))
 
-    # Rec 8: concept merge queue (embed trigger)
-    _process_concept_merge_queue(deterministic_plans, cfg, store)
+        # Rec 8: concept merge queue (embed trigger)
+        _process_concept_merge_queue(deterministic_plans, cfg, store)
 
-    # Step 3: Agent fallback for uncertain sources only
-    if uncertain:
-        log.info("Spawning planning agent for %d uncertain sources...", len(uncertain))
-        uncertain_manifest = Manifest(entries=uncertain)
-        uncertain_concept_matches = {
-            e.hash: concept_matches.get(e.hash, []) for e in uncertain
-        }
-        agent_plans = generate_plans(uncertain_manifest, uncertain_concept_matches, cfg)
-        _process_concept_merge_queue(agent_plans, cfg, store)
-        # Merge: deterministic plans first, then agent plans
-        all_plans = Plans(plans=deterministic_plans.plans + agent_plans.plans)
-    else:
-        all_plans = deterministic_plans
+        # Step 3: Agent fallback for uncertain sources only
+        if uncertain:
+            log.info("Spawning planning agent for %d uncertain sources...", len(uncertain))
+            uncertain_manifest = Manifest(entries=uncertain)
+            uncertain_concept_matches = {
+                e.hash: concept_matches.get(e.hash, []) for e in uncertain
+            }
+            agent_plans = generate_plans(uncertain_manifest, uncertain_concept_matches, cfg)
+            _process_concept_merge_queue(agent_plans, cfg, store)
+            all_plans = Plans(plans=deterministic_plans.plans + agent_plans.plans)
+        else:
+            all_plans = deterministic_plans
 
     # Save plans
     extract_dir = cfg.resolved_extract_dir

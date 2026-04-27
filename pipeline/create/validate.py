@@ -108,7 +108,7 @@ def validate_single_file(file_path: Path, note_type: str) -> list[str]:
         if parsed_fm is not None and not isinstance(parsed_fm, dict):
             violations.append("invalid YAML frontmatter: expected mapping")
             parsed_fm = {}
-    except Exception as e:
+    except (ValueError, yaml.YAMLError) as e:
         violations.append(f"invalid YAML frontmatter: {e}")
         parsed_fm = {}
     fm = parsed_fm if isinstance(parsed_fm, dict) else {}
