@@ -429,30 +429,41 @@ def _do_merge(cfg: Config, duplicate_name: str, canonical_name: str) -> bool:
     except OSError:
         return False
 
+    canonical_body = re.sub(r"^---\s*\n.*?\n---\s*\n", "", canonical_content, flags=re.DOTALL)
     duplicate_body = re.sub(r"^---\s*\n.*?\n---\s*\n", "", duplicate_content, flags=re.DOTALL)
-    merged_content = canonical_content.rstrip() + f"\n\n## Merged from {duplicate_name}\n\n{duplicate_body.strip()}\n"
+    merged_content = canonical_body.rstrip() + f"\n\n## Merged from {duplicate_name}\n\n{duplicate_body.strip()}\n"
     from pipeline.utils import _atomic_write
     _atomic_write(canonical_path, merged_content)
 
     _archive_duplicate(duplicate_path, cfg)
 
+    # Pre-index: find all files referencing duplicate_name (O(N))
+    pattern = re.compile(rf"\[\[{re.escape(duplicate_name)}(?P<suffix>[|#][^\]]*)?\]\]")
     all_dirs = [cfg.entries_dir, cfg.concepts_dir, cfg.mocs_dir, cfg.sources_dir]
+    target_files: list[Path] = []
     for directory in all_dirs:
         if not directory.exists():
             continue
         for note_md in directory.glob("*.md"):
             try:
                 text = note_md.read_text(encoding="utf-8", errors="replace")
-                original = text
-                text = re.sub(
-                    rf"\[\[{re.escape(duplicate_name)}(?P<suffix>[|#][^\]]*)?\]\]",
-                    lambda m: f"[[{canonical_name}{m.group('suffix') or ''}]]",
-                    text,
-                )
-                if text != original:
-                    note_md.write_text(text, encoding="utf-8")
+                if pattern.search(text):
+                    target_files.append(note_md)
             except OSError:
                 continue
+    # Batch replace in identified files only (O(N) total)
+    for note_md in target_files:
+        try:
+            text = note_md.read_text(encoding="utf-8", errors="replace")
+            original = text
+            text = pattern.sub(
+                lambda m: f"[[{canonical_name}{m.group('suffix') or ''}]]",
+                text,
+            )
+            if text != original:
+                note_md.write_text(text, encoding="utf-8")
+        except OSError:
+            continue
 
     return True
 

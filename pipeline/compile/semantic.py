@@ -422,46 +422,74 @@ def _semantic_moc_rebuild(cfg: Config, client, index: NoteIndex) -> int:
 
 
 def _run_semantic_compile(cfg: Config, result) -> tuple[bool, str]:
+    """Run semantic compile: direct LLM first, Hermes subprocess fallback.
+
+    If the direct LLM path fails (timeout, model unavailable, generation error),
+    falls back to the Hermes agent subprocess as a secondary attempt.
+    If both fail, reports loud failure with result.error set.
+    """
     from pipeline.llm_client import get_llm_client
     from pipeline.compile.core import _run_agent_compile
 
     client = get_llm_client(cfg)
 
-    if cfg.llm_provider == "hermes":
-        return _run_agent_compile(cfg, result)
+    def _try_direct() -> tuple[bool, str]:
+        """Attempt direct LLM semantic compile. Returns (ok, summary_or_error)."""
+        t0 = time.time()
+        index = NoteIndex()
+        index.load(cfg)
+        if len(index.notes) > 0:
+            index.embed_all(client)
 
-    t0 = time.time()
+        all_ok = True
+        try:
+            result.crosslinks_added = _semantic_crosslink(cfg, client, index)
+        except (ConnectionError, TimeoutError, OSError, ValueError) as e:
+            log.warning("Direct cross-linking failed: %s", e)
+            all_ok = False
 
-    index = NoteIndex()
-    index.load(cfg)
-    if len(index.notes) > 0:
-        index.embed_all(client)
+        try:
+            result.concepts_merged = _semantic_concept_merge(cfg, client, index)
+        except (ConnectionError, TimeoutError, OSError, ValueError) as e:
+            log.warning("Direct concept merge failed: %s", e)
+            all_ok = False
 
-    all_ok = True
+        try:
+            result.mocs_updated = _semantic_moc_rebuild(cfg, client, index)
+        except (ConnectionError, TimeoutError, OSError, ValueError) as e:
+            log.warning("Direct MoC rebuild failed: %s", e)
+            all_ok = False
+
+        result.agent_duration_s = time.time() - t0
+        result.agent_succeeded = all_ok
+
+        if all_ok:
+            summary = (
+                f"cross-links added: {result.crosslinks_added}\n"
+                f"concepts merged: {result.concepts_merged}\n"
+                f"mocs updated: {result.mocs_updated}"
+            )
+            return True, summary
+        return False, "Direct semantic compile failed (see logs)"
+
+    # Try direct first
+    direct_ok, direct_output = _try_direct()
+    if direct_ok:
+        return True, direct_output
+
+    log.warning("Direct semantic compile failed; attempting Hermes subprocess fallback")
+
+    # Fallback: Hermes agent subprocess (legacy 600s path)
     try:
-        result.crosslinks_added = _semantic_crosslink(cfg, client, index)
+        agent_ok, agent_output = _run_agent_compile(cfg, result)
+        if agent_ok:
+            result.agent_succeeded = True
+            return True, agent_output
     except Exception as e:
-        log.error("Semantic cross-linking failed: %s", e)
-        all_ok = False
+        log.error("Hermes fallback also failed: %s", e)
 
-    try:
-        result.concepts_merged = _semantic_concept_merge(cfg, client, index)
-    except Exception as e:
-        log.error("Semantic concept merge failed: %s", e)
-        all_ok = False
-
-    try:
-        result.mocs_updated = _semantic_moc_rebuild(cfg, client, index)
-    except Exception as e:
-        log.error("Semantic MoC rebuild failed: %s", e)
-        all_ok = False
-
-    result.agent_duration_s = time.time() - t0
-    result.agent_succeeded = all_ok
-
-    summary = (
-        f"cross-links added: {result.crosslinks_added}\n"
-        f"concepts merged: {result.concepts_merged}\n"
-        f"mocs updated: {result.mocs_updated}"
-    )
-    return all_ok, summary
+    result.success = False
+    result.error = "Semantic compile failed: direct LLM and Hermes fallback both exhausted"
+    result.agent_succeeded = False
+    log.error(result.error)
+    return False, result.error

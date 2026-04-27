@@ -26,11 +26,12 @@ import threading
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
-from typing import Optional
+from typing import Iterator, Optional
+
+from pipeline._version import __version__
 
 log = logging.getLogger(__name__)
 
-# Default QMD MCP HTTP endpoint
 _DEFAULT_QMD_MCP_URL = os.environ.get("QMD_MCP_URL", "http://localhost:8181")
 
 
@@ -105,7 +106,7 @@ class QMDMCPClient:
             {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {},
-                "clientInfo": {"name": "obsidian-llm-wiki", "version": "0.3.0"},
+                "clientInfo": {"name": "obsidian-llm-wiki", "version": __version__},
             },
         )
 

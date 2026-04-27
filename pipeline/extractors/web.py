@@ -298,6 +298,10 @@ def _try_camoufox(url: str, timeout: int = 45) -> str:
 
             await page.route("**/*", _guard_route)
             await page.goto(url, wait_until="domcontentloaded", timeout=timeout * 1000)
+            try:
+                await page.wait_for_load_state("networkidle", timeout=5000)
+            except Exception:
+                pass  # non-blocking: continue even if networkidle times out
             if not _validate_url(page.url):
                 log.warning("Blocked browser redirect to potentially unsafe URL: %s", page.url[:80])
                 return ""

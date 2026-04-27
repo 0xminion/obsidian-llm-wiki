@@ -1,17 +1,4 @@
-"""Semantic concept search — QMD MCP integration.
-
-Replaces the previous Ollama embedding backend with QMD's MCP HTTP server.
-QMD runs as a long-lived daemon on port 8181, avoiding repeated model loading.
-
-Search priority (per user requirement):
-  1. QMD query (hybrid / vec semantic) — default
-  2. QMD lex (BM25 keyword fallback)              — fallback1
-  3. Local keyword fallback (no QMD server)       — fallback2
-
-Environment:
-  QMD_MCP_URL — override base URL (default http://localhost:8181)
-  USE_QMD_MCP — "true" to use QMD (default "true" if QMD server is reachable)
-"""
+"""Semantic concept search — QMD MCP integration."""
 
 from __future__ import annotations
 
@@ -100,10 +87,10 @@ def run_qmd_query(
             query_text=query.strip(),
             n_results=n_results,
             min_score=min_score,
-            collections=[collection or "concepts"],
+            collections=[collection or cfg.qmd_collection],
         )
         if results:
-            return _qmd_results_to_concept_matches(results, collection_filter=collection or "concepts")
+            return _qmd_results_to_concept_matches(results, collection_filter=collection or cfg.qmd_collection)
 
     # Fallback: local keyword fallback
     if concepts_dir is not None:
