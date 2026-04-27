@@ -482,6 +482,7 @@ def batch_smart_filenames(
         return {}
 
     from concurrent.futures import ThreadPoolExecutor, as_completed
+
     from pipeline.llm_client import LLMClient
 
     results: dict[str, str] = {}
@@ -519,6 +520,17 @@ def batch_smart_filenames(
 # PROMPT LOADING — Load .prompt template files
 # Ported from lib/common.sh load_prompt()
 # ═══════════════════════════════════════════════════════════
+
+def _atomic_write(path: Path, content: str, encoding: str = "utf-8") -> None:
+    """Write content to *path* atomically via a temporary file and os.replace.
+
+    Writes to ``{path}.tmp`` first, then renames the temp file into place.
+    This prevents partially-written files on crash or power loss.
+    """
+    tmp = Path(f"{path}.tmp")
+    tmp.write_text(content, encoding=encoding)
+    os.replace(tmp, path)
+
 
 def load_prompt(prompt_name: str, prompts_dir: str | Path | None = None) -> str:
     """Load a .prompt template by name.

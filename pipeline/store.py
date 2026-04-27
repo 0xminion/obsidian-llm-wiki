@@ -15,7 +15,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
-from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
 log = logging.getLogger(__name__)
 
@@ -150,6 +150,59 @@ class ContentStore:
                 cache_value TEXT NOT NULL,
                 updated_at REAL NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS compile_state (
+                filename TEXT PRIMARY KEY,
+                last_mtime REAL NOT NULL,
+                last_hash TEXT,
+                last_compile REAL NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_compile_state_last_compile ON compile_state(last_compile);
+
+            CREATE TABLE IF NOT EXISTS pipeline_runs (
+                run_id TEXT PRIMARY KEY,
+                status TEXT NOT NULL,
+                started_at REAL NOT NULL,
+                completed_at REAL,
+                vault_path TEXT NOT NULL,
+                total_sources INT DEFAULT 0,
+                processed_sources INT DEFAULT 0,
+                failed_sources INT DEFAULT 0,
+                error TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_pipeline_runs_status ON pipeline_runs(status);
+            CREATE INDEX IF NOT EXISTS idx_pipeline_runs_started_at ON pipeline_runs(started_at);
+
+            CREATE TABLE IF NOT EXISTS pipeline_batches (
+                run_id TEXT NOT NULL,
+                batch_id TEXT PRIMARY KEY,
+                batch_index INT NOT NULL,
+                status TEXT NOT NULL,
+                plan_hash TEXT,
+                started_at REAL NOT NULL,
+                completed_at REAL,
+                error TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_pipeline_batches_run_id ON pipeline_batches(run_id);
+            CREATE INDEX IF NOT EXISTS idx_pipeline_batches_status ON pipeline_batches(status);
+
+            CREATE TABLE IF NOT EXISTS embeddings (
+                content_hash TEXT PRIMARY KEY,
+                embedding BLOB NOT NULL,
+                updated_at REAL NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_embeddings_updated ON embeddings(updated_at);
+
+            CREATE TABLE IF NOT EXISTS merge_queue (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                new_concept TEXT NOT NULL,
+                existing_concept TEXT NOT NULL,
+                similarity REAL NOT NULL DEFAULT 0.0,
+                status TEXT DEFAULT 'pending',
+                created_at REAL NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_merge_status ON merge_queue(status);
+            CREATE INDEX IF NOT EXISTS idx_merge_existing ON merge_queue(existing_concept);
         """)
         self._conn.commit()
 
@@ -489,6 +542,288 @@ class ContentStore:
         """Store wikilink index."""
         data = {k: list(v) for k, v in links.items()}
         self.cache_set("wikilinks:index", json.dumps(data))
+
+    # ─── Compile State (Incremental Compile) ─────────────────────────────────
+
+    def compile_state_get(self, filename: str) -> dict | None:
+        """Get compile state for a single filename, or None."""
+        row = self._conn.execute(
+            "SELECT filename, last_mtime, last_hash, last_compile FROM compile_state WHERE filename = ?",
+            (filename,),
+        ).fetchone()
+        if not row:
+            return None
+        return dict(row)
+
+    def compile_state_set(
+        self,
+        filename: str,
+        last_mtime: float,
+        last_hash: str,
+        last_compile: float,
+    ) -> None:
+        """Upsert compile state for a single filename."""
+        self._conn.execute(
+            """INSERT OR REPLACE INTO compile_state
+               (filename, last_mtime, last_hash, last_compile)
+               VALUES (?, ?, ?, ?)""",
+            (filename, last_mtime, last_hash, last_compile),
+        )
+        self._conn.commit()
+
+    def compile_state_get_all(self) -> dict[str, dict]:
+        """Return {filename: {last_mtime, last_hash, last_compile}} for all rows."""
+        rows = self._conn.execute(
+            "SELECT filename, last_mtime, last_hash, last_compile FROM compile_state"
+        ).fetchall()
+        return {r["filename"]: dict(r) for r in rows}
+
+    def compile_state_clear(self) -> int:
+        """Clear the entire compile_state table. Returns rows deleted."""
+        cursor = self._conn.execute("DELETE FROM compile_state")
+        self._conn.commit()
+        return cursor.rowcount
+
+    # ─── Pipeline State Machine ────────────────────────────────────────────────
+
+    def run_insert(
+        self,
+        run_id: str,
+        status: str,
+        started_at: float,
+        vault_path: str,
+        total_sources: int = 0,
+        error: str | None = None,
+    ) -> None:
+        """Insert a new pipeline run record."""
+        self._conn.execute(
+            """INSERT INTO pipeline_runs
+               (run_id, status, started_at, vault_path, total_sources, error)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (run_id, status, started_at, vault_path, total_sources, error),
+        )
+        self._conn.commit()
+
+    def run_update_status(
+        self,
+        run_id: str,
+        status: str,
+        processed_sources: int | None = None,
+        failed_sources: int | None = None,
+        error: str | None = None,
+        completed_at: float | None = None,
+    ) -> None:
+        """Update run status and optional counters."""
+        parts = ["status = ?"]
+        params: list = [status]
+        if processed_sources is not None:
+            parts.append("processed_sources = ?")
+            params.append(processed_sources)
+        if failed_sources is not None:
+            parts.append("failed_sources = ?")
+            params.append(failed_sources)
+        if error is not None:
+            parts.append("error = ?")
+            params.append(error)
+        if completed_at is not None:
+            parts.append("completed_at = ?")
+            params.append(completed_at)
+        params.append(run_id)
+        sql = "UPDATE pipeline_runs SET " + ", ".join(parts) + " WHERE run_id = ?"
+        self._conn.execute(sql, tuple(params))
+        self._conn.commit()
+
+    def run_get_active(self) -> dict | None:
+        """Return the most recent active (not completed) run, or None."""
+        row = self._conn.execute(
+            """SELECT * FROM pipeline_runs
+               WHERE status IN ('running', 'paused')
+               ORDER BY started_at DESC
+               LIMIT 1"""
+        ).fetchone()
+        return dict(row) if row else None
+
+    def run_get_by_id(self, run_id: str) -> dict | None:
+        """Get a run by ID."""
+        row = self._conn.execute(
+            "SELECT * FROM pipeline_runs WHERE run_id = ?",
+            (run_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def run_get_recent(self, limit: int = 10) -> list[dict]:
+        """Return most recent runs ordered by started_at DESC."""
+        rows = self._conn.execute(
+            """SELECT * FROM pipeline_runs
+               ORDER BY started_at DESC
+               LIMIT ?""",
+            (limit,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def batch_insert(
+        self,
+        run_id: str,
+        batch_id: str,
+        batch_index: int,
+        status: str,
+        started_at: float,
+        plan_hash: str | None = None,
+        error: str | None = None,
+    ) -> None:
+        """Insert a new batch record."""
+        self._conn.execute(
+            """INSERT INTO pipeline_batches
+               (run_id, batch_id, batch_index, status, plan_hash, started_at, error)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (run_id, batch_id, batch_index, status, plan_hash, started_at, error),
+        )
+        self._conn.commit()
+
+    def batch_update_status(
+        self,
+        batch_id: str,
+        status: str,
+        completed_at: float | None = None,
+        error: str | None = None,
+    ) -> None:
+        """Update batch status."""
+        parts = ["status = ?"]
+        params: list = [status]
+        if completed_at is not None:
+            parts.append("completed_at = ?")
+            params.append(completed_at)
+        if error is not None:
+            parts.append("error = ?")
+            params.append(error)
+        params.append(batch_id)
+        sql = "UPDATE pipeline_batches SET " + ", ".join(parts) + " WHERE batch_id = ?"
+        self._conn.execute(sql, tuple(params))
+        self._conn.commit()
+
+    def batch_get_by_run(self, run_id: str) -> list[dict]:
+        """Get all batches for a run, ordered by batch_index."""
+        rows = self._conn.execute(
+            """SELECT * FROM pipeline_batches
+               WHERE run_id = ?
+               ORDER BY batch_index ASC""",
+            (run_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def batch_get_failed_or_skipped(self, run_id: str) -> list[dict]:
+        """Get batches for a run that are failed or skipped (for resume)."""
+        rows = self._conn.execute(
+            """SELECT * FROM pipeline_batches
+               WHERE run_id = ? AND status IN ('failed','skipped','pending')
+               ORDER BY batch_index ASC""",
+            (run_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    # ─── Merge Queue ──────────────────────────────────────────────────────────
+
+    def merge_queue_add(self, new_concept: str, existing_concept: str, similarity: float) -> int:
+        """Add a proposed concept merge to the queue. Returns the queue id."""
+        now = time.time()
+        cursor = self._conn.execute(
+            """INSERT INTO merge_queue
+               (new_concept, existing_concept, similarity, status, created_at)
+               VALUES (?, ?, ?, 'pending', ?)""",
+            (new_concept, existing_concept, similarity, now),
+        )
+        self._conn.commit()
+        return cursor.lastrowid
+
+    def merge_queue_get_pending(self, limit: int = 50) -> list[dict]:
+        """Get pending merge proposals."""
+        rows = self._conn.execute(
+            """SELECT * FROM merge_queue
+               WHERE status = 'pending'
+               ORDER BY similarity DESC
+               LIMIT ?""",
+            (limit,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def merge_queue_approve(self, item_id: int) -> None:
+        """Approve a merge proposal."""
+        self._conn.execute(
+            "UPDATE merge_queue SET status = 'approved' WHERE id = ?",
+            (item_id,),
+        )
+        self._conn.commit()
+
+    def merge_queue_reject(self, item_id: int) -> None:
+        """Reject a merge proposal."""
+        self._conn.execute(
+            "UPDATE merge_queue SET status = 'rejected' WHERE id = ?",
+            (item_id,),
+        )
+        self._conn.commit()
+
+    def merge_queue_clear(self) -> int:
+        """Clear all pending merges. Returns count cleared."""
+        cursor = self._conn.execute(
+            "DELETE FROM merge_queue WHERE status = 'pending'",
+        )
+        self._conn.commit()
+        return cursor.rowcount
+
+    # ─── Embeddings ───────────────────────────────────────────────────────────
+
+    def embedding_set(self, content_hash: str, embedding: list[float]) -> None:
+        """Store an embedding vector for a content hash."""
+        import struct
+        blob = struct.pack(f"{len(embedding)}f", *embedding)
+        now = time.time()
+        self._conn.execute(
+            """INSERT OR REPLACE INTO embeddings
+               (content_hash, embedding, updated_at)
+               VALUES (?, ?, ?)""",
+            (content_hash, blob, now),
+        )
+        self._conn.commit()
+
+    def embedding_get(self, content_hash: str) -> list[float] | None:
+        """Retrieve an embedding vector, or None if not found."""
+        import struct
+        row = self._conn.execute(
+            "SELECT embedding FROM embeddings WHERE content_hash = ?",
+            (content_hash,),
+        ).fetchone()
+        if not row:
+            return None
+        blob = row["embedding"]
+        n = len(blob) // 4
+        return list(struct.unpack(f"{n}f", blob))
+
+    def embedding_find_top_match(self, content_hash: str, min_similarity: float = 0.92) -> tuple[str, float] | None:
+        """Return (content_hash, cosine_similarity) for the best matching existing embedding."""
+        import math
+        import struct
+        target = self.embedding_get(content_hash)
+        if target is None:
+            return None
+        rows = self._conn.execute(
+            "SELECT content_hash, embedding FROM embeddings WHERE content_hash != ?",
+            (content_hash,),
+        ).fetchall()
+        best_match: tuple[str, float] | None = None
+        for row in rows:
+            blob = row["embedding"]
+            n = len(blob) // 4
+            emb = list(struct.unpack(f"{n}f", blob))
+            dot = sum(a * b for a, b in zip(target, emb))
+            norm_target = math.sqrt(sum(a * a for a in target))
+            norm_emb = math.sqrt(sum(b * b for b in emb))
+            if norm_target == 0 or norm_emb == 0:
+                continue
+            sim = dot / (norm_target * norm_emb)
+            if sim >= min_similarity:
+                if best_match is None or sim > best_match[1]:
+                    best_match = (row["content_hash"], sim)
+        return best_match
 
     # ─── Stats ────────────────────────────────────────────────────────────────
 

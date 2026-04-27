@@ -6,10 +6,10 @@ URL pattern matching, challenge page detection, and validation.
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import logging
 import re
-import ipaddress
 import socket
 import subprocess
 from typing import Optional
@@ -428,3 +428,98 @@ def transcribe_assemblyai(audio_file: str, api_key: str, timeout: int = 45) -> s
             time.sleep(5)
 
     return ""
+
+
+# ─── Quality Scoring ───────────────────────────────────────────────────────────
+
+def score_defuddle(body: str) -> float:
+    """Paragraph count / total lines ratio for defuddle output.
+
+    A single paragraph of continuous text is ideal (ratio ≈ 1.0).
+    Many short lines (nav menus, footers) drive the score down.
+    """
+    if not body:
+        return 0.0
+    lines = body.splitlines()
+    non_empty = [ln for ln in lines if ln.strip()]
+    if not non_empty:
+        return 0.0
+    # paragraphs = blocks separated by blank lines
+    paragraphs = 1
+    prev_blank = False
+    for line in lines:
+        if line.strip():
+            if prev_blank:
+                paragraphs += 1
+            prev_blank = False
+        else:
+            prev_blank = True
+    return min(paragraphs / len(non_empty), 1.0)
+
+
+def score_youtube(word_count: int, duration_min: int) -> float:
+    """Words/min density (ideal = 120 WPM)."""
+    if duration_min <= 0:
+        return 0.0
+    wpm = word_count / duration_min
+    return max(0.0, min(1.0, 1.0 - abs(wpm - 120) / 120))
+
+
+def score_web(body: str) -> float:
+    """Text-to-noise ratio after stripping nav/footer markers.
+
+    Only removes lines that are *entirely* noise markers, so inline
+    words like "navigator" or "cookies" are never stripped.
+    """
+    if not body:
+        return 0.0
+    noise = re.compile(
+        r"(?im)^\s*(?:navigation|footer|privacy\s+policy|terms\s+of\s+use|cookie\s+notice|advertisements?)\s*$"
+    )
+    cleaned = noise.sub("", body)
+    cleaned_stripped = re.sub(r"\s+", "", cleaned)
+    body_stripped = re.sub(r"\s+", "", body)
+    if not body_stripped:
+        return 0.0
+    return min(len(cleaned_stripped) / len(body_stripped), 1.0)
+
+
+def score_pdf(body: str, page_estimate: int) -> float:
+    """Chars per page estimate."""
+    if page_estimate <= 0:
+        return 0.0
+    chars_per_page = len(body) / page_estimate
+    # ideal ~ 3000 chars/page
+    return max(0.0, min(1.0, chars_per_page / 3000))
+
+
+def score_podcast(word_count: int, audio_sec: int) -> float:
+    """Ideal 150 WPM, penalize if <50 words."""
+    if audio_sec <= 0:
+        return 0.0
+    wpm = (word_count / audio_sec) * 60
+    if word_count < 50:
+        return 0.0
+    return max(0.0, min(1.0, 1.0 - abs(wpm - 150) / 150))
+
+
+__all__ = [
+    "ExtractionError",
+    "_run",
+    "_curl_get",
+    "_curl_post_json",
+    "_validate_url",
+    "_strip_markdown",
+    "extract_title",
+    "_extract_youtube_video_id",
+    "_extract_arxiv_paper_id",
+    "_is_challenge_page",
+    "validate_extraction",
+    "transcribe_with_whisper",
+    "transcribe_assemblyai",
+    "score_defuddle",
+    "score_youtube",
+    "score_web",
+    "score_pdf",
+    "score_podcast",
+]

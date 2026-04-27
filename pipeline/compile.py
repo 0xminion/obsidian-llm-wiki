@@ -12,22 +12,156 @@ Architecture:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import math
 import re
 import subprocess
+import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional
 
-
+from pipeline._common import VaultLock
 from pipeline.config import Config
 from pipeline.models import Edge, EdgeType
-from pipeline.utils import count_md, load_prompt as _load_prompt
+from pipeline.store import ContentStore
+from pipeline.utils import count_md
+from pipeline.utils import load_prompt as _load_prompt
 
 log = logging.getLogger(__name__)
+
+_compiling = threading.Event()  # sentinel to prevent watch callbacks during compile
+
+
+def _archive_duplicate(path: Path, cfg: Config) -> None:
+    """Move a duplicate concept file to the deleted-concepts archive instead of unlinking.
+
+    Creates the archive directory if it does not exist.
+    """
+    archive_dir = cfg.vault_path / "Meta" / "Scripts" / ".deleted-concepts"
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    archived_name = f"{path.stem}_{timestamp}.md"
+    path.rename(archive_dir / archived_name)
+
+
+# ─── IncrementalCompiler ──────────────────────────────────────────────────────
+
+class IncrementalCompiler:
+    """Tracks file mtimes/hashes in store.db and filters changed files for compile.
+
+    On compile, only files whose mtime > last_compile are analyzed.
+    In watch mode, only changed files + downstream MoCs are re-compiled.
+    """
+
+    def __init__(self, store: ContentStore) -> None:
+        self.store = store
+
+    @staticmethod
+    def _file_hash(path: Path) -> str:
+        """Return a quick hash of file content."""
+        try:
+            data = path.read_bytes()
+        except OSError:
+            return ""
+        return hashlib.md5(data, usedforsecurity=False).hexdigest()[:12]
+
+    def get_changed_files(
+        self,
+        cfg: Config,
+        full: bool = False,
+    ) -> tuple[set[str], dict[str, float]]:
+        """Return (changed_filenames, current_mtimes) relative to vault root.
+
+        If full=True, returns all files and marks all as changed.
+        """
+        if full:
+            current: dict[str, float] = {}
+            for d in (cfg.entries_dir, cfg.concepts_dir, cfg.mocs_dir, cfg.sources_dir):
+                if not d.exists():
+                    continue
+                for md in d.glob("*.md"):
+                    rel = str(md.relative_to(cfg.vault_path))
+                    try:
+                        current[rel] = md.stat().st_mtime
+                    except OSError:
+                        continue
+            return set(current.keys()), current
+
+        previous = self.store.compile_state_get_all()
+        changed: set[str] = set()
+        current = {}
+        for d in (cfg.entries_dir, cfg.concepts_dir, cfg.mocs_dir, cfg.sources_dir):
+            if not d.exists():
+                continue
+            for md in d.glob("*.md"):
+                rel = str(md.relative_to(cfg.vault_path))
+                try:
+                    mtime = md.stat().st_mtime
+                except OSError:
+                    continue
+                current[rel] = mtime
+                state = previous.get(rel)
+                if state is None:
+                    changed.add(rel)
+                elif mtime > state.get("last_compile", 0) + 0.01:
+                    old_hash = state.get("last_hash", "")
+                    new_hash = self._file_hash(md)
+                    if old_hash != new_hash:
+                        changed.add(rel)
+        return changed, current
+
+    def update_state(
+        self,
+        files: dict[str, float],
+        cfg: Config,
+    ) -> None:
+        """Write current compile_state for the given files (by relative path)."""
+        now = time.time()
+        for rel, mtime in files.items():
+            path = cfg.vault_path / rel
+            h = self._file_hash(path)
+            self.store.compile_state_set(rel, mtime, h, now)
+
+    def collect_downstream_mocs(self, cfg: Config, changed: set[str]) -> set[str]:
+        """Return additional MoC files that link to changed files."""
+        result: set[str] = set()
+        changed_stems = {Path(c).stem for c in changed}
+        if not cfg.mocs_dir.exists():
+            return result
+        for md in cfg.mocs_dir.glob("*.md"):
+            rel = str(md.relative_to(cfg.vault_path))
+            if rel in changed:
+                continue
+            try:
+                text = md.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            links = set(re.findall(r"\[\[[^\]|#]+(?:[|#][^\]]*)?\]\]", text))
+            link_stems = {link[2:].split("|", 1)[0].split("#", 1)[0].rstrip("]") for link in links}
+            for stem in changed_stems:
+                if stem in link_stems:
+                    result.add(rel)
+                    break
+        return result
+
+    def get_files_for_compile(
+        self,
+        cfg: Config,
+        full: bool = False,
+    ) -> tuple[set[str], dict[str, float]]:
+        """Return (files_to_compile, current_mtimes). Includes downstream MoCs when incremental."""
+        changed, current = self.get_changed_files(cfg, full=full)
+        if full:
+            return changed, current
+        if changed:
+            downstream = self.collect_downstream_mocs(cfg, changed)
+            changed |= downstream
+        return changed, current
 
 
 # ─── Compile Result ─────────────────────────────────────────────────────────
@@ -237,12 +371,15 @@ def _frontmatter_list_items(frontmatter: str, field_name: str) -> list[str]:
     return items
 
 
-def _build_edges(cfg: Config) -> int:
+def _build_edges(cfg: Config, bidirectional: bool = False) -> int:
     """Rebuild deterministic graph edges from the current vault state.
 
     Generated edges are derived data, so this command rewrites them instead of
     appending. Manually-authored edges are preserved unless they point at notes
     that no longer exist.
+
+    Args:
+        bidirectional: If True, flag edges without reverse as WEAK_LINK.
 
     Returns number of generated edges written.
     """
@@ -336,6 +473,22 @@ def _build_edges(cfg: Config) -> int:
             if len(shared_tags) >= 2:
                 add_edge(name, other_name, EdgeType.RELATES_TO, f"shared tags: {', '.join(sorted(shared_tags)[:3])}")
 
+    # ─── Bidirectional Edge Inference (Rec 5) ────────────────────────────
+    if bidirectional:
+        # Only flag ASYMMETRIC edge types where a reverse edge makes semantic sense.
+        # RELATES_TO is already canonicalised as symmetric by _edge_key.
+        asymmetric_types = {
+            EdgeType.EXTENDS.value, EdgeType.CONTRADICTS.value, EdgeType.SUPPORTS.value,
+            EdgeType.SUPERSEDES.value, EdgeType.TESTED_BY.value, EdgeType.DEPENDS_ON.value,
+            EdgeType.INSPIRED_BY.value, EdgeType.PART_OF.value,
+        }
+        directed = {
+            (e.source, e.target, e.type.value) for e in edges if e.type.value in asymmetric_types
+        }
+        for source, target, etype in list(directed):
+            if (target, source, etype) not in directed:
+                add_edge(target, source, EdgeType.WEAK_LINK, f"inferred reverse ({etype})")
+
     lines = ["source\ttarget\ttype\tdescription"]
     valid_notes = set(notes)
     written_edges: set[tuple[str, str, str]] = set()
@@ -348,7 +501,8 @@ def _build_edges(cfg: Config) -> int:
                 written_edges.add(key)
     lines.extend(edge.to_tsv() for edge in edges if _edge_key(edge.source, edge.target, edge.type.value) not in written_edges)
     new_content = "\n".join(lines) + "\n"
-    edges_file.write_text(new_content, encoding="utf-8")
+    from pipeline.utils import _atomic_write
+    _atomic_write(edges_file, new_content)
     log.info("Rebuilt edges.tsv with %d generated edges", len(edges))
     return 0 if previous_content == new_content else len(edges)
 
@@ -406,7 +560,8 @@ def _detect_duplicates(cfg: Config) -> int:
             f"Found {dup_count} potential duplicate pairs:\n\n"
             + "\n".join(report_lines) + "\n"
         )
-        report_path.write_text(report_content, encoding="utf-8")
+        from pipeline.utils import _atomic_write
+        _atomic_write(report_path, report_content)
         log.info("Duplicate report: %d pairs flagged → %s", dup_count, report_path)
 
     return dup_count
@@ -543,7 +698,8 @@ def _add_wikilink(cfg: Config, source_name: str, target_name: str, reason: str) 
     if reason:
         link_line += f" — {reason}"
     lines.insert(insert_idx, link_line)
-    source_path.write_text("\n".join(lines), encoding="utf-8")
+    from pipeline.utils import _atomic_write
+    _atomic_write(source_path, "\n".join(lines))
     log.debug("Added link: %s -> %s", source_name, target_name)
     return True
 
@@ -706,16 +862,14 @@ def _merge_concepts(cfg: Config, canonical_name: str, duplicate_name: str, index
 
     # Extract body from both
     duplicate_body = re.sub(r"^---\s*\n.*?\n---\s*\n", "", duplicate_content, flags=re.DOTALL)
-
-    # Append duplicate body to canonical under a plain-text merged section.
-    # Do not leave a wikilink to the deleted duplicate.
     merged_content = canonical_content.rstrip() + f"\n\n## Merged from {duplicate_name}\n\n{duplicate_body.strip()}\n"
-    canonical_path.write_text(merged_content, encoding="utf-8")
+    from pipeline.utils import _atomic_write
+    _atomic_write(canonical_path, merged_content)
 
-    # Delete duplicate
-    duplicate_path.unlink()
+    # Archive duplicate instead of deleting
+    _archive_duplicate(duplicate_path, cfg)
 
-    # Update ALL notes that link to the duplicate (entries, concepts, MoCs, sources)
+    # Update ALL notes that link to the duplicate (entries, concepts, MoCs, and edges)
     all_dirs = [cfg.entries_dir, cfg.concepts_dir, cfg.mocs_dir, cfg.sources_dir]
     for directory in all_dirs:
         if not directory.exists():
@@ -730,7 +884,8 @@ def _merge_concepts(cfg: Config, canonical_name: str, duplicate_name: str, index
                     text,
                 )
                 if text != original:
-                    note_md.write_text(text, encoding="utf-8")
+                    from pipeline.utils import _atomic_write
+                    _atomic_write(note_md, text)
             except OSError:
                 continue
 
@@ -753,7 +908,8 @@ def _merge_concepts(cfg: Config, canonical_name: str, duplicate_name: str, index
                 continue
             seen_edges.add(key)
             rewritten.append("\t".join(parts))
-        cfg.edges_file.write_text("\n".join(rewritten).rstrip() + "\n", encoding="utf-8")
+        from pipeline.utils import _atomic_write
+        _atomic_write(cfg.edges_file, "\n".join(rewritten).rstrip() + "\n")
 
     # Invalidate entry in index so stale data isn't reused
     if duplicate_name in index.notes:
@@ -1005,6 +1161,116 @@ def _parse_agent_metrics(output: str) -> dict:
     return metrics
 
 
+# ─── Merge Queue Processing (Rec 8) ─────────────────────────────────────────
+
+def _process_merge_queue(
+    cfg: Config,
+    store: ContentStore,
+    confidence_threshold: float = 0.95,
+) -> int:
+    """Review pending merge queue and execute merges.
+
+    - If similarity >= confidence_threshold, merge immediately (heuristic).
+    - Otherwise, propose via a lightweight LLM call.
+    - Returns count of merges executed.
+    """
+    pending = store.merge_queue_get_pending()
+    if not pending:
+        return 0
+
+    from pipeline.llm_client import get_llm_client
+
+    client = get_llm_client(cfg)
+    merged = 0
+
+    for item in pending:
+        new_concept = item["new_concept"]
+        existing_concept = item["existing_concept"]
+        similarity = float(item["similarity"])
+
+        # High-confidence heuristic: auto-merge
+        if similarity >= confidence_threshold:
+            log.info("Auto-merge (high confidence): %s -> %s", new_concept, existing_concept)
+            _do_merge(cfg, new_concept, existing_concept)
+            store.merge_queue_approve(item["id"])
+            merged += 1
+            continue
+
+        # Lightweight LLM validation for borderline cases
+        prompt = (
+            f"You are a knowledge base editor.\n"
+            f"Two wiki concepts may be duplicates:\n"
+            f"  Existing concept: {existing_concept}\n"
+            f"  New concept: {new_concept}\n"
+            f"  Embedding similarity: {similarity:.3f}\n\n"
+            f"Should they be merged? Answer with exactly one word: MERGE or KEEP.\n"
+        )
+        answer = ""
+        try:
+            resp = client.generate(prompt, timeout=30)
+            if resp and resp.strip():
+                answer = resp.strip().upper()
+        except Exception as e:
+            log.debug("LLM merge proposal failed: %s", e)
+
+        if answer.startswith("MERGE"):
+            log.info("LLM approved merge: %s -> %s", new_concept, existing_concept)
+            _do_merge(cfg, new_concept, existing_concept)
+            store.merge_queue_approve(item["id"])
+            merged += 1
+        else:
+            log.info("LLM rejected merge: %s vs %s", new_concept, existing_concept)
+            store.merge_queue_reject(item["id"])
+
+    return merged
+
+
+def _do_merge(cfg: Config, duplicate_name: str, canonical_name: str) -> bool:
+    """Lightweight in-Python merge of duplicate concept into canonical.
+
+    Updates references and deletes the duplicate concept file.
+    """
+    canonical_path = cfg.concepts_dir / f"{canonical_name}.md"
+    duplicate_path = cfg.concepts_dir / f"{duplicate_name}.md"
+    if not canonical_path.exists() or not duplicate_path.exists():
+        return False
+
+    try:
+        canonical_content = canonical_path.read_text(encoding="utf-8", errors="replace")
+        duplicate_content = duplicate_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+
+    duplicate_body = re.sub(r"^---\s*\n.*?\n---\s*\n", "", duplicate_content, flags=re.DOTALL)
+    merged_content = canonical_content.rstrip() + f"\n\n## Merged from {duplicate_name}\n\n{duplicate_body.strip()}\n"
+    from pipeline.utils import _atomic_write
+    _atomic_write(canonical_path, merged_content)
+
+    # Archive duplicate instead of deleting
+    _archive_duplicate(duplicate_path, cfg)
+
+    # Update references across all dirs
+    all_dirs = [cfg.entries_dir, cfg.concepts_dir, cfg.mocs_dir, cfg.sources_dir]
+    for directory in all_dirs:
+        if not directory.exists():
+            continue
+        for note_md in directory.glob("*.md"):
+            try:
+                text = note_md.read_text(encoding="utf-8", errors="replace")
+                original = text
+                text = re.sub(
+                    rf"\[\[{re.escape(duplicate_name)}(?P<suffix>[|#][^\]]*)?\]\]",
+                    lambda m: f"[[{canonical_name}{m.group('suffix') or ''}]]",
+                    text,
+                )
+                if text != original:
+                    note_md.write_text(text, encoding="utf-8")
+            except OSError:
+                continue
+
+    return True
+
+
 # ─── Compile Report + Log ────────────────────────────────────────────────────
 
 def _write_compile_report(cfg: Config, result: CompileResult) -> Path:
@@ -1080,81 +1346,235 @@ def _append_log_entry(cfg: Config, result: CompileResult) -> None:
 
 # ─── Main Entry Point ────────────────────────────────────────────────────────
 
-def run_compile(cfg: Config) -> dict:
+def run_compile(cfg: Config, process_merges: bool = False, incremental: bool = False, full: bool = False, bidirectional: bool = True, watch_mode: bool = False) -> dict:
     """Run the compile pass. Returns structured result dict.
 
-    Flow:
-      1. Capture vault snapshot (before)
-      2. Run agent for cross-linking + concept merging (semantic ops)
-      3. Deterministic: rebuild wiki-index
-      4. Deterministic: construct typed edges
-      5. Deterministic: detect duplicates
-      6. Capture vault snapshot (after)
-      7. Diff to get actual metrics
-      8. Write compile report + log entry
+    Args:
+        process_merges: If True, process the merge queue after semantic compile.
+        incremental: If True, only analyze files whose mtime > last_compile.
+        full: If True, force full recompile regardless of incremental state.
+        bidirectional: If True, flag edges without reverse as WEAK_LINK.
+        watch_mode: If True, acquire VaultLock and set compiling sentinel.
     """
-    result = CompileResult()
+    if _compiling.is_set():
+        log.info("Compile already in progress, skipping")
+        return CompileResult(success=True).to_dict()
 
-    # 1. Snapshot before
-    before = VaultSnapshot.capture(cfg)
-    result.entries_before = before.entries
-    result.concepts_before = before.concepts
-    result.mocs_before = before.mocs
+    _compiling.set()
+    lock: Optional[VaultLock] = None
+    if watch_mode:
+        lock = VaultLock(cfg.vault_path, name="pipeline")
+        if not lock.acquire():
+            log.warning("Watch mode: could not acquire VaultLock, skipping compile")
+            _compiling.clear()
+            return CompileResult(success=False, error="VaultLock busy").to_dict()
 
-    log.info("=== Compile pass: %d entries, %d concepts, %d MoCs ===",
-             before.entries, before.concepts, before.mocs)
+    # Determine whether to use incremental mode
+    use_incremental = incremental and not full
 
-    # 2. Semantic compile: cross-linking + concept merging + MoC rebuild
-    agent_ok, agent_output = _run_semantic_compile(cfg, result)
-    result.agent_succeeded = agent_ok
+    # Default incremental on for >100 notes
+    total_notes = (
+        count_md(cfg.entries_dir)
+        + count_md(cfg.concepts_dir)
+        + count_md(cfg.mocs_dir)
+        + count_md(cfg.sources_dir)
+    )
+    if not full and total_notes > 100:
+        use_incremental = True
 
-    # Parse agent output for metrics (legacy compat)
-    if agent_output and result.crosslinks_added == 0:
-        agent_metrics = _parse_agent_metrics(agent_output)
-        result.crosslinks_added = agent_metrics["crosslinks_added"]
-        result.concepts_merged = agent_metrics["concepts_merged"]
-        result.mocs_updated = agent_metrics["mocs_updated"]
+    store = ContentStore.open_vault_cache(cfg.vault_path)
+    try:
+        inc = IncrementalCompiler(store)
+        changed_files: set[str] = set()
+        current_mtimes: dict[str, float] = {}
+        if use_incremental:
+            changed_files, current_mtimes = inc.get_files_for_compile(cfg, full=full)
+            if changed_files:
+                log.info("Incremental compile: %d changed files + downstream MoCs", len(changed_files))
+            else:
+                log.info("Incremental compile: no changed files, skipping semantic analysis")
 
-    # 3. Deterministic: wiki index rebuild
-    result.wiki_index_rebuilt = _rebuild_wiki_index(cfg)
+        result = CompileResult()
 
-    # 4. Deterministic: typed edges construction
-    result.edges_added = _build_edges(cfg)
+        # 1. Snapshot before
+        before = VaultSnapshot.capture(cfg)
+        result.entries_before = before.entries
+        result.concepts_before = before.concepts
+        result.mocs_before = before.mocs
 
-    # 5. Deterministic: duplicate detection
-    result.duplicates_flagged = _detect_duplicates(cfg)
+        log.info("=== Compile pass: %d entries, %d concepts, %d MoCs ===",
+                 before.entries, before.concepts, before.mocs)
 
-    # 6. Snapshot after
-    after = VaultSnapshot.capture(cfg)
-    result.entries_after = after.entries
-    result.concepts_after = after.concepts
-    result.mocs_after = after.mocs
+        # 2. Semantic compile: cross-linking + concept merging + MoC rebuild
+        agent_ok = True
+        agent_output = ""
+        if changed_files or not use_incremental:
+            agent_ok, agent_output = _run_semantic_compile(cfg, result)
+        result.agent_succeeded = agent_ok
 
-    # 7. Diff for validation
-    diff = _diff_snapshots(before, after)
-    log.info("Compile diff: %d files changed, %d new wikilinks, "
-             "entries %+d, concepts %+d, MoCs %+d",
-             diff["files_changed"], diff["new_wikilinks"],
-             diff["entries_delta"], diff["concepts_delta"], diff["mocs_delta"])
+        # Parse agent output for metrics (legacy compat)
+        if agent_output and result.crosslinks_added == 0:
+            agent_metrics = _parse_agent_metrics(agent_output)
+            result.crosslinks_added = agent_metrics["crosslinks_added"]
+            result.concepts_merged = agent_metrics["concepts_merged"]
+            result.mocs_updated = agent_metrics["mocs_updated"]
 
-    # If metrics claim 0 but vault actually changed, update from diff
-    if result.crosslinks_added == 0 and diff["new_wikilinks"] > 0:
-        result.crosslinks_added = diff["new_wikilinks"]
-    if result.concepts_merged == 0 and diff["concepts_delta"] < 0:
-        result.concepts_merged = abs(diff["concepts_delta"])
+        # 8. Merge queue processing (Rec 8)
+        if process_merges:
+            try:
+                merge_count = _process_merge_queue(cfg, store)
+                if merge_count:
+                    result.concepts_merged += merge_count
+            finally:
+                pass
 
-    # Determine overall success
-    if not agent_ok:
-        result.success = False
-        result.error = "Semantic compile failed; deterministic maintenance still ran"
-        if not result.wiki_index_rebuilt:
-            result.error += "; wiki index rebuild also failed"
+        # 3. Deterministic: wiki index rebuild
+        result.wiki_index_rebuilt = _rebuild_wiki_index(cfg)
 
-    # 8. Write report + log
-    report_path = _write_compile_report(cfg, result)
-    result.report_path = str(report_path)
-    _append_log_entry(cfg, result)
+        # 4. Deterministic: typed edges construction
+        result.edges_added = _build_edges(cfg, bidirectional=bidirectional)
 
-    log.info("Compile complete: %s", json.dumps(result.to_dict(), indent=2))
+        # 5. Deterministic: duplicate detection
+        result.duplicates_flagged = _detect_duplicates(cfg)
 
-    return result.to_dict()
+        # Update compile state (M15: re-capture mtimes after compile)
+        _, current_mtimes = inc.get_changed_files(cfg, full=False)
+        inc.update_state(current_mtimes, cfg)
+
+        # 6. Snapshot after
+        after = VaultSnapshot.capture(cfg)
+        result.entries_after = after.entries
+        result.concepts_after = after.concepts
+        result.mocs_after = after.mocs
+
+        # 7. Diff for validation
+        diff = _diff_snapshots(before, after)
+        log.info("Compile diff: %d files changed, %d new wikilinks, "
+                 "entries %+d, concepts %+d, MoCs %+d",
+                 diff["files_changed"], diff["new_wikilinks"],
+                 diff["entries_delta"], diff["concepts_delta"], diff["mocs_delta"])
+
+        # If metrics claim 0 but vault actually changed, update from diff
+        if result.crosslinks_added == 0 and diff["new_wikilinks"] > 0:
+            result.crosslinks_added = diff["new_wikilinks"]
+        if result.concepts_merged == 0 and diff["concepts_delta"] < 0:
+            result.concepts_merged = abs(diff["concepts_delta"])
+
+        # Determine overall success
+        if not agent_ok:
+            result.success = False
+            result.error = "Semantic compile failed; deterministic maintenance still ran"
+            if not result.wiki_index_rebuilt:
+                result.error += "; wiki index rebuild also failed"
+
+        # 8. Write report + log
+        report_path = _write_compile_report(cfg, result)
+        result.report_path = str(report_path)
+        _append_log_entry(cfg, result)
+
+        log.info("Compile complete: %s", json.dumps(result.to_dict(), indent=2))
+
+        return result.to_dict()
+    finally:
+        store.close()
+        if lock:
+            lock.release()
+        _compiling.clear()
+
+
+def _watch_with_watchdog(cfg: Config, incremental: bool = True, bidirectional: bool = True) -> None:
+    """Watch vault for changes using watchdog library (preferred)."""
+    from watchdog.events import FileSystemEventHandler  # type: ignore[import-untyped]
+    from watchdog.observers import Observer  # type: ignore[import-untyped]
+
+    class _CompileHandler(FileSystemEventHandler):
+        def __init__(self, inc: IncrementalCompiler) -> None:
+            self.inc = inc
+            self._last_compile = 0.0
+
+        def on_modified(self, event) -> None:
+            if event.is_directory:
+                return
+            p = Path(event.src_path)
+            if p.suffix != ".md":
+                return
+            self._maybe_compile()
+
+        def on_created(self, event) -> None:
+            if event.is_directory:
+                return
+            p = Path(event.src_path)
+            if p.suffix != ".md":
+                return
+            self._maybe_compile()
+
+        def _maybe_compile(self) -> None:
+            if _compiling.is_set():
+                return
+            now = time.time()
+            if now - self._last_compile < 5.0:
+                return
+            self._last_compile = now
+            log.info("Watchdog: file change detected, triggering compile...")
+            try:
+                run_compile(cfg, incremental=incremental, full=False, bidirectional=bidirectional, watch_mode=True)
+            except Exception:
+                log.exception("Watch compile failed")
+
+    store = ContentStore.open_vault_cache(cfg.vault_path)
+    handler = _CompileHandler(IncrementalCompiler(store))
+    observer = Observer()
+    for d in (cfg.entries_dir, cfg.concepts_dir, cfg.mocs_dir, cfg.sources_dir):
+        if d.exists():
+            observer.schedule(handler, str(d), recursive=False)
+    observer.start()
+    log.info("Watchdog watching vault: %s", cfg.vault_path)
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        observer.stop()
+        observer.join()
+        store.close()
+
+
+def _watch_with_polling(cfg: Config, incremental: bool = True, bidirectional: bool = True, interval: float = 30.0) -> None:
+    """Poll vault for changes every `interval` seconds and recompile when changed."""
+    store = ContentStore.open_vault_cache(cfg.vault_path)
+    inc = IncrementalCompiler(store)
+    log.info("Polling watch started (every %.0fs): %s", interval, cfg.vault_path)
+    try:
+        while True:
+            time.sleep(interval)
+            changed, current = inc.get_files_for_compile(cfg, full=False)
+            if changed:
+                log.info("Polling: %d changed file(s), triggering compile...", len(changed))
+                if _compiling.is_set():
+                    log.debug("Polling: compile already in progress, skipping")
+                else:
+                    try:
+                        run_compile(cfg, incremental=incremental, full=False, bidirectional=bidirectional, watch_mode=True)
+                    except Exception:
+                        log.exception("Watch compile failed")
+            else:
+                log.debug("Polling: no changes")
+    except KeyboardInterrupt:
+        pass
+    finally:
+        store.close()
+
+
+def watch_compile(cfg: Config, incremental: bool = True, bidirectional: bool = True) -> None:
+    """Auto-trigger compile on file changes.
+
+    Uses watchdog if available, otherwise falls back to polling every 30s.
+    In watch mode, only re-compiles changed files + downstream MoCs.
+    """
+    import importlib.util
+    if importlib.util.find_spec("watchdog") is not None:
+        _watch_with_watchdog(cfg, incremental=incremental, bidirectional=bidirectional)
+    else:
+        log.info("watchdog not installed; falling back to 30s polling")
+        _watch_with_polling(cfg, incremental=incremental, bidirectional=bidirectional)

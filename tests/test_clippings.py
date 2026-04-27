@@ -17,8 +17,7 @@ import pytest
 from pipeline.config import Config
 from pipeline.models import ExtractedSource, SourceType
 from pipeline.utils import collect_clipping_files, parse_clipping_file
-from pipeline.vault import archive_clippings, _clipping_hash
-
+from pipeline.vault import _clipping_hash, archive_clippings
 
 # ── Fixtures ──────────────────────────────────────────────────────────────
 
@@ -78,7 +77,7 @@ class TestParseClippingFile:
 
     def test_returns_none_when_no_url(self, tmp_path: Path):
         p = tmp_path / "nolink.md"
-        p.write_text("No urls here.\n", encoding="utf-8")
+        p.write_text("No urls here.\n")
         assert parse_clipping_file(p) is None
 
     def test_youtube_type_detection(self, make_clipping):
@@ -106,6 +105,7 @@ class TestCollectClippingFiles:
         assert len(results) == 1
         assert results[0][0].name == "good.md"
         assert results[0][1]["url"] == "https://example.com/g"
+        assert results[0][0].exists()
 
     def test_alpha_sorted(self, tmp_path: Path, make_clipping):
         make_clipping(name="c", url="https://example.com/c")
@@ -128,6 +128,11 @@ class TestArchiveClippings:
         path = make_clipping(name="article", url="https://example.com/article", dir=clippings)
         h = _clipping_hash(path)
 
+        # Move into the clippings dir so archive_clippings can find it
+        target = clippings / path.name
+        path.rename(target)
+        path = target
+
         cfg = Config(vault_path=tmp_path)
 
         count = archive_clippings(cfg, {h})
@@ -141,7 +146,9 @@ class TestArchiveClippings:
         clippings.mkdir()
         archive.mkdir()
 
-        make_clipping(name="keep", url="https://example.com/keep", dir=clippings)
+        make_clipping(name="keep", url="https://example.com/keep")
+        clip = tmp_path / "keep.md"
+        clip.rename(clippings / clip.name)
 
         cfg = Config(vault_path=tmp_path)
 
@@ -157,6 +164,11 @@ class TestArchiveClippings:
 
         path = make_clipping(name="dup", url="https://example.com/dup", dir=clippings)
         (archive / "dup.md").write_text("old")
+
+        # Move into the clippings dir so archive_clippings can find it
+        target = clippings / path.name
+        path.rename(target)
+        path = target
 
         cfg = Config(vault_path=tmp_path)
 
@@ -188,7 +200,7 @@ class TestClippingHash:
 
 class TestCliClippingWiring:
     def test_collect_url_files_and_clipping_files_combined(self, tmp_path: Path, make_clipping):
-        from pipeline.cli import _collect_url_files
+        from pipeline.cli import _collect_clipping_files, _collect_url_files
         from pipeline.utils import collect_clipping_files
 
         # Simulate vault structure

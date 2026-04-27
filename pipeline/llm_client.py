@@ -18,17 +18,21 @@ Environment overrides (used when cfg values are empty):
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 import os
+import re
 import subprocess
-import urllib.request
 import urllib.error
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, TypeVar
 
 log = logging.getLogger(__name__)
+
+T = TypeVar("T")
 
 
 class LLMGenerationError(Exception):
@@ -43,6 +47,60 @@ class LLMResponse:
     success: bool = False
 
 
+def _extract_json(text: str) -> dict | None:
+    """Extract the first JSON object or array from raw text."""
+    # Fast path: try the whole text first
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    # Find the first JSON object
+    obj_match = re.search(r"\{[\s\S]*?\}", text)
+    if obj_match:
+        try:
+            return json.loads(obj_match.group())
+        except json.JSONDecodeError:
+            pass
+    # Find the first JSON array
+    arr_match = re.search(r"\[[\s\S]*?\]", text)
+    if arr_match:
+        try:
+            return json.loads(arr_match.group())
+        except json.JSONDecodeError:
+            pass
+    return None
+
+
+def _validate_schema(data: dict, schema: type[T]) -> T | None:
+    """Validate a dict against a dataclass schema (or Pydantic if available)."""
+    # Pydantic fallback
+    try:
+        import pydantic
+        if issubclass(schema, pydantic.BaseModel):
+            return schema(**data)  # type: ignore[return-value]
+    except Exception:
+        pass
+    # Dataclass path (preferred — no heavy deps)
+    if not hasattr(schema, "__dataclass_fields__"):
+        log.debug("Schema %s is not a dataclass; skipping structured validation", schema.__name__)
+        return None
+    try:
+        sig = inspect.signature(schema)
+        kwargs: dict = {}
+        for param in sig.parameters.values():
+            if param.name in data:
+                kwargs[param.name] = data[param.name]
+            elif param.default is not inspect.Parameter.empty:
+                continue
+            else:
+                log.debug("Missing required field '%s' for %s", param.name, schema.__name__)
+                return None
+        return schema(**kwargs)  # type: ignore[return-value]
+    except Exception as e:
+        log.debug("Dataclass validation failed for %s: %s", schema.__name__, e)
+        return None
+
+
 class BaseProvider:
     """Abstract base for LLM providers."""
 
@@ -55,6 +113,28 @@ class BaseProvider:
         base_url: str = "",
     ) -> LLMResponse:
         raise NotImplementedError
+
+    def generate_structured(
+        self,
+        prompt: str,
+        schema: type[T],
+        model: str,
+        timeout: int,
+        api_key: str = "",
+        base_url: str = "",
+    ) -> T | None:
+        """Generate structured output validated against a dataclass or Pydantic schema.
+
+        Subclasses should override this for native structured-output support.
+        The default implementation falls back to plain text with JSON extraction.
+        """
+        resp = self.generate(prompt, model, timeout, api_key, base_url)
+        if not resp.success or not resp.text:
+            return None
+        data = _extract_json(resp.text)
+        if data is None:
+            return None
+        return _validate_schema(data, schema)
 
     def embed(
         self,
@@ -134,6 +214,39 @@ class OllamaProvider(BaseProvider):
         except Exception as e:
             log.debug("Ollama embed failed: %s", e)
         return None
+
+    def generate_structured(
+        self,
+        prompt: str,
+        schema: type[T],
+        model: str,
+        timeout: int,
+        api_key: str = "",
+        base_url: str = "",
+    ) -> T | None:
+        url = self._url(base_url)
+        try:
+            req = urllib.request.Request(
+                f"{url}/api/generate",
+                data=json.dumps({
+                    "model": model,
+                    "prompt": prompt,
+                    "stream": False,
+                    "format": "json",
+                }).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                raw = data.get("response", "").strip()
+                parsed = _extract_json(raw)
+                if parsed is None:
+                    return None
+                return _validate_schema(parsed, schema)
+        except Exception as e:
+            log.debug("Ollama structured generate failed: %s", e)
+            return None
 
     def embed_batch(
         self,
@@ -245,6 +358,54 @@ class OpenRouterProvider(BaseProvider):
         log.warning("OpenRouter embedding not supported; use Ollama for embeddings or set embed_provider=ollama")
         return {}
 
+    def generate_structured(
+        self,
+        prompt: str,
+        schema: type[T],
+        model: str,
+        timeout: int,
+        api_key: str = "",
+        base_url: str = "",
+    ) -> T | None:
+        if not api_key:
+            log.debug("OpenRouter API key not configured")
+            return None
+        if not model:
+            log.debug("OpenRouter requires a model")
+            return None
+
+        url = (base_url or "https://openrouter.ai/api/v1").rstrip("/")
+        try:
+            req = urllib.request.Request(
+                f"{url}/chat/completions",
+                data=json.dumps({
+                    "model": model,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": 0.3,
+                    "response_format": {"type": "json_object"},
+                }).encode("utf-8"),
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {api_key}",
+                    "HTTP-Referer": "https://github.com/0xminion/obsidian-llm-wiki",
+                    "X-Title": "Obsidian LLM Wiki",
+                },
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                choices = data.get("choices", [])
+                if choices:
+                    text = choices[0].get("message", {}).get("content", "").strip()
+                    parsed = _extract_json(text)
+                    if parsed is None:
+                        return None
+                    return _validate_schema(parsed, schema)
+                return None
+        except Exception as e:
+            log.debug("OpenRouter structured generate failed: %s", e)
+            return None
+
 
 class HermesProvider(BaseProvider):
     """Hermes subprocess — agentic, supports tool use. Slow."""
@@ -346,6 +507,24 @@ class LLMClient:
         t = timeout or self.timeout
         url = self.embed_base_url or self.base_url
         return self._provider_impl.embed(text, m, t, url)
+
+    def generate_structured(
+        self,
+        prompt: str,
+        schema: type[T],
+        model: Optional[str] = None,
+        timeout: Optional[int] = None,
+    ) -> T | None:
+        """Generate structured output and validate against a dataclass schema.
+
+        Falls back to plain-text JSON extraction for providers without native support.
+        """
+        m = model or self.model
+        t = timeout or self.timeout
+        provider_base = self.agent_cmd if self.provider == "hermes" else self.base_url
+        return self._provider_impl.generate_structured(
+            prompt, schema, m, t, self.api_key, provider_base
+        )
 
     def embed_batch(
         self,

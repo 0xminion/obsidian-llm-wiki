@@ -29,10 +29,10 @@ def stage_for_review(
     in the pending_reviews table for approval.
     """
     from pipeline.create import (
-        generate_source_content,
+        _generate_concept_template,
         generate_entry_content,
         generate_entry_insights,
-        _generate_concept_template,
+        generate_source_content,
     )
     from pipeline.vault import title_to_filename
 
@@ -44,6 +44,7 @@ def stage_for_review(
     def _reserve_note_filenames(base_filename: str) -> tuple[str, str]:
         """Reserve distinct (source, entry) stems for graph-unambiguous notes."""
         suffix = 0
+        max_attempts = 1000
         while True:
             entry_candidate = base_filename if suffix == 0 else f"{base_filename}-{suffix}"
             source_candidate = f"{entry_candidate}-source"
@@ -59,10 +60,13 @@ def stage_for_review(
                 reserved_paths.add(entry_path)
                 return source_candidate, entry_candidate
             suffix += 1
+            if suffix > max_attempts:
+                raise RuntimeError("Too many filename collisions")
 
     def _reserve_path(directory: Path, base_filename: str) -> tuple[str, Path]:
         candidate = base_filename
         suffix = 0
+        max_attempts = 1000
         while True:
             path = directory / f"{candidate}.md"
             if not path.exists() and path not in reserved_paths:
@@ -70,6 +74,8 @@ def stage_for_review(
                 return candidate, path
             suffix += 1
             candidate = f"{base_filename}-{suffix}"
+            if suffix > max_attempts:
+                raise RuntimeError("Too many filename collisions")
 
     for plan in plans.plans:
         try:
@@ -234,12 +240,15 @@ def approve_reviews(cfg: Config, review_ids: Optional[list[int]] = None) -> dict
             resolved_path = file_path
             if resolved_path.exists() or resolved_path in reserved_paths:
                 idx = 1
+                max_attempts = 1000
                 while True:
                     candidate = resolved_path.parent / f"{file_path.stem}-{idx}.md"
                     if not candidate.exists() and candidate not in reserved_paths:
                         resolved_path = candidate
                         break
                     idx += 1
+                    if idx > max_attempts:
+                        raise RuntimeError("Too many filename collisions")
                 log.warning("Collision resolved: wrote %s instead", resolved_path.name)
             reserved_paths.add(resolved_path)
 
@@ -300,7 +309,8 @@ def approve_reviews(cfg: Config, review_ids: Optional[list[int]] = None) -> dict
             and all(r["id"] in selected_pending_ids for r in all_pending if r["plan_hash"] == plan_hash)
         }
         try:
-            from pipeline.vault import reindex as vault_reindex, archive_inbox, archive_clippings
+            from pipeline.vault import archive_clippings, archive_inbox
+            from pipeline.vault import reindex as vault_reindex
             vault_reindex(cfg)
             archive_inbox(cfg, successful_hashes)
             archive_clippings(cfg, successful_hashes)

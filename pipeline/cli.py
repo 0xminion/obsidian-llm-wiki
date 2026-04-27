@@ -23,11 +23,11 @@ import typer
 
 from pipeline._common import VaultLock
 from pipeline.config import Config, load_config
-from pipeline.extract import extract_all
-from pipeline.plan import plan_sources
 from pipeline.create import create_all, create_file_templates
+from pipeline.extract import extract_all
 from pipeline.models import ExtractedSource, Manifest, Plans, SourceType
-from pipeline.utils import collect_clipping_files, extract_body, parse_url_file_content
+from pipeline.plan import plan_sources
+from pipeline.utils import extract_body, parse_url_file_content
 from pipeline.vault import reindex as vault_reindex
 
 app = typer.Typer(
@@ -125,6 +125,43 @@ def _collect_url_files(inbox_dir: Path) -> list[tuple[Path, str]]:
     return results
 
 
+def _collect_clipping_files(clippings_dir: Path) -> list[tuple[Path, dict]]:
+    """Scan 02-Clippings for markdown files, return list of (filepath, data_dict)."""
+    from pipeline.utils import collect_clipping_files
+
+    if not clippings_dir.exists():
+        return []
+    return collect_clipping_files(clippings_dir)
+
+
+def _validate_clipping_quality(content: str) -> tuple[bool, float]:
+    """Validate a clipping's quality. Returns (is_valid, score).
+
+    - Fails if body (after frontmatter) is < 200 chars.
+    - Fails if link URLs outnumber paragraphs (nav/footer detection).
+    - Score is defuddle paragraph density.
+    """
+    from pipeline.extractors._shared import score_defuddle
+
+    # Strip frontmatter
+    body = content
+    if content.startswith("---"):
+        parts = content.split("---", 2)
+        if len(parts) >= 3:
+            body = parts[2]
+
+    stripped = body.strip()
+    if len(stripped) < 200:
+        return False, 0.0
+
+    # Count paragraphs vs link-only lines
+    lines = stripped.splitlines()
+    paragraphs = [ln for ln in lines if ln.strip()]
+    link_lines = [ln for ln in lines if re.match(r"^https?://", ln.strip())]
+    if link_lines and len(link_lines) >= len(paragraphs):
+        return False, 0.0
+
+    return True, score_defuddle(stripped)
 def _query_keywords(question: str) -> set[str]:
     """Extract meaningful keywords from a question for note retrieval."""
     stopwords = {
@@ -244,7 +281,7 @@ def init(
     quiet: bool = typer.Option(False, "--quiet", "-q", help="Minimal output"),
 ):
     """Initialize or migrate vault structure."""
-    from pipeline.vault_setup import detect_vault, setup_vault, migrate_vault
+    from pipeline.vault_setup import detect_vault, migrate_vault, setup_vault
 
     vault_path = vault or Path.home() / "MyVault"
     repo_root = Path(__file__).parent.parent
@@ -383,7 +420,7 @@ def ingest(
         extract_dir.mkdir(parents=True, exist_ok=True)
 
         # ─── Metrics ────────────────────────────────────────────────────────
-        from pipeline.metrics import reset_metrics, start_stage, end_stage, get_metrics
+        from pipeline.metrics import end_stage, get_metrics, reset_metrics, start_stage
         reset_metrics()
 
         # ─── Collect URLs + Clippings ────────────────────────────────────────
@@ -639,9 +676,9 @@ def compile_pass(
     vault: Path = typer.Argument(None, help="Vault path (default: ~/MyVault)"),
 ):
     """Run the compile pass — concept convergence, MoC updates, edge construction."""
-    from pipeline.compile import run_compile
-    from pipeline.metrics import reset_metrics, start_stage, end_stage, get_metrics
     from pipeline._common import VaultLock
+    from pipeline.compile import run_compile
+    from pipeline.metrics import end_stage, get_metrics, reset_metrics, start_stage
 
     cfg = _load_cfg(vault)
     typer.echo(f"Compile pass — vault: {cfg.vault_path}")
@@ -687,7 +724,7 @@ def approve(
     json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON"),
 ):
     """Approve pending reviews and write files to the vault."""
-    from pipeline.review import show_pending, approve_reviews
+    from pipeline.review import approve_reviews, show_pending
 
     cfg = _load_cfg(vault)
     pending = show_pending(cfg)
@@ -762,27 +799,27 @@ def dlq(
 
     cfg = _load_cfg(vault)
     store = ContentStore.open(cfg.resolved_extract_dir)
+    try:
+        if clear:
+            cleared = store.dlq_clear(reason=reason or None)
+            typer.echo(f"Cleared {cleared} DLQ items.")
+            raise typer.Exit(code=0)
 
-    if clear:
-        cleared = store.dlq_clear(reason=reason or None)
-        typer.echo(f"Cleared {cleared} DLQ items.")
+        pending = store.dlq_get_pending()
+
+        if not pending:
+            typer.echo("Dead letter queue is empty.")
+            raise typer.Exit(code=0)
+
+        typer.echo(f"Dead letter queue: {len(pending)} items")
+        for item in pending:
+            typer.echo(f"\n  URL: {item['url']}")
+            typer.echo(f"  Reason: {item['reason']}")
+            typer.echo(f"  Attempts: {item['attempts']}")
+            if item.get("last_error"):
+                typer.echo(f"  Error: {item['last_error'][:100]}")
+    finally:
         store.close()
-        raise typer.Exit(code=0)
-
-    pending = store.dlq_get_pending()
-    store.close()
-
-    if not pending:
-        typer.echo("Dead letter queue is empty.")
-        raise typer.Exit(code=0)
-
-    typer.echo(f"Dead letter queue: {len(pending)} items")
-    for item in pending:
-        typer.echo(f"\n  URL: {item['url']}")
-        typer.echo(f"  Reason: {item['reason']}")
-        typer.echo(f"  Attempts: {item['attempts']}")
-        if item.get("last_error"):
-            typer.echo(f"  Error: {item['last_error'][:100]}")
 
 
 # ─── store ────────────────────────────────────────────────────────────────────
@@ -796,8 +833,10 @@ def store_stats(
 
     cfg = _load_cfg(vault)
     store = ContentStore.open(cfg.resolved_extract_dir)
-    stats = store.get_stats()
-    store.close()
+    try:
+        stats = store.get_stats()
+    finally:
+        store.close()
 
     typer.echo(f"Content Store: {cfg.resolved_extract_dir / 'store.db'}")
     typer.echo(f"  URLs:    {stats['urls_total']} total ({stats['urls_ok']} ok, {stats['urls_failed']} failed)")
@@ -814,6 +853,7 @@ def update_tags(
 ):
     """Rebuild tag-registry.md from actual tag usage across all notes."""
     from collections import Counter
+
     from pipeline.utils import extract_tags
 
     cfg = _load_cfg(vault)
@@ -1136,6 +1176,46 @@ def setup_qmd_cmd(
 
     vault_path = _resolve_vault(vault)
     setup_qmd(vault_path)
+
+
+# ─── enrich ───────────────────────────────────────────────────────────────────
+
+@app.command()
+def enrich(
+    vault: Path = typer.Argument(None, help="Vault path (default: ~/MyVault)"),
+    note: str = typer.Argument(..., help="Relative path to the note inside the vault"),
+):
+    """Re-extract a source note, diff against existing, and propose updates."""
+    from pipeline.enrich import enrich_note
+
+    cfg = _load_cfg(vault)
+    note_path = cfg.vault_path / note
+    # Path traversal guard
+    resolved = note_path.resolve()
+    try:
+        if not resolved.is_relative_to(cfg.vault_path):
+            typer.echo("ERROR: note path must be inside the vault.", err=True)
+            raise typer.Exit(code=1)
+    except ValueError:
+        # is_relative_to raises ValueError on unrelated anchors (Python 3.12+)
+        typer.echo("ERROR: note path must be inside the vault.", err=True)
+        raise typer.Exit(code=1)
+    if not resolved.exists():
+        typer.echo(f"ERROR: note not found: {resolved}", err=True)
+        raise typer.Exit(code=1)
+
+    result = enrich_note(resolved, cfg)
+    status = result.get("status", "unknown")
+    if status == "error":
+        typer.echo(f"ERROR: {result.get('error', 'unknown error')}", err=True)
+        raise typer.Exit(code=1)
+    if status == "no_changes":
+        typer.echo("No changes detected.")
+        raise typer.Exit(code=0)
+    typer.echo(f"Plan generated ({result.get('diff_length', 0)} chars diff)")
+    if result.get("plan_path"):
+        typer.echo(f"Plan written to: {result['plan_path']}")
+    raise typer.Exit(code=0)
 
 
 # ─── setup-hooks ──────────────────────────────────────────────────────────────

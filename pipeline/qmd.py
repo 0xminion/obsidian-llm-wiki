@@ -16,6 +16,7 @@ Environment:
 from __future__ import annotations
 
 import logging
+import math
 import os
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -191,3 +192,54 @@ def run_qmd_convergence(
         h: [{"concept": m.concept, "score": m.score} for m in ml]
         for h, ml in matches.items()
     }
+
+
+# ─── Embedding helpers (Rec 3) ──────────────────────────────────────────────
+
+
+def batch_embed(texts: list[str], client=None) -> dict[str, list[float]]:
+    """Embed a batch of texts using QMD MCP.
+
+    Falls back to sequential single-text embeds if the batch endpoint
+    is not supported by the QMD server."""
+    if not texts:
+        return {}
+    _client = client or _get_client()
+    if _client is None:
+        return {}
+    try:
+        result = _client.embed_batch(texts)
+        if result:
+            return result
+    except Exception:
+        log.debug("QMD batch embed failed, falling back to sequential")
+
+    # Sequential fallback
+    results: dict[str, list[float]] = {}
+    for text in texts:
+        try:
+            emb = _client.embed(text)
+            if emb:
+                results[text] = emb
+        except Exception:
+            continue
+    return results
+
+
+def semantic_similarity(text_a: str, text_b: str) -> float:
+    """Compute cosine similarity between two text embeddings via QMD.
+
+    Returns 0.0 if QMD is unreachable or either embedding fails."""
+    if not text_a or not text_b:
+        return 0.0
+    embeddings = batch_embed([text_a, text_b])
+    emb_a = embeddings.get(text_a)
+    emb_b = embeddings.get(text_b)
+    if not emb_a or not emb_b:
+        return 0.0
+    dot = sum(x * y for x, y in zip(emb_a, emb_b))
+    norm_a = math.sqrt(sum(x * x for x in emb_a))
+    norm_b = math.sqrt(sum(x * x for x in emb_b))
+    if norm_a == 0 or norm_b == 0:
+        return 0.0
+    return dot / (norm_a * norm_b)

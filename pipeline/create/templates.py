@@ -195,11 +195,12 @@ def generate_entry_insights(
     extracted: dict,
     cfg: Config,
 ) -> str:
-    """Generate just the insights (Summary + Core insights) via LLM.
+    """Generate just the insights (Summary + Core insights) via LLM with structured output.
 
-    Uses the provider-agnostic LLMClient. Respects LLM_PROVIDER / LLM_MODEL env vars.
+    Uses the provider-agnostic LLMClient and validates against InsightOutput schema.
     """
     from pipeline.llm_client import get_llm_client
+    from pipeline.models import InsightOutput
 
     client = get_llm_client(cfg)
     content = extracted.get("content", "")[:cfg.max_content_insights]
@@ -214,8 +215,25 @@ def generate_entry_insights(
 CONTENT:
 {content}
 
-Output ONLY the two sections above. No preamble."""
+Output ONLY valid JSON matching this schema:
+{{"summary": "string", "core_insights": ["string", ...]}}"""
 
+    structured = client.generate_structured(
+        prompt,
+        schema=InsightOutput,
+        model=cfg.llm_model or cfg.ollama_insight_model,
+        timeout=cfg.llm_structured_timeout,
+    )
+    if structured is not None and isinstance(structured, InsightOutput):
+        parts = []
+        if structured.summary:
+            parts.append(f"## Summary\n{structured.summary}")
+        if structured.core_insights:
+            parts.append("## Core insights\n" + "\n".join(f"- {i}" for i in structured.core_insights))
+        return "\n\n".join(parts)
+
+    # Fallback to raw text generate
+    log.debug("Structured insight generation failed; falling back to raw text")
     raw = client.generate(prompt, model=cfg.llm_model or cfg.ollama_insight_model, timeout=60)
     if raw:
         return raw
@@ -344,7 +362,12 @@ def create_file_templates(
     Returns stats dict.
     """
     from pipeline.create.orchestrator import postprocess_creation
-    from pipeline.utils import batch_smart_filenames, is_filename_too_long, smart_filename, title_to_filename
+    from pipeline.utils import (
+        batch_smart_filenames,
+        is_filename_too_long,
+        smart_filename,
+        title_to_filename,
+    )
     from pipeline.vault import (
         resolve_collision,
         update_moc,

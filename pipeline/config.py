@@ -88,6 +88,9 @@ class Config:
     ollama_insight_model: str = "minimax-m2.7:cloud"
     ollama_filename_model: str = "minimax-m2.7:cloud"
 
+    # Structured output
+    llm_structured_timeout: int = 90
+
     # Extraction
     extract_timeout: int = 45
 
@@ -100,8 +103,36 @@ class Config:
     max_total_content: int = 15000  # max total content chars in batch prompt
     max_content_insights: int = 6000  # max chars for insight agent
 
+    # Quality thresholds
+    min_quality: float = 0.0
+    min_clipping_quality: float = 0.5
+
     # Whisper
     whisper_language: str = ""  # empty = auto-detect, "en", "zh", etc.
+
+    # Staleness thresholds (days)
+    default_staleness_days: int = 3 * 365  # default = 3 years
+    high_volatility_tags: list[str] = field(default_factory=
+        lambda: ["crypto", "ai", "blockchain"])
+    medium_volatility_tags: list[str] = field(default_factory=
+        lambda: ["tech", "technology", "science"])
+    low_volatility_tags: list[str] = field(default_factory=
+        lambda: ["history", "philosophy"])
+    high_staleness_days: int = 365
+    medium_staleness_days: int = 730
+    low_staleness_days: int = 5 * 365
+
+    @property
+    def staleness_thresholds(self) -> dict[str, int]:
+        """Return {volatility_tag: days} mapping for staleness scoring."""
+        thresholds: dict[str, int] = {}
+        for tag in self.high_volatility_tags:
+            thresholds[tag] = self.high_staleness_days
+        for tag in self.medium_volatility_tags:
+            thresholds[tag] = self.medium_staleness_days
+        for tag in self.low_volatility_tags:
+            thresholds[tag] = self.low_staleness_days
+        return thresholds
 
     @property
     def resolved_extract_dir(self) -> Path:
@@ -204,6 +235,18 @@ class Config:
             errors.append(f"extract_timeout too low (<5s), got {self.extract_timeout}")
         if self.agent_timeout < 30:
             errors.append(f"agent_timeout too low (<30s), got {self.agent_timeout}")
+        # Provider validation
+        if self.llm_provider not in {"ollama", "openrouter", "hermes"}:
+            errors.append(
+                f"llm_provider must be ollama/openrouter/hermes, got {self.llm_provider}"
+            )
+        # Quality bounds
+        if not (0.0 <= self.min_quality <= 1.0):
+            errors.append(f"min_quality must be in [0, 1], got {self.min_quality}")
+        if not (0.0 <= self.min_clipping_quality <= 1.0):
+            errors.append(
+                f"min_clipping_quality must be in [0, 1], got {self.min_clipping_quality}"
+            )
         return errors
 
 
@@ -273,6 +316,7 @@ def load_config(
         ollama_host=_env("OLLAMA_HOST", "http://localhost:11434"),
         ollama_insight_model=_env("OLLAMA_INSIGHT_MODEL", "minimax-m2.7:cloud"),
         ollama_filename_model=_env("OLLAMA_FILENAME_MODEL", "minimax-m2.7:cloud"),
+        llm_structured_timeout=_int_env("LLM_STRUCTURED_TIMEOUT", 90, env_values),
         extract_timeout=_int_env("EXTRACT_TIMEOUT", 45, env_values),
         agent_timeout=_int_env("AGENT_TIMEOUT", 900, env_values),
         plan_timeout=_int_env("PLAN_TIMEOUT", 600, env_values),

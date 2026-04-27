@@ -1,9 +1,8 @@
-"""Regression coverage for post-review quality recommendations."""
-
 from __future__ import annotations
 
 import json
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 from typer.testing import CliRunner
 
@@ -12,8 +11,15 @@ from pipeline.compile import _build_edges
 from pipeline.config import Config
 from pipeline.doctor import run_doctor
 from pipeline.fixtures import create_example_vault
+from pipeline.models import ExtractedSource
+from pipeline.plan import (
+    _keyword_dedup_fallback,
+    _process_concept_merge_queue,
+    _semantic_dedup,
+)
 from pipeline.release import check_release_hygiene
 from pipeline.stats import collect_stats, generate_dashboard
+from pipeline.store import ContentStore
 from pipeline.telemetry import read_recent_events, redact_url
 
 runner = CliRunner()
@@ -117,3 +123,118 @@ def test_release_hygiene_detects_version_and_docs_alignment():
     assert report["ok"] is True
     assert report["version"]
     assert any(check["name"] == "docs_index" for check in report["checks"])
+
+
+# ─── Rec 3: Semantic Near-Duplicate Detection ────────────────────────────────
+
+
+
+def test_semantic_dedup_skips_qmd_duplicate(tmp_path: Path):
+    cfg = MagicMock()
+    cfg.sources_dir = tmp_path / "sources"
+    cfg.sources_dir.mkdir(parents=True, exist_ok=True)
+
+    store = ContentStore(tmp_path / "store.db")
+    # Seed an embedding for existing content
+    store.embedding_set("existing-hash", [1.0, 0.0, 0.0])
+
+    src = ExtractedSource(
+        url="https://example.com/a",
+        title="Example A",
+        content="x" * 1200,
+        source_file="a.url",
+    )
+    # Mock QMD to return embedding identical to stored one
+    with patch("pipeline.plan.batch_embed") as mock_batch:
+        mock_batch.return_value = {src.content[:1000]: [1.0, 0.0, 0.0]}
+        result = _semantic_dedup([src], cfg, store)
+    assert len(result) == 0
+    assert src.semantic_similarity == 1.0
+
+
+def test_semantic_dedup_fallback_to_jaccard(tmp_path: Path):
+    cfg = MagicMock()
+    cfg.sources_dir = tmp_path / "sources"
+    cfg.sources_dir.mkdir(parents=True, exist_ok=True)
+    # Write an existing source with very similar text
+    (cfg.sources_dir / "old.md").write_text("hello world foo bar baz qux")
+
+    store = ContentStore(tmp_path / "store2.db")
+    src = ExtractedSource(
+        url="https://example.com/b",
+        title="old",
+        content="hello world foo bar baz qux xyz",
+        source_file="b.url",
+    )
+    with patch("pipeline.plan.batch_embed", return_value={}):
+        result = _semantic_dedup([src], cfg, store)
+    assert len(result) == 0
+
+
+def test_keyword_dedup_fallback(tmp_path: Path):
+    cfg = MagicMock()
+    cfg.sources_dir = tmp_path / "sources"
+    cfg.sources_dir.mkdir(parents=True, exist_ok=True)
+    (cfg.sources_dir / "target.md").write_text("# Target")
+
+    src = ExtractedSource(
+        url="https://example.com/c",
+        title="target",
+        content="some content here",
+        source_file="c.url",
+    )
+    result = _keyword_dedup_fallback([src], cfg)
+    assert len(result) == 0
+
+
+# ─── Rec 8: Concept Merge Queue ──────────────────────────────────────────────
+
+
+
+def test_merge_queue_adds_similar_concept(tmp_path: Path):
+    cfg = MagicMock()
+    cfg.concepts_dir = tmp_path / "concepts"
+    cfg.concepts_dir.mkdir(parents=True, exist_ok=True)
+    (cfg.concepts_dir / "blockchain.md").write_text("# Blockchain")
+
+    store = ContentStore(tmp_path / "store3.db")
+    plan = MagicMock()
+    plan.concept_new = ["blockchain"]
+
+    plans = MagicMock()
+    plans.plans = [plan]
+
+    with patch("pipeline.plan.batch_embed") as mock_emb:
+        mock_emb.return_value = {
+            "blockchain": [1.0, 0.0, 0.0],
+        }
+        _process_concept_merge_queue(plans, cfg, store)
+
+    pending = store.merge_queue_get_pending()
+    assert len(pending) == 1
+    assert pending[0]["new_concept"] == "blockchain"
+    assert pending[0]["existing_concept"] == "blockchain"
+    assert pending[0]["similarity"] > 0.5
+    # concept_new should be emptied because it matched existing
+    assert plan.concept_new == []
+
+
+def test_merge_queue_review_and_approve(tmp_path: Path):
+    store = ContentStore(tmp_path / "store4.db")
+    store.merge_queue_add("new-a", "old-a", 0.92)
+    pending = store.merge_queue_get_pending()
+    assert len(pending) == 1
+    store.merge_queue_approve(pending[0]["id"])
+    assert store.merge_queue_get_pending() == []
+
+
+def test_merge_queue_review_and_reject(tmp_path: Path):
+    store = ContentStore(tmp_path / "store4b.db")
+    store.merge_queue_add("new-b", "old-b", 0.85)
+    pending = store.merge_queue_get_pending()
+    assert len(pending) == 1
+    store.merge_queue_reject(pending[0]["id"])
+    assert store.merge_queue_get_pending() == []
+
+
+

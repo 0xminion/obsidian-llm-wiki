@@ -160,6 +160,26 @@ def generate_dashboard(cfg: Config) -> str:
         "",
     ])
 
+    # ─── Knowledge Staleness ───────────────────────────────────────────────────
+    try:
+        from pipeline.lint import check_staleness
+    except Exception:
+        check_staleness = None  # type: ignore[misc]
+
+    if check_staleness is not None:
+        stale_issues = check_staleness(cfg.vault_path)
+        stale_high = [i for i in stale_issues if i.severity.name == "WARNING"]
+        stale_info = [i for i in stale_issues if i.severity.name == "INFO"]
+        lines.extend([
+            "## Knowledge Staleness",
+            "",
+            "| Metric | Count |",
+            "|--------|-------|",
+            f"| Stale notes (high volatility) | {len(stale_high)} |",
+            f"| Stale notes (medium/low) | {len(stale_info)} |",
+            "",
+        ])
+
     # ─── Graph Semantics ───────────────────────────────────────────────────────
     edge_types = stats["graph"]["edge_types"]
     lines.extend([

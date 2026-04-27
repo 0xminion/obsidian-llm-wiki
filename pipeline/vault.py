@@ -11,14 +11,14 @@ Handles all filesystem interactions with the Obsidian vault:
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import re
 import threading as _threading
-
-import yaml
-
 from datetime import datetime, timezone
 from pathlib import Path
+
+import yaml
 
 from pipeline.config import Config
 from pipeline.models import Edge, ExtractedSource, Plan
@@ -220,9 +220,9 @@ def update_moc(cfg: Config, moc_name: str, entry_name: str, description: str) ->
 
     if not moc_path.exists():
         # Create new MoC with basic structure
-        datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         content = (
-            f"---\ntitle: {moc_name}\ntype: moc\nstatus: draft\ntags: []\n---\n\n"
+            f"---\ntitle: {moc_name}\ntype: moc\nstatus: draft\ncreated: {today}\ntags: []\n---\n\n"
             f"# {moc_name}\n\n"
             f"## Overview / 概述\n\n"
             f"Map of Content for {moc_name}.\n\n"
@@ -505,7 +505,8 @@ def reindex(cfg: Config) -> str:
 
     # Write to disk
     cfg.config_dir.mkdir(parents=True, exist_ok=True)
-    cfg.wiki_index.write_text(index_content, encoding="utf-8")
+    from pipeline.utils import _atomic_write
+    _atomic_write(cfg.wiki_index, index_content)
 
     return index_content
 

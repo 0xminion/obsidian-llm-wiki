@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -56,16 +57,20 @@ class QMDMCPClient:
         self.timeout = timeout
         self._session_id: Optional[str] = None
         self._req_id = 0
+        self._lock = threading.Lock()
 
     def _call(
         self, method: str, params: dict, timeout: int | None = None
     ) -> dict:
         """Raw JSON-RPC POST to /mcp."""
-        self._req_id += 1
+        with self._lock:
+            self._req_id += 1
+            req_id = self._req_id
+            session_id = self._session_id
         payload = json.dumps(
             {
                 "jsonrpc": "2.0",
-                "id": self._req_id,
+                "id": req_id,
                 "method": method,
                 "params": params,
             },
@@ -75,8 +80,8 @@ class QMDMCPClient:
             "Content-Type": "application/json",
             "Accept": "application/json, text/event-stream",
         }
-        if self._session_id:
-            headers["mcp-session-id"] = self._session_id
+        if session_id:
+            headers["mcp-session-id"] = session_id
         req = urllib.request.Request(self.url, data=payload, headers=headers, method="POST")
         t = timeout or self.timeout
         try:
@@ -84,7 +89,8 @@ class QMDMCPClient:
                 hdrs = resp.headers
                 sid = hdrs.get("mcp-session-id") or hdrs.get("Mcp-Session-Id") or hdrs.get("MCP-SESSION-ID")
                 if sid:
-                    self._session_id = sid
+                    with self._lock:
+                        self._session_id = sid
                 return json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as e:
             body = e.read().decode("utf-8", errors="replace")
@@ -105,10 +111,12 @@ class QMDMCPClient:
 
     def ensure_session(self) -> bool:
         """Return True if a valid MCP session exists, initializing if needed."""
-        if self._session_id:
-            return True
+        with self._lock:
+            if self._session_id:
+                return True
         self.initialize()
-        return self._session_id is not None
+        with self._lock:
+            return self._session_id is not None
 
     def health(self) -> dict:
         try:
@@ -232,6 +240,38 @@ class QMDMCPClient:
         if "error" in res:
             return {}
         return res.get("result", {}).get("structuredContent", {})
+
+    def embed_batch(self, texts: list[str]) -> dict[str, list[float]]:
+        """Embed a batch of texts via QMD MCP.
+
+        Returns {text: embedding} for successes. Falls back to empty dict
+        if the QMD server does not expose an embed tool."""
+        if not texts:
+            return {}
+        if not self.ensure_session():
+            return {}
+        res = self._call(
+            "tools/call",
+            {"name": "embed", "arguments": {"texts": texts}},
+            timeout=60,
+        )
+        if "error" in res:
+            log.debug("QMD embed_batch failed: %s", res["error"])
+            return {}
+        structured = res.get("result", {}).get("structuredContent", {})
+        embeddings = structured.get("embeddings", [])
+        if not isinstance(embeddings, list) or len(embeddings) != len(texts):
+            return {}
+        return {
+            text: emb
+            for text, emb in zip(texts, embeddings)
+            if isinstance(emb, list) and len(emb) > 0
+        }
+
+    def embed(self, text: str) -> list[float] | None:
+        """Embed a single text via QMD MCP."""
+        batch = self.embed_batch([text])
+        return batch.get(text)
 
 
 def _get_qmd_client(base_url: str = "") -> QMDMCPClient | None:

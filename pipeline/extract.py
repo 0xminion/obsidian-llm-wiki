@@ -15,52 +15,64 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
 
 from pipeline.config import Config
-from pipeline.models import ExtractedSource, Manifest, SourceType
-from pipeline.store import ContentStore
-from pipeline.telemetry import StageEvent, TelemetrySink, redact_url
 
 # ─── Re-exports for backward compatibility (tests patch these names) ──────────
-from pipeline.extractors._shared import (  # noqa: F401
-    _run,
-    _curl_get,
-    _curl_post_json,
-    _strip_markdown,
-    extract_title,
-    _extract_youtube_video_id,
-    _extract_arxiv_paper_id,
-    _is_challenge_page,
-    validate_extraction as _validate_extraction,
-    ExtractionError,
-    _YT_PATTERNS,
+from pipeline.extractors._shared import (
+    _ARXIV_PATTERN,
+    _CHALLENGE_PATTERNS,
     _PODCAST_PATTERNS,
     _TWITTER_PATTERNS,
-    _ARXIV_PATTERN,
+    _YT_PATTERNS,
     _YT_VIDEO_ID_PATTERNS,
-    _CHALLENGE_PATTERNS,
-    transcribe_with_whisper,
+    ExtractionError,
+    _curl_get,
+    _curl_post_json,
+    _extract_arxiv_paper_id,
+    _extract_youtube_video_id,
+    _is_challenge_page,
+    _run,
+    _strip_markdown,
+    extract_title,
+    score_pdf,
+    score_podcast,
+    score_web,
+    score_youtube,
     transcribe_assemblyai,
+    transcribe_with_whisper,
+)
+from pipeline.extractors._shared import (
+    validate_extraction as _validate_extraction,
+)
+from pipeline.extractors.podcast import (
+    _episode_title_match,
+    _parse_rss_episode,
+    _transcribe_podcast_audio,
+)
+from pipeline.extractors.podcast import (  # noqa: F401
+    extract_podcast as _extract_podcast,
+)
+from pipeline.extractors.web import (
+    _extract_web_content,
+    _try_archive_extract,
+    _try_camoufox,
+    _try_curl_extract,
+    _try_defuddle,
+    _try_defuddle_json,
+)
+from pipeline.extractors.web import (  # noqa: F401
+    extract_web as _extract_web,
+)
+from pipeline.extractors.youtube import (
+    _try_youtube_transcript,
 )
 
 # ─── Re-exports from extractor modules (tests patch these) ────────────────────
 from pipeline.extractors.youtube import (  # noqa: F401
     extract_youtube as _extract_youtube,
-    _try_youtube_transcript,
 )
-from pipeline.extractors.podcast import (  # noqa: F401
-    extract_podcast as _extract_podcast,
-    _episode_title_match,
-    _parse_rss_episode,
-    _transcribe_podcast_audio,
-)
-from pipeline.extractors.web import (  # noqa: F401
-    extract_web as _extract_web,
-    _extract_web_content,
-    _try_defuddle,
-    _try_defuddle_json,
-    _try_curl_extract,
-    _try_archive_extract,
-    _try_camoufox,
-)
+from pipeline.models import ExtractedSource, Manifest, SourceType
+from pipeline.store import ContentStore
+from pipeline.telemetry import StageEvent, TelemetrySink, redact_url
 
 __all__ = [
     "ExtractionError",
@@ -93,6 +105,7 @@ __all__ = [
     "_CHALLENGE_PATTERNS",
     "transcribe_with_whisper",
     "transcribe_assemblyai",
+    "_compute_quality_score",
 ]
 
 log = logging.getLogger(__name__)
@@ -109,6 +122,20 @@ def detect_source_type(url: str) -> SourceType:
     if _TWITTER_PATTERNS.search(url):
         return SourceType.TWITTER
     return SourceType.WEB
+
+
+def _compute_quality_score(source: ExtractedSource) -> tuple[float, dict]:
+    """Compute quality score and metrics for an extracted source."""
+    word_count = len(source.content.split())
+    if source.type == SourceType.YOUTUBE:
+        # Rough estimate: 5 min video if not known
+        return score_youtube(word_count, 5), {"wpm": word_count / 5 if word_count else 0, "source": "youtube"}
+    if source.type == SourceType.PODCAST:
+        # Rough estimate: 30 min audio if not known
+        return score_podcast(word_count, 30 * 60), {"wpm": (word_count / (30 * 60)) * 60 if word_count else 0, "source": "podcast"}
+    if source.type == SourceType.WEB or source.type == SourceType.TWITTER:
+        return score_web(source.content), {"source": "web"}
+    return score_pdf(source.content, 1), {"source": "pdf"}
 
 
 # ─── Main Entry Points ───────────────────────────────────────────────────────
@@ -154,48 +181,54 @@ def extract_url(url: str, cfg: Config,
                 log.warning("Extraction quality check failed (attempt %d/%d) for %s: %s",
                             attempt + 1, max_retries, url, reason)
                 if attempt < max_retries - 1:
-                    wait_time = 2 ** attempt
+                    wait_time = min(2 ** attempt, 60)
                     log.info("Retrying in %ds...", wait_time)
                     time.sleep(wait_time)
-                continue
+                    continue
+            else:
+                # Content-level dedup: check if extracted content already exists.
+                # Persist the extraction artifact before registering URL/content so
+                # a disk failure cannot poison future dedup state.
+                if store:
+                    chash = store.content_hash(source.content)
+                    dup_name = store.get_content_duplicate(source.content)
+                    if dup_name:
+                        log.info("Dedup: content matches existing source '%s' — skipping %s",
+                                 dup_name, url[:80])
+                        # Register URL so it is not reprocessed on next run
+                        if store:
+                            store.register_url(url, source_type.value, status="dedup")
+                        return ExtractedSource(
+                            url=url,
+                            title=f"[dedup: matches {dup_name}]",
+                            content="",
+                            type=source_type,
+                        )
 
-            # Content-level dedup: check if extracted content already exists.
-            # Persist the extraction artifact before registering URL/content so
-            # a disk failure cannot poison future dedup state.
-            if store:
-                chash = store.content_hash(source.content)
-                dup_name = store.get_content_duplicate(source.content)
-                if dup_name:
-                    log.info("Dedup: content matches existing source '%s' — skipping %s",
-                             dup_name, url[:80])
-                    # Register URL so it is not reprocessed on next run
-                    if store:
-                        store.register_url(url, source_type.value, status="dedup")
-                    return ExtractedSource(
-                        url=url,
-                        title=f"[dedup: matches {dup_name}]",
-                        content="",
-                        type=source_type,
+                # Compute quality score after successful extraction and dedup check
+                qsc, qmet = _compute_quality_score(source)
+                source.quality_score = qsc
+                source.quality_metrics = qmet
+
+                source.save(cfg.resolved_extract_dir)
+                telemetry.emit(StageEvent(
+                    stage="extract",
+                    status="ok",
+                    duration_s=0,
+                    details={
+                        "url": redact_url(url),
+                        "attempt": attempt + 1,
+                        "source_type": source_type.value,
+                        "title": source.title,
+                        "content_length": len(source.content),
+                    },
+                ))
+                if store:
+                    store.register_url(url, source_type.value, chash)
+                    store.register_content(
+                        source.content, source.title, source_type.value,
                     )
-            source.save(cfg.resolved_extract_dir)
-            telemetry.emit(StageEvent(
-                stage="extract",
-                status="ok",
-                duration_s=0,
-                details={
-                    "url": redact_url(url),
-                    "attempt": attempt + 1,
-                    "source_type": source_type.value,
-                    "title": source.title,
-                    "content_length": len(source.content),
-                },
-            ))
-            if store:
-                store.register_url(url, source_type.value, chash)
-                store.register_content(
-                    source.content, source.title, source_type.value,
-                )
-            return source
+                return source
 
         except ExtractionError as e:
             # Loud failure — no retry, no metadata-only fallback
@@ -223,7 +256,7 @@ def extract_url(url: str, cfg: Config,
             log.error("Extraction failed (attempt %d/%d) for %s: %s",
                       attempt + 1, max_retries, url, e)
             if attempt < max_retries - 1:
-                time.sleep(2 ** attempt)
+                time.sleep(min(2 ** attempt, 60))
 
     # All retries exhausted — record to DLQ
     log.error("All %d extraction attempts failed for %s: %s", max_retries, url, last_error)

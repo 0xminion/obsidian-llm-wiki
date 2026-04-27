@@ -16,9 +16,24 @@ from enum import Enum
 from pathlib import Path
 from typing import Optional
 
-
 log = logging.getLogger(__name__)
 
+
+__all__ = [
+    "SourceType",
+    "Template",
+    "Language",
+    "EdgeType",
+    "ExtractedSource",
+    "Plan",
+    "Manifest",
+    "Plans",
+    "Edge",
+    "ConceptMatch",
+    "ConvergenceResult",
+    "QualityScore",
+    "PlanOutputList",
+]
 
 # ─── Enums ────────────────────────────────────────────────────────────────────
 
@@ -53,6 +68,18 @@ class EdgeType(str, Enum):
     INSPIRED_BY = "inspired_by"
     PART_OF = "part_of"
     RELATES_TO = "relates_to"
+    WEAK_LINK = "weak_link"
+
+
+# ─── Quality Score ─────────────────────────────────────────────────────────────
+
+@dataclass
+class QualityScore:
+    """Per-extractor quality assessment."""
+
+    extractor: str
+    score: float  # 0.0–1.0
+    metrics: dict = field(default_factory=dict)
 
 
 # ─── Stage 1: Extracted Source ───────────────────────────────────────────────
@@ -67,6 +94,9 @@ class ExtractedSource:
     type: SourceType = SourceType.UNKNOWN
     author: str = ""
     source_file: str = ""
+    semantic_similarity: Optional[float] = None
+    quality_score: float = 0.0
+    quality_metrics: dict = field(default_factory=dict)
 
     @property
     def hash(self) -> str:
@@ -91,14 +121,9 @@ class ExtractedSource:
             "type": self.type.value,
             "author": self.author,
             "source_file": self.source_file,
+            "quality_score": self.quality_score,
+            "quality_metrics": self.quality_metrics,
         }
-
-    def save(self, extract_dir: Path) -> Path:
-        """Save to extract_dir/{hash}.json."""
-        extract_dir.mkdir(parents=True, exist_ok=True)
-        path = extract_dir / f"{self.hash}.json"
-        path.write_text(json.dumps(self.to_dict(), ensure_ascii=False, indent=2))
-        return path
 
     @classmethod
     def load(cls, path: Path) -> ExtractedSource:
@@ -110,7 +135,17 @@ class ExtractedSource:
             type=SourceType(data.get("type", "unknown")),
             author=data.get("author", ""),
             source_file=data.get("source_file", ""),
+            quality_score=data.get("quality_score", 0.0),
+            quality_metrics=data.get("quality_metrics", {}),
         )
+
+    def save(self, extract_dir: Path) -> Path:
+        """Save to extract_dir/{hash}.json."""
+        extract_dir.mkdir(parents=True, exist_ok=True)
+        path = extract_dir / f"{self.hash}.json"
+        from pipeline.utils import _atomic_write
+        _atomic_write(path, json.dumps(self.to_dict(), ensure_ascii=False, indent=2))
+        return path
 
 
 # ─── Stage 2: Plan ───────────────────────────────────────────────────────────
@@ -174,7 +209,8 @@ class Manifest:
         extract_dir.mkdir(parents=True, exist_ok=True)
         path = extract_dir / "manifest.json"
         data = [e.to_dict() for e in self.entries]
-        path.write_text(json.dumps(data, ensure_ascii=False, indent=2))
+        from pipeline.utils import _atomic_write
+        _atomic_write(path, json.dumps(data, ensure_ascii=False, indent=2))
         return path
 
     @classmethod
@@ -203,6 +239,8 @@ class Manifest:
                         type=src_type,
                         author=d.get("author", ""),
                         source_file=d.get("source_file", ""),
+                        quality_score=d.get("quality_score", 0.0),
+                        quality_metrics=d.get("quality_metrics", {}),
                     )
                 )
             except (TypeError, ValueError, KeyError):
@@ -226,7 +264,8 @@ class Plans:
     def save(self, extract_dir: Path) -> Path:
         path = extract_dir / "plans.json"
         data = [p.to_dict() for p in self.plans]
-        path.write_text(json.dumps(data, ensure_ascii=False, indent=2))
+        from pipeline.utils import _atomic_write
+        _atomic_write(path, json.dumps(data, ensure_ascii=False, indent=2))
         return path
 
     @classmethod
@@ -377,3 +416,34 @@ class ConvergenceResult:
 
     hash: str
     matches: list[ConceptMatch] = field(default_factory=list)
+
+
+# ─── Structured Output Schemas (Rec 7) ──────────────────────────────────────
+
+@dataclass
+class InsightOutput:
+    """Structured output for insight generation."""
+
+    summary: str = ""
+    core_insights: list[str] = field(default_factory=list)
+
+
+@dataclass
+class PlanOutput:
+    """Structured output for plan generation."""
+
+    hash: str = ""
+    title: str = ""
+    language: str = "en"
+    template: str = "standard"
+    tags: list[str] = field(default_factory=list)
+    concept_updates: list[str] = field(default_factory=list)
+    concept_new: list[str] = field(default_factory=list)
+    moc_targets: list[str] = field(default_factory=list)
+
+
+@dataclass
+class PlanOutputList:
+    """Structured output schema for batched plan generation."""
+
+    plans: list[PlanOutput] = field(default_factory=list)

@@ -14,16 +14,27 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import re
 import time
 
-from pipeline.llm_client import get_llm_client
 from pipeline.config import Config
-from pipeline.models import (
-    ConceptMatch, ExtractedSource, Language, Manifest, Plan, Plans, Template, SourceType,
-)
-from pipeline.utils import _CJK_RE, extract_body as _extract_body, load_prompt
 from pipeline.lint import _parse_frontmatter
+from pipeline.llm_client import get_llm_client
+from pipeline.models import (
+    ConceptMatch,
+    ExtractedSource,
+    Language,
+    Manifest,
+    Plan,
+    Plans,
+    SourceType,
+    Template,
+)
+from pipeline.qmd import batch_embed
+from pipeline.store import ContentStore
+from pipeline.utils import _CJK_RE, load_prompt
+from pipeline.utils import extract_body as _extract_body
 
 log = logging.getLogger(__name__)
 
@@ -101,6 +112,166 @@ def dedup_check(manifest: Manifest, cfg: Config) -> Manifest:
             filtered.append(entry)
 
     return Manifest(entries=filtered)
+
+
+# ─── Semantic Near-Duplicate Detection (Rec 3) ────────────────────────────────
+
+def _keyword_dedup_fallback(
+    sources: list[ExtractedSource],
+    cfg: Config,
+) -> list[ExtractedSource]:
+    """Keyword/filename fallback when QMD is unreachable.
+
+    Simple dedup based on title/filename exact or substring match."""
+    existing_names: set[str] = set()
+    sources_dir = cfg.sources_dir
+    if sources_dir.is_dir():
+        for fpath in sources_dir.glob("*.md"):
+            existing_names.add(fpath.stem.lower())
+
+    filtered: list[ExtractedSource] = []
+    for src in sources:
+        title = (src.title or "").lower().strip()
+        # Skip if title matches an existing filename
+        if title and title in existing_names:
+            log.info("Keyword dedup: %s matches existing filename %s", src.hash, title)
+            continue
+        filtered.append(src)
+    return filtered
+
+
+def _semantic_dedup(
+    sources: list[ExtractedSource],
+    cfg: Config,
+    store: ContentStore,
+) -> list[ExtractedSource]:
+    """Semantic near-duplicate detection using QMD embeddings.
+
+    - Embeds content[:1000] for each source via QMD (batch when possible).
+    - Queries existing embeddings in store for top match with cosine > 0.92.
+    - If match found, logs and skips source.
+    - Falls back to Jaccard if QMD is unreachable.
+    - Falls back to keyword/filename matching if Jaccard also fails.
+    """
+    if not sources:
+        return []
+
+    # Build preview texts
+    texts = [src.content[:1000] for src in sources]
+    embeddings: dict[str, list[float]] = {}
+
+    # Try QMD batch embed
+    try:
+        from pipeline.qmd import _get_client
+        _client = _get_client()
+        emb_map = batch_embed(texts, client=_client) if _client else {}
+        for src in sources:
+            key = src.content[:1000]
+            if key in emb_map:
+                embeddings[src.hash] = emb_map[key]
+    except Exception:
+        log.debug("QMD batch embed failed for dedup")
+
+    if embeddings:
+        filtered: list[ExtractedSource] = []
+        for src in sources:
+            emb = embeddings.get(src.hash)
+            if not emb:
+                filtered.append(src)
+                continue
+            # Store embedding for future dedup
+            store.embedding_set(src.content_hash, emb)
+            match = store.embedding_find_top_match(src.content_hash, min_similarity=0.92)
+            if match:
+                chash, sim = match
+                src.semantic_similarity = float(sim)
+                log.info(
+                    "Semantic dedup: %s matches existing content %s (sim=%.3f)",
+                    src.hash,
+                    chash,
+                    round(sim, 3),
+                )
+                continue
+            filtered.append(src)
+        return filtered
+
+    # Fallback 1: Jaccard against existing vault sources
+    log.info("QMD unreachable for semantic dedup; falling back to Jaccard")
+    fallback_manifest = Manifest(entries=sources)
+    filtered_manifest = dedup_check(fallback_manifest, cfg)
+    if len(filtered_manifest.entries) < len(sources):
+        return filtered_manifest.entries
+
+    # Fallback 2: keyword/filename matching
+    log.info("Jaccard dedup found no duplicates; falling back to keyword/filename")
+    return _keyword_dedup_fallback(sources, cfg)
+
+
+# ─── Concept Merge Queue (Rec 8) ──────────────────────────────────────────────
+
+def _cosine_similarity(a: list[float], b: list[float]) -> float:
+    """Cosine similarity between two vectors."""
+    dot = sum(x * y for x, y in zip(a, b))
+    norm_a = math.sqrt(sum(x * x for x in a))
+    norm_b = math.sqrt(sum(x * x for x in b))
+    if norm_a == 0 or norm_b == 0:
+        return 0.0
+    return dot / (norm_a * norm_b)
+
+
+def _process_concept_merge_queue(
+    plans: Plans,
+    cfg: Config,
+    store: ContentStore,
+) -> None:
+    """Check concept_new candidates against existing concepts via embedding.
+
+    If a new concept is semantically similar (>0.88) to an existing one,
+    add it to the merge queue instead of creating a new concept.
+    """
+    all_new: list[str] = []
+    for plan in plans.plans:
+        all_new.extend(plan.concept_new)
+
+    if not all_new:
+        return
+
+    existing_names: list[str] = []
+    if cfg.concepts_dir.is_dir():
+        existing_names = [f.stem for f in cfg.concepts_dir.glob("*.md")]
+    if not existing_names:
+        return
+
+    # Batch embed all names to minimize QMD calls
+    unique_texts = list(set(all_new + existing_names))
+    from pipeline.qmd import _get_client
+    _client = _get_client()
+    emb_map = batch_embed(unique_texts, client=_client) if _client else {}
+    if not emb_map:
+        return
+
+    new_embs = {name: emb for name, emb in emb_map.items() if name in all_new}
+    existing_embs = {name: emb for name, emb in emb_map.items() if name in existing_names}
+
+    for plan in plans.plans:
+        kept: list[str] = []
+        for new_name in plan.concept_new:
+            new_emb = new_embs.get(new_name)
+            if not new_emb:
+                kept.append(new_name)
+                continue
+
+            matched = False
+            for ex_name, ex_emb in existing_embs.items():
+                sim = _cosine_similarity(new_emb, ex_emb)
+                if sim > 0.88:
+                    store.merge_queue_add(new_name, ex_name, sim)
+                    log.info("Merge queue: %s -> %s (sim=%.3f)", new_name, ex_name, sim)
+                    matched = True
+                    break
+            if not matched:
+                kept.append(new_name)
+        plan.concept_new = kept
 
 
 # ─── QMD concept search ──────────────────────────────────────────────────────
@@ -397,11 +568,11 @@ def generate_plans(
     concept_matches: dict[str, list[ConceptMatch]],
     cfg: Config,
 ) -> Plans:
-    """Generate creation plans via direct LLM call (Ollama by default).
+    """Generate creation plans via direct LLM call with structured output enforcement.
 
-    Builds the planning prompt, calls the LLM via pipeline.llm_client
-    (not a Hermes subprocess), parses the JSON response, and validates
-    each plan against the schema.
+    Builds the planning prompt, calls the LLM via pipeline.llm_client,
+    parses the JSON response using structured output validation,
+    and validates each plan against the schema.
     """
     prompt = build_plan_prompt(manifest, concept_matches, cfg)
 
@@ -412,23 +583,81 @@ def generate_plans(
     prompt_file.write_text(prompt, encoding="utf-8")
     log.info("Plan prompt size: %d chars", len(prompt))
 
+    from pipeline.models import PlanOutput
+
+    # Call LLM directly via llm_client (Ollama / OpenRouter / Hermes)
     # Call LLM directly via llm_client (Ollama / OpenRouter / Hermes)
     plan_dicts: list[dict] = []
     llm = get_llm_client(cfg)
-
     for attempt in range(cfg.max_retries):
         try:
             log.info("Plan agent attempt %d/%d", attempt + 1, cfg.max_retries)
-            raw = llm.generate(prompt, timeout=cfg.plan_timeout)
-            if raw and raw.strip():
-                plan_dicts = _parse_agent_output(raw)
-                if plan_dicts:
+            batch_size = len(manifest.entries)
+            if batch_size == 1:
+                structured = llm.generate_structured(
+                    prompt,
+                    schema=PlanOutput,
+                    timeout=cfg.llm_structured_timeout,
+                )
+                if structured is not None and isinstance(structured, PlanOutput):
+                    plan_dicts = [{
+                        "hash": structured.hash,
+                        "title": structured.title,
+                        "language": structured.language,
+                        "template": structured.template,
+                        "tags": structured.tags,
+                        "concept_updates": structured.concept_updates,
+                        "concept_new": structured.concept_new,
+                        "moc_targets": structured.moc_targets,
+                    }]
                     break
-            log.warning("Plan agent attempt %d produced empty/invalid output", attempt + 1)
+            else:
+                from pipeline.models import PlanOutputList
+                structured = llm.generate_structured(
+                    prompt,
+                    schema=PlanOutputList,
+                    timeout=cfg.llm_structured_timeout,
+                )
+                if structured is not None and isinstance(structured, PlanOutputList):
+                    plan_dicts = [
+                        {
+                            "hash": p.hash,
+                            "title": p.title,
+                            "language": p.language,
+                            "template": p.template,
+                            "tags": p.tags,
+                            "concept_updates": p.concept_updates,
+                            "concept_new": p.concept_new,
+                            "moc_targets": p.moc_targets,
+                        }
+                        for p in structured.plans
+                    ]
+                    break
+            log.warning("Plan agent attempt %d produced empty/invalid structured output", attempt + 1)
             if attempt < cfg.max_retries - 1:
                 time.sleep(2 ** attempt)
         except Exception as e:
             log.warning("Plan agent attempt %d failed: %s", attempt + 1, e)
+            if attempt < cfg.max_retries - 1:
+                time.sleep(2 ** attempt)
+
+    if not plan_dicts:
+        # Fallback to raw text + manual parsing for backwards compat
+        log.warning("Structured output failed; falling back to raw text parsing")
+        for attempt in range(cfg.max_retries):
+            try:
+                raw = llm.generate(prompt, timeout=cfg.plan_timeout)
+                if raw and raw.strip():
+                    # Reuse the legacy JSON extractor
+                    data = json.loads(raw)
+                    if isinstance(data, list):
+                        plan_dicts = [p for p in data if isinstance(p, dict) and "hash" in p]
+                        break
+                    elif isinstance(data, dict):
+                        plan_dicts = [data]
+                        break
+            except Exception:
+                pass
             if attempt < cfg.max_retries - 1:
                 time.sleep(2 ** attempt)
 
@@ -494,9 +723,12 @@ def plan_sources(manifest: Manifest, cfg: Config) -> Plans:
         log.info("No sources to plan, returning empty Plans")
         return Plans(plans=[])
 
-    # Step 0: Dedup check
+    store = ContentStore.open(cfg.resolved_extract_dir)
+
+    # Step 0: Semantic dedup
     log.info("Running semantic dedup check against existing sources...")
-    filtered_manifest = dedup_check(manifest, cfg)
+    deduped_entries = _semantic_dedup(manifest.entries, cfg, store)
+    filtered_manifest = Manifest(entries=deduped_entries)
     removed = len(manifest.entries) - len(filtered_manifest.entries)
     if removed > 0:
         log.info("Found %d semantic duplicates — removed from pipeline", removed)
@@ -525,6 +757,9 @@ def plan_sources(manifest: Manifest, cfg: Config) -> Plans:
     log.info("Deterministic: %d plans, %d uncertain (need agent)",
              len(deterministic_plans.plans), len(uncertain))
 
+    # Rec 8: concept merge queue (embed trigger)
+    _process_concept_merge_queue(deterministic_plans, cfg, store)
+
     # Step 3: Agent fallback for uncertain sources only
     if uncertain:
         log.info("Spawning planning agent for %d uncertain sources...", len(uncertain))
@@ -533,6 +768,7 @@ def plan_sources(manifest: Manifest, cfg: Config) -> Plans:
             e.hash: concept_matches.get(e.hash, []) for e in uncertain
         }
         agent_plans = generate_plans(uncertain_manifest, uncertain_concept_matches, cfg)
+        _process_concept_merge_queue(agent_plans, cfg, store)
         # Merge: deterministic plans first, then agent plans
         all_plans = Plans(plans=deterministic_plans.plans + agent_plans.plans)
     else:

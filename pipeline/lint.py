@@ -17,6 +17,7 @@ Or via CLI:
 
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -24,10 +25,15 @@ from enum import Enum
 from pathlib import Path
 from typing import Optional
 
-import logging
-from pipeline.note_schema import concept_schema, effective_entry_schema, markdown_headings
+from pipeline.note_schema import (
+    concept_schema,
+    effective_entry_schema,
+    markdown_headings,
+)
 from pipeline.utils import (
     extract_body as _extract_body,
+)
+from pipeline.utils import (
     parse_frontmatter as _parse_frontmatter,
 )
 
@@ -77,7 +83,7 @@ def _find_md_files(vault: Path, *dirs: str) -> list[Path]:
 _WIKI_DIRS = ("04-Wiki/entries", "04-Wiki/concepts", "04-Wiki/mocs", "04-Wiki/sources")
 
 
-def _build_wikilink_index(vault: Path, cache=None) -> tuple[dict[str, Path], dict[str, set[str]]]:
+def _build_wikilink_index(vault: Path, cache=None) -> tuple[dict[str, Path], dict[str, set[str]], dict[str, set[str]]]:
     """Build note name index and wikilink graph.
 
     Uses vault cache for incremental updates — only re-reads files whose mtime
@@ -88,9 +94,10 @@ def _build_wikilink_index(vault: Path, cache=None) -> tuple[dict[str, Path], dic
         cache: Optional ContentStore with vault cache methods
 
     Returns:
-        (note_paths, incoming_links) where:
+        (note_paths, incoming_links, outgoing_links) where:
         - note_paths: {note_name: file_path}
         - incoming_links: {note_name: set of notes that link TO it}
+        - outgoing_links: {note_name: set of notes it links to}
     """
     note_paths: dict[str, Path] = {}
     outgoing: dict[str, set[str]] = {}  # note_name -> set of notes it links to
@@ -122,7 +129,7 @@ def _build_wikilink_index(vault: Path, cache=None) -> tuple[dict[str, Path], dic
                         incoming[target].add(source)
 
             log.debug("Lint: using cached wikilink index (%d notes)", len(note_paths))
-            return note_paths, incoming
+            return note_paths, incoming, {}
 
     # Cache miss or stale — build from scratch
     for d in _WIKI_DIRS:
@@ -161,7 +168,7 @@ def _build_wikilink_index(vault: Path, cache=None) -> tuple[dict[str, Path], dic
                 cache.cache_set_file_index(dir_path, index)
         log.debug("Lint: rebuilt wikilink index (%d notes, cached)", len(note_paths))
 
-    return note_paths, incoming
+    return note_paths, incoming, outgoing
 
 
 # ─── Check Functions ─────────────────────────────────────────────────────────
@@ -172,7 +179,7 @@ def check_orphaned_notes(vault: Path, _cache=None) -> list[LintIssue]:
     Uses cached wikilink index when available.
     """
     issues = []
-    note_paths, incoming = _build_wikilink_index(vault, _cache)
+    note_paths, incoming, _ = _build_wikilink_index(vault, _cache)
 
     for note_name, md_path in note_paths.items():
         if not incoming.get(note_name):
@@ -241,22 +248,159 @@ def check_stale_reviews(vault: Path, days: int = 14) -> list[LintIssue]:
     return issues
 
 
+# ─── Knowledge Decay / Staleness Scoring ───────────────────────────────────────
+
+_VOLATILITY_MAP: dict[str, str] = {
+    "crypto": "high",
+    "ai": "high",
+    "blockchain": "high",
+    "ethereum": "high",
+    "bitcoin": "high",
+    "gpt": "high",
+    "llm": "high",
+    "tech": "medium",
+    "technology": "medium",
+    "science": "medium",
+    "research": "medium",
+    "history": "low",
+    "philosophy": "low",
+    "art": "low",
+    "literature": "low",
+}
+
+_VOLATILITY_DEFAULT_DAYS = 3 * 365  # 3 years default
+
+
+def _parse_note_date(fm: dict, mtime: float | None = None) -> datetime | None:
+    """Extract date from frontmatter or file mtime."""
+    for key in ("date", "source_date"):
+        val = fm.get(key)
+        if val:
+            s = str(val).strip()[:10]
+            try:
+                return datetime.strptime(s, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            except ValueError:
+                continue
+    if mtime is not None:
+        return datetime.fromtimestamp(mtime, tz=timezone.utc)
+    return None
+
+
+def _compute_staleness(
+    note_path: Path, thresholds: dict[str, int] | None = None
+) -> tuple[bool, float, str]:
+    """Compute staleness for a single note.
+
+    Returns (is_stale, days_old, threshold_tag).
+    """
+    content = note_path.read_text(encoding="utf-8", errors="replace")
+    fm = _parse_frontmatter(content)
+    mtime = note_path.stat().st_mtime
+    note_date = _parse_note_date(fm, mtime)
+
+    if note_date is None:
+        return False, 0.0, ""
+
+    now = datetime.now(timezone.utc)
+    days_old = (now - note_date).total_seconds() / 86400.0
+
+    tags = fm.get("tags", [])
+    if not isinstance(tags, list):
+        tags = []
+
+    # Determine highest volatility from tags present
+    max_volatility = "default"
+    volatility_days = thresholds or _STALENESS_THRESHOLDS()
+
+    for tag in tags:
+        tag_str = str(tag).strip().lower()
+        v = _VOLATILITY_MAP.get(tag_str)
+        if v:
+            # Check if this tag overrides a current max
+            if _volatility_rank(v) > _volatility_rank(max_volatility):
+                max_volatility = v
+    # Map back to threshold tag
+    tag_to_threshold = {
+        "high": "high",
+        "medium": "medium",
+        "low": "low",
+        "default": "default",
+    }
+    threshold_tag = tag_to_threshold.get(max_volatility, "default")
+    threshold_days = volatility_days.get(threshold_tag, _VOLATILITY_DEFAULT_DAYS)
+
+    is_stale = days_old > threshold_days
+    return is_stale, days_old, threshold_tag
+
+
+def _volatility_rank(volatility: str) -> int:
+    return {"default": 0, "low": 1, "medium": 2, "high": 3}.get(volatility, 0)
+
+
+def _STALENESS_THRESHOLDS(
+    default: int = 3 * 365,
+    high: int = 365,
+    medium: int = 730,
+    low: int = 5 * 365,
+) -> dict[str, int]:
+    return {
+        "default": default,
+        "high": high,
+        "medium": medium,
+        "low": low,
+    }
+
+
+def check_staleness(vault: Path) -> list[LintIssue]:
+    """Check: Notes older than volatility-based staleness threshold."""
+    issues = []
+    thresholds = _STALENESS_THRESHOLDS()
+
+    for d in ("04-Wiki/entries", "04-Wiki/concepts", "04-Wiki/sources"):
+        dir_path = vault / d
+        if not dir_path.exists():
+            continue
+        for md in dir_path.glob("*.md"):
+            try:
+                is_stale, days_old, threshold_tag = _compute_staleness(md, thresholds)
+            except Exception:
+                continue
+            if not is_stale:
+                continue
+            # Severity by volatility
+            if threshold_tag == "high":
+                severity = Severity.WARNING
+            elif threshold_tag == "medium":
+                severity = Severity.INFO
+            elif threshold_tag == "low":
+                severity = Severity.INFO
+            else:
+                severity = Severity.INFO
+            threshold_days = thresholds.get(threshold_tag, thresholds["default"])
+            issues.append(LintIssue(
+                check="staleness",
+                severity=severity,
+                note=md.stem,
+                detail=f"{days_old:.0f} days old (threshold {threshold_days}d, tag '{threshold_tag}')",
+            ))
+
+    return issues
+
+
 def check_broken_wikilinks(vault: Path, _cache=None) -> list[LintIssue]:
     """Check 4: Wikilinks pointing to non-existent notes.
 
     Uses cached wikilink index when available.
     """
     issues = []
-    note_paths, _ = _build_wikilink_index(vault, _cache)
+    note_paths, _, outgoing = _build_wikilink_index(vault, _cache)
     existing_names = set(note_paths.keys())
 
-    # Re-check outgoing links (from cache or re-read)
-    for md in note_paths.values():
-        content = md.read_text(encoding="utf-8", errors="replace")
+    for note_name, targets in outgoing.items():
+        md = note_paths[note_name]
         rel = md.relative_to(vault)
-        for match in re.finditer(r"\[\[([^\]|#]+)(?:[|#][^\]]*)?\]\]", content):
-            target = match.group(1).strip()
-            if target and target not in existing_names:
+        for target in targets:
+            if target not in existing_names:
                 issues.append(LintIssue(
                     check="broken_wikilinks",
                     severity=Severity.ERROR,
@@ -452,6 +596,43 @@ def check_edges_consistency(vault: Path) -> list[LintIssue]:
                 severity=Severity.ERROR,
                 note=f"Edge target '{target}'",
                 detail="Not found as a note",
+            ))
+
+    return issues
+
+
+def check_weak_links(vault: Path) -> list[LintIssue]:
+    """Check 10b: Notes with incoming but zero outgoing edges (weak links).
+
+    Severity: WARNING for notes with >3 incoming and 0 outgoing.
+    """
+    issues = []
+    edges_file = vault / "06-Config" / "edges.tsv"
+
+    if not edges_file.exists():
+        return issues
+
+    # Count incoming and outgoing per note
+    incoming: dict[str, int] = {}
+    outgoing: dict[str, int] = {}
+    lines = edges_file.read_text(encoding="utf-8", errors="replace").strip().split("\n")
+    for line in lines[1:]:
+        if not line.strip() or line.startswith("#"):
+            continue
+        parts = line.split("\t")
+        if len(parts) < 3:
+            continue
+        source, target = parts[0].strip(), parts[1].strip()
+        incoming[target] = incoming.get(target, 0) + 1
+        outgoing[source] = outgoing.get(source, 0) + 1
+
+    for note, inc_count in incoming.items():
+        if inc_count > 3 and outgoing.get(note, 0) == 0:
+            issues.append(LintIssue(
+                check="weak_links",
+                severity=Severity.WARNING,
+                note=note,
+                detail=f"{inc_count} incoming edges, 0 outgoing — likely weak link",
             ))
 
     return issues
@@ -872,11 +1053,13 @@ class LintChecker:
             ("8. Orphaned Concepts", check_orphaned_concepts, "orphaned_concepts"),
             ("9. Wiki Index Drift", check_wiki_index_drift, "wiki_index_drift"),
             ("10. Edges Consistency", check_edges_consistency, "edges_consistency"),
+            ("10b. Weak Links", check_weak_links, "weak_links"),
             ("11. Stubs/Placeholders", check_stubs, "stubs"),
             ("12. Tag Quality", check_tag_quality, "tag_quality"),
             ("13. Frontmatter Validity", check_frontmatter_validity, "frontmatter_validity"),
             ("14. Required Sections", check_required_sections, "required_sections"),
             ("15. Markdown Format", check_markdown_format, "markdown_format"),
+            ("16. Staleness", check_staleness, "staleness"),
         ]
 
         for name, check_fn, check_id in checks:
