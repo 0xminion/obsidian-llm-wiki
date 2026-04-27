@@ -145,7 +145,10 @@ def test_semantic_dedup_skips_qmd_duplicate(tmp_path: Path):
         source_file="a.url",
     )
     # Mock QMD to return embedding identical to stored one
-    with patch("pipeline.plan.batch_embed") as mock_batch:
+    with patch("pipeline.plan.batch_embed") as mock_batch, patch(
+        "pipeline.qmd._get_client"
+    ) as mock_client:
+        mock_client.return_value = MagicMock()
         mock_batch.return_value = {src.content[:1000]: [1.0, 0.0, 0.0]}
         result = _semantic_dedup([src], cfg, store)
     assert len(result) == 0
@@ -204,7 +207,10 @@ def test_merge_queue_adds_similar_concept(tmp_path: Path):
     plans = MagicMock()
     plans.plans = [plan]
 
-    with patch("pipeline.plan.batch_embed") as mock_emb:
+    with patch("pipeline.plan.batch_embed") as mock_emb, patch(
+        "pipeline.qmd._get_client"
+    ) as mock_client:
+        mock_client.return_value = MagicMock()
         mock_emb.return_value = {
             "blockchain": [1.0, 0.0, 0.0],
         }
