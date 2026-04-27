@@ -11,7 +11,6 @@ Handles all filesystem interactions with the Obsidian vault:
 from __future__ import annotations
 
 import hashlib
-import json
 import logging
 import re
 import threading as _threading

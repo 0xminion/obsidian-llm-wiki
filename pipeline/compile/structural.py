@@ -5,8 +5,6 @@ from __future__ import annotations
 import re
 import logging
 from datetime import datetime, timezone
-from pathlib import Path
-
 from pipeline.config import Config
 from pipeline.models import Edge, EdgeType
 from pipeline.utils import frontmatter_list_items as _frontmatter_list_items

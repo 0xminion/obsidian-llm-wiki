@@ -200,7 +200,7 @@ class TestClippingHash:
 
 class TestCliClippingWiring:
     def test_collect_url_files_and_clipping_files_combined(self, tmp_path: Path, make_clipping):
-        from pipeline.cli import _collect_clipping_files, _collect_url_files
+        from pipeline.cli import _collect_url_files
         from pipeline.utils import collect_clipping_files
 
         # Simulate vault structure

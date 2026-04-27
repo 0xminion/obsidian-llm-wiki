@@ -277,7 +277,7 @@ PARALLEL=3
 python3 -m pytest tests/ -v
 ```
 
-666 tests covering: extraction, planning, creation, validation, lint, compile, vault operations, models, config, security regressions, and integration.
+820 tests covering: extraction, planning, creation, validation, lint, compile, vault operations, models, config, security regressions, adversarial parsers, and integration.
 
 ## Clippings Workflow (02-Clippings)
 
@@ -314,7 +314,7 @@ pipeline ingest ~/MyVault
 python3 -m pytest tests/ -v
 ```
 
-**666 tests** covering: extraction, planning, creation, validation, lint, compile (semantic + deterministic), LLM client (multi-provider), vault operations, models, config, security regressions, and integration.
+**820 tests** covering: extraction, planning, creation, validation, lint, compile (semantic + deterministic), LLM client (multi-provider), vault operations, models, config, security regressions, adversarial parsers, and integration.
 
 ## Architecture
 
@@ -322,34 +322,49 @@ Python-first with a unified LLM client supporting multiple providers:
 
 ```
 pipeline/
-├── assets/            # Packaged prompt/note-template assets copied into vaults
-├── cli/               # Typer CLI — all commands
-├── llm_client/        # Unified LLM client (Ollama/OpenRouter/Hermes)
-├── extract/           # Stage 1: URL routing, extraction, dedup
-├── plan/              # Stage 2: semantic search, agent planning
-├── create/            # Stage 3 creation
-│   ├── agent/         # Agent execution (Hermes, legacy)
-│   ├── orchestrator/   # Batch coordination + post-processing
-│   ├── prompts/       # Prompt construction
-│   ├── templates/     # Template mode (deterministic + fast LLM insights)
-│   └── validate/      # Output validation + auto-repair
-├── compile/           # Compile pass: semantic ops + deterministic ops
-├── lint/              # 15 lint checks with cache support
-├── vault/             # File operations, collision detection
-├── store/             # SQLite content store + vault cache
-├── config/            # Configuration and environment
-├── models/            # Data models (Manifest, Plan, Edge, etc.)
-├── qdrant/            # Semantic search orchestrator (Qdrant → keyword fallback)
-├── qdrant_mcp/        # Qdrant MCP HTTP client (JSON-RPC over HTTP)
-├── utils/             # Shared utilities
-└── extractors/         # Type-specific extractors
-    ├── web/
-    ├── youtube/
-    ├── podcast/
-    └── _shared/
+├── cli/                # Typer CLI package
+│   ├── _helpers.py     # Shared: PipelineLock, config, logging, collectors
+│   ├── ingest.py       # Main 3-stage pipeline command
+│   ├── compile_cmd.py  # compile command
+│   ├── review_cmd.py   # approve, reject, review-status
+│   ├── quality.py      # lint, validate, doctor, release-check
+│   └── manage.py       # init, stats, reindex, tags, query, dlq, etc.
+├── compile/            # Compile pass package
+│   ├── core.py         # Orchestration, IncrementalCompiler, CircuitBreaker
+│   ├── semantic.py     # LLM: cross-link, concept merge, MoC rebuild
+│   ├── structural.py   # Deterministic: wiki index, edges, duplicates
+│   └── watch.py        # File-system watcher for incremental compile
+├── lint/               # Lint package
+│   ├── checks.py       # 17 check functions
+│   ├── fixes.py        # Auto-fix: frontmatter, markdown, banned tags
+│   ├── models.py       # Severity, LintIssue, LintResult
+│   └── runner.py       # LintChecker class, run_lint, run_validate
+├── create/             # Stage 3 creation
+│   ├── templates.py    # Template mode (deterministic + LLM insights)
+│   ├── orchestrator.py # Batch coordination, ThreadPoolExecutor
+│   ├── validate.py     # 15 validation checks + auto-repair
+│   ├── prompts.py      # Prompt construction
+│   └── agent.py        # DEPRECATED: Hermes subprocess creation
+├── extractors/         # Type-specific extractors
+│   ├── web.py          # defuddle → curl → archive.org → camoufox
+│   ├── youtube.py      # TranscriptAPI → supadata → whisper
+│   ├── podcast.py      # AssemblyAI → whisper
+│   └── _shared.py      # Content quality gate, title extraction
+├── llm_client.py       # Unified LLM client (Ollama/OpenRouter/Hermes)
+├── extract.py          # Stage 1: URL routing, retry, manifest
+├── plan.py             # Stage 2: dedup, concept search, planning
+├── log.py              # Structured logging, correlation IDs, stage_timer
+├── language.py         # Language detection (CJK ratio, script analysis)
+├── qmd.py              # Semantic search via QMD MCP
+├── vault.py            # File ops, collision resolution, archiving
+├── store.py            # SQLite content store + vault cache
+├── config.py           # Environment + vault path resolution
+├── models.py           # Data models (Manifest, Plan, Edge, etc.)
+├── utils.py            # Filename gen, CircuitBreaker, shared helpers
+└── assets/             # Packaged prompt/note-template assets
 ```
 
-~2,900 lines of Python, 666 tests, unified LLM client with 3 providers, 0 shell scripts in the critical path.
+~15,800 lines of Python, 820 tests, unified LLM client with 3 providers, 0 shell scripts in the critical path.
 
 ## Agentic Usage
 

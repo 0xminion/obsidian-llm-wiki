@@ -10,8 +10,6 @@ Targets:
 
 from __future__ import annotations
 
-import pytest
-
 from pipeline.config import Config
 from pipeline.utils import frontmatter_list_items, parse_frontmatter
 from pipeline.compile.structural import _build_edges, _detect_duplicates
@@ -184,7 +182,7 @@ class TestBuildEdges:
         cfg = _make_vault(tmp_path)
         _write_note(cfg, "entry", "note-a", "---\ntitle: A\n---\nSee [[note-b|the B note]].\n")
         _write_note(cfg, "entry", "note-b", "---\ntitle: B\n---\n# B\n")
-        result = _build_edges(cfg)
+        _build_edges(cfg)
         content = cfg.edges_file.read_text(encoding="utf-8")
         assert "note-a" in content
         assert "note-b" in content
@@ -194,7 +192,7 @@ class TestBuildEdges:
         cfg = _make_vault(tmp_path)
         _write_note(cfg, "entry", "alpha", "---\ntitle: alpha\n---\nSee [[beta#section-1]].\n")
         _write_note(cfg, "entry", "beta", "---\ntitle: beta\n---\n# Beta\n")
-        result = _build_edges(cfg)
+        _build_edges(cfg)
         content = cfg.edges_file.read_text(encoding="utf-8")
         assert "alpha" in content
         assert "beta" in content
@@ -203,10 +201,10 @@ class TestBuildEdges:
         """[[self]] should NOT create an edge to itself."""
         cfg = _make_vault(tmp_path)
         _write_note(cfg, "entry", "narcissist", "---\ntitle: narcissist\n---\n[[narcissist]]\n")
-        result = _build_edges(cfg)
+        _build_edges(cfg)
         content = cfg.edges_file.read_text(encoding="utf-8")
-        lines = [l for l in content.splitlines() if not l.startswith("source\t")]
-        assert all("narcissist\tnarcissist" not in l for l in lines)
+        lines = [line for line in content.splitlines() if not line.startswith("source\t")]
+        assert all("narcissist\tnarcissist" not in line for line in lines)
 
     def test_large_vault_concept_tag_loop(self, tmp_path):
         """100+ concept notes with shared tags to exercise the O(n^2) loop."""
@@ -227,7 +225,7 @@ class TestBuildEdges:
         cfg = _make_vault(tmp_path)
         _write_note(cfg, "entry", "child", "---\ntitle: child\n---\n# Child\n")
         _write_note(cfg, "moc", "parent-moc", "---\ntitle: Parent\n---\n[[child]]\n")
-        result = _build_edges(cfg)
+        _build_edges(cfg)
         content = cfg.edges_file.read_text(encoding="utf-8")
         assert "part_of" in content
 
@@ -238,7 +236,7 @@ class TestBuildEdges:
             cfg, "concept", "theory",
             "---\ntitle: theory\nsources:\n  - \"[[evidence]]\"\n---\n# Theory\n",
         )
-        result = _build_edges(cfg)
+        _build_edges(cfg)
         content = cfg.edges_file.read_text(encoding="utf-8")
         assert "tested_by" in content
 

@@ -4,7 +4,21 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-04-27
+
 ### Added
+- **Module decomposition**: Split 3 monolithic files into focused packages with backward-compatible re-exports:
+  - `cli.py` (1,252 lines) → `pipeline/cli/` (6 modules: ingest, compile_cmd, review_cmd, quality, manage, _helpers)
+  - `lint.py` (1,207 lines) → `pipeline/lint/` (4 modules: checks, fixes, models, runner)
+  - `compile.py` (1,580 lines) → `pipeline/compile/` (4 modules: core, semantic, structural, watch)
+- **CircuitBreaker** (`pipeline/utils.py`): Thread-safe circuit breaker for LLM failure protection. Wired into compile agent, insight pre-generation, and batch filename generation.
+- **Structured logging with correlation IDs** (`pipeline/log.py`): `batch_id`, `source_hash`, `stage` propagated via `contextvars`. Includes `stage_timer()` context manager for automatic stage timing.
+- **Language detection module** (`pipeline/language.py`): Extracted from inline heuristics across plan/create modules.
+- **74 new tests** (total: 820):
+  - 52 adversarial parser tests (`tests/test_adversarial_parsers.py`)
+  - 22 enrich coverage tests (`tests/test_enrich.py`)
+  - 5 E2E smoke tests in `tests/test_integration.py`
+- **Shared utility extraction**: `frontmatter_list_items()` deduplicated from compile modules into `pipeline/utils.py`.
 - GitHub Actions CI for static checks, tests, wheel build, and installed CLI smoke test.
 - Central note schema definitions shared by template generation and lint validation.
 - Packaged vault assets under `pipeline/assets/` so wheel installs can initialize complete vault scaffolding.
@@ -13,10 +27,18 @@ All notable changes to this project will be documented in this file.
 - Release checklist documenting artifact-based verification.
 
 ### Fixed
+- **Exception narrowing** across 11 files: replaced all bare `except Exception` with specific types (`ConnectionError`, `TimeoutError`, `OSError`, `ValueError`, `json.JSONDecodeError`). Prevents silent suppression of programming errors.
+- **Security**: `config.py` `resolved_extract_dir` now uses `tempfile.gettempdir()` + `mkdir(mode=0o700)` instead of hardcoded `/tmp` paths.
+- **CI**: `tests.yml` syntax check updated for new package paths (was referencing deleted `pipeline/compile.py`).
+- **Ruff**: Fixed 14 lint errors (unused imports, unused variables, ambiguous variable names) introduced during decomposition.
 - Entry template generation now matches validator-required sections for comparison and procedural notes.
 - Batch validation checks new concept files in `04-Wiki/concepts/` instead of `04-Wiki/entries/`.
 - OpenRouter HTTP-error test now uses a file-like body, eliminating unraisable cleanup noise.
-- Static-check noise from an unused test import.
+- Static-check noise from unused test imports.
+
+### Changed
+- **Architecture docs** updated to reflect new package structure, test count (820), and line count (~15,800).
+- **README** architecture tree updated to match actual package layout.
 
 ## [0.2.0] - 2026-04-23
 

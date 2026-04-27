@@ -16,7 +16,6 @@ from typing import Optional
 
 from pipeline._common import VaultLock
 from pipeline.config import Config
-from pipeline.models import Edge, EdgeType
 from pipeline.store import ContentStore
 from pipeline.utils import CircuitBreaker, count_md
 from pipeline.utils import load_prompt as _load_prompt

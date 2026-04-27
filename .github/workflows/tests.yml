@@ -31,9 +31,27 @@ jobs:
           python -m py_compile pipeline/utils.py
           python -m py_compile pipeline/config.py
           python -m py_compile pipeline/models.py
-          python -m py_compile pipeline/compile.py
           python -m py_compile pipeline/stats.py
           python -m py_compile pipeline/vault.py
+          python -m py_compile pipeline/log.py
+          python -m py_compile pipeline/language.py
+          python -m py_compile pipeline/cli/__init__.py
+          python -m py_compile pipeline/cli/_helpers.py
+          python -m py_compile pipeline/cli/ingest.py
+          python -m py_compile pipeline/cli/compile_cmd.py
+          python -m py_compile pipeline/cli/review_cmd.py
+          python -m py_compile pipeline/cli/quality.py
+          python -m py_compile pipeline/cli/manage.py
+          python -m py_compile pipeline/compile/__init__.py
+          python -m py_compile pipeline/compile/core.py
+          python -m py_compile pipeline/compile/semantic.py
+          python -m py_compile pipeline/compile/structural.py
+          python -m py_compile pipeline/compile/watch.py
+          python -m py_compile pipeline/lint/__init__.py
+          python -m py_compile pipeline/lint/checks.py
+          python -m py_compile pipeline/lint/fixes.py
+          python -m py_compile pipeline/lint/models.py
+          python -m py_compile pipeline/lint/runner.py
           python -m py_compile pipeline/create/__init__.py
           python -m py_compile pipeline/create/prompts.py
           python -m py_compile pipeline/create/agent.py

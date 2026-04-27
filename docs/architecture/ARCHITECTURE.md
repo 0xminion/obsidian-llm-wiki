@@ -1,9 +1,9 @@
 # Obsidian LLM Wiki — Architecture & Design Rationale
 
-**Version**: 0.2.1  
-**Date**: 2026-04-24  
+**Version**: 0.3.0  
+**Date**: 2026-04-27  
 **Author**: 0xminion  
-**Lines**: ~2,900 Python | **Tests**: 666 | **Stages**: 3 + compile pass + query
+**Lines**: ~15,800 Python | **Tests**: 820 | **Stages**: 3 + compile pass + query
 
 ---
 
@@ -186,31 +186,50 @@ flowchart TB
 ```
 obsidian-llm-wiki/
 ├── pipeline/
-│   ├── cli.py                  # typer CLI — all commands, PipelineLock
-│   ├── llm_client.py           # UNIFIED: Ollama / OpenRouter / Hermes
-│   ├── extract.py              # Stage 1: URL routing, retry, manifest
-│   ├── plan.py                 # Stage 2: dedup, concept search, planning
-│   ├── compile.py              # Compile: semantic + deterministic ops
-│   ├── lint.py                 # 15 health checks + synonym detection
-│   ├── qmd.py                  # Semantic search via Ollama embeddings
-│   ├── vault.py                # File ops, collision resolution, archiving
-│   ├── store.py                # SQLite: dedup, lint cache, wal
-│   ├── config.py               # Environment + vault path resolution
-│   ├── models.py               # Dataclasses: Plan, Manifest, Edge, etc.
-│   ├── utils.py                # Filename gen, title_to_filename, smart_filename
+│   ├── cli/                    # Typer CLI package (decomposed from cli.py)
+│   │   ├── __init__.py         # Re-exports for backward compat
+│   │   ├── _helpers.py         # Shared: PipelineLock, config, logging, collectors
+│   │   ├── ingest.py           # Main 3-stage pipeline command
+│   │   ├── compile_cmd.py      # compile command
+│   │   ├── review_cmd.py       # approve, reject, review-status
+│   │   ├── quality.py          # lint, validate, doctor, config-doctor, release-check
+│   │   └── manage.py           # init, stats, reindex, tags, query, dlq, etc.
+│   ├── compile/                # Compile package (decomposed from compile.py)
+│   │   ├── __init__.py         # Re-exports for backward compat
+│   │   ├── core.py             # Orchestration, IncrementalCompiler, CircuitBreaker
+│   │   ├── semantic.py         # LLM ops: cross-link, concept merge, MoC rebuild
+│   │   ├── structural.py       # Deterministic: wiki index, edges, duplicates
+│   │   └── watch.py            # File-system watcher for incremental compile
+│   ├── lint/                   # Lint package (decomposed from lint.py)
+│   │   ├── __init__.py         # Re-exports for backward compat
+│   │   ├── models.py           # Severity, LintIssue, LintResult
+│   │   ├── checks.py           # 17 check functions
+│   │   ├── fixes.py            # Auto-fix: frontmatter, markdown, banned tags
+│   │   └── runner.py           # LintChecker class, run_lint, run_validate
 │   ├── create/
 │   │   ├── agent.py            # DEPRECATED: Hermes subprocess creation
 │   │   ├── orchestrator.py     # Batch coordination, ThreadPoolExecutor
 │   │   ├── templates.py        # Template mode: 90% Python, 10% LLM insights
 │   │   ├── prompts.py          # Prompt construction for agents
 │   │   └── validate.py         # 15 validation checks + auto-repair
-│   └── extractors/
-│       ├── web.py              # defuddle → curl → archive.org → camoufox
-│       ├── youtube.py          # TranscriptAPI → supadata → whisper
-│       ├── podcast.py          # AssemblyAI → whisper
-│       └── _shared.py          # Content quality gate, title extraction
+│   ├── extractors/
+│   │   ├── web.py              # defuddle → curl → archive.org → camoufox
+│   │   ├── youtube.py          # TranscriptAPI → supadata → whisper
+│   │   ├── podcast.py          # AssemblyAI → whisper
+│   │   └── _shared.py          # Content quality gate, title extraction
+│   ├── llm_client.py           # UNIFIED: Ollama / OpenRouter / Hermes
+│   ├── extract.py              # Stage 1: URL routing, retry, manifest
+│   ├── plan.py                 # Stage 2: dedup, concept search, planning
+│   ├── log.py                  # Structured logging, correlation IDs, stage_timer
+│   ├── language.py             # Language detection (CJK ratio, script analysis)
+│   ├── qmd.py                  # Semantic search via QMD MCP
+│   ├── vault.py                # File ops, collision resolution, archiving
+│   ├── store.py                # SQLite: dedup, lint cache, wal
+│   ├── config.py               # Environment + vault path resolution
+│   ├── models.py               # Dataclasses: Plan, Manifest, Edge, etc.
+│   └── utils.py                # Filename gen, CircuitBreaker, shared helpers
 ├── pipeline/assets/            # Canonical packaged prompts + vault templates
-├── tests/                      # Test suite
+├── tests/                      # 820 tests
 ├── docs/
 │   ├── architecture/ARCHITECTURE.md
 │   ├── product/PRD.md
@@ -555,9 +574,9 @@ QMD is the semantic concept search interface (`pipeline/qmd.py`). It **replaced*
 |----------|----------|----------------|
 | `pipeline/plan.py:concept_search()` | Find existing concepts for new sources | Every `ingest` run |
 | `pipeline/qmd.py:run_qmd_convergence()` | Concept convergence for creation | Every `ingest` run |
-| `pipeline/compile.py:NoteIndex.embed_all()` | Build note similarity matrix | Every `compile` run |
-| `pipeline/cli.py:query --fast` | Direct semantic query (optional) | On user demand |
-| `pipeline/compile.py:_semantic_moc_rebuild()` | Find related notes for MoC topics | Every `compile` run |
+| `pipeline/compile/semantic.py:NoteIndex.embed_all()` | Build note similarity matrix | Every `compile` run |
+| `pipeline/cli/manage.py:query --fast` | Direct semantic query (optional) | On user demand |
+| `pipeline/compile/semantic.py:_semantic_moc_rebuild()` | Find related notes for MoC topics | Every `compile` run |
 
 ### 8.3 Search priority
 
@@ -736,6 +755,22 @@ class ConceptMatch:
 | LLM generate | Connection timeout, empty response | 2 | 1s, 2s |
 | File write | Permission denied, disk full | 1 | N/A |
 
+### Circuit Breaker (LLM calls)
+
+`CircuitBreaker` (`pipeline/utils.py`) protects against cascading LLM failures during batch operations. After `threshold` consecutive failures (default 5), the breaker opens for `reset_seconds` (default 60–120s), skipping LLM calls and falling back to deterministic alternatives. Used in:
+
+- `pipeline/compile/core.py` — `_run_agent()` skips semantic operations when breaker is open
+- `pipeline/create/templates.py` — insight pre-generation falls back to empty insights
+- `pipeline/utils.py` — `batch_smart_filenames()` falls back to heuristic truncation
+
+### Structured Logging & Correlation IDs
+
+`pipeline/log.py` provides correlation IDs via `contextvars` (`batch_id`, `source_hash`, `stage`). Every log line includes these fields for tracing failures across parallel workers. The `stage_timer()` context manager automatically logs stage start/finish with elapsed time.
+
+### Exception Narrowing
+
+All `except Exception` handlers have been replaced with specific types (`ConnectionError`, `TimeoutError`, `OSError`, `ValueError`, `json.JSONDecodeError`) across 11 modules. This prevents accidental suppression of programming errors (`TypeError`, `AttributeError`, `KeyError`).
+
 ### Recovery Patterns
 
 - **Agent timeout (exit 124)**: Post-creation validation checks files written before timeout. Partial batches are accepted if ≥1 file per plan is valid.
@@ -788,4 +823,4 @@ AGENT_CMD=hermes
 
 ---
 
-*This architecture document is Version 0.2.0 and reflects the codebase as of commit `75bfde7`.*
+*This architecture document is Version 0.3.0 and reflects the codebase as of 2026-04-27.*

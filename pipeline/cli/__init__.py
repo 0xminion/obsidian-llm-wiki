@@ -37,11 +37,46 @@ from pipeline.vault import reindex as vault_reindex  # noqa: F401
 import shutil  # noqa: F401
 
 # ── Register command modules (side-effect imports) ──────────────────────────
-import pipeline.cli.ingest  # noqa: F401
-import pipeline.cli.compile_cmd  # noqa: F401
-import pipeline.cli.review_cmd  # noqa: F401
-import pipeline.cli.quality  # noqa: F401
-import pipeline.cli.manage  # noqa: F401
+from pipeline.cli import ingest as ingest  # noqa: F401
+from pipeline.cli import compile_cmd as compile_cmd  # noqa: F401
+from pipeline.cli import review_cmd as review_cmd  # noqa: F401
+from pipeline.cli import quality as quality  # noqa: F401
+from pipeline.cli import manage as manage  # noqa: F401
+
+
+__all__ = [
+    "ingest",
+    "compile_cmd",
+    "review_cmd",
+    "quality",
+    "manage",
+    "app",
+    "main",
+    "PipelineLock",
+    "_auto_setup",
+    "_build_query_prompt",
+    "_collect_clipping_files",
+    "_collect_url_files",
+    "_collision_safe_path",
+    "_gather_query_note_context",
+    "_load_cfg",
+    "_query_keywords",
+    "_resolve_vault",
+    "_setup_logging",
+    "_validate_clipping_quality",
+    "check_dependencies",
+    "query_vault_fast",
+    "create_all",
+    "create_file_templates",
+    "extract_all",
+    "plan_sources",
+    "vault_reindex",
+    "shutil",
+    "ExtractedSource",
+    "Manifest",
+    "Plans",
+    "SourceType",
+]
 
 
 def main():
