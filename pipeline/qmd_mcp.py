@@ -26,8 +26,7 @@ import threading
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
-from typing import Iterator, Optional
-
+from typing import Optional
 from pipeline._version import __version__
 
 log = logging.getLogger(__name__)

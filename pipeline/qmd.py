@@ -87,10 +87,10 @@ def run_qmd_query(
             query_text=query.strip(),
             n_results=n_results,
             min_score=min_score,
-            collections=[collection or cfg.qmd_collection],
+            collections=[collection or "concepts"],
         )
         if results:
-            return _qmd_results_to_concept_matches(results, collection_filter=collection or cfg.qmd_collection)
+            return _qmd_results_to_concept_matches(results, collection_filter=collection or "concepts")
 
     # Fallback: local keyword fallback
     if concepts_dir is not None:

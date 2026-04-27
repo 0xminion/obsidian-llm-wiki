@@ -395,9 +395,13 @@ def test_query_cli_outputs_do_not_overwrite(tmp_path):
     from typer.testing import CliRunner
     from pipeline import cli
 
+    from pipeline.cli import manage as manage_mod
+
     cfg = _vault(tmp_path)
 
-    with patch.object(cli, "_load_cfg", lambda vault: cfg), patch.object(cli, "query_vault_fast", lambda cfg_arg, question: "answer"):
+    with patch.object(cli, "_load_cfg", lambda vault: cfg), patch.object(
+        manage_mod, "query_vault_fast", lambda cfg_arg, question: "answer"
+    ):
         runner = CliRunner()
         r1 = runner.invoke(cli.app, ["query", str(cfg.vault_path), "--ask", "one", "--fast"])
         r2 = runner.invoke(cli.app, ["query", str(cfg.vault_path), "--ask", "two", "--fast"])
