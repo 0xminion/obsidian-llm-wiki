@@ -256,7 +256,7 @@ class ContentStore:
     @staticmethod
     def normalize_url(url: str) -> str:
         """Normalize URL for dedup comparison."""
-        parsed = urlparse(url)
+        parsed = urlparse(url.rstrip(")"))
         skip_params = {
             "utm_source", "utm_medium", "utm_campaign", "utm_content",
             "utm_term", "ref", "source", "fbclid", "gclid",
