@@ -64,6 +64,9 @@ from pipeline.extractors.web import (
 from pipeline.extractors.web import (  # noqa: F401
     extract_web as _extract_web,
 )
+from pipeline.extractors.twitter import (  # noqa: F401
+    extract_twitter as _extract_twitter,
+)
 from pipeline.extractors.youtube import (
     _try_youtube_transcript,
 )
@@ -175,6 +178,11 @@ def extract_url(url: str, cfg: Config,
                 source = _extract_youtube(url, cfg)
             elif source_type == SourceType.PODCAST:
                 source = _extract_podcast(url, cfg)
+            elif source_type == SourceType.TWITTER:
+                source = _extract_twitter(url, cfg=cfg)
+                # Fall back to generic web if FxTwitter returned empty (rate limits, etc.)
+                if not source.content:
+                    source = _extract_web(url, cfg, source_type=source_type)
             else:
                 source = _extract_web(url, cfg, source_type=source_type)
 

@@ -106,8 +106,13 @@ def extract_frontmatter_field(content: str, field: str) -> str:
 
 
 def escape_yaml(s: str) -> str:
-    """Escape strings for safe YAML double-quoted values."""
+    """Escape strings for safe YAML double-quoted values.
+
+    YAML double-quoted scalars use \" for literal quotes and \\ for literal
+    backslash.  We must escape both.
+    """
     return s.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+
 
 
 def strip_qmd_noise(text: str) -> str:

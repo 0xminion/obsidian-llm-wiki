@@ -328,7 +328,7 @@ def generate_plan_heuristic(
     """
     from pipeline.extractors._shared import extract_title
 
-    title = extract_title(entry.content) or entry.title or entry.url
+    title = entry.title or extract_title(entry.content) or entry.url
     language = detect_language(entry.content)
     template = (
         template_for_language(language)
@@ -487,7 +487,7 @@ For EACH source, output a JSON object in a JSON array. Schema per source:
 RULES:
 - title: Use the content REAL title. Tweet → first meaningful topic. Blog → article title. YouTube → video title.
 - NEVER use: "Tweet - user - ID", "Blog - slug", "YouTube - VIDEO_ID", URL slugs
-- language: Chinese content → "zh", everything else → "en"
+- language: Chinese content → "zh". English content → "en". All other languages → translate to English, process in English.
 - template: Data/methodology/findings → "technical". Narrative/philosophical → "standard". Chinese → "chinese".
 - tags: 3-6 topic-specific tags derived from content:
   * PREFER reusing tags from EXISTING TAG VOCABULARY above — only mint new tags when content genuinely requires them
@@ -699,8 +699,9 @@ def plan_sources(manifest: Manifest, cfg: Config) -> Plans:
 
     Step 0: Dedup check — skip sources already in vault
     Step 1: Semantic concept pre-search via qmd
-    Step 2: Deterministic planning (heuristics) — handles ~80% of sources
-    Step 3: Agent fallback — only for uncertain sources
+    Step 2: LLM planning for ALL sources (deterministic planner was producing
+            empty tags, concept title-copies, and no MoCs — now always LLM)
+    Step 3: Save plans
 
     Returns Plans object (possibly empty on total failure).
     """
@@ -738,29 +739,11 @@ def plan_sources(manifest: Manifest, cfg: Config) -> Plans:
             len(filtered_manifest.entries),
         )
 
-        # Step 2: Deterministic planning
-        log.info("Generating plans deterministically...")
-        deterministic_plans, uncertain = generate_plans_deterministic(
-            filtered_manifest, concept_matches,
-        )
-        log.info("Deterministic: %d plans, %d uncertain (need agent)",
-                 len(deterministic_plans.plans), len(uncertain))
-
-        # Rec 8: concept merge queue (embed trigger)
-        _process_concept_merge_queue(deterministic_plans, cfg, store)
-
-        # Step 3: Agent fallback for uncertain sources only
-        if uncertain:
-            log.info("Spawning planning agent for %d uncertain sources...", len(uncertain))
-            uncertain_manifest = Manifest(entries=uncertain)
-            uncertain_concept_matches = {
-                e.hash: concept_matches.get(e.hash, []) for e in uncertain
-            }
-            agent_plans = generate_plans(uncertain_manifest, uncertain_concept_matches, cfg)
-            _process_concept_merge_queue(agent_plans, cfg, store)
-            all_plans = Plans(plans=deterministic_plans.plans + agent_plans.plans)
-        else:
-            all_plans = deterministic_plans
+        # Step 2: Always use LLM planner — deterministic planner produced
+        # empty tags, title-copy concepts, and zero MoCs.
+        log.info("Generating plans via LLM for all %d sources...", len(filtered_manifest.entries))
+        all_plans = generate_plans(filtered_manifest, concept_matches, cfg)
+        _process_concept_merge_queue(all_plans, cfg, store)
 
     # Save plans
     extract_dir = cfg.resolved_extract_dir

@@ -244,40 +244,206 @@ def _strip_markdown(text: str) -> str:
     return text.strip()
 
 
-def extract_title(content: str) -> str:
+def extract_title(content: str, fallback_title: str = "") -> str:
     """Extract a title from content text.
 
+    When content is a Cloudflare/garbage HTML page (starts with <!DOCTYPE or <html),
+    returns fallback_title instead of parsing garbage.
+
     Strategy:
-      1. Find first # heading (skip "Original content")
-      2. Fallback to first non-empty line (max 120 chars)
+      1. If content starts with HTML tag → return fallback_title
+      2. Find first # heading (skip "Original content")
+      3. Fallback to first non-empty line (max 120 chars)
+      4. Last resort: return fallback_title
     """
     if not content:
-        return ""
+        return fallback_title or ""
+
+    stripped = content.lstrip()[:50]
+    # HTML pages: Cloudflare challenge, GDPR wall, etc.
+    if stripped.startswith(("<!DOCTYPE", "<html", "<HTML", "<head>", "<HEAD>")):
+        return fallback_title or ""
 
     for line in content.split("\n"):
-        stripped = line.strip()
-        if stripped.startswith("# ") and not stripped.lstrip("# ").startswith("Original content"):
-            title = stripped.lstrip("# ").strip()
+        s = line.strip()
+        if s.startswith("# ") and not s.lstrip("# ").startswith("Original content"):
+            title = s.lstrip("# ").strip()
             if len(title) > 5:
                 return _strip_markdown(title[:120])
 
-    # Fallback: first non-empty, non-URL, non-image line
+    # Fallback: first non-empty, non-URL, non-image line, and not UI noise
+    _UI_NOISE = re.compile(
+        r"(?im)^\s*(?:get\s+(?:the\s+)?app|sign\s+(?:up|in)|follow|like|save|share|login|"
+        r"subscribe|join|bookmark|press\s+enter|click\s+to\s+view|image\s+in\s+full"
+        r"|load(?:ing)?\s+(?:more|comments)|terms\s+.*\s+use|privacy\s+.*\s+policy|"
+        r"\d+\s+claps?|respond|comment)"
+    )
     for line in content.split("\n"):
-        stripped = line.strip()
-        if not stripped:
+        s = line.strip()
+        if not s or s.startswith(("http", "!", "[")):
             continue
-        if stripped.startswith(("http", "!", "[")):
+        if _UI_NOISE.search(s):
             continue
-        if len(stripped) > 20:
-            return _strip_markdown(stripped[:120])
+        if len(s) > 20:
+            return _strip_markdown(s[:120])
 
-    # Last resort: first non-empty line
+    # Last resort: first non-empty line (still skip UI noise)
     for line in content.split("\n"):
-        stripped = line.strip()
-        if stripped:
-            return _strip_markdown(stripped[:120])
+        s = line.strip()
+        if s and not _UI_NOISE.search(s):
+            return _strip_markdown(s[:120])
 
+    return fallback_title or ""
+
+
+def _extract_html_title(html: str, fallback: str = "") -> str:
+    """Extract title from raw HTML using <title> or og:title.
+
+    Returns fallback if neither found.
+    """
+    if not html:
+        return fallback
+
+    # 1. <title> tag
+    m = re.search(r"<\s*title\s*>\s*(.+?)\s*<\s*/\s*title\s*>", html, re.IGNORECASE | re.DOTALL)
+    if m:
+        t = m.group(1).strip()
+        if t and len(t) > 2:
+            return _strip_html(t)[:120]
+
+    # 2. og:title
+    m = re.search(r'<\s*meta\s+[^>]*property=["\']og:title["\'][^>]*content=["\']([^"\']+)["\']', html, re.IGNORECASE | re.DOTALL)
+    if m:
+        t = m.group(1).strip()
+        if t and len(t) > 2:
+            return _strip_html(t)[:120]
+    # og:title can also be content-first
+    m = re.search(r'<\s*meta\s+[^>]*content=["\']([^"\']+)["\'][^>]*property=["\']og:title["\']', html, re.IGNORECASE | re.DOTALL)
+    if m:
+        t = m.group(1).strip()
+        if t and len(t) > 2:
+            return _strip_html(t)[:120]
+
+    return fallback
+
+
+def _strip_html(text: str) -> str:
+    """Remove simple HTML tags from a string."""
+    return re.sub(r"<[^>]+>", "", text).strip()
+
+
+def _url_to_title(url: str) -> str:
+    """Convert a URL path slug into a readable title.
+
+    Handles apostrophes in URL slugs (e.g. medium.com/.../here-s-why-it-s-hard).
+    """
+    from urllib.parse import urlparse, unquote
+    try:
+        parsed = urlparse(url)
+        path = unquote(parsed.path)
+        # Get the last non-empty path segment
+        segments = [s for s in path.split("/") if s]
+        if segments:
+            slug = segments[-1]
+            # Strip extensions
+            slug = slug.rsplit(".", 1)[0] if "." in slug else slug
+            # Strip trailing Medium-style hash (e.g. 8684d9a77e11)
+            slug = re.sub(r"-[a-f0-9]{11,}$", "", slug)
+            # Words from slug parts, preserving apostrophes
+            # "here-s-why-it-s-hard" → split on "-" then convert "s" back to "'s"
+            raw_parts = re.split(r"[-_]+", slug)
+            words = []
+            for i, w in enumerate(raw_parts):
+                if w == "s" and words:
+                    words[-1] = words[-1] + "'s"   # "here" + "s" → "here's"
+                elif w == "re" and words:
+                    words[-1] = words[-1] + "'re"  # "we" + "re" → "we're"
+                elif w == "m" and words:
+                    words[-1] = words[-1] + "'m"    # "i" + "m" → "i'm"
+                elif w == "ve" and words:
+                    words[-1] = words[-1] + "'ve"   # "they" + "ve" → "they've"
+                elif w == "d" and words:
+                    words[-1] = words[-1] + "'d"
+                elif w == "ll" and words:
+                    words[-1] = words[-1] + "'ll"
+                elif w == "t" and words and words[-1].lower() in ("won", "can"):
+                    words[-1] = words[-1] + "'t"
+                else:
+                    words.append(w)
+            return " ".join(words).title()[:120]
+    except Exception:
+        pass
     return ""
+
+def _is_cloudflare_html(content: str) -> bool:
+    """Detect Cloudflare challenge/error pages."""
+    if not content:
+        return False
+    first_5k = content[:5000].lower()
+    markers = [
+        "<!doctype html", "<html", "checking your browser",
+        "enable javascript", "please wait while we check",
+        "cloudflare", "ddos protection",
+    ]
+    return any(m in first_5k for m in markers[:4]) or first_5k.count("<") > first_5k.count(">") + 50
+
+
+# ── Title noise detectors ──────────────────────────────────────────────────────
+
+_MEDIUM_TITLE_PATTERNS = [
+    re.compile(r"^\s*Get\s+(?:the\s+)?app\s*$", re.IGNORECASE),
+    re.compile(r"^\s*Press\s+enter\s+or\s+click\s+to\s+view\s*$", re.IGNORECASE),
+    re.compile(r"^\s*Sign\s+[Uu]p\s*$"),
+    re.compile(r"^\s*Sign\s+[Ii]n\s*$"),
+]
+
+_CLOUDFLARE_TITLES = {
+    "your privacy, your choice",
+    "just a moment...",
+    "are you human?",
+    "error 1020",
+    "access denied",
+    "attention required! | cloudflare",
+    "checking your browser before accessing",
+    "please wait while your request is being verified",
+}
+
+_ARCHIVE_NAV_TITLES = {
+    "about", "- about", "blog", "terms of use", "privacy policy",
+    "wayback machine",
+}
+
+
+def _is_ui_noise_title(title: str) -> bool:
+    """Check if a title is Medium UI noise, Cloudflare, GDPR, archive.org nav, etc."""
+    if not title:
+        return True
+    t = title.strip().lower()
+    for pat in _MEDIUM_TITLE_PATTERNS:
+        if pat.match(t):
+            return True
+    if t in _CLOUDFLARE_TITLES or t in _ARCHIVE_NAV_TITLES:
+        return True
+    if any(m in t for m in ("checking your browser", "just a moment", "your privacy, your choice")):
+        return True
+    return False
+
+
+# ─── URL Patterns ────────────────────────────────────────────────────────────
+def _is_archive_wrapper(content: str) -> bool:
+    """Detect archive.org Wayback Machine wrapper pages (not real article content).
+
+    When defuddle processes an archive.org snapshot, it sometimes parses the
+    archive navigation bar (About, Blog, Terms of Use links) instead of the
+    actual article.  This detects those wrapper pages so we can fall back to
+    Camoufox or use the URL-derived title.
+    """
+    if not content:
+        return False
+    text = content[:2000].lower()
+    archive_refs = text.count("archive.org") + text.count("wayback machine")
+    nav_markers = sum(1 for m in ["about", "blog", "terms of use", "privacy policy"] if m in text[:500])
+    return archive_refs >= 3 or nav_markers >= 2
 
 
 # ─── URL Patterns ────────────────────────────────────────────────────────────

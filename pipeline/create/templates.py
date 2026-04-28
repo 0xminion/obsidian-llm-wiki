@@ -198,19 +198,36 @@ def generate_entry_insights(
     """Generate just the insights (Summary + Core insights) via LLM with structured output.
 
     Uses the provider-agnostic LLMClient and validates against InsightOutput schema.
+    Respects source language — Chinese content gets Chinese section headers.
     """
     from pipeline.llm_client import get_llm_client
     from pipeline.models import InsightOutput
 
     client = get_llm_client(cfg)
     content = extracted.get("content", "")[:cfg.max_content_insights]
-    prompt = f"""Analyze this content and produce exactly two sections:
 
-## Summary
-(1-2 sentence summary)
+    # Language-aware section headers
+    is_chinese = plan.language.value == "zh" or plan.template.value == "chinese"
+    if is_chinese:
+        summary_heading = "## 摘要"
+        insights_heading = "## 核心发现"
+        summary_prompt = "(1-2句中文摘要)"
+        insights_prompt = "(3-5条关键发现，用破折号列表)"
+        lang_instruction = "请用中文总结以下内容。输出格式必须是中文。"
+    else:
+        summary_heading = "## Summary"
+        insights_heading = "## Core insights"
+        summary_prompt = "(1-2 sentence summary)"
+        insights_prompt = "(3-5 bullet points of key insights)"
+        lang_instruction = "Analyze this content and produce exactly two sections:"
 
-## Core insights
-(3-5 bullet points of key insights)
+    prompt = f"""{lang_instruction}
+
+{summary_heading}
+{summary_prompt}
+
+{insights_heading}
+{insights_prompt}
 
 CONTENT:
 {content}
@@ -227,9 +244,9 @@ Output ONLY valid JSON matching this schema:
     if structured is not None and isinstance(structured, InsightOutput):
         parts = []
         if structured.summary:
-            parts.append(f"## Summary\n{structured.summary}")
+            parts.append(f"{summary_heading}\n{structured.summary}")
         if structured.core_insights:
-            parts.append("## Core insights\n" + "\n".join(f"- {i}" for i in structured.core_insights))
+            parts.append(insights_heading + "\n" + "\n".join(f"- {i}" for i in structured.core_insights))
         return "\n\n".join(parts)
 
     # Fallback to raw text generate
@@ -325,14 +342,17 @@ def _generate_concept_template(
     if plan.moc_targets:
         links = "\n".join(f"- [[{moc}]] (MoC)" for moc in plan.moc_targets)
 
+    name_escaped = escape_yaml(name)
+    source_note_escaped = escape_yaml(source_note_name)
+
     return f"""---
-title: "{name}"
+title: "{name_escaped}"
 created: {today}
 type: concept
 status: draft
 tags: []
 sources:
-  - "[[{source_note_name}]]"
+  - "[[{source_note_escaped}]]"
 ---
 
 # {name}

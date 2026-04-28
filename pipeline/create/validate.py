@@ -46,7 +46,7 @@ _REQUIRED_SECTIONS: dict[str, list[str]] = {
 _MIN_BODY_LENGTHS = {
     "entry": 200,
     "concept": 150,
-    "source": 200,
+    "source": 100,  # Twitter threads and short posts are often <200 chars
 }
 
 # Source body patterns that indicate just a link instead of full content
