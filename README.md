@@ -1,82 +1,290 @@
 # Obsidian LLM Wiki
 
-An LLM-powered knowledge management pipeline that transforms raw web content into a structured, interconnected Obsidian wiki. Inspired by Andrej Karpathy's "LLM Knowledge Bases" approach.
+An LLM-assisted knowledge pipeline that turns raw URLs and markdown clippings into a structured Obsidian wiki: Source notes, Entry notes, evergreen Concepts, Maps of Content, typed graph edges, indexes, and reviewable provenance.
 
-**How it works:** Drop URLs into your vault, run one command. The 3-stage pipeline extracts content, plans note structure with semantic concept matching, and creates interlinked Source → Entry → Concept → MoC notes. Supports English and Chinese natively.
+The design rule is simple: **Python owns facts and files; LLMs only provide bounded semantic judgment.** That keeps the system inspectable, testable, and safe enough to run as an unattended vault maintenance tool.
 
+```text
+01-Raw/*.url or 02-Clippings/*.md
+        ↓
+pipeline ingest
+        ↓
+04-Wiki/{sources, entries, concepts, mocs}
+        ↓
+compile / lint / graph-doctor / migrate / query
+        ↓
+06-Config/{wiki-index.md, tag-registry.md, edges.tsv, schema-version.json}
 ```
-URLs in 01-Raw/  →  pipeline ingest  →  04-Wiki/{sources, entries, concepts, mocs}
-                                              ↓
-                                       Auto-updates:
-                                       wiki-index.md, tag-registry.md,
-                                       edges.tsv, log.md
-```
 
-## Quick Start
+## Quick start
 
 ```bash
 git clone https://github.com/0xminion/obsidian-llm-wiki.git
 cd obsidian-llm-wiki
-pip install -e .
+python3 -m pip install -e .
+
 pipeline init ~/MyVault
-# Edit API keys:
 nano ~/MyVault/Meta/Scripts/.env
 ```
 
-## Usage
+Add a URL and run the pipeline:
 
 ```bash
-# Drop a URL (.url files in plain text or Windows InternetShortcut format both work)
 echo 'https://example.com/article' > ~/MyVault/01-Raw/my-source.url
-
-# Run the pipeline — that's it (3.8 min for 18 URLs with Ollama local inference)
 pipeline ingest ~/MyVault
-# Or, without installing the console script:
+```
+
+Without installing the console script:
+
+```bash
 python3 -m pipeline.cli ingest ~/MyVault
 ```
 
-### LLM Provider Configuration
+## Configuration
 
-Choose your provider via environment variables (in `~/MyVault/Meta/Scripts/.env`):
+Runtime config lives in `~/MyVault/Meta/Scripts/.env`.
 
 ```bash
-# Option 1: Ollama (default) — fast, private, local
+# Default local/direct LLM path
 LLM_PROVIDER=ollama
 OLLAMA_HOST=http://localhost:11434
-OLLAMA_INSIGHT_MODEL=minimax-m2.7:cloud   # insights + filenames
+OLLAMA_INSIGHT_MODEL=minimax-m2.7:cloud
 OLLAMA_FILENAME_MODEL=minimax-m2.7:cloud
 
-# Option 2: OpenRouter — access 200+ models (Claude, GPT, Qwen, etc.)
+# Cloud LLM fallback
 LLM_PROVIDER=openrouter
 LLM_MODEL=anthropic/claude-sonnet-4
-LLM_API_KEY=sk-openrouter-...
+LLM_API_KEY=***
 
-# Option 3: Hermes — full agent with tool access (slower, subprocess)
+# Agent fallback for complex query mode
 LLM_PROVIDER=hermes
 AGENT_CMD=hermes
+
+# Optional extraction APIs
+TRANSCRIPT_API_KEY=***
+SUPADATA_API_KEY=***
+ASSEMBLYAI_API_KEY=***
+
+PARALLEL=3
+USE_QMD_MCP=true
+QMD_MCP_URL=http://localhost:8181
 ```
 
-`pipeline ingest` scans `01-Raw/*.url` and `02-Clippings/*.md` as its inbox. Files in `02-Clippings/` are assumed already extracted by defuddle or other web-clipper tools — they bypass Stage 1 extraction and go straight to Stage 2 planning + Stage 3 creation.
+Set `USE_QMD_MCP=false` to force local keyword fallback and avoid constructing a QMD client.
 
-### Pipeline Commands
+## Command surface
 
 ```bash
-pipeline ingest ~/MyVault           # full pipeline: extract → plan → create
-pipeline ingest --parallel 5        # more parallel workers
-pipeline ingest --dry-run           # preview without executing
-pipeline ingest --review            # stage plans for human review
-pipeline ingest --resume            # continue from reviewed plans
-pipeline compile ~/MyVault          # semantic cross-linking, MoC rebuild, edges
-pipeline lint ~/MyVault             # 15 health checks + synonym detection
-pipeline lint --fix                 # auto-fix safe issues
-pipeline validate ~/MyVault         # post-write quality gate
-pipeline validate --fix             # auto-repair missing sections
-pipeline reindex ~/MyVault          # rebuild wiki-index.md
-pipeline stats ~/MyVault            # vault dashboard
-pipeline tags ~/MyVault             # rebuild tag registry
-pipeline query --ask "question"     # Q&A against your vault (Hermes agent)
-pipeline query --ask "question" --fast  # fast direct LLM query (sub-5s)
+pipeline ingest ~/MyVault                  # extract → plan → create
+pipeline ingest ~/MyVault --parallel 5     # tune Stage 3 workers
+pipeline ingest ~/MyVault --dry-run        # preview without writes
+pipeline ingest ~/MyVault --review         # stage plans for human approval
+pipeline ingest ~/MyVault --resume         # continue from reviewed plans
+
+pipeline approve ~/MyVault --json          # approve staged review queue atomically
+pipeline reject ~/MyVault --json           # reject staged review queue
+pipeline review-status ~/MyVault --json    # inspect pending review rows
+
+pipeline compile ~/MyVault                 # semantic cross-links, merges, MoCs, edges, index
+pipeline lint ~/MyVault                    # vault health checks
+pipeline lint ~/MyVault --fix              # safe auto-fixes
+pipeline validate ~/MyVault                # post-write quality gate
+pipeline validate ~/MyVault --fix          # repair missing safe sections
+
+pipeline doctor ~/MyVault --json           # first-run + config diagnostics
+pipeline config-doctor ~/MyVault --json    # redacted config diagnostics alias
+pipeline graph-doctor ~/MyVault --json     # unresolved links, stale edges, duplicate stems
+pipeline migrate ~/MyVault --yes --json    # idempotent schema/assets migrations
+pipeline release-check --json              # package/release metadata hygiene
+
+pipeline fixture ~/MyVault --overwrite     # deterministic demo corpus
+pipeline fixture ~/MyVault --adversarial --overwrite --json
+pipeline telemetry ~/MyVault --json        # recent redacted pipeline events
+pipeline stats ~/MyVault --json            # vault dashboard
+pipeline reindex ~/MyVault                 # rebuild wiki-index.md
+pipeline tags ~/MyVault                    # rebuild tag-registry.md
+pipeline query ~/MyVault --ask "question" # Hermes-agent Q&A
+pipeline query ~/MyVault --ask "question" --fast  # direct LLM Q&A
+pipeline setup-qmd ~/MyVault               # install/configure QMD helper
+pipeline setup-hooks ~/MyVault             # install vault git hooks
 ```
+
+## How it works
+
+### Stage 1: Extract
+
+Pure Python routing and extraction. No LLM is used here.
+
+| Source | Primary path | Fallback path |
+|---|---|---|
+| Web / X / PDFs | defuddle / liteparse | curl extraction → archive.org → camoufox where available |
+| YouTube | transcript API | Supadata → audio download → faster-whisper |
+| Podcasts | AssemblyAI | local whisper |
+| Markdown clippings | direct read from `02-Clippings/` | none; Stage 1 is bypassed |
+
+Network boundaries are hardened:
+
+- URL parsing rejects unsupported schemes, credentials, localhost, private/reserved/link-local/multicast/unspecified targets, and weird IPv4 encodings.
+- curl requests pin DNS via `--resolve` and **fail closed** if a safe public pin cannot be established.
+- Secret-bearing headers are sent through curl config on stdin, not argv.
+- YouTube fetches are canonicalized after hostname allowlist validation; raw user URLs are not passed through to `yt-dlp`.
+
+### Stage 2: Plan
+
+Planning decides what files should exist and how they should connect.
+
+1. Content and URL deduplication via SQLite-backed store.
+2. Concept matching through QMD MCP when available; keyword fallback otherwise.
+3. Deterministic heuristics for obvious plans.
+4. Direct LLM call only for uncertain cases.
+5. Optional human review queue with `--review` / `approve` / `reject`.
+
+### Stage 3: Create
+
+Creation is template-first. Python builds paths, frontmatter, wikilinks, concept stubs, MoC membership, and collision-safe writes. The LLM is only asked for bounded summaries/insights.
+
+Safety properties:
+
+- All note stems go through `safe_note_stem()`.
+- Every constructed path is containment-checked before write.
+- Source and entry notes use distinct stems (`foo` and `foo-source`) so Obsidian stem resolution stays unambiguous.
+- YAML is emitted with safe builders; wikilinks in YAML are quoted.
+- Batch validation runs before writes are considered successful.
+
+### Compile pass
+
+`pipeline compile` combines semantic work with deterministic rebuilds.
+
+Semantic operations:
+
+- missing wikilink suggestions from embeddings + LLM validation;
+- near-duplicate concept merge proposals;
+- MoC synthesis from related notes;
+- `semantic_status` and `semantic_degraded_reason` in `CompileResult` so empty/failed LLM responses are not falsely reported as success.
+
+Deterministic operations:
+
+- rebuild `wiki-index.md`;
+- rebuild `edges.tsv` from entries, sources, concepts, and MoCs;
+- rewrite duplicate report, including clean “0 duplicates” state;
+- clear edge cache after direct edge rewrites.
+
+Semantic pair generation is blocked by tags, title tokens, and bounded fallback windows before expensive similarity/LLM work. The common path avoids full O(N²) scans.
+
+## Vault structure
+
+```text
+01-Raw/                 .url inbox
+02-Clippings/           pre-extracted markdown inbox
+03-Queries/             query files for Q&A
+04-Wiki/
+├── sources/            original extracted content
+├── entries/            summaries and insights
+├── concepts/           evergreen atomic notes
+└── mocs/               maps of content
+05-Outputs/             Q&A answers
+06-Config/
+├── wiki-index.md
+├── tag-registry.md
+├── edges.tsv
+├── log.md
+└── schema-version.json
+07-WIP/                 user drafts; pipeline must not touch
+08-Archive-Raw/         processed URL inbox
+09-Archive-Queries/     processed questions
+10-Archive-Clippings/   processed markdown clippings
+Meta/
+├── Scripts/            .env, logs, cache.db, telemetry
+├── prompts/            runtime prompt overrides seeded from package assets
+└── Templates/          runtime note templates seeded from package assets
+```
+
+## Graph and migrations
+
+`pipeline graph-doctor` checks graph integrity without mutating vault state:
+
+- unresolved wikilinks;
+- stale `edges.tsv` rows;
+- malformed edge rows;
+- duplicate Obsidian stems across note collections.
+
+`pipeline migrate` is the versioned vault migration entry point. Current schema version is `1`; it backfills vault structure/assets and writes `06-Config/schema-version.json`.
+
+## Semantic search and QMD
+
+QMD MCP is used for semantic concept retrieval and compile embeddings when available. Query modes are explicit so behavior is honest:
+
+- `auto` — vector semantic search, then lexical fallback;
+- `vec` — vector only;
+- `lex` — BM25/keyword only.
+
+```bash
+pipeline setup-qmd ~/MyVault
+qmd query "prediction markets" --json -n 5 -c concepts
+```
+
+If QMD is unavailable or disabled, the pipeline falls back to local keyword matching. If QMD returns embeddings during compile, those vectors are consumed directly instead of discarding semantic signal.
+
+## Agentic skill installation
+
+This repository includes a Hermes-compatible ingestion skill at:
+
+```text
+skills/obsidian-ingest.md
+```
+
+Install it into a Hermes profile by copying it as `SKILL.md` inside that profile’s skills directory:
+
+```bash
+# Replace coder with your active Hermes profile if different.
+mkdir -p ~/.hermes/profiles/coder/skills/obsidian/obsidian-ingest
+cp skills/obsidian-ingest.md \
+  ~/.hermes/profiles/coder/skills/obsidian/obsidian-ingest/SKILL.md
+```
+
+Then restart/reload the agent session and ask it to list skills. Trigger phrases include: `obsidian`, `vault`, `clip`, `ingest`, `save to obsidian`, `wiki`, `knowledge base`, URLs, PDFs, YouTube links, and “read later”.
+
+The skill’s job is operational, not magical: write inbox files, run `pipeline ingest`, run health gates, and report exact vault paths.
+
+## Critical rules
+
+1. Never touch `07-WIP/`.
+2. Never trust titles, LLM filename suggestions, review DB paths, or note aliases as filesystem paths.
+3. Every note write must be under the expected vault collection directory after path resolution.
+4. Never overwrite existing notes without collision handling or an explicit migration path.
+5. Source and entry stems must be distinct to avoid ambiguous Obsidian links.
+6. Chinese content stays Chinese in generated body sections.
+7. Tags are topic-specific English; avoid platform/source labels.
+8. Empty LLM output during semantic work is degraded/failure, not success.
+9. Secret values must not appear in argv, telemetry, docs, logs, or summaries.
+
+## Testing and release gates
+
+Current verified baseline: **852 passing tests**.
+
+```bash
+ruff check .
+pyflakes pipeline tests
+pytest -q
+```
+
+Installed-wheel smoke test:
+
+```bash
+rm -rf /tmp/obsidian-llm-wiki-wheel /tmp/obsidian-llm-wiki-venv /tmp/obsidian-llm-wiki-vault
+python3 -m pip wheel . -w /tmp/obsidian-llm-wiki-wheel --no-deps
+python3 -m venv /tmp/obsidian-llm-wiki-venv
+/tmp/obsidian-llm-wiki-venv/bin/pip install /tmp/obsidian-llm-wiki-wheel/*.whl
+/tmp/obsidian-llm-wiki-venv/bin/pipeline init /tmp/obsidian-llm-wiki-vault
+/tmp/obsidian-llm-wiki-venv/bin/pipeline fixture /tmp/obsidian-llm-wiki-vault --adversarial --overwrite --json
+/tmp/obsidian-llm-wiki-venv/bin/pipeline graph-doctor /tmp/obsidian-llm-wiki-vault --json
+/tmp/obsidian-llm-wiki-venv/bin/pipeline migrate /tmp/obsidian-llm-wiki-vault --yes --json
+```
+
+Expected seeded asset counts after `pipeline init`:
+
+- prompts: `8`
+- templates: `9`
 
 ## Documentation
 
@@ -86,298 +294,5 @@ pipeline query --ask "question" --fast  # fast direct LLM query (sub-5s)
 - [Changelog](docs/release/CHANGELOG.md)
 - [Release process](docs/release/RELEASE.md)
 - [Patch notes](docs/release/PATCH_NOTES.md)
-- [Latest audit](docs/audits/AUDIT_2026-04-24.md)
+- [Audits](docs/audits/)
 - [Code reviews](docs/reviews/)
-
-## How It Works
-
-### Stage 1: Extract
-
-Pure Python extraction — no LLM involved. Routes URLs to type-specific extractors with hardened URL validation on each network boundary and fallback chains:
-
-| Source | Primary | Fallback |
-|--------|---------|----------|
-| Web | defuddle | curl extraction |
-| X/Twitter | defuddle | curl extraction |
-| YouTube | TranscriptAPI | Supadata → faster-whisper |
-| Podcasts | AssemblyAI | whisper |
-
-Features: retry with exponential backoff, SSRF-resistant URL validation, content quality validation, SQLite dedup store, dead letter queue for failures, and loud failure when every extraction fails.
-
-### Stage 2: Plan
-
-Single LLM agent batches planning for all extracted sources. Before the agent runs:
-
-1. **Dedup check** — Jaccard similarity against existing vault sources
-2. **Semantic concept search** — QMD MCP (HTTP daemon on localhost:8181) finds related concepts via hybrid semantic+keyword search
-3. **Tag vocabulary injection** — existing tags passed to agent for reuse
-
-The agent produces creation plans: title, language (EN/ZH), template, tags, concept targets, MoC assignments.
-
-### Stage 3: Create
-
-Default mode writes deterministic templates, then uses the configured LLM only for bounded insights. `--agent` enables the heavier legacy batch-agent creation path.
-
-**Post-creation validation (per-batch):**
-- Frontmatter completeness (title, source, date, status, template, tags)
-- Required sections present per template type
-- Stub/placeholder detection (20+ patterns)
-- Minimum body length (200 chars for entries)
-- Banned tag detection
-
-**Auto-repair:** Missing sections get content derived from the file's existing body — never boilerplate.
-
-### Compile Pass
-
-Runs after ingest or manually via `pipeline compile`:
-
-**Semantic operations (direct LLM, no subprocess):**
-1. **Cross-link analysis** — embedding similarity + LLM validation adds missing `[[wikilinks]]`
-2. **Concept merging** — detects near-duplicates, merges with LLM approval, updates all references
-3. **MoC rebuild** — resynthesizes topic hubs from related notes via embeddings
-
-**Deterministic operations:**
-4. **Wiki index rebuild** — deterministic scan of all entries, concepts, MoCs
-5. **Typed edges** — `edges.tsv` from wikilinks, sources, tags (9 relationship types)
-6. **Duplicate detection** — title similarity report for human review
-7. **Structured metrics report + log entry**
-
-### Lint System
-
-15 health checks; graph-sensitive checks rebuild from disk to avoid stale reports:
-
-| Check | What it catches |
-|-------|----------------|
-| Orphaned notes | Notes with zero incoming links |
-| Unreviewed entries | Entries never human-reviewed |
-| Stale reviews | Reviews pending > 14 days |
-| Broken wikilinks | Links to non-existent notes |
-| Empty notes | Body too short |
-| Concept structure | Missing required sections |
-| Entry template | Wrong sections for template type |
-| Orphaned concepts | Concepts not referenced by entries |
-| Wiki index drift | Index counts vs actual files |
-| Edges consistency | edges.tsv references to missing notes |
-| Stubs | Placeholder content detected |
-| Tag quality | Banned tags, too-short tags, synonyms |
-| Frontmatter validity | YAML parse errors |
-| Required sections | Missing mandatory sections |
-| Markdown format | Structural issues |
-
-## Vault Structure
-
-```
-01-Raw/              ← drop .url inbox items here (Stage 1 extracted)
-02-Clippings/        ← drop defuddle'd markdown clippings (bypass Stage 1, auto-ingested)
-03-Queries/          ← drop .md files with questions for Q&A
-04-Wiki/
-├── sources/         ← full original content
-├── entries/         ← summaries + insights
-├── concepts/        ← shared vocabulary (evergreen)
-└── mocs/            ← topic hubs
-05-Outputs/          ← Q&A responses
-06-Config/           ← wiki-index, edges.tsv, tag-registry, log.md
-07-WIP/              ← your drafts (untouched by automation)
-08-Archive-Raw/      ← processed inbox items
-09-Archive-Queries/  ← answered queries
-10-Archive-Clippings/ ← processed clippings
-Meta/
-├── Scripts/         ← pipeline code, logs, cache
-├── prompts/         ← runtime prompt templates seeded from packaged assets
-└── Templates/       ← runtime note templates seeded from packaged assets
-```
-
-## Note Structures
-
-**Entries** (English):
-```
-Summary → Core insights → Other takeaways → Diagrams → Open questions → Linked concepts
-```
-
-**Entries** (Chinese):
-```
-摘要 → 核心发现 → 其他要点 → 图表 → 开放问题 → 关联概念
-```
-
-**Other entry templates:** technical, comparison, procedural.
-
-**Concepts** (evergreen, one idea per note):
-```
-Core concept → Context (flowing prose) → Links
-```
-
-**MoCs** — topic hubs with synthesized summaries.
-
-## Typed Relationships
-
-Relationships in `06-Config/edges.tsv` (4-column TSV):
-
-```
-source	target	type	description
-```
-
-Types: `extends`, `contradicts`, `supports`, `supersedes`, `tested_by`, `depends_on`, `inspired_by`, `part_of`, `relates_to`
-
-Built automatically during `pipeline compile` from wikilinks, concept sources, shared concept tags, and MoC membership. Shared-tag relationships are emitted as symmetric `relates_to` edges, not directional claims.
-
-## Semantic Search
-
-Uses [QMD MCP](https://github.com/tobi/qmd) running as an HTTP daemon on `localhost:8181` for semantic concept matching. QMD handles embedding generation, indexing, and keyword/vector search internally. Falls back to local keyword search if QMD is unavailable.
-
-QMD query modes are explicit in code so performance claims stay honest:
-
-- `auto` — default pipeline mode: try vector semantic search, then BM25 keyword fallback.
-- `vec` — vector semantic only; useful when meaning matters more than latency.
-- `lex` — BM25 keyword only; used by fast-path tests and operational checks where sub-second latency is the contract.
-
-Legacy Ollama embedding (`qwen3-embedding:0.6b`) is still supported for other operations (e.g., compile pass) but concept search now prefers QMD MCP.
-
-`pipeline query` uses the wiki index plus retrieved snippets from relevant entries, sources, concepts, and MoCs before asking the agent.
-
-```bash
-# One-time setup
-python3 -m pipeline.cli setup-qmd
-
-# Manual queries
-qmd query "prediction markets" --json -n 5 -c concepts
-```
-
-## Critical Rules
-
-1. Never touch `07-WIP/`
-2. Never overwrite existing notes — collision detection appends `-1`, `-2`, etc.
-3. No stubs — every section must have real content at creation
-4. Tags: topic-specific English only, never platform names (`x.com`, `tweet`, `source`)
-5. Chinese body stays Chinese in all 04-Wiki notes
-6. YAML wikilinks must be quoted: `source: "[[note]]"`
-7. File names match content language (Chinese titles → Chinese filenames)
-8. Never use URL slugs as filenames
-
-## Configuration
-
-API keys in `~/MyVault/Meta/Scripts/.env`:
-
-```bash
-# YouTube transcripts
-TRANSCRIPT_API_KEY=***
-SUPADATA_API_KEY=***
-
-# Podcast transcription
-ASSEMBLYAI_API_KEY=***
-
-# Defaults
-VAULT_PATH=$HOME/MyVault
-AGENT_CMD=hermes
-PARALLEL=3
-```
-
-## Testing
-
-```bash
-python3 -m pytest tests/ -v
-```
-
-820 tests covering: extraction, planning, creation, validation, lint, compile, vault operations, models, config, security regressions, adversarial parsers, and integration.
-
-## Clippings Workflow (02-Clippings)
-
-For content already extracted by other tools (Readwise, Obsidian Web Clipper, etc.):
-
-```bash
-# Drop markdown clippings here
-cp my-article.md ~/MyVault/02-Clippings/
-
-# Run pipeline — skips Stage 1 extraction, goes straight to Plan → Create
-pipeline ingest ~/MyVault
-```
-
-**Key differences from URL flow:**
-- Content already extracted (no HTTP calls)
-- `_strip_quotes()` helper for titles with wrapping quotes
-- Source URL regex strips trailing punctuation (prevents `url:` field contamination)
-- `\b` word boundaries for type detection (prevents `fakeyoutube.com` matching as YouTube)
-- Skips `source.save()` — no orphaned `.json` sidecars
-- `collect_clipping_files()` called directly (no `_collect_clipping_files` wrapper)
-- `vault.py` imports: `json`, `hashlib`, `logging` — watch for F821 (undefined name) lint
-
-## Recommended Workflow
-
-**Daily:** Drop URLs in `01-Raw/` or clippings in `02-Clippings/`, run `pipeline ingest ~/MyVault`
-
-**Weekly:** `pipeline compile` → review entries → `pipeline lint --fix`
-
-**Monthly:** Check `pipeline stats` for growth trends
-
-## Testing
-
-```bash
-python3 -m pytest tests/ -v
-```
-
-**820 tests** covering: extraction, planning, creation, validation, lint, compile (semantic + deterministic), LLM client (multi-provider), vault operations, models, config, security regressions, adversarial parsers, and integration.
-
-## Architecture
-
-Python-first with a unified LLM client supporting multiple providers:
-
-```
-pipeline/
-├── cli/                # Typer CLI package
-│   ├── _helpers.py     # Shared: PipelineLock, config, logging, collectors
-│   ├── ingest.py       # Main 3-stage pipeline command
-│   ├── compile_cmd.py  # compile command
-│   ├── review_cmd.py   # approve, reject, review-status
-│   ├── quality.py      # lint, validate, doctor, release-check
-│   └── manage.py       # init, stats, reindex, tags, query, dlq, etc.
-├── compile/            # Compile pass package
-│   ├── core.py         # Orchestration, IncrementalCompiler, CircuitBreaker
-│   ├── semantic.py     # LLM: cross-link, concept merge, MoC rebuild
-│   ├── structural.py   # Deterministic: wiki index, edges, duplicates
-│   └── watch.py        # File-system watcher for incremental compile
-├── lint/               # Lint package
-│   ├── checks.py       # 17 check functions
-│   ├── fixes.py        # Auto-fix: frontmatter, markdown, banned tags
-│   ├── models.py       # Severity, LintIssue, LintResult
-│   └── runner.py       # LintChecker class, run_lint, run_validate
-├── create/             # Stage 3 creation
-│   ├── templates.py    # Template mode (deterministic + LLM insights)
-│   ├── orchestrator.py # Batch coordination, ThreadPoolExecutor
-│   ├── validate.py     # 15 validation checks + auto-repair
-│   ├── prompts.py      # Prompt construction
-│   └── agent.py        # DEPRECATED: Hermes subprocess creation
-├── extractors/         # Type-specific extractors
-│   ├── web.py          # defuddle → curl → archive.org → camoufox
-│   ├── youtube.py      # TranscriptAPI → supadata → whisper
-│   ├── podcast.py      # AssemblyAI → whisper
-│   └── _shared.py      # Content quality gate, title extraction
-├── llm_client.py       # Unified LLM client (Ollama/OpenRouter/Hermes)
-├── extract.py          # Stage 1: URL routing, retry, manifest
-├── plan.py             # Stage 2: dedup, concept search, planning
-├── log.py              # Structured logging, correlation IDs, stage_timer
-├── language.py         # Language detection (CJK ratio, script analysis)
-├── qmd.py              # Semantic search via QMD MCP
-├── vault.py            # File ops, collision resolution, archiving
-├── store.py            # SQLite content store + vault cache
-├── config.py           # Environment + vault path resolution
-├── models.py           # Data models (Manifest, Plan, Edge, etc.)
-├── utils.py            # Filename gen, CircuitBreaker, shared helpers
-└── assets/             # Packaged prompt/note-template assets
-```
-
-~15,800 lines of Python, 820 tests, unified LLM client with 3 providers, 0 shell scripts in the critical path.
-
-## Agentic Usage
-
-**For AI agents:** Load the `obsidian-ingest` skill for canonical ingestion commands.
-
-**Trigger phrases:** "obsidian", "vault", "clip", "ingest", "save to obsidian", "wiki", "knowledge base", or any URL pattern.
-
-**Skill location:** `~/.hermes/skills/obsidian-ingest/SKILL.md`
-
-**Key commands for agents:**
-- `pipeline ingest ~/MyVault` — full pipeline
-- `pipeline ingest --parallel 3 ~/MyVault` — parallel workers
-- `pipeline ingest --dry-run ~/MyVault` — preview mode
-- `pipeline compile ~/MyVault` — cross-link and index rebuild
-- `pipeline lint --fix ~/MyVault` — auto-fix vault issues
-- `pipeline query --ask "question" ~/MyVault` — Q&A against vault
