@@ -278,8 +278,41 @@ def _strip_leading_teasers(content: str) -> str:
     return "\n".join(result).strip()
 
 
+def _try_defuddle_direct(url: str, timeout: int = 45) -> str:
+    """Try defuddle directly against a URL (uses defuddle's own HTTP fetch).
+
+    This works for sites like X/Twitter where defuddle's internal fetch
+    handles cookies/session better than a bare curl download.
+    """
+    if not _validate_url(url):
+        log.warning("Blocked potentially unsafe URL: %s", url[:80])
+        return ""
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".md", delete=False) as out:
+            tmpfile = out.name
+        try:
+            result = _run(
+                ["defuddle", "parse", "--markdown", url, "-o", tmpfile],
+                timeout=timeout,
+            )
+            if result.returncode == 0 and os.path.exists(tmpfile) and os.path.getsize(tmpfile) > 0:
+                text = Path(tmpfile).read_text(encoding="utf-8", errors="replace")
+                if not _is_challenge_page(text) and len(text.strip()) > 50:
+                    return _strip_leading_teasers(text)
+        finally:
+            if os.path.exists(tmpfile):
+                os.unlink(tmpfile)
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        pass
+    return ""
+
+
 def _try_defuddle(url: str, timeout: int = 45) -> str:
     """Try defuddle against safely downloaded HTML, not a live URL."""
+    # First: try defuddle direct (better for X/Twitter and other auth walls)
+    direct = _try_defuddle_direct(url, timeout)
+    if direct:
+        return direct
     if not _validate_url(url):
         log.warning("Blocked potentially unsafe URL: %s", url[:80])
         return ""
