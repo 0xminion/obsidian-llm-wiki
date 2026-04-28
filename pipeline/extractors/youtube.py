@@ -16,10 +16,12 @@ from urllib.parse import quote
 from pipeline.config import Config
 from pipeline.models import ExtractedSource, SourceType
 from pipeline.extractors._shared import (
+    _canonical_youtube_url,
     _curl_get,
     _curl_post_json,
     _run,
     _extract_youtube_video_id,
+    _is_youtube_url,
     transcribe_with_whisper,
     ExtractionError,
 )
@@ -33,17 +35,20 @@ def extract_youtube(url: str, cfg: Config) -> ExtractedSource:
     Chain: TranscriptAPI → Supadata → yt-dlp + faster-whisper.
     FAILS LOUDLY if no transcript — never metadata-only.
     """
+    if not _is_youtube_url(url):
+        raise ExtractionError(f"Unsafe or non-YouTube URL: {url}")
     video_id = _extract_youtube_video_id(url)
     timeout = cfg.extract_timeout
 
     if not video_id:
         raise ExtractionError(f"Could not extract video ID from URL: {url}")
+    canonical_url = _canonical_youtube_url(video_id)
 
     # Fetch metadata from YouTube oEmbed
     title = ""
     author = ""
     meta_json = _curl_get(
-        f"https://www.youtube.com/oembed?url={quote(url, safe='')}&format=json",
+        f"https://www.youtube.com/oembed?url={quote(canonical_url, safe='')}&format=json",
         timeout=timeout,
     )
     if meta_json:
@@ -55,7 +60,7 @@ def extract_youtube(url: str, cfg: Config) -> ExtractedSource:
             pass
 
     # Try transcript extraction chain
-    transcript = _try_youtube_transcript(url, video_id, cfg)
+    transcript = _try_youtube_transcript(canonical_url, video_id, cfg)
 
     if not transcript or len(transcript) < 50:
         log.error("YouTube transcript extraction failed for %s", video_id)
@@ -69,7 +74,7 @@ def extract_youtube(url: str, cfg: Config) -> ExtractedSource:
         content = transcript
 
     return ExtractedSource(
-        url=url,
+        url=canonical_url,
         title=title or url,
         content=content,
         type=SourceType.YOUTUBE,
@@ -80,13 +85,12 @@ def extract_youtube(url: str, cfg: Config) -> ExtractedSource:
 def _try_youtube_transcript(url: str, video_id: str, cfg: Config) -> str:
     """Try TranscriptAPI → Supadata → Whisper fallback chain."""
     timeout = cfg.extract_timeout
-
-    # 1) TranscriptAPI (primary) — MUST pass full URL
+    canonical_url = _canonical_youtube_url(video_id)
     if cfg.transcript_api_key:
         try:
             api_url = (
                 f"https://transcriptapi.com/api/v2/youtube/transcript"
-                f"?video_url={quote(url, safe='')}&format=text&include_timestamp=true&send_metadata=true"
+                f"?video_url={quote(canonical_url, safe='')}&format=text&include_timestamp=true&send_metadata=true"
             )
             resp = _curl_get(
                 api_url,
@@ -107,7 +111,7 @@ def _try_youtube_transcript(url: str, video_id: str, cfg: Config) -> str:
         try:
             resp = _curl_post_json(
                 "https://api.supadata.ai/v1/youtube/transcript",
-                data={"video_url": f"https://www.youtube.com/watch?v={video_id}",
+                data={"video_url": canonical_url,
                       "format": "text"},
                 headers={"x-api-key": cfg.supadata_api_key},
                 timeout=timeout,
@@ -129,7 +133,7 @@ def _try_youtube_transcript(url: str, video_id: str, cfg: Config) -> str:
         try:
             dl = _run(
                 ["yt-dlp", "-x", "--audio-format", "mp3",
-                 "--max-filesize", "200M", "-o", tmp_audio, url],
+                 "--max-filesize", "200M", "-o", tmp_audio, canonical_url],
                 timeout=120,
             )
             if dl.returncode != 0 or not os.path.exists(tmp_audio):

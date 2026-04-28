@@ -300,6 +300,10 @@ def query(
                 )
                 if result.returncode == 0:
                     answer = result.stdout.strip()
+                    if not answer:
+                        had_failures = True
+                        typer.echo(f"Agent returned empty response for {qname}", err=True)
+                        continue
                     typer.echo(f"\n--- Answer ({qname}) ---\n")
                     typer.echo(answer)
                     out_file = _collision_safe_path(outputs_dir / f"{qname}.md")
@@ -332,17 +336,62 @@ def query(
 def fixture_cmd(
     vault: Path = typer.Argument(..., help="Vault path to populate"),
     overwrite: bool = typer.Option(False, "--overwrite", help="Overwrite existing fixture files"),
+    adversarial: bool = typer.Option(False, "--adversarial", help="Create edge-case golden corpus fixture"),
     json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON"),
 ):
     """Create a deterministic example vault for demos and snapshot tests."""
-    from pipeline.fixtures import create_example_vault
+    from pipeline.fixtures import create_adversarial_vault, create_example_vault
 
-    summary = create_example_vault(vault, overwrite=overwrite)
+    if adversarial:
+        summary = create_adversarial_vault(vault, overwrite=overwrite)
+    else:
+        summary = create_example_vault(vault, overwrite=overwrite)
     if json_output:
         typer.echo(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True))
     else:
         typer.echo(f"Fixture vault ready: {vault}")
         typer.echo(f"  Files written: {summary['files_written']}")
+
+
+@app.command(name="graph-doctor")
+def graph_doctor_cmd(
+    vault: Path = typer.Argument(None, help="Vault path (default: ~/MyVault)"),
+    json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON"),
+):
+    """Check graph integrity: unresolved links, stale edges, duplicate stems."""
+    from pipeline.graph_doctor import collect_graph_diagnostics
+
+    cfg = _load_cfg(vault)
+    report = collect_graph_diagnostics(cfg)
+    if json_output:
+        typer.echo(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
+    else:
+        typer.echo(f"Graph doctor: {'ok' if report['ok'] else 'issues found'}")
+        typer.echo(f"  Notes: {report['notes']}")
+        typer.echo(f"  Unresolved links: {len(report['unresolved_links'])}")
+        typer.echo(f"  Stale edges: {len(report['stale_edges'])}")
+        typer.echo(f"  Duplicate stems: {len(report['duplicate_stems'])}")
+    if not report["ok"]:
+        raise typer.Exit(code=1)
+
+
+@app.command(name="migrate")
+def migrate_cmd(
+    vault: Path = typer.Argument(None, help="Vault path (default: ~/MyVault)"),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Run non-interactively"),
+    json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON"),
+):
+    """Apply idempotent vault schema/assets migrations."""
+    from pipeline.migrations import migrate_vault_schema
+
+    cfg = _load_cfg(vault)
+    report = migrate_vault_schema(cfg, yes=yes)
+    if json_output:
+        typer.echo(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
+    else:
+        typer.echo(f"Vault schema version: {report['schema_version']}")
+        for action in report["actions"]:
+            typer.echo(f"  + {action}")
 
 
 @app.command(name="telemetry")

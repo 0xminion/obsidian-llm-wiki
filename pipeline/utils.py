@@ -392,6 +392,11 @@ _CN_PUNCT_RE = re.compile(r"[？?！!，,。.、]")
 _CN_QUOTES_RE = re.compile(r"['\"《》「」（）()]")
 _MULTI_SPACE_RE = re.compile(r"\s+")
 
+# Filename hardening: note stems are identifiers, not paths.
+_PATH_SEP_RE = re.compile(r"[/\\]+")
+_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]+")
+_DOT_SEGMENT_RE = re.compile(r"(?:^|-)\.\.(?:-|$)")
+
 # English title: kebab-case
 _APOSTROPHE_RE = re.compile(r"['']")
 _NON_ALNUM_RE = re.compile(r"[^a-zA-Z0-9]")
@@ -399,32 +404,66 @@ _MULTI_DASH_RE = re.compile(r"-+")
 _TRIM_DASH_RE = re.compile(r"^-+|-+$")
 
 
-def title_to_filename(title: str, max_length: int = 120) -> str:
-    """Convert a title to a safe filename.
+def safe_note_stem(value: str, max_length: int = 120, fallback: str = "untitled") -> str:
+    """Return a vault-safe Obsidian note stem.
 
-    Rules (mirrors common.sh title_to_filename):
-      - Chinese titles → keep Chinese chars, replace punctuation
-      - English titles → kebab-case lowercase
-      - Truncate to max_length (default 120)
+    This is a filesystem boundary. Titles, LLM filename suggestions, MoC names,
+    and review paths are all untrusted inputs; none may carry path semantics.
     """
+    s = str(value or "").strip()
+    s = _CONTROL_RE.sub("-", s)
+    s = _PATH_SEP_RE.sub("-", s)
+    s = re.sub(r"^[a-zA-Z]:", lambda m: m.group(0)[0].lower(), s)
+    s = s.replace(":", "-")
+    s = s.replace(".", "-")
+    s = _CN_PUNCT_RE.sub(" ", s)
+    s = _CN_QUOTES_RE.sub("", s)
+    s = _MULTI_SPACE_RE.sub("-", s)
+    s = re.sub(r"[^a-zA-Z0-9一-鿿_-]+", "-", s)
+    s = _MULTI_DASH_RE.sub("-", s)
+    while _DOT_SEGMENT_RE.search(s):
+        s = _DOT_SEGMENT_RE.sub("-", s)
+        s = _MULTI_DASH_RE.sub("-", s)
+    s = _TRIM_DASH_RE.sub("", s.lower() if not _CJK_RE.search(s) else s)
+    if not s or s in {".", ".."}:
+        s = fallback
+    return s[:max_length].strip("-_") or fallback
+
+
+def assert_path_within(base_dir: Path, target: Path) -> Path:
+    """Resolve *target* and require it to stay under *base_dir*."""
+    base = Path(base_dir).resolve()
+    resolved = Path(target).resolve()
+    if resolved != base and not resolved.is_relative_to(base):
+        raise ValueError(f"Path escapes allowed directory: {target}")
+    return resolved
+
+
+def safe_note_path(base_dir: Path, stem: str, suffix: str = ".md") -> Path:
+    """Build a safe note path under *base_dir* from an untrusted stem."""
+    safe_stem = safe_note_stem(stem)
+    target = Path(base_dir) / f"{safe_stem}{suffix}"
+    assert_path_within(Path(base_dir), target)
+    return target
+
+
+def title_to_filename(title: str, max_length: int = 120) -> str:
+    """Convert a title to a safe Obsidian filename stem."""
     if not title:
         return ""
 
     if _CJK_RE.search(title):
-        # Chinese title: keep Chinese chars, replace specials
         s = _CN_COLON_RE.sub("-", title)
         s = _CN_PUNCT_RE.sub(" ", s)
         s = _CN_QUOTES_RE.sub("", s)
         s = _MULTI_SPACE_RE.sub(" ", s)
-        return s.strip()[:max_length]
     else:
-        # English title: kebab-case
         s = title.lower()
         s = _APOSTROPHE_RE.sub("", s)
         s = _NON_ALNUM_RE.sub("-", s)
         s = _MULTI_DASH_RE.sub("-", s)
         s = _TRIM_DASH_RE.sub("", s)
-        return s[:max_length]
+    return safe_note_stem(s, max_length=max_length)
 
 
 # Module-level cache for LLM-generated filenames
@@ -514,8 +553,10 @@ def smart_filename(title: str, content_preview: str = "", agent_cmd: str = "herm
 
     # Try LLM
     llm_name = _llm_short_filename(title, content_preview)
-    if llm_name and not is_filename_too_long(llm_name):
-        return llm_name
+    if llm_name:
+        llm_name = safe_note_stem(llm_name)
+        if not is_filename_too_long(llm_name):
+            return llm_name
 
     # Fallback: extract first sentence / clause, then truncate
     # Split on sentence boundaries for cleaner truncation
@@ -603,7 +644,7 @@ def batch_smart_filenames(
             try:
                 title, fname = future.result()
                 if fname:
-                    results[title] = fname
+                    results[title] = safe_note_stem(fname)
             except Exception:
                 pass
 

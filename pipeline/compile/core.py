@@ -152,6 +152,8 @@ class CompileResult:
     wiki_index_rebuilt: bool = False
     duplicates_flagged: int = 0
     agent_succeeded: bool = False
+    semantic_status: str = "skipped"
+    semantic_degraded_reason: str = ""
     agent_duration_s: float = 0.0
     error: str = ""
     report_path: str = ""
@@ -169,6 +171,8 @@ class CompileResult:
             "wiki_index_rebuilt": self.wiki_index_rebuilt,
             "duplicates_flagged": self.duplicates_flagged,
             "agent_succeeded": self.agent_succeeded,
+            "semantic_status": self.semantic_status,
+            "semantic_degraded_reason": self.semantic_degraded_reason,
             "agent_duration_s": round(self.agent_duration_s, 1),
             "error": self.error,
         }

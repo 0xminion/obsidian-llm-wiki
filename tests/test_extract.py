@@ -586,9 +586,10 @@ class TestExtractAll:
 # ─── _curl_get / _curl_post_json ────────────────────────────────────────────
 
 class TestCurlHelpers:
+    @patch("pipeline.extractors._shared._curl_resolve_args", return_value=["--resolve", "api.example.com:443:93.184.216.34"])
     @patch("pipeline.extractors._shared._validate_url", return_value=True)
     @patch("pipeline.extractors._shared._run")
-    def test_curl_get(self, mock_run, _mock_validate):
+    def test_curl_get(self, mock_run, _mock_validate, _mock_resolve):
         mock_run.return_value = MagicMock(stdout='{"key": "value"}', returncode=0)
         result = _curl_get("https://api.example.com/data", timeout=10)
         assert result == '{"key": "value"}'
@@ -598,18 +599,23 @@ class TestCurlHelpers:
         assert "-sL" not in args
         assert "--max-redirs" in args
 
+    @patch("pipeline.extractors._shared._curl_resolve_args", return_value=["--resolve", "api.example.com:443:93.184.216.34"])
     @patch("pipeline.extractors._shared._validate_url", return_value=True)
     @patch("pipeline.extractors._shared._run")
-    def test_curl_get_with_headers(self, mock_run, _mock_validate):
+    def test_curl_get_with_headers(self, mock_run, _mock_validate, _mock_resolve):
         mock_run.return_value = MagicMock(stdout="response", returncode=0)
         _curl_get("https://api.example.com", headers={"Authorization": "Bearer key"}, timeout=10)
         args = mock_run.call_args[0][0]
-        assert "-H" in args
-        assert "Authorization: Bearer key" in args
+        assert "--config" in args
+        assert "-H" not in args
+        flat = " ".join(args)
+        assert "Bearer key" not in flat
+        assert "Authorization: Bearer key" in mock_run.call_args.kwargs.get("input_data", "")
 
+    @patch("pipeline.extractors._shared._curl_resolve_args", return_value=["--resolve", "api.example.com:443:93.184.216.34"])
     @patch("pipeline.extractors._shared._validate_url", return_value=True)
     @patch("pipeline.extractors._shared._run")
-    def test_curl_post_json(self, mock_run, _mock_validate):
+    def test_curl_post_json(self, mock_run, _mock_validate, _mock_resolve):
         mock_run.return_value = MagicMock(stdout="ok", returncode=0)
         result = _curl_post_json(
             "https://api.example.com/submit",

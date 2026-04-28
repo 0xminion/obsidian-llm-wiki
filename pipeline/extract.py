@@ -24,6 +24,8 @@ from pipeline.extractors._shared import (
     _TWITTER_PATTERNS,
     _YT_PATTERNS,
     _YT_VIDEO_ID_PATTERNS,
+    _canonical_youtube_url,
+    _is_youtube_url,
     ExtractionError,
     _curl_get,
     _curl_post_json,
@@ -102,6 +104,8 @@ __all__ = [
     "_try_camoufox",
     "_ARXIV_PATTERN",
     "_YT_VIDEO_ID_PATTERNS",
+    "_canonical_youtube_url",
+    "_is_youtube_url",
     "_CHALLENGE_PATTERNS",
     "transcribe_with_whisper",
     "transcribe_assemblyai",
@@ -115,7 +119,7 @@ log = logging.getLogger(__name__)
 
 def detect_source_type(url: str) -> SourceType:
     """Detect source type from URL patterns."""
-    if _YT_PATTERNS.search(url):
+    if _YT_PATTERNS.search(url) and _is_youtube_url(url):
         return SourceType.YOUTUBE
     if _PODCAST_PATTERNS.search(url):
         return SourceType.PODCAST

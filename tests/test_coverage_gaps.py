@@ -12,13 +12,10 @@ Gaps covered:
 
 from __future__ import annotations
 
-import hashlib
-import json
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -279,8 +276,9 @@ class TestConceptMergeScaleBoundary:
         for i in range(0, 110, 10):
             index.embeddings[f"concept-{i:03d}"] = [0.1] * 64
 
+        mock_client.generate.return_value = "KEEP_BOTH concept-000 | concept-010 | scale-test"
         t0 = time.time()
-        merged = _semantic_concept_merge(cfg, mock_client, index)
+        _semantic_concept_merge(cfg, mock_client, index)
         elapsed = time.time() - t0
 
         assert elapsed < 1.0, f"Merge with embeddings took {elapsed:.2f}s"

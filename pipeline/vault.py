@@ -23,6 +23,7 @@ from pipeline.config import Config
 from pipeline.models import Edge, ExtractedSource, Plan
 from pipeline.utils import extract_frontmatter_field as _extract_frontmatter_field
 from pipeline.utils import parse_url_file_content, title_to_filename
+from pipeline.utils import safe_note_path, safe_note_stem
 
 log = logging.getLogger(__name__)
 
@@ -128,7 +129,7 @@ def write_source(cfg: Config, source: ExtractedSource) -> Path:
     body = f"# {source.title}\n\n{source.content}\n"
     content = frontmatter + body
 
-    target = cfg.sources_dir / f"{filename}.md"
+    target = safe_note_path(cfg.sources_dir, filename)
     target.write_text(content, encoding="utf-8")
     return target
 
@@ -163,7 +164,7 @@ def write_entry(cfg: Config, plan: Plan, content: str, source_note_name: str | N
     if not content.strip().startswith("#"):
         full_content = frontmatter + f"# {plan.title}\n\n{content}"
 
-    target = cfg.entries_dir / f"{filename}.md"
+    target = safe_note_path(cfg.entries_dir, filename)
     target.write_text(full_content, encoding="utf-8")
     return target
 
@@ -192,53 +193,81 @@ def write_concept(cfg: Config, name: str, content: str, sources: list[str]) -> P
     if not content.strip().startswith("#"):
         full_content = frontmatter + f"# {name}\n\n{content}"
 
-    target = cfg.concepts_dir / f"{filename}.md"
+    target = safe_note_path(cfg.concepts_dir, filename)
     target.write_text(full_content, encoding="utf-8")
     return target
 
 
 # ─── Update MoC ───────────────────────────────────────────────────────────────
 
-def update_moc(cfg: Config, moc_name: str, entry_name: str, description: str) -> None:
+def _safe_display_text(value: str, fallback: str = "Untitled") -> str:
+    """Return a single-line display string safe for YAML and Markdown headings."""
+    for part in re.split(r"[\x00-\x1f\x7f]+", str(value or "")):
+        part = part.strip()
+        if part:
+            return part
+    return fallback
+
+
+def update_moc(
+    cfg: Config,
+    moc_name: str,
+    entry_name: str,
+    description: str,
+    *,
+    entry_display_title: str | None = None,
+) -> None:
     """Append an entry under a topic section in a MoC file.
 
-    Creates the MoC if it doesn't exist.
+    ``entry_name`` is the canonical Obsidian stem. ``entry_display_title`` is
+    optional alias text rendered as ``[[stem|title]]``.
     """
     cfg.mocs_dir.mkdir(parents=True, exist_ok=True)
 
-    filename = title_to_filename(moc_name)
-    moc_path = cfg.mocs_dir / f"{filename}.md"
+    moc_title = _safe_display_text(moc_name)
+    filename = title_to_filename(moc_title)
+    moc_path = safe_note_path(cfg.mocs_dir, filename)
 
-    entry_line = f"- [[{entry_name}]]: {description}"
+    if re.fullmatch(r"[A-Za-z0-9_-]+", str(entry_name or "")):
+        entry_stem = str(entry_name)
+    else:
+        entry_stem = safe_note_stem(entry_name)
+    if entry_display_title:
+        alias = _safe_display_text(entry_display_title)
+        link = f"[[{entry_stem}|{alias}]]"
+    else:
+        link = f"[[{entry_stem}]]"
+    desc = _safe_display_text(description, fallback="")
+    entry_line = f"- {link}: {desc}" if desc else f"- {link}"
 
     if not moc_path.exists():
-        # Create new MoC with basic structure
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        frontmatter = _build_frontmatter({
+            "title": moc_title,
+            "type": "moc",
+            "status": "draft",
+            "created": today,
+            "tags": [],
+        })
         content = (
-            f"---\ntitle: {moc_name}\ntype: moc\nstatus: draft\ncreated: {today}\ntags: []\n---\n\n"
-            f"# {moc_name}\n\n"
-            f"## Overview / 概述\n\n"
-            f"Map of Content for {moc_name}.\n\n"
-            f"---\n\n"
-            f"## Entries\n\n"
-            f"{entry_line}\n"
+            frontmatter
+            + f"\n# {moc_title}\n\n"
+            + "## Overview / 概述\n\n"
+            + f"Map of Content for {moc_title}.\n\n"
+            + "---\n\n"
+            + "## Entries\n\n"
+            + f"{entry_line}\n"
         )
         moc_path.write_text(content, encoding="utf-8")
         return
 
-    # MoC exists — try to append under a generic "Entries" section or last section
     existing = moc_path.read_text(encoding="utf-8")
-
-    # Find the last ## heading section or "Entries" section
-    # Strategy: find "## Entries" or the last ## heading, append after its content
     lines = existing.split("\n")
     insert_idx = None
 
-    # First try to find "## Entries" section
     for i, line in enumerate(lines):
         stripped = line.strip()
         if stripped.startswith("## ") and "entries" in stripped.lower():
-            # Found Entries section — find where to insert (before next ## or end)
             for j in range(i + 1, len(lines)):
                 if lines[j].startswith("## "):
                     insert_idx = j
@@ -247,22 +276,19 @@ def update_moc(cfg: Config, moc_name: str, entry_name: str, description: str) ->
                 insert_idx = len(lines)
             break
 
-    # If no Entries section, create one and append entry_line (no insert needed)
     if insert_idx is None:
         lines.append("")
         lines.append("## Entries")
         lines.append("")
         lines.append(entry_line)
-        moc_path.write_text("\n".join(lines), encoding="utf-8")
-        return
+    else:
+        full_text = "\n".join(lines)
+        if not re.search(rf'\[\[{re.escape(entry_stem)}(?:\|[^\]]*)?\]\]', full_text):
+            lines.insert(insert_idx, entry_line)
 
-    # Check for duplicate before inserting
-    # Use regex to match exact wikilink (not substring like [[AI]] inside [[AI Safety]])
-    full_text = "\n".join(lines)
-    if not re.search(rf'\[\[{re.escape(entry_name)}(?:\|[^\]]*)?\]\]', full_text):
-        lines.insert(insert_idx, entry_line)
-
-    moc_path.write_text("\n".join(lines), encoding="utf-8")
+    new_content = "\n".join(lines)
+    if new_content != existing:
+        moc_path.write_text(new_content, encoding="utf-8")
 
 
 # ─── Edge Management ─────────────────────────────────────────────────────────

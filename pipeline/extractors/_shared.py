@@ -155,34 +155,81 @@ def _parse_ipv4_weird(host: str) -> str:
     return ".".join(str(v) for v in values)
 
 
+def _curl_resolve_args(url: str) -> list[str] | None:
+    """Pin curl to a public resolved IP to reduce DNS rebinding TOCTOU.
+
+    Returns None when a safe public pin cannot be established; callers must
+    fail closed instead of letting curl perform its own DNS lookup.
+    """
+    parsed = urlparse(url)
+    host = parsed.hostname or ""
+    if not host:
+        return None
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    try:
+        infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    except socket.gaierror:
+        return None
+    for info in infos:
+        ip = info[4][0]
+        try:
+            if not _host_is_blocked_address(ip):
+                return ["--resolve", f"{host}:{port}:{ip}"]
+        except ValueError:
+            continue
+    return None
+
+
+def _curl_header_config(headers: Optional[dict]) -> str:
+    if not headers:
+        return ""
+    lines = []
+    for k, v in headers.items():
+        key = str(k).replace("\n", "").replace("\r", "")
+        value = str(v).replace("\n", "").replace("\r", "")
+        lines.append(f'header = "{key}: {value}"')
+    return "\n".join(lines) + "\n"
+
+
 def _curl_get(url: str, headers: Optional[dict] = None, timeout: int = 45) -> str:
-    """GET via curl (not Python urllib — urllib gets 403)."""
+    """GET via curl without exposing secret headers in argv."""
     if not _validate_url(url):
         log.warning("Blocked potentially unsafe URL: %s", url[:80])
         return ""
     args = ["curl", "-s", "--max-redirs", "0", "--proto", "=http,https", "--max-time", str(timeout)]
+    resolve_args = _curl_resolve_args(url)
+    if resolve_args is None:
+        log.warning("Blocked URL after unsafe DNS pinning result: %s", url[:80])
+        return ""
+    args.extend(resolve_args)
+    input_config = None
     if headers:
-        for k, v in headers.items():
-            args.extend(["-H", f"{k}: {v}"])
+        args.extend(["--config", "-"])
+        input_config = _curl_header_config(headers)
     args.append(url)
-    result = _run(args, timeout=timeout + 5)
+    result = _run(args, timeout=timeout + 5, input_data=input_config)
     return result.stdout.strip()
 
 
 def _curl_post_json(url: str, data: dict, headers: Optional[dict] = None,
                     timeout: int = 45) -> str:
-    """POST JSON via curl."""
+    """POST JSON via curl without exposing secret headers in argv."""
     if not _validate_url(url):
         log.warning("Blocked potentially unsafe URL: %s", url[:80])
         return ""
-    args = ["curl", "-s", "--max-redirs", "0", "--proto", "=http,https", "--max-time", str(timeout), "-X", "POST",
-            "-H", "Content-Type: application/json"]
+    args = ["curl", "-s", "--max-redirs", "0", "--proto", "=http,https", "--max-time", str(timeout), "-X", "POST"]
+    resolve_args = _curl_resolve_args(url)
+    if resolve_args is None:
+        log.warning("Blocked URL after unsafe DNS pinning result: %s", url[:80])
+        return ""
+    args.extend(resolve_args)
+    config_lines = ['header = "Content-Type: application/json"']
     if headers:
-        for k, v in headers.items():
-            args.extend(["-H", f"{k}: {v}"])
+        config_lines.append(_curl_header_config(headers).strip())
+    args.extend(["--config", "-"])
     args.extend(["-d", json.dumps(data)])
     args.append(url)
-    result = _run(args, timeout=timeout + 5)
+    result = _run(args, timeout=timeout + 5, input_data="\n".join(line for line in config_lines if line) + "\n")
     return result.stdout.strip()
 
 
@@ -235,6 +282,16 @@ def extract_title(content: str) -> str:
 
 # ─── URL Patterns ────────────────────────────────────────────────────────────
 
+_YT_ALLOWED_HOSTS = {
+    "youtube.com",
+    "www.youtube.com",
+    "m.youtube.com",
+    "music.youtube.com",
+    "youtu.be",
+    "www.youtu.be",
+    "youtube-nocookie.com",
+    "www.youtube-nocookie.com",
+}
 _YT_PATTERNS = re.compile(
     r"(?:youtube\.com|youtu\.be|youtube-nocookie\.com)"
 )
@@ -265,17 +322,32 @@ _YT_VIDEO_ID_PATTERNS = [
 ]
 
 
+def _is_youtube_url(url: str) -> bool:
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return False
+    host = (parsed.hostname or "").lower().rstrip(".")
+    return parsed.scheme in {"http", "https"} and host in _YT_ALLOWED_HOSTS
+
+
+def _canonical_youtube_url(video_id: str) -> str:
+    return f"https://www.youtube.com/watch?v={video_id}"
+
+
 def _extract_youtube_video_id(url: str) -> str:
-    """Extract 11-char YouTube video ID from URL."""
+    """Extract 11-char YouTube video ID only from validated YouTube URLs."""
+    if not _is_youtube_url(url):
+        return ""
+    parsed = urlparse(url)
+    if (parsed.hostname or "").lower().rstrip(".") in {"youtu.be", "www.youtu.be"}:
+        segment = parsed.path.strip("/").split("/", 1)[0]
+        if re.fullmatch(r"[a-zA-Z0-9_-]{11}", segment):
+            return segment
     for pat in _YT_VIDEO_ID_PATTERNS:
         m = pat.search(url)
         if m:
             return m.group(1)
-    # Fallback: find any 11-char alphanumeric sequence in known path/query segments
-    for segment in url.split("/"):
-        m = re.search(r"[a-zA-Z0-9_-]{11}", segment)
-        if m:
-            return m.group(0)
     return ""
 
 
@@ -358,17 +430,28 @@ def transcribe_with_whisper(audio_file: str, language: str = "") -> str:
 # ─── AssemblyAI Transcription ────────────────────────────────────────────────
 
 def transcribe_assemblyai(audio_file: str, api_key: str, timeout: int = 45) -> str:
-    """Upload audio to AssemblyAI and poll for transcription result."""
-    api_url = "https://api.assemblyai.com"
+    """Upload audio to AssemblyAI and poll for transcription result.
 
-    # Step 1: Upload
+    Secret-bearing headers are passed through curl config on stdin, never argv.
+    """
+    api_url = "https://api.assemblyai.com"
+    auth_cfg = _curl_header_config({"Authorization": f"Bearer {api_key}"})
+
+    upload_url_endpoint = f"{api_url}/v2/upload"
+    upload_args = [
+        "curl", "-s", "-X", "POST", upload_url_endpoint,
+        "--config", "-",
+        "--data-binary", f"@{audio_file}",
+        "--max-time", str(min(timeout, 300)),
+    ]
+    upload_resolve = _curl_resolve_args(upload_url_endpoint)
+    if upload_resolve is None:
+        return ""
+    upload_args.extend(upload_resolve)
     upload_result = _run(
-        ["curl", "-s", "-X", "POST", f"{api_url}/v2/upload",
-         "-H", f"Authorization: Bearer {api_key}",
-         "-H", "Content-Type: application/octet-stream",
-         "--data-binary", f"@{audio_file}",
-         "--max-time", str(min(timeout, 300))],
+        upload_args,
         timeout=timeout + 10,
+        input_data=auth_cfg + 'header = "Content-Type: application/octet-stream"\n',
     )
     if upload_result.returncode != 0:
         return ""
@@ -379,20 +462,27 @@ def transcribe_assemblyai(audio_file: str, api_key: str, timeout: int = 45) -> s
     if not upload_url:
         return ""
 
-    # Step 2: Submit transcript request
     submit_data = json.dumps({
         "audio_url": upload_url,
         "speech_models": ["universal-2"],
         "punctuate": True,
         "format_text": True,
     })
+    submit_url = f"{api_url}/v2/transcript"
+    submit_args = [
+        "curl", "-s", "-X", "POST", submit_url,
+        "--config", "-",
+        "-d", submit_data,
+        "--max-time", "30",
+    ]
+    submit_resolve = _curl_resolve_args(submit_url)
+    if submit_resolve is None:
+        return ""
+    submit_args.extend(submit_resolve)
     submit_result = _run(
-        ["curl", "-s", "-X", "POST", f"{api_url}/v2/transcript",
-         "-H", f"Authorization: Bearer {api_key}",
-         "-H", "Content-Type: application/json",
-         "-d", submit_data,
-         "--max-time", "30"],
+        submit_args,
         timeout=35,
+        input_data=auth_cfg + 'header = "Content-Type: application/json"\n',
     )
     if submit_result.returncode != 0:
         return ""
@@ -403,15 +493,15 @@ def transcribe_assemblyai(audio_file: str, api_key: str, timeout: int = 45) -> s
     if not transcript_id:
         return ""
 
-    # Step 3: Poll until complete
     import time
     for _ in range(120):  # max 10 minutes
-        poll_result = _run(
-            ["curl", "-s", f"{api_url}/v2/transcript/{transcript_id}",
-             "-H", f"Authorization: Bearer {api_key}",
-             "--max-time", "10"],
-            timeout=15,
-        )
+        poll_url = f"{api_url}/v2/transcript/{transcript_id}"
+        poll_args = ["curl", "-s", poll_url, "--config", "-", "--max-time", "10"]
+        poll_resolve = _curl_resolve_args(poll_url)
+        if poll_resolve is None:
+            return ""
+        poll_args.extend(poll_resolve)
+        poll_result = _run(poll_args, timeout=15, input_data=auth_cfg)
         if poll_result.returncode != 0:
             return ""
         try:
@@ -422,10 +512,9 @@ def transcribe_assemblyai(audio_file: str, api_key: str, timeout: int = 45) -> s
         status = poll_data.get("status", "")
         if status == "completed":
             return poll_data.get("text", "")
-        elif status == "error":
+        if status == "error":
             return ""
-        else:
-            time.sleep(5)
+        time.sleep(5)
 
     return ""
 

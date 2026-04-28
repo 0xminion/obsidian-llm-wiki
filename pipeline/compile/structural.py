@@ -154,6 +154,8 @@ def _build_edges(cfg: Config, bidirectional: bool = False) -> int:
     new_content = "\n".join(lines) + "\n"
     from pipeline.utils import _atomic_write
     _atomic_write(edges_file, new_content)
+    from pipeline.vault import clear_edge_cache
+    clear_edge_cache()
     log.info("Rebuilt edges.tsv with %d generated edges", len(edges))
     return 0 if previous_content == new_content else len(edges)
 
@@ -195,18 +197,21 @@ def _detect_duplicates(cfg: Config) -> int:
                 report_lines.append(f"- **{name_a}** ↔ **{name_b}** (overlap: {overlap:.0%}, type: {type_a})")
                 dup_count += 1
 
+    report_dir = cfg.vault_path / "Meta" / "Scripts"
+    report_dir.mkdir(parents=True, exist_ok=True)
+    report_path = report_dir / "compile-duplicate-report.md"
     if report_lines:
-        report_dir = cfg.vault_path / "Meta" / "Scripts"
-        report_dir.mkdir(parents=True, exist_ok=True)
-        report_path = report_dir / "compile-duplicate-report.md"
-        report_content = (
-            f"# Duplicate Detection Report\n\n"
-            f"Generated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}\n\n"
-            f"Found {dup_count} potential duplicate pairs:\n\n"
-            + "\n".join(report_lines) + "\n"
-        )
-        from pipeline.utils import _atomic_write
-        _atomic_write(report_path, report_content)
-        log.info("Duplicate report: %d pairs flagged → %s", dup_count, report_path)
+        detail = "\n".join(report_lines) + "\n"
+    else:
+        detail = "No potential duplicate pairs found.\n"
+    report_content = (
+        f"# Duplicate Detection Report\n\n"
+        f"Generated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}\n\n"
+        f"Found {dup_count} potential duplicate pairs:\n\n"
+        + detail
+    )
+    from pipeline.utils import _atomic_write
+    _atomic_write(report_path, report_content)
+    log.info("Duplicate report: %d pairs flagged → %s", dup_count, report_path)
 
     return dup_count

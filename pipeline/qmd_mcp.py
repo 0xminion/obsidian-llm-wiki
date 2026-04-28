@@ -306,8 +306,12 @@ def _qmd_results_to_concept_matches(
         # Derive collection from file path when QMD doesn't populate it
         derived_collection = r.collection
         if not derived_collection:
-            path_parts = r.file.split("/")
-            if len(path_parts) > 1:
+            path_parts = [part for part in r.file.split("/") if part]
+            for known in ("sources", "entries", "concepts", "mocs"):
+                if known in path_parts:
+                    derived_collection = known
+                    break
+            if not derived_collection and len(path_parts) > 1:
                 derived_collection = path_parts[0]
         if collection_filter and derived_collection and derived_collection != collection_filter:
             continue

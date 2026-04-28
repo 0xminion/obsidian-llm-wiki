@@ -20,10 +20,10 @@ _DEFAULT_MCP_URL = os.environ.get("QMD_MCP_URL", "http://localhost:8181")
 def _get_client(base_url: str = "") -> QMDMCPClient | None:
     """Return a fresh QMD client, checking server health each time.
 
-    The QMD *server* keeps embedding models loaded across requests,
-    so we don't need to cache the client object.  Re-checking health
-    each call means we automatically recover if the server restarts.
+    Set USE_QMD_MCP=false/0/no/off to force local fallback.
     """
+    if os.environ.get("USE_QMD_MCP", "").strip().lower() in {"0", "false", "no", "off"}:
+        return None
     url = base_url or _DEFAULT_MCP_URL
     client = QMDMCPClient(base_url=url, timeout=60)
     try:

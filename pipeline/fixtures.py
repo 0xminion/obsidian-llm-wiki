@@ -105,3 +105,82 @@ created: {FIXTURE_DATE}
         "concepts": 1,
         "mocs": 1,
     }
+
+
+def create_adversarial_vault(vault_path: Path, *, overwrite: bool = False) -> dict[str, int | str]:
+    """Create a deterministic edge-case vault used as a golden regression corpus.
+
+    It contains CJK-safe stems, quoted URLs, source/entry distinct stems,
+    duplicate-looking but valid titles, and links that should all resolve.
+    """
+    vault_path = Path(vault_path)
+    files = {
+        "04-Wiki/sources/cjk-title-source.md": """---
+type: source
+title: CJK / Path Safety Source
+source_url: "https://example.com/?q=\"quoted\"&ok=1"
+date_extracted: 2026-01-01
+---
+
+# CJK / Path Safety Source
+
+Source content with a quoted URL.
+""",
+        "04-Wiki/entries/cjk-title.md": """---
+type: entry
+title: CJK Title 中文
+source: "[[cjk-title-source]]"
+tags:
+  - safety
+  - graph
+---
+
+# CJK Title 中文
+
+This links to [[cjk-title-source]], [[path-safety]], and [[golden-corpus]].
+""",
+        "04-Wiki/concepts/path-safety.md": """---
+type: concept
+title: Path Safety
+tags:
+  - safety
+  - graph
+sources:
+  - "[[cjk-title]]"
+---
+
+# Path Safety
+
+Path safety keeps generated filenames inside the vault. Evidence: [[cjk-title]].
+""",
+        "04-Wiki/mocs/golden-corpus.md": """---
+type: moc
+title: Golden Corpus
+created: 2026-01-01
+---
+
+# Golden Corpus
+
+## Entries
+
+- [[cjk-title|CJK Title 中文]]: validates adversarial-safe graph wiring
+- [[path-safety]]
+""",
+        "06-Config/edges.tsv": "source\ttarget\ttype\tdescription\ncjk-title\tcjk-title-source\trelates_to\tmanual source edge\ncjk-title\tpath-safety\trelates_to\tmanual concept edge\n",
+        "06-Config/wiki-index.md": "# Wiki Index\n\n- [[cjk-title]]\n- [[cjk-title-source]]\n- [[path-safety]]\n- [[golden-corpus]]\n",
+        "06-Config/url-index.tsv": "url\thash\ttitle\nhttps://example.com/?q=%22quoted%22&ok=1\tadversarial001\tCJK / Path Safety Source\n",
+    }
+    written = 0
+    for rel, content in sorted(files.items()):
+        path = vault_path / rel
+        if path.exists() and not overwrite:
+            continue
+        _write(path, content)
+        written += 1
+    return {
+        "files_written": written,
+        "sources": 1,
+        "entries": 1,
+        "concepts": 1,
+        "mocs": 1,
+    }

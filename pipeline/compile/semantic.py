@@ -56,16 +56,23 @@ class NoteIndex:
                 }
 
     def embed_all(self, client, skip_local: bool = False) -> None:
-        """Embed all notes. If *skip_local* is True the local batch is skipped (QMD handles it)."""
-        if not self.notes or skip_local:
-            return
-        from pipeline.qmd import _get_client
-        if _get_client() is not None:
-            log.info("QMD enabled — skipping local embed batch; relying on QMD semantic search")
+        """Embed all notes using QMD when available, otherwise local client."""
+        if not self.notes:
             return
         texts = [f"{n['title']}\n{n['preview']}" for n in self.notes.values()]
         names = list(self.notes.keys())
-        batch = client.embed_batch(texts)
+        batch = {}
+        from pipeline.qmd import _get_client
+        qmd_client = _get_client()
+        if qmd_client is not None and hasattr(qmd_client, "embed_batch"):
+            batch = qmd_client.embed_batch(texts) or {}
+            if batch:
+                log.info("QMD embedded %d notes", len(batch))
+            elif skip_local:
+                log.warning("QMD embedding returned no vectors and local fallback is disabled")
+                return
+        if not batch and not skip_local:
+            batch = client.embed_batch(texts)
         if batch:
             # Lookup by index to avoid dict-key collision on duplicate content.
             for i, name in enumerate(names):
@@ -90,10 +97,14 @@ class NoteIndex:
 
 
 def _add_wikilink(cfg: Config, source_name: str, target_name: str, reason: str) -> bool:
+    from pipeline.utils import safe_note_path, safe_note_stem
+
+    source_stem = safe_note_stem(source_name)
+    target_stem = safe_note_stem(target_name)
     source_dirs = [cfg.entries_dir, cfg.concepts_dir, cfg.mocs_dir]
     source_path = None
     for d in source_dirs:
-        candidate = d / f"{source_name}.md"
+        candidate = safe_note_path(d, source_stem)
         if candidate.exists():
             source_path = candidate
             break
@@ -105,7 +116,7 @@ def _add_wikilink(cfg: Config, source_name: str, target_name: str, reason: str) 
     except OSError:
         return False
 
-    if f"[[{target_name}]]" in content:
+    if f"[[{target_stem}]]" in content:
         return False
 
     sections = {
@@ -115,7 +126,7 @@ def _add_wikilink(cfg: Config, source_name: str, target_name: str, reason: str) 
     }
     note_type = "entry"
     for d, nt in [(cfg.entries_dir, "entry"), (cfg.concepts_dir, "concept"), (cfg.mocs_dir, "moc")]:
-        if (d / f"{source_name}.md").exists():
+        if safe_note_path(d, source_stem).exists():
             note_type = nt
             break
 
@@ -132,13 +143,13 @@ def _add_wikilink(cfg: Config, source_name: str, target_name: str, reason: str) 
         if insert_idx < len(lines):
             break
 
-    link_line = f"- [[{target_name}]]"
+    link_line = f"- [[{target_stem}]]"
     if reason:
         link_line += f" — {reason}"
     lines.insert(insert_idx, link_line)
     from pipeline.utils import _atomic_write
     _atomic_write(source_path, "\n".join(lines))
-    log.debug("Added link: %s -> %s", source_name, target_name)
+    log.debug("Added link: %s -> %s", source_stem, target_stem)
     return True
 
 
@@ -151,17 +162,36 @@ def _semantic_crosslink(cfg: Config, client, index: NoteIndex) -> int:
 
     candidates: list[tuple[str, str, float, set[str]]] = []
     names = list(index.notes.keys())
-    for i, name_a in enumerate(names):
+    candidate_pairs: set[tuple[str, str]] = set()
+    tag_index: dict[str, set[str]] = {}
+    token_index: dict[str, set[str]] = {}
+    for name, info in index.notes.items():
+        for tag in info["tags"]:
+            tag_index.setdefault(tag, set()).add(name)
+        title_tokens = set(re.findall(r"[a-zA-Z0-9一-鿿]{3,}", info["title"].lower()))
+        for token in title_tokens:
+            token_index.setdefault(token, set()).add(name)
+    for bucket in list(tag_index.values()) + [b for b in token_index.values() if 1 < len(b) <= 50]:
+        ordered = sorted(bucket)
+        for i, a in enumerate(ordered):
+            for b in ordered[i + 1:]:
+                candidate_pairs.add((a, b))
+    # If embeddings are available, sample a bounded local window as a fallback.
+    if index.embeddings and not candidate_pairs:
+        for i, a in enumerate(names):
+            for b in names[i + 1:i + 21]:
+                candidate_pairs.add((a, b))
+
+    for name_a, name_b in sorted(candidate_pairs):
         info_a = index.notes[name_a]
-        for name_b in names[i + 1:]:
-            info_b = index.notes[name_b]
-            if name_b in info_a["links"] or name_a in info_b["links"]:
-                continue
-            sim = index.similarity(name_a, name_b)
-            shared_tags = info_a["tags"] & info_b["tags"]
-            score = sim + (len(shared_tags) * 0.1)
-            if score > 0.5 or len(shared_tags) >= 2:
-                candidates.append((name_a, name_b, score, shared_tags))
+        info_b = index.notes[name_b]
+        if name_b in info_a["links"] or name_a in info_b["links"]:
+            continue
+        shared_tags = info_a["tags"] & info_b["tags"]
+        sim = index.similarity(name_a, name_b) if index.embeddings else 0.0
+        score = sim + (len(shared_tags) * 0.1)
+        if score > 0.5 or len(shared_tags) >= 2:
+            candidates.append((name_a, name_b, score, shared_tags))
 
     if not candidates:
         return 0
@@ -186,6 +216,8 @@ def _semantic_crosslink(cfg: Config, client, index: NoteIndex) -> int:
 
     prompt = "\n".join(prompt_lines)
     response = client.generate(prompt, timeout=120)
+    if not response:
+        raise ValueError("empty LLM response during semantic cross-linking")
 
     links_added = 0
     for line in response.splitlines():
@@ -211,32 +243,47 @@ def _semantic_concept_merge(cfg: Config, client, index: NoteIndex) -> int:
 
     candidates: list[tuple[str, str, float]] = []
     names = list(concepts.keys())
-    # Pre-filter with embedding threshold to reduce Python O(N^2) work
-    for i, name_a in enumerate(names):
+    token_index: dict[str, set[str]] = {}
+    for name, info in concepts.items():
+        words = set(re.sub(r"[^a-zA-Z0-9一-鿿]", " ", info["title"].lower()).split())
+        for word in words:
+            if len(word) >= 2:
+                token_index.setdefault(word, set()).add(name)
+    candidate_pairs: set[tuple[str, str]] = set()
+    for bucket in token_index.values():
+        if len(bucket) < 2 or len(bucket) > 50:
+            continue
+        ordered = sorted(bucket)
+        for i, a in enumerate(ordered):
+            for b in ordered[i + 1:]:
+                candidate_pairs.add((a, b))
+    if index.embeddings and not candidate_pairs:
+        for i, a in enumerate(names):
+            for b in names[i + 1:i + 21]:
+                candidate_pairs.add((a, b))
+
+    for name_a, name_b in sorted(candidate_pairs):
         emb_a = index.embeddings.get(name_a)
-        for name_b in names[i + 1:]:
-            emb_b = index.embeddings.get(name_b)
-            sim = 0.0
-            if emb_a and emb_b:
-                dot = sum(x * y for x, y in zip(emb_a, emb_b))
-                norm_a = math.sqrt(sum(x * x for x in emb_a))
-                norm_b = math.sqrt(sum(x * x for x in emb_b))
-                if norm_a and norm_b:
-                    sim = dot / (norm_a * norm_b)
-            # Skip if embeddings are present but say "not similar" (<0.5).
-            # If no embeddings, fall through to string-overlap heuristic.
-            if (emb_a and emb_b) and sim < 0.5:
-                continue
-            info_a = concepts[name_a]
-            info_b = concepts[name_b]
-            words_a = set(re.sub(r"[^a-zA-Z0-9一-鿿]", " ", info_a["title"].lower()).split())
-            words_b = set(re.sub(r"[^a-zA-Z0-9一-鿿]", " ", info_b["title"].lower()).split())
-            overlap = 0.0
-            if words_a and words_b:
-                overlap = len(words_a & words_b) / min(len(words_a), len(words_b))
-            score = max(overlap, sim)
-            if score > 0.75:
-                candidates.append((name_a, name_b, score))
+        emb_b = index.embeddings.get(name_b)
+        sim = 0.0
+        if emb_a and emb_b:
+            dot = sum(x * y for x, y in zip(emb_a, emb_b))
+            norm_a = math.sqrt(sum(x * x for x in emb_a))
+            norm_b = math.sqrt(sum(x * x for x in emb_b))
+            if norm_a and norm_b:
+                sim = dot / (norm_a * norm_b)
+        if (emb_a and emb_b) and sim < 0.5:
+            continue
+        info_a = concepts[name_a]
+        info_b = concepts[name_b]
+        words_a = set(re.sub(r"[^a-zA-Z0-9一-鿿]", " ", info_a["title"].lower()).split())
+        words_b = set(re.sub(r"[^a-zA-Z0-9一-鿿]", " ", info_b["title"].lower()).split())
+        overlap = 0.0
+        if words_a and words_b:
+            overlap = len(words_a & words_b) / min(len(words_a), len(words_b))
+        score = max(overlap, sim)
+        if score > 0.75:
+            candidates.append((name_a, name_b, score))
 
     if not candidates:
         return 0
@@ -267,6 +314,8 @@ def _semantic_concept_merge(cfg: Config, client, index: NoteIndex) -> int:
 
     prompt = "\n".join(prompt_lines)
     response = client.generate(prompt, timeout=120)
+    if not response:
+        raise ValueError("empty LLM response during semantic concept merge")
 
     merged = 0
     for line in response.splitlines():
@@ -342,6 +391,8 @@ def _merge_concepts(cfg: Config, canonical_name: str, duplicate_name: str, index
             rewritten.append("\t".join(parts))
         from pipeline.utils import _atomic_write
         _atomic_write(cfg.edges_file, "\n".join(rewritten).rstrip() + "\n")
+        from pipeline.vault import clear_edge_cache
+        clear_edge_cache()
 
     if duplicate_name in index.notes:
         del index.notes[duplicate_name]
@@ -420,7 +471,7 @@ def _semantic_moc_rebuild(cfg: Config, client, index: NoteIndex) -> int:
         prompt = "\n".join(prompt_lines)
         response = client.generate(prompt, timeout=120)
         if not response:
-            continue
+            raise ValueError("empty LLM response during semantic MoC rebuild")
 
         moc_path = cfg.mocs_dir / f"{moc_name}.md"
         try:
@@ -456,33 +507,35 @@ def _run_semantic_compile(cfg: Config, result) -> tuple[bool, str]:
         index = NoteIndex()
         index.load(cfg)
         if len(index.notes) > 0:
-            from pipeline.qmd import _get_client
-            skip_local = _get_client() is not None
-            if skip_local:
-                log.info("QMD enabled --- skipping local embed batch")
-            index.embed_all(client, skip_local=skip_local)
+            index.embed_all(client)
 
         all_ok = True
+        failure_reasons: list[str] = []
         try:
             result.crosslinks_added = _semantic_crosslink(cfg, client, index)
         except (ConnectionError, TimeoutError, OSError, ValueError) as e:
             log.warning("Direct cross-linking failed: %s", e)
+            failure_reasons.append(str(e))
             all_ok = False
 
         try:
             result.concepts_merged = _semantic_concept_merge(cfg, client, index)
         except (ConnectionError, TimeoutError, OSError, ValueError) as e:
             log.warning("Direct concept merge failed: %s", e)
+            failure_reasons.append(str(e))
             all_ok = False
 
         try:
             result.mocs_updated = _semantic_moc_rebuild(cfg, client, index)
         except (ConnectionError, TimeoutError, OSError, ValueError) as e:
             log.warning("Direct MoC rebuild failed: %s", e)
+            failure_reasons.append(str(e))
             all_ok = False
 
         result.agent_duration_s = time.time() - t0
         result.agent_succeeded = all_ok
+        result.semantic_status = "ok" if all_ok else "degraded"
+        result.semantic_degraded_reason = "; ".join(failure_reasons)
 
         if all_ok:
             summary = (
@@ -491,7 +544,7 @@ def _run_semantic_compile(cfg: Config, result) -> tuple[bool, str]:
                 f"mocs updated: {result.mocs_updated}"
             )
             return True, summary
-        return False, "Direct semantic compile failed (see logs)"
+        return False, result.semantic_degraded_reason or "Direct semantic compile failed (see logs)"
 
     # Try direct first
     direct_ok, direct_output = _try_direct()

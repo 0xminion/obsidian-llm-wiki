@@ -11,7 +11,7 @@ from datetime import date
 from pipeline.config import Config
 from pipeline.models import Plan
 from pipeline.note_schema import effective_entry_schema
-from pipeline.utils import escape_yaml
+from pipeline.utils import escape_yaml, safe_note_path, safe_note_stem
 
 log = logging.getLogger(__name__)
 
@@ -384,9 +384,10 @@ def create_file_templates(
 
     def _paired_note_filenames(base_filename: str) -> tuple[str, str]:
         """Return distinct (source, entry) stems for graph-unambiguous notes."""
+        safe_base = safe_note_stem(base_filename)
         suffix = 0
         while True:
-            entry_candidate = base_filename if suffix == 0 else f"{base_filename}-{suffix}"
+            entry_candidate = safe_base if suffix == 0 else f"{safe_base}-{suffix}"
             source_candidate = f"{entry_candidate}-source"
             paths = (
                 cfg.sources_dir / f"{source_candidate}.md",
@@ -506,7 +507,7 @@ def create_file_templates(
                     extracted,
                     note_title=source_note_title,
                 )
-                source_path = cfg.sources_dir / f"{source_filename}.md"
+                source_path = safe_note_path(cfg.sources_dir, source_filename)
                 source_path.parent.mkdir(parents=True, exist_ok=True)
                 source_path.write_text(source_content, encoding="utf-8")
                 stats["sources"] += 1
@@ -528,7 +529,7 @@ def create_file_templates(
                     include_frontmatter=True,
                     note_title=entry_link_name,
                 )
-                entry_path = cfg.entries_dir / f"{entry_filename}.md"
+                entry_path = safe_note_path(cfg.entries_dir, entry_filename)
                 entry_path.parent.mkdir(parents=True, exist_ok=True)
                 entry_path.write_text(entry_content, encoding="utf-8")
                 stats["entries"] += 1
@@ -545,7 +546,7 @@ def create_file_templates(
                         source_display_title=entry_link_name,
                     )
                     concept_filename = resolve_collision(cfg.concepts_dir, title_to_filename(concept_name))
-                    concept_path = cfg.concepts_dir / f"{concept_filename}.md"
+                    concept_path = safe_note_path(cfg.concepts_dir, concept_filename)
                     concept_path.parent.mkdir(parents=True, exist_ok=True)
                     concept_path.write_text(concept_content, encoding="utf-8")
                 except OSError as e:
@@ -557,8 +558,9 @@ def create_file_templates(
                     update_moc(
                         cfg,
                         moc_name,
-                        entry_link_name,
+                        entry_filename,
                         f"Related to [[{entry_filename}]]",
+                        entry_display_title=entry_link_name,
                     )
                 except OSError as e:
                     log.warning("Failed to update MoC %s: %s", moc_name, e)
