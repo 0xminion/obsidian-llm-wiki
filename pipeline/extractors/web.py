@@ -1,6 +1,6 @@
 """Web content extraction with Cloudflare detection and fallback chain.
 
-Chain: defuddle → curl+liteparse → defuddle --json → archive.org → Camoufox.
+Chain: defuddle -> curl+liteparse -> defuddle --json -> archive.org -> Camoufox.
 Detects and retries on Cloudflare challenge pages.
 Handles arxiv specially via alphaxiv.org.
 """
@@ -36,44 +36,59 @@ log = logging.getLogger(__name__)
 def extract_web(url: str, cfg: Config, source_type: SourceType = SourceType.WEB) -> ExtractedSource:
     """Extract web content via defuddle CLI with curl fallback and retry logic.
 
-    Chain: defuddle → curl+liteparse → defuddle --json → archive.org → Camoufox
+    Chain: defuddle -> curl+liteparse -> defuddle --json -> archive.org -> Camoufox
     Detects and retries on Cloudflare challenge pages.
     """
-    from pipeline.extractors._shared import _extract_html_title, _url_to_title, _is_cloudflare_html
+    from pipeline.extractors._shared import _extract_html_title, _is_cloudflare_html
     from pipeline.extractors._shared import _is_ui_noise_title as _garbage_title
+    from pipeline.extractors._shared import _should_use_camoufox_first
 
     timeout = cfg.extract_timeout
     max_retries = cfg.max_retries
 
-    # ── Step 0: Get a proper title early ─────────────────────────────────────────
-    # Try to fetch raw HTML title tags as fallback.
+    # -- Step 0: JS-rendered domains -> Camoufox FIRST ----------------------
+    content = ""
+    camoufox_title = ""
+    if _should_use_camoufox_first(url):
+        log.info("JS-rendered site detected for %s; trying Camoufox first", url)
+        cfx_text, cfx_title = _try_camoufox_with_title(url, timeout)
+        if cfx_text and len(cfx_text.strip()) > 100:
+            content = cfx_text
+            if cfx_title and not _garbage_title(cfx_title):
+                camoufox_title = cfx_title
+
+    # -- Step 0b: Fetch title if Camoufox did not succeed ---------------------
     fallback_title = ""
-    try:
-        quick_html = _curl_get(url, timeout=min(timeout, 10))
-        if quick_html and not _is_cloudflare_html(quick_html):
-            fallback_title = _extract_html_title(quick_html, fallback="")
-            if _garbage_title(fallback_title):
-                fallback_title = ""
-    except Exception:
-        pass
-    if not fallback_title:
-        fallback_title = _url_to_title(url)
+    if not content:
+        try:
+            quick_html = _curl_get(url, timeout=min(timeout, 10))
+            if quick_html and not _is_cloudflare_html(quick_html):
+                fallback_title = _extract_html_title(quick_html, fallback="")
+                if _garbage_title(fallback_title):
+                    fallback_title = ""
+        except Exception:
+            pass
+        if not fallback_title:
+            fallback_title = _url_to_title(url)
+    else:
+        fallback_title = camoufox_title or _url_to_title(url)
 
     # ── Step 1: Main extraction chain ────────────────────────────────────────────
-    content = ""
-    camoufox_title = ""  # populated if Camoufox saves us
-    for attempt in range(max_retries):
-        content = _extract_web_content(url, timeout, attempt=attempt)
+    if not content:
+        content = ""
+        camoufox_title = ""  # populated if Camoufox saves us
+        for attempt in range(max_retries):
+            content = _extract_web_content(url, timeout, attempt=attempt)
 
-        if not content:
-            continue
-        if _is_challenge_page(content):
-            content = ""
-            continue
-        if len(content.strip()) < 20:
-            content = ""
-            continue
-        break
+            if not content:
+                continue
+            if _is_challenge_page(content):
+                content = ""
+                continue
+            if len(content.strip()) < 20:
+                content = ""
+                continue
+            break
 
     # ── Step 2: archive.org fallback ─────────────────────────────────────────────
     if not content or _is_challenge_page(content):
@@ -117,14 +132,14 @@ def extract_web(url: str, cfg: Config, source_type: SourceType = SourceType.WEB)
             content = f"URL: {url}\n\nNote: Content extraction failed ({reason})."
 
     # ── Title extraction ─────────────────────────────────────────────────────────
-    # Pipeline: Camoufox title → defuddle JSON title → content-based → HTML
+    # Pipeline: Camoufox title -> defuddle JSON title -> content-based -> HTML
     first_body_line = content.strip().split("\n")[0][:80].lower() if content else ""
     _BODY_NOISE = re.compile(
         r"^\s*(?:press\s+enter\s+or\s+click\s+to\s+view|get\s+(?:the\s+)?app|sign\s+up|"
         r"sign\s+in|loading\s+more|please\s+wait)"
     )
 
-    # Detect if content starts with H2 (defuddle stripped H1 → can't trust content-based title)
+    # Detect if content starts with H2 (defuddle stripped H1 -> can't trust content-based title)
     defuddle_stripped_h1 = content.strip().startswith("## ")
 
     # 1. Use Camoufox document.title if it exists and is clean
@@ -132,7 +147,7 @@ def extract_web(url: str, cfg: Config, source_type: SourceType = SourceType.WEB)
     if camoufox_title and not _garbage_title(camoufox_title):
         title = camoufox_title
     elif _BODY_NOISE.search(first_body_line):
-        # Body starts with Medium/Substack lazy-load noise → skip content-based
+        # Body starts with Medium/Substack lazy-load noise -> skip content-based
         title = fallback_title
     elif defuddle_stripped_h1:
         # defuddle --markdown stripped the H1; content-based title = first sentence
@@ -140,7 +155,7 @@ def extract_web(url: str, cfg: Config, source_type: SourceType = SourceType.WEB)
     else:
         # 2. Try content-based heading extraction (best signal when defuddle works)
         from pipeline.extractors._shared import extract_title as _extract_title
-        content_title = _extract_title(content, fallback_title="")
+        content_title = _extract_title(content, fallback_title="" or fallback_title)
 
         # 3. Validate content-based title
         if content_title:
@@ -178,7 +193,7 @@ def extract_web(url: str, cfg: Config, source_type: SourceType = SourceType.WEB)
 
 
 def _extract_web_content(url: str, timeout: int = 45, attempt: int = 0) -> str:
-    """Extract web content. Tries defuddle → curl fallback.
+    """Extract web content. Tries defuddle -> curl fallback.
 
     attempt > 0 rotates user-agents for retry.
     Handles arxiv specially via alphaxiv.org.
@@ -331,7 +346,7 @@ def _try_defuddle_json(url: str, timeout: int = 45) -> str:
 
 
 def _try_curl_extract(url: str, timeout: int = 45, attempt: int = 0) -> str:
-    """Try liteparse: curl download → liteparse parse --format text.
+    """Try liteparse: curl download -> liteparse parse --format text.
 
     Rotates user-agents on retry to bypass simple bot detection.
     """
@@ -364,7 +379,7 @@ def _try_curl_extract(url: str, timeout: int = 45, attempt: int = 0) -> str:
                 )
                 if parse.returncode == 0 and parse.stdout:
                     result = parse.stdout
-                    # liteparse returns raw HTML → detect and reject it
+                    # liteparse returns raw HTML -> detect and reject it
                     if result.strip().startswith(("<!DOCTYPE", "<!doctype html", "<html", "<HTML")):
                         log.warning("liteparse returned raw HTML for %s, rejecting", url)
                         return ""

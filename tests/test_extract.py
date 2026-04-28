@@ -331,8 +331,12 @@ class TestExtractWeb:
         assert "body of the article" in source.content
 
     @patch("pipeline.extractors.web._extract_web_content")
-    def test_fallback_on_failure(self, mock_content, cfg: Config):
+    @patch("pipeline.extractors.web._try_archive_extract")
+    @patch("pipeline.extractors.web._try_camoufox_with_title")
+    def test_fallback_on_failure(self, mock_cfx, mock_archive, mock_content, cfg: Config):
         mock_content.return_value = ""
+        mock_archive.return_value = ""
+        mock_cfx.return_value = ("", "")
         source = _extract_web("https://example.com/article", cfg)
         assert "extraction failed" in source.content.lower()
         assert source.type == SourceType.WEB

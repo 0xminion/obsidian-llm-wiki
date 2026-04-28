@@ -488,6 +488,28 @@ _YT_VIDEO_ID_PATTERNS = [
 ]
 
 
+_JS_RENDERED_PATTERNS = [
+    re.compile(r"medium\.com", re.IGNORECASE),
+    re.compile(r"substack\.com", re.IGNORECASE),
+    re.compile(r"nature\.com", re.IGNORECASE),
+    re.compile(r"akjournals\.com", re.IGNORECASE),
+    re.compile(r"blog\.monad\.xyz", re.IGNORECASE),
+    re.compile(r"blogs\.law\.ox\.ac\.uk", re.IGNORECASE),
+    re.compile(r"oddchain\.com", re.IGNORECASE),
+    re.compile(r"thetokendispatch\.com", re.IGNORECASE),
+    re.compile(r"sciencedirect\.com", re.IGNORECASE),
+    re.compile(r"springer\.com", re.IGNORECASE),
+    re.compile(r"ieee\.org", re.IGNORECASE),
+    re.compile(r"acm\.org", re.IGNORECASE),
+    re.compile(r"jstor\.org", re.IGNORECASE),
+]
+
+def _should_use_camoufox_first(url: str) -> bool:
+    """Return True for JS-rendered / Cloudflare-walled domains."""
+    if not url:
+        return False
+    return any(p.search(url) for p in _JS_RENDERED_PATTERNS)
+
 def _is_youtube_url(url: str) -> bool:
     try:
         parsed = urlparse(url)

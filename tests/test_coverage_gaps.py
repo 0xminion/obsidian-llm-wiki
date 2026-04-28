@@ -157,12 +157,12 @@ class TestCamoufoxFallbackChain:
 
         def _succeed_camoufox(url, timeout):
             calls.append("camoufox")
-            return "Camoufox extracted content.\nBody."
+            return "Camoufox extracted content.\nBody.", "Camoufox Title"
 
         monkeypatch.setattr("pipeline.extractors.web._try_defuddle", _fail_defuddle)
         monkeypatch.setattr("pipeline.extractors.web._try_curl_extract", _fail_curl)
         monkeypatch.setattr("pipeline.extractors.web._try_archive_extract", _fail_archive)
-        monkeypatch.setattr("pipeline.extractors.web._try_camoufox", _succeed_camoufox)
+        monkeypatch.setattr("pipeline.extractors.web._try_camoufox_with_title", _succeed_camoufox)
 
         result = extract_web("https://example.com/page", cfg)
 
@@ -179,7 +179,7 @@ class TestCamoufoxFallbackChain:
         monkeypatch.setattr("pipeline.extractors.web._try_defuddle", lambda u, t: "")
         monkeypatch.setattr("pipeline.extractors.web._try_curl_extract", lambda u, t, attempt=0: "")
         monkeypatch.setattr("pipeline.extractors.web._try_archive_extract", lambda u, t: "")
-        monkeypatch.setattr("pipeline.extractors.web._try_camoufox", lambda u, t: "")
+        monkeypatch.setattr("pipeline.extractors.web._try_camoufox_with_title", lambda u, t: ("", ""))
 
         result = extract_web("https://example.com/total-fail", cfg)
         assert "URL: https://example.com/total-fail" in result.content

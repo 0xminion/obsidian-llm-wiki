@@ -168,12 +168,14 @@ class TestExtractValidation:
         with patch("pipeline.extractors.web._try_defuddle") as mock_d1, \
              patch("pipeline.extractors.web._try_curl_extract") as mock_curl, \
              patch("pipeline.extractors.web._try_defuddle_json") as mock_json, \
-             patch("pipeline.extractors.web._try_archive_extract") as mock_archive:
+             patch("pipeline.extractors.web._try_archive_extract") as mock_archive, \
+             patch("pipeline.extractors.web._try_camoufox_with_title") as mock_cfx:
 
             mock_d1.return_value = ""
             mock_curl.return_value = ""
             mock_json.return_value = ""
             mock_archive.return_value = ""
+            mock_cfx.return_value = ("", "")
 
             with pytest.raises(ExtractionError, match="Extraction failed after"):
                 extract_url(url, cfg)
