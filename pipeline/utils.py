@@ -185,7 +185,18 @@ def parse_clipping_file(file_path: Path) -> dict | None:
     if not url:
         # Try to find the first http link in the body
         m = re.search(r"https?://\S+", body)
-        url = m.group(0).rstrip(".,;:!?)\">'") if m else ""
+        raw = m.group(0) if m else ""
+        # Strip trailing punctuation that Markdown / browsers add, but preserve
+        # balanced parentheses that are part of the real URL path.
+        while raw.endswith((".", ",", ";", ":", "!", "?", ")", "]", "\">", "'", '"')):
+            if raw.endswith(")") and raw.count("(") < raw.count(")"):
+                raw = raw[:-1]
+                continue
+            elif raw[-1] in (".", ",", ";", ":", "!", "?", "]", "\">", "'", '"'):
+                raw = raw[:-1]
+                continue
+            break
+        url = raw
     if not url:
         return None
 

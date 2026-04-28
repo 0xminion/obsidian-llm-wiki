@@ -266,7 +266,7 @@ def _run_agent(cfg: Config, prompt: str, description: str, max_retries: int = 3)
                 cwd=str(cfg.vault_path),
                 capture_output=True,
                 text=True,
-                timeout=600,
+                timeout=120,
             )
             duration = time.monotonic() - t0
             last_output = result.stdout or ""

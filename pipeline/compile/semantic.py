@@ -55,8 +55,9 @@ class NoteIndex:
                     "path": str(md.relative_to(cfg.vault_path)),
                 }
 
-    def embed_all(self, client) -> None:
-        if not self.notes:
+    def embed_all(self, client, skip_local: bool = False) -> None:
+        """Embed all notes. If *skip_local* is True the local batch is skipped (QMD handles it)."""
+        if not self.notes or skip_local:
             return
         from pipeline.qmd import _get_client
         if _get_client() is not None:
@@ -66,7 +67,9 @@ class NoteIndex:
         names = list(self.notes.keys())
         batch = client.embed_batch(texts)
         if batch:
-            for name, text in zip(names, texts):
+            # Lookup by index to avoid dict-key collision on duplicate content.
+            for i, name in enumerate(names):
+                text = texts[i]
                 if text in batch:
                     self.embeddings[name] = batch[text]
             log.info("Embedded %d/%d notes", len(self.embeddings), len(self.notes))
@@ -208,8 +211,22 @@ def _semantic_concept_merge(cfg: Config, client, index: NoteIndex) -> int:
 
     candidates: list[tuple[str, str, float]] = []
     names = list(concepts.keys())
+    # Pre-filter with embedding threshold to reduce Python O(N^2) work
     for i, name_a in enumerate(names):
+        emb_a = index.embeddings.get(name_a)
         for name_b in names[i + 1:]:
+            emb_b = index.embeddings.get(name_b)
+            sim = 0.0
+            if emb_a and emb_b:
+                dot = sum(x * y for x, y in zip(emb_a, emb_b))
+                norm_a = math.sqrt(sum(x * x for x in emb_a))
+                norm_b = math.sqrt(sum(x * x for x in emb_b))
+                if norm_a and norm_b:
+                    sim = dot / (norm_a * norm_b)
+            # Skip if embeddings are present but say "not similar" (<0.5).
+            # If no embeddings, fall through to string-overlap heuristic.
+            if (emb_a and emb_b) and sim < 0.5:
+                continue
             info_a = concepts[name_a]
             info_b = concepts[name_b]
             words_a = set(re.sub(r"[^a-zA-Z0-9一-鿿]", " ", info_a["title"].lower()).split())
@@ -217,7 +234,6 @@ def _semantic_concept_merge(cfg: Config, client, index: NoteIndex) -> int:
             overlap = 0.0
             if words_a and words_b:
                 overlap = len(words_a & words_b) / min(len(words_a), len(words_b))
-            sim = index.similarity(name_a, name_b)
             score = max(overlap, sim)
             if score > 0.75:
                 candidates.append((name_a, name_b, score))
@@ -226,7 +242,8 @@ def _semantic_concept_merge(cfg: Config, client, index: NoteIndex) -> int:
         return 0
 
     candidates.sort(key=lambda x: x[2], reverse=True)
-    candidates = candidates[:10]
+    max_candidates = getattr(cfg, 'max_merge_candidates', 10)
+    candidates = candidates[:max_candidates]
 
     prompt_lines = [
         "You are a knowledge base editor. Review these concept pairs and decide if they should be merged.",
@@ -439,7 +456,11 @@ def _run_semantic_compile(cfg: Config, result) -> tuple[bool, str]:
         index = NoteIndex()
         index.load(cfg)
         if len(index.notes) > 0:
-            index.embed_all(client)
+            from pipeline.qmd import _get_client
+            skip_local = _get_client() is not None
+            if skip_local:
+                log.info("QMD enabled --- skipping local embed batch")
+            index.embed_all(client, skip_local=skip_local)
 
         all_ok = True
         try:

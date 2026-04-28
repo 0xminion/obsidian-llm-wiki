@@ -257,8 +257,6 @@ class Config:
         return errors
 
 
-
-
 def _int_env(key: str, default: int, env_values: Optional[dict[str, str]] = None) -> int:
     """Safely parse an integer from environment variables or .env values."""
     raw = os.environ.get(key)

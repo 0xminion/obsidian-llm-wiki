@@ -1,7 +1,6 @@
 """Shared infrastructure for the pipeline.
 
 Ports common.sh utilities to Python:
-- check_dependencies(): Preflight dependency check
 - VaultLock: Directory-based lock with PID/time-based stale detection
 - run_with_retry(): Retry with exponential backoff
 - append_log_md(): Append structured entries to log.md (Karpathy-style)

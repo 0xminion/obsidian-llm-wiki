@@ -7,6 +7,7 @@ All notable changes to this project will be documented in this file.
 ## [0.3.0] - 2026-04-27
 
 ### Added
+- **Direct Semantic Compile Pass** — Replaced the 600-second Hermes subprocess fallback with Python-driven embedding similarity + LLM validation. Compile pass now completes in ~3 minutes instead of hanging for 10 minutes. Falls back to Hermes subprocess only on direct-LLM failure.
 - **Module decomposition**: Split 3 monolithic files into focused packages with backward-compatible re-exports:
   - `cli.py` (1,252 lines) → `pipeline/cli/` (6 modules: ingest, compile_cmd, review_cmd, quality, manage, _helpers)
   - `lint.py` (1,207 lines) → `pipeline/lint/` (4 modules: checks, fixes, models, runner)
