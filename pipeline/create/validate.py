@@ -27,7 +27,7 @@ _STUB_PATTERNS = [
 ]
 
 # Tags that should never appear
-_BANNED_TAGS = {"x.com", "tweet", "source", "http", "https", "url", "link", "rss", "feed"}
+_BANNED_TAGS = {"x.com", "tweet", "http", "https", "url", "link", "rss", "feed"}
 
 _REQUIRED_FM_FIELDS: dict[str, list[str]] = {
     "entry": ["title", "source", "date_entry", "status", "template", "tags"],

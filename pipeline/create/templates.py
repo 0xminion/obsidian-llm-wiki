@@ -55,7 +55,7 @@ def generate_source_content(
     if not include_frontmatter:
         return body
 
-    tags_block = f"tags:\n{tags_yaml}" if tags_yaml else "tags: []"
+    tags_block = f"tags:\n  - source\n{tags_yaml}" if tags_yaml else "tags:\n  - source"
 
     return f"""---
 title: "{title}"
@@ -64,6 +64,8 @@ source_type: {source_type}
 author: "{author}"
 date_captured: {today}
 {tags_block}
+status: processed
+aliases: []
 template: {plan.template.value}
 ---
 
@@ -174,7 +176,12 @@ def generate_entry_content(
     language_line = ""
     if plan.language.value != "en":
         language_line = f"\nlanguage: {plan.language.value}"
-    tags_line = f"\ntags:\n{tags_yaml}" if tags_yaml else "\ntags: []"
+    entry_tags = ["entry"]
+    for t in plan.tags:
+        if t not in entry_tags:
+            entry_tags.append(t)
+    tags_yaml = "\n".join(f"  - {t}" for t in entry_tags)
+    tags_block = f"tags:\n{tags_yaml}" if tags_yaml else "tags: []"
 
     return f"""---
 title: "{title}"
@@ -183,8 +190,12 @@ source_url: "{url}"
 type: {source_type}
 author: "{author}"
 date_entry: {today}
-status: draft{language_line}{tags_line}
+status: review
+reviewed: ""
+review_notes: ""
 template: {plan.template.value}
+{tags_block}{language_line}
+aliases: []
 ---
 
 {body}"""

@@ -658,18 +658,28 @@ def generate_plans(
 
     for d in plan_dicts:
         try:
+            # Inject correct hash from manifest ONLY when LLM omitted hash entirely
+            plan_hash = d.get("hash", "")
+            if not plan_hash or plan_hash.strip() == "":
+                # Try to match by title to the correct source
+                for entry in manifest.entries:
+                    if entry.title == d.get("title", "") or len(manifest.entries) == 1:
+                        plan_hash = entry.hash
+                        break
+                d["hash"] = plan_hash
+
             # Validate required fields
-            if "hash" not in d or "title" not in d:
+            if not plan_hash or not d.get("title"):
                 log.warning("Plan missing required fields (hash/title), skipping")
                 continue
 
-            # Skip plans for unknown hashes
-            if d["hash"] not in known_hashes:
-                log.warning("Plan for unknown hash %s, skipping", d.get("hash"))
+            # Skip plans for unknown hashes (LLM-provided wrong hash = reject)
+            if plan_hash not in known_hashes:
+                log.warning("Plan for unknown hash %s, skipping", plan_hash)
                 continue
 
             plan = Plan(
-                hash=d["hash"],
+                hash=plan_hash,
                 title=d["title"][:120],
                 language=Language(d.get("language", "en")),
                 template=Template(d.get("template", "standard")),

@@ -132,55 +132,46 @@ def extract_web(url: str, cfg: Config, source_type: SourceType = SourceType.WEB)
             content = f"URL: {url}\n\nNote: Content extraction failed ({reason})."
 
     # ── Title extraction ─────────────────────────────────────────────────────────
-    # Pipeline: Camoufox title -> defuddle JSON title -> content-based -> HTML
+    # Pipeline: Camoufox title → HTML title → content-based (H1/H2) → URL slug
     first_body_line = content.strip().split("\n")[0][:80].lower() if content else ""
     _BODY_NOISE = re.compile(
         r"^\s*(?:press\s+enter\s+or\s+click\s+to\s+view|get\s+(?:the\s+)?app|sign\s+up|"
         r"sign\s+in|loading\s+more|please\s+wait)"
     )
 
-    # Detect if content starts with H2 (defuddle stripped H1 -> can't trust content-based title)
-    defuddle_stripped_h1 = content.strip().startswith("## ")
-
-    # 1. Use Camoufox document.title if it exists and is clean
     title = ""
+
+    # 1. Camoufox title (highest fidelity)
     if camoufox_title and not _garbage_title(camoufox_title):
         title = camoufox_title
-    elif _BODY_NOISE.search(first_body_line):
-        # Body starts with Medium/Substack lazy-load noise -> skip content-based
-        title = fallback_title
-    elif defuddle_stripped_h1:
-        # defuddle --markdown stripped the H1; content-based title = first sentence
-        title = fallback_title
-    else:
-        # 2. Try content-based heading extraction (best signal when defuddle works)
-        from pipeline.extractors._shared import extract_title as _extract_title
-        content_title = _extract_title(content, fallback_title="" or fallback_title)
 
-        # 3. Validate content-based title
+    # 2. Content-based: H1 heading or first good line (even if starts with ##)
+    if not title and not _BODY_NOISE.search(first_body_line):
+        from pipeline.extractors._shared import extract_title as _extract_title
+        content_title = _extract_title(content, fallback_title="")
         if content_title:
             is_error_msg = any(m in content_title.lower() for m in (
                 "request could not be satisfied", "403 error", "access denied",
                 "error 1020", "attention required", "blocked", "checking your browser",
             ))
-            # Reject if it looks like a body sentence (no title-like brevity/structure)
+            # Reject only if it looks like a body sentence (no title-like brevity/structure)
             looks_like_body = (
-                len(content_title) > 80
+                len(content_title) > 120
                 or content_title[0].islower()
                 or content_title.startswith(("'", '"', "“"))
-                or content_title.endswith((".", "?", "!"))
+                or content_title.endswith((".",))  # period = sentence
             )
             if not is_error_msg and not looks_like_body and not _garbage_title(content_title):
                 title = content_title
 
-    # 4. Final fallback pipeline
+    # 3. Final fallback pipeline
     if not title or _garbage_title(title):
         if fallback_title and not _garbage_title(fallback_title):
             title = fallback_title
         else:
             title = _url_to_title(url)
 
-    # 5. Clean up: strip site suffixes like "| Site Name" from HTML titles
+    # 4. Clean up: strip site suffixes like "| Site Name" from HTML titles
     title = re.sub(r"\s*[|]\s*(?:Home\s+-\s+)?[^|]{3,80}$", "", title).strip()
 
     return ExtractedSource(

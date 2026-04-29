@@ -247,56 +247,64 @@ def _strip_markdown(text: str) -> str:
 def extract_title(content: str, fallback_title: str = "") -> str:
     """Extract a title from content text.
 
-    When content is a Cloudflare/garbage HTML page (starts with <!DOCTYPE or <html),
-    returns fallback_title instead of parsing garbage.
-
     Strategy:
       1. If content starts with HTML tag → return fallback_title
       2. Find first # heading (skip "Original content")
-      3. Fallback: first non-empty line that LOOKS LIKE a title
-      4. Last resort: return fallback_title
-
-    A line "looks like a title" when:
-      - 10–80 chars
-      - Starts with uppercase or CJK character
-      - Does NOT end with sentence-ending punctuation (. ? !)
-      - Does NOT start with lowercase or apostrophe/quote
-      - Not UI noise
+      3. Find first ## heading if no # heading (ar5iv papers etc.)
+      4. Fallback: first non-empty line that LOOKS LIKE a title
+      5. Last resort: return fallback_title
     """
     if not content:
         return fallback_title or ""
 
     stripped = content.lstrip()[:50]
-    # HTML pages: Cloudflare challenge, GDPR wall, etc.
     if stripped.startswith(("<!DOCTYPE", "<html", "<HTML", "<head>", "<HEAD>")):
         return fallback_title or ""
 
-    for line in content.split("\n"):
+    # Strip ar5iv footnote noise from the first lines
+    clean = re.sub(r"††[^\n]*", "", content)
+    # Strip inline LaTeX footnote marks (\[...\]) and footnotes from headings
+    for i, line in enumerate(clean.split("\n")):
+        if line.startswith("#"):
+            clean = clean.replace(line, re.sub(r"\\\[.*?\\\]", "", line))
+            break
+
+    for line in clean.split("\n"):
         s = line.strip()
         if s.startswith("# ") and not s.lstrip("# ").startswith("Original content"):
             title = s.lstrip("# ").strip()
             if len(title) > 5:
                 return _strip_markdown(title[:120])
 
-    # Fallback: first non-empty, non-URL, non-image line that looks like a title
+    # Also check ## headings (ar5iv papers use ## for main title)
+    for line in clean.split("\n"):
+        s = line.strip()
+        if s.startswith("## "):
+            title = s.lstrip("#").strip()
+            if 10 <= len(title) <= 120:
+                lower = title.lower()
+                if lower not in {"abstract", "introduction", "background", "methods", "results", "discussion", "conclusion", "references", "acknowledgements", "acknowledgments"} and not lower.startswith("acknowledg"):
+                    return _strip_markdown(title)
+
     _UI_NOISE = re.compile(
         r"(?im)^\s*(?:get\s+(?:the\s+)?app|sign\s+(?:up|in)|follow|like|save|share|login|"
         r"subscribe|join|bookmark|press\s+enter|click\s+to\s+view|image\s+in\s+full"
         r"|load(?:ing)?\s+(?:more|comments)|terms\s+.*\s+use|privacy\s+.*\s+policy|"
         r"\d+\s+claps?|respond|comment)"
     )
-    for line in content.split("\n"):
+    for line in clean.split("\n"):
         s = line.strip()
-        if not s or s.startswith(("http", "!", "[")):
+        if not s or s.startswith(("http", "!", "[", "#")):
             continue
         if _UI_NOISE.search(s):
             continue
-        # Title heuristics
+        # Title heuristics (titles may end in ? but not . or sentence-like)
         if len(s) < 10 or len(s) > 80:
             continue
         if s[0].islower() or s[0] in ("'", '"', "“"):
             continue
-        if s[-1] in (".", "?", "!"):
+        # Reject if it ends with period (sentence, not title)
+        if s[-1] == ".":
             continue
         return _strip_markdown(s[:120])
 
