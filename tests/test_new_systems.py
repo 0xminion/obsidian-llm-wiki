@@ -467,8 +467,13 @@ class TestGenerateConceptTemplate:
         from pipeline.create.templates import _generate_concept_template
         content = _generate_concept_template("Test Concept", sample_plan)
         assert "type: concept" in content
-        assert "status: draft" in content
+        assert "status: evergreen" in content
         assert "sources:" in content
+        assert "aliases: []" in content
+        assert "date_created:" in content
+        assert "last_updated:" in content
+        assert "tags:" in content
+        assert "- concept" in content
 
 
 # ─── Review Workflow Tests ────────────────────────────────────────────────────

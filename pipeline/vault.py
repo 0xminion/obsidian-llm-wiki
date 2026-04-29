@@ -103,8 +103,8 @@ def _build_frontmatter(fields: dict) -> str:
 
 # ─── Write Source ─────────────────────────────────────────────────────────────
 
-def write_source(cfg: Config, source: ExtractedSource) -> Path:
-    """Write a source note to cfg.sources_dir.
+def write_source(cfg: Config, source: ExtractedSource, *, tags: list[str] | None = None) -> Path:
+    """Write a source note to cfg.sources_dir following the Source.md template.
 
     Returns the Path of the created file.
     Raises FileExistsError if collision detected (after resolution).
@@ -115,6 +115,11 @@ def write_source(cfg: Config, source: ExtractedSource) -> Path:
     filename = resolve_collision(cfg.sources_dir, filename)
 
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    source_tags = ["source"]
+    if tags:
+        for t in tags:
+            if t not in source_tags:
+                source_tags.append(t)
 
     frontmatter = _build_frontmatter({
         "title": source.title,
@@ -122,11 +127,12 @@ def write_source(cfg: Config, source: ExtractedSource) -> Path:
         "source_type": source.type.value if hasattr(source.type, "value") else str(source.type),
         "author": source.author or "",
         "date_captured": now,
-        "tags": [],
-        "status": "raw",
+        "tags": source_tags,
+        "status": "processed",
+        "aliases": [],
     })
 
-    body = f"# {source.title}\n\n{source.content}\n"
+    body = f"# {source.title}\n\n## Original content\n\n{source.content}\n"
     content = frontmatter + body
 
     target = safe_note_path(cfg.sources_dir, filename)
@@ -136,8 +142,15 @@ def write_source(cfg: Config, source: ExtractedSource) -> Path:
 
 # ─── Write Entry ──────────────────────────────────────────────────────────────
 
-def write_entry(cfg: Config, plan: Plan, content: str, source_note_name: str | None = None) -> Path:
-    """Write an entry note to cfg.entries_dir.
+def write_entry(
+    cfg: Config,
+    plan: Plan,
+    content: str,
+    source_note_name: str | None = None,
+    *,
+    language: str | None = None,
+) -> Path:
+    """Write an entry note to cfg.entries_dir following the Entry.md template.
 
     Returns the Path of the created file.
     """
@@ -150,14 +163,29 @@ def write_entry(cfg: Config, plan: Plan, content: str, source_note_name: str | N
     source_name = source_note_name or title_to_filename(plan.title)
     source_link = f"[[{source_name}]]"
 
-    frontmatter = _build_frontmatter({
+    entry_tags = ["entry"]
+    for t in plan.tags:
+        if t not in entry_tags:
+            entry_tags.append(t)
+
+    fm_fields: dict = {
         "title": plan.title,
-        "source": source_link,  # links to the Source note (same filename)
+        "source": source_link,
         "date_entry": now,
-        "status": "draft",
+        "status": "review",
+        "reviewed": "",
+        "review_notes": "",
         "template": plan.template.value if hasattr(plan.template, "value") else str(plan.template),
-        "tags": plan.tags,
-    })
+        "tags": entry_tags,
+        "aliases": [],
+    }
+    lang = language or plan.language.value
+    if lang == "zh":
+        fm_fields["language"] = "zh"
+    if plan.title_en:
+        fm_fields["title_en"] = plan.title_en
+
+    frontmatter = _build_frontmatter(fm_fields)
 
     full_content = frontmatter + content
     # Safety net: agent/review paths may omit the heading — templates always include it
@@ -171,7 +199,16 @@ def write_entry(cfg: Config, plan: Plan, content: str, source_note_name: str | N
 
 # ─── Write Concept ────────────────────────────────────────────────────────────
 
-def write_concept(cfg: Config, name: str, content: str, sources: list[str]) -> Path:
+def write_concept(
+    cfg: Config,
+    name: str,
+    content: str,
+    sources: list[str],
+    *,
+    tags: list[str] | None = None,
+    language: str = "en",
+    title_en: str | None = None,
+) -> Path:
     """Write a concept note to cfg.concepts_dir.
 
     Returns the Path of the created file.
@@ -181,13 +218,29 @@ def write_concept(cfg: Config, name: str, content: str, sources: list[str]) -> P
     filename = title_to_filename(name)
     filename = resolve_collision(cfg.concepts_dir, filename)
 
-    frontmatter = _build_frontmatter({
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    concept_tags = ["concept"]
+    if tags:
+        for t in tags:
+            if t not in concept_tags:
+                concept_tags.append(t)
+
+    fm_fields: dict = {
         "title": name,
         "type": "concept",
-        "status": "draft",
+        "date_created": now,
+        "last_updated": now,
         "sources": sources,
-        "tags": [],
-    })
+        "tags": concept_tags,
+        "status": "evergreen",
+        "aliases": [],
+    }
+    if language == "zh":
+        fm_fields["language"] = "zh"
+    if title_en:
+        fm_fields["title_en"] = title_en
+
+    frontmatter = _build_frontmatter(fm_fields)
 
     full_content = frontmatter + content
     if not content.strip().startswith("#"):
@@ -216,11 +269,14 @@ def update_moc(
     description: str,
     *,
     entry_display_title: str | None = None,
+    tags: list[str] | None = None,
 ) -> None:
     """Append an entry under a topic section in a MoC file.
 
     ``entry_name`` is the canonical Obsidian stem. ``entry_display_title`` is
     optional alias text rendered as ``[[stem|title]]``.
+
+    ``tags`` are wired into new MoC frontmatter (``map-of-content`` + topic tags).
     """
     cfg.mocs_dir.mkdir(parents=True, exist_ok=True)
 
@@ -238,36 +294,53 @@ def update_moc(
     else:
         link = f"[[{entry_stem}]]"
     desc = _safe_display_text(description, fallback="")
-    entry_line = f"- {link}: {desc}" if desc else f"- {link}"
+    # Template format: "- [[Entry]] — <description>" (em dash, not colon)
+    entry_line = f"- {link} — {desc}" if desc else f"- {link}"
 
     if not moc_path.exists():
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        moc_tags = ["map-of-content"]
+        if tags:
+            for t in tags:
+                if t not in moc_tags:
+                    moc_tags.append(t)
         frontmatter = _build_frontmatter({
             "title": moc_title,
             "type": "moc",
-            "status": "draft",
-            "created": today,
-            "tags": [],
+            "status": "active",
+            "date_created": today,
+            "date_updated": today,
+            "tags": moc_tags,
         })
         content = (
-            frontmatter
-            + f"\n# {moc_title}\n\n"
-            + "## Overview / 概述\n\n"
-            + f"Map of Content for {moc_title}.\n\n"
-            + "---\n\n"
-            + "## Entries\n\n"
-            + f"{entry_line}\n"
+            f"# {moc_title}\n\n"
+            "## Overview / 概述\n\n"
+            f"Map of Content for {moc_title}.\n\n"
+            "## Topics / 主题\n\n"
+            f"{entry_line}\n\n"
+            "## Bridge Concepts / 桥接概念\n\n"
+            "## Cross-References / 关联图谱\n\n"
+            "## Related MoCs / 相关图谱\n"
         )
-        moc_path.write_text(content, encoding="utf-8")
+        moc_path.write_text(frontmatter + "\n" + content, encoding="utf-8")
         return
 
     existing = moc_path.read_text(encoding="utf-8")
+
+    # Update date_updated in frontmatter if present
+    existing = re.sub(
+        r"^(date_updated:)\s*\S+",
+        r"\1 " + datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+        existing,
+        flags=re.MULTILINE,
+    )
+
     lines = existing.split("\n")
     insert_idx = None
 
     for i, line in enumerate(lines):
         stripped = line.strip()
-        if stripped.startswith("## ") and "entries" in stripped.lower():
+        if stripped.startswith("## ") and ("entries" in stripped.lower() or "topics" in stripped.lower() or "主题" in stripped):
             for j in range(i + 1, len(lines)):
                 if lines[j].startswith("## "):
                     insert_idx = j
@@ -278,7 +351,7 @@ def update_moc(
 
     if insert_idx is None:
         lines.append("")
-        lines.append("## Entries")
+        lines.append("## Topics / 主题")
         lines.append("")
         lines.append(entry_line)
     else:

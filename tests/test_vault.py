@@ -129,7 +129,10 @@ class TestWriteSource:
         assert "source_url: https://example.com/article" in text
         assert "source_type: web" in text
         assert "author: Test Author" in text
-        assert "status: raw" in text
+        assert "status: processed" in text
+        assert "tags:\n- source" in text
+        assert "aliases: []" in text
+        assert "## Original content" in text
 
     def test_no_collision_overwrite(self, cfg: Config):
         source = ExtractedSource(
@@ -172,7 +175,11 @@ class TestWriteEntry:
         assert path.exists()
         text = path.read_text()
         assert "title: My Entry" in text
-        assert "status: draft" in text
+        assert "status: review" in text
+        assert "reviewed: ''" in text
+        assert "review_notes: ''" in text
+        assert "tags:\n- entry\n- test" in text
+        assert "aliases: []" in text
 
     def test_quoted_wikilink_in_yaml(self, cfg: Config):
         plan = Plan(hash="abc123", title="Test Entry", tags=[])

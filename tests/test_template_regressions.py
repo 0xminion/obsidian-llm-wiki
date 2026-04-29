@@ -207,8 +207,8 @@ def test_template_source_creation_uses_collision_resolution(cfg: Config):
     assert any('source: "[[same-title-1-source]]"' in text for text in entry_texts)
 
     moc_text = (cfg.mocs_dir / "general.md").read_text(encoding="utf-8")
-    assert "[[same-title|Same Title]]: Related to [[same-title]]" in moc_text
-    assert "[[same-title-1|Same Title-1]]: Related to [[same-title-1]]" in moc_text
+    assert "[[same-title|Same Title]] — Related to [[same-title]]" in moc_text
+    assert "[[same-title-1|Same Title-1]] — Related to [[same-title-1]]" in moc_text
 
     concept_a = (cfg.concepts_dir / "concept-a.md").read_text(encoding="utf-8")
     concept_b = (cfg.concepts_dir / "concept-b.md").read_text(encoding="utf-8")

@@ -301,71 +301,117 @@ def _generate_concept_template(
     source_note_name: str | None = None,
     source_display_title: str | None = None,
 ) -> str:
-    """Generate a Concept note template with real skeleton content.
+    """Generate a Concept note following the evergreen format.
 
     Uses the canonical source note filename for wikilinks/frontmatter so the vault
     graph stays consistent, while optionally using a prettier display title in prose.
+
+    Matches pipeline/assets/templates/Concept.md and prompts/concept-structure.prompt:
+    - status: evergreen (not draft)
+    - tags: concept + topic tags from plan
+    - sections: Core concept / 核心概念, Context / 背景, Links / 关联
+    - Context is flowing prose, NOT bullet points
     """
     today = date.today().isoformat()
     source_note_name = source_note_name or plan.title or name
-    source_display_title = escape_yaml(source_display_title or plan.title or source_note_name)
+    source_display_title_safe = source_display_title or plan.title or source_note_name
 
-    if plan.title and plan.title != name:
+    # ── language + bilingual sections ──────────────────────────────────────
+    is_chinese = plan.language.value == "zh" or plan.template.value == "chinese"
+
+    if is_chinese:
+        core_heading = "核心概念"
+        context_heading = "背景"
+        links_heading = "关联"
+        h1_title = name
+        title_en_line = f'\ntitle_en: "{escape_yaml(source_display_title_safe)}"'
+        language_line = "\nlanguage: zh"
         core_concept = (
-            f"{name} is a concept introduced or explored in "
-            f"\"{source_display_title}\". It represents a key idea that connects "
-            f"multiple sources and entries in the knowledge base."
+            f"{name} 是一个在知识库中反复出现的核心概念，"
+            f"首次在「{escape_yaml(source_display_title_safe)}」中浮现。"
+            f"它代表一个连接多个来源与条目的关键思想。"
         )
     else:
+        core_heading = "Core concept"
+        context_heading = "Context"
+        links_heading = "Links"
+        h1_title = name
+        title_en_line = ""
+        language_line = ""
         core_concept = (
-            f"{name} — a core concept in the knowledge base. "
-            f"This note aggregates references and context from related entries."
+            f"{name} is a concept introduced or explored in "
+            f"\"{escape_yaml(source_display_title_safe)}\". It represents a key idea that connects "
+            f"multiple sources and entries in the knowledge base."
         )
 
-    context_lines = []
+    # ── Context as flowing prose (not bullets) ──────────────────────────────
+    context_paragraphs = []
     if plan.concept_updates:
-        context_lines.append(
-            f"Related to existing concepts: {', '.join(f'[[{c}]]' for c in plan.concept_updates)}"
+        context_paragraphs.append(
+            f"This concept is closely related to existing ideas in the vault, including "
+            f"{', '.join(f'[[{c}]]' for c in plan.concept_updates)}. "
+            f"Exploring these connections can reveal broader patterns and help synthesize "
+            f"a more complete understanding."
         )
     if plan.concept_new and len(plan.concept_new) > 1:
         siblings = [c for c in plan.concept_new if c != name]
         if siblings:
-            context_lines.append(
-                f"Emerging alongside: {', '.join(f'[[{c}]]' for c in siblings)}"
+            context_paragraphs.append(
+                f"Alongside {name}, several new concepts are emerging from this source: "
+                f"{', '.join(f'[[{c}]]' for c in siblings)}. "
+                f"These ideas appear together and may form a cluster worth tracking."
             )
-    context_lines.append(
-        f"First appeared in source: [[{source_note_name}]] ({today})"
+    context_paragraphs.append(
+        f"First identified in [[{source_note_name}]] on {today}. "
+        f"As the vault grows, this note should be enriched with additional evidence, "
+        f"counter-arguments, and cross-references from new entries."
     )
-    context = "\n\n".join(f"- {line}" for line in context_lines)
+    context = "\n\n".join(context_paragraphs)
 
     links = ""
     if plan.moc_targets:
-        links = "\n".join(f"- [[{moc}]] (MoC)" for moc in plan.moc_targets)
+        links = "\n".join(f"- [[{moc}]]" for moc in plan.moc_targets)
+    if plan.concept_updates:
+        if links:
+            links += "\n"
+        links += "\n".join(f"- [[{c}]]" for c in plan.concept_updates)
+    if not links:
+        links = "- No linked notes yet"
+
+    # ── tags: always include 'concept', plus plan tags ──────────────────────
+    concept_tags = ["concept"]
+    for t in plan.tags:
+        if t not in concept_tags:
+            concept_tags.append(t)
+    tags_yaml = "\n".join(f"  - {t}" for t in concept_tags)
 
     name_escaped = escape_yaml(name)
     source_note_escaped = escape_yaml(source_note_name)
 
     return f"""---
-title: "{name_escaped}"
-created: {today}
+title: "{name_escaped}"{title_en_line}
 type: concept
-status: draft
-tags: []
+date_created: {today}
+last_updated: {today}
 sources:
   - "[[{source_note_escaped}]]"
+tags:
+{tags_yaml}
+status: evergreen
+aliases: []{language_line}
 ---
 
-# {name}
+# {h1_title}
 
-## Core concept
+## {core_heading}
 
 {core_concept}
 
-## Context
+## {context_heading}
 
 {context}
 
-## Links
+## {links_heading}
 
 {links}
 """
@@ -581,6 +627,7 @@ def create_file_templates(
                         entry_filename,
                         f"Related to [[{entry_filename}]]",
                         entry_display_title=entry_link_name,
+                        tags=plan.tags,
                     )
                 except OSError as e:
                     log.warning("Failed to update MoC %s: %s", moc_name, e)

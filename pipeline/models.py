@@ -162,9 +162,10 @@ class Plan:
     concept_updates: list[str] = field(default_factory=list)
     concept_new: list[str] = field(default_factory=list)
     moc_targets: list[str] = field(default_factory=list)
+    title_en: str | None = None  # English title when original is Chinese
 
     def to_dict(self) -> dict:
-        return {
+        d = {
             "hash": self.hash,
             "title": self.title,
             "language": self.language.value,
@@ -174,9 +175,13 @@ class Plan:
             "concept_new": self.concept_new,
             "moc_targets": self.moc_targets,
         }
+        if self.title_en:
+            d["title_en"] = self.title_en
+        return d
 
     @classmethod
     def from_dict(cls, data: dict) -> Plan:
+        """Restore Plan from serialized dict."""
         try:
             lang = Language(data.get("language", "en"))
         except ValueError:
@@ -194,6 +199,7 @@ class Plan:
             concept_updates=data.get("concept_updates", []),
             concept_new=data.get("concept_new", []),
             moc_targets=data.get("moc_targets", []),
+            title_en=data.get("title_en"),
         )
 
 
