@@ -114,7 +114,13 @@ class TestExtractTitle:
     def test_fallback_to_body_line(self):
         content = "Some introductory text without a heading.\n\nThis is a meaningful paragraph about the topic at hand."
         result = extract_title(content)
-        assert len(result) > 0
+        # No valid title-like line found (first line ends with period = sentence, not title)
+        assert result == ""
+
+    def test_fallback_with_valid_title_line(self):
+        content = "Psilocybin desynchronizes the human brain\n\nThis is body text."
+        result = extract_title(content)
+        assert result == "Psilocybin desynchronizes the human brain"
 
     def test_truncates_to_120(self):
         long_title = "# " + "A" * 200

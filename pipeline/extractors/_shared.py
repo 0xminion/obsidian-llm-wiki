@@ -253,8 +253,15 @@ def extract_title(content: str, fallback_title: str = "") -> str:
     Strategy:
       1. If content starts with HTML tag → return fallback_title
       2. Find first # heading (skip "Original content")
-      3. Fallback to first non-empty line (max 120 chars)
+      3. Fallback: first non-empty line that LOOKS LIKE a title
       4. Last resort: return fallback_title
+
+    A line "looks like a title" when:
+      - 10–80 chars
+      - Starts with uppercase or CJK character
+      - Does NOT end with sentence-ending punctuation (. ? !)
+      - Does NOT start with lowercase or apostrophe/quote
+      - Not UI noise
     """
     if not content:
         return fallback_title or ""
@@ -271,7 +278,7 @@ def extract_title(content: str, fallback_title: str = "") -> str:
             if len(title) > 5:
                 return _strip_markdown(title[:120])
 
-    # Fallback: first non-empty, non-URL, non-image line, and not UI noise
+    # Fallback: first non-empty, non-URL, non-image line that looks like a title
     _UI_NOISE = re.compile(
         r"(?im)^\s*(?:get\s+(?:the\s+)?app|sign\s+(?:up|in)|follow|like|save|share|login|"
         r"subscribe|join|bookmark|press\s+enter|click\s+to\s+view|image\s+in\s+full"
@@ -284,14 +291,14 @@ def extract_title(content: str, fallback_title: str = "") -> str:
             continue
         if _UI_NOISE.search(s):
             continue
-        if len(s) > 20:
-            return _strip_markdown(s[:120])
-
-    # Last resort: first non-empty line (still skip UI noise)
-    for line in content.split("\n"):
-        s = line.strip()
-        if s and not _UI_NOISE.search(s):
-            return _strip_markdown(s[:120])
+        # Title heuristics
+        if len(s) < 10 or len(s) > 80:
+            continue
+        if s[0].islower() or s[0] in ("'", '"', "“"):
+            continue
+        if s[-1] in (".", "?", "!"):
+            continue
+        return _strip_markdown(s[:120])
 
     return fallback_title or ""
 
