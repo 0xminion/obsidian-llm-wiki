@@ -1,0 +1,22 @@
+=== INSIGHT GENERATION PROMPT ===
+
+Analyze this content and produce exactly two sections:
+
+{{SUMMARY_HEADING}}
+{{SUMMARY_PROMPT}}
+
+{{INSIGHTS_HEADING}}
+{{INSIGHTS_PROMPT}}
+
+CONTENT:
+{{CONTENT}}
+
+Instructions for insights section:
+- Extract EVERY significant insight, claim, argument, finding, or observation from the content
+- Do NOT limit yourself to 3-5 points — if there are 10 important insights, list all 10
+- Group related points under sub-headings when appropriate
+- Prioritize depth over brevity: each insight should include supporting evidence or context
+- Include counter-arguments or limitations mentioned in the content
+
+Output ONLY valid JSON matching this schema:
+{"summary": "string", "core_insights": ["string", ...]}

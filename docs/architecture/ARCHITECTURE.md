@@ -1,9 +1,8 @@
 # Obsidian LLM Wiki — Architecture
 
-**Version:** 0.3.0
-**Date:** 2026-04-28
-**Pipeline code:** ~16,575 Python lines in `pipeline/`
-**Test baseline:** 852 passing tests
+**Version:** 0.3.1  
+**Date:** 2026-04-29  
+**Pipeline code:** ~16,200 Python lines in `pipeline/`  
 **Console script:** `pipeline = pipeline.cli:app`
 
 ## Design thesis
@@ -40,6 +39,7 @@ flowchart TB
 pipeline/
 ├── cli/
 │   ├── _helpers.py         shared CLI config, locking, query helpers
+│   ├── __main__.py         python -m pipeline.cli entry point
 │   ├── ingest.py           extract → plan → create orchestration
 │   ├── compile_cmd.py      compile command wrapper
 │   ├── review_cmd.py       approve/reject/review-status
@@ -52,29 +52,48 @@ pipeline/
 │   └── watch.py            incremental watch support
 ├── create/
 │   ├── templates.py        deterministic template creation + bounded LLM insights
-│   ├── orchestrator.py     batch coordination
+│   ├── orchestrator.py     batch coordination (now thin wrapper for templates)
 │   ├── validate.py         post-create validation and auto-repair
-│   ├── prompts.py          prompt construction
-│   └── agent.py            legacy/compatibility agent creation path
+│   └── prompts.py          prompt construction from assets/prompts/
 ├── extractors/
 │   ├── _shared.py          URL safety, curl helpers, title extraction, transcription
 │   ├── web.py              web/PDF extraction fallback chain
 │   ├── youtube.py          transcript APIs and canonical YouTube fallback
+│   ├── twitter.py          X/Twitter extraction via defuddle direct fetch
 │   └── podcast.py          RSS/audio extraction
 ├── lint/                   health checks, fixes, models, runner
-├── assets/                 packaged prompt and note-template assets
+├── assets/
+│   ├── prompts/            .prompt files for content generation (loaded at runtime)
+│   └── templates/          .md templates for note types (Entry, Concept, Source, MoC)
 ├── graph_doctor.py         graph integrity diagnostics
 ├── migrations.py           idempotent vault schema/assets migrations
 ├── fixtures.py             deterministic and adversarial fixture vaults
 ├── qmd.py                  QMD MCP semantic search facade
-├── qmd_mcp.py              QMD result conversion/client details
+├── qmd_mcp.py              QMD MCP client, JSON-RPC, session lifecycle
 ├── vault.py                vault file operations, MoC/index/edge writes
 ├── review.py               staged review approval/rejection
 ├── store.py                SQLite content store, review queue, cache
 ├── config.py               environment and vault path resolution
-├── llm_client.py           Ollama/OpenRouter/Hermes LLM abstraction
+├── llm_client.py           Ollama/OpenRouter/Hermes unified LLM abstraction
 └── utils.py                filename/path safety, prompt loading, shared helpers
 ```
+
+### Prompt system (new in 0.3.1)
+
+All LLM prompts now live in `pipeline/assets/prompts/` as `.prompt` files:
+- `insight-generation.prompt` — loaded by `templates._load_insight_prompt()`
+- `entry-structure.prompt` — loaded by `prompts._load_prompt()`
+- `concept-structure.prompt` — loaded by `prompts._load_prompt()`
+- `batch-create.prompt` — legacy, replaced by deterministic templates
+- `compile-pass.prompt` — used by `compile/core.py`
+
+Prompts are loaded via `utils.load_prompt(name, prompts_dir)` and use `{{VAR}}` substitution.
+
+### Removed components (0.3.1)
+
+- `pipeline/create/agent.py` — Hermes subprocess creation path removed (deprecated since 0.3.0)
+- `--agent` flag from `ingest` CLI — no longer supported
+- `create_all()` from `pipeline/create/orchestrator.py` — superseded by `create_file_templates()`
 
 ## Stage 1: Extract
 
@@ -122,7 +141,7 @@ QMD MCP is optional. `USE_QMD_MCP=false|0|no|off` disables client construction c
 
 ## Stage 3: Create
 
-Creation is template-first and path-safe.
+Creation is template-first, deterministic, and path-safe. **LLM calls are bounded and fail gracefully.**
 
 Responsibilities owned by Python:
 
@@ -137,9 +156,24 @@ Responsibilities owned by Python:
 
 Responsibilities allowed for LLM:
 
-- bounded entry insight text;
+- bounded entry insight text (Summary + Core insights only);
 - filename shortening suggestions that are re-sanitized;
 - semantic judgment during compile.
+
+### Insight generation flow
+
+```
+_load_insight_prompt() → load from assets/prompts/insight-generation.prompt
+     ↓
+{{VAR}} substitution (language-aware)
+     ↓
+LLMClient.generate_structured(prompt, schema=InsightOutput)
+     ↓ (if structured fails)
+LLMClient.generate(prompt) [raw text]
+     ↓ (if LLM fails)
+deterministic fallback: extract first paragraph as summary,
+                       first sentences of next paragraphs as bullets
+```
 
 ### Filename and path boundary
 
@@ -200,155 +234,74 @@ Graph nodes are Obsidian note stems from four collections:
 - `04-Wiki/concepts`
 - `04-Wiki/mocs`
 
-`edges.tsv` format:
+Typed edges are stored in `06-Config/edges.tsv` as `(from, to, type, context)` rows.
 
-```text
-source<TAB>target<TAB>type<TAB>description
-```
+Wikilinks are resolved case-insensitively against the vault filesystem. Broken wikilinks are surfaced by `lint`.
 
-Relationship types include:
+## Configuration
 
-```text
-extends, contradicts, supports, supersedes, tested_by,
-depends_on, inspired_by, part_of, relates_to
-```
-
-Source notes are first-class graph nodes. This preserves entry→source provenance and prevents the graph from lying about where claims came from.
-
-## Diagnostics
-
-### doctor / config-doctor
-
-Validate runtime readiness and emit redacted configuration data.
+All provider settings are env-configurable. No code changes needed to switch providers or models.
 
 ```bash
-pipeline doctor ~/MyVault --json
-pipeline config-doctor ~/MyVault --json
+# Choose provider: ollama | openrouter | hermes
+LLM_PROVIDER=ollama
+
+# Generation model (default: gemma4:31b-cloud)
+LLM_MODEL=gemma4:31b-cloud
+
+# Dedicated models for specific stages
+OLLAMA_INSIGHT_MODEL=gemma4:31b-cloud
+OLLAMA_FILENAME_MODEL=gemma4:31b-cloud
+OLLAMA_PLAN_MODEL=minimax-m2.7:cloud   # smaller prompt → structured JSON reliable
+
+# Embedding (Ollama only; kept separate from generation provider)
+EMBED_MODEL=qwen3-embedding:0.6b
+
+# QMD MCP
+USE_QMD_MCP=true
+QMD_MCP_URL=http://localhost:8181
 ```
 
-### graph-doctor
+## LLM provider abstraction
 
-Reports:
+The unified `LLMClient` supports multiple backends via the same interface:
 
-- unresolved wikilinks;
-- stale edge rows;
-- malformed edge rows;
-- duplicate stems across note collections.
+```python
+from pipeline.llm_client import get_llm_client
 
-```bash
-pipeline graph-doctor ~/MyVault --json
+client = get_llm_client(cfg)
+text = client.generate("Summarize this article...", timeout=60)
+embedding = client.embed("concept description")
+batch = client.embed_batch(["text1", "text2", "text3"])
 ```
 
-### migrate
+| Provider | Use case |
+|---|---|
+| Ollama | Default local inference (fast, free) |
+| OpenRouter | Frontier models without subprocess overhead |
+| Hermes | Legacy subprocess fallback (deprecated) |
 
-Current schema version: `1`.
+Error handling: `generate()` swallows errors and returns `""`. `generate_or_raise()` raises `LLMGenerationError` for critical paths.
 
-`pipeline migrate` backfills vault structure/assets and writes:
+## Data flow
 
-```text
-06-Config/schema-version.json
+```
+01-Raw/*.url  ──►  Stage 1: extract_all()  ──►  /tmp/obsidian-extracted-*/{hash}.json
+02-Clippings/*.md  ──►  (skip Stage 1)  ──►  manifest.json
+
+manifest.json  ──►  Stage 2: plan_sources()  ──►  /tmp/obsidian-extracted-*/plans.json
+
+plans.json  ──►  Stage 3: create_file_templates()  ──►  04-Wiki/{sources,entries,concepts,mocs}/*.md
+
+04-Wiki/*.md  ──►  compile_pass()  ──►  06-Config/{edges.tsv,wiki-index.md,duplicate-report.md}
 ```
 
-```bash
-pipeline migrate ~/MyVault --yes --json
-```
+## Changelog (0.3.1)
 
-### fixture
-
-Two fixture modes exist:
-
-- default deterministic example vault;
-- adversarial golden corpus with CJK titles, malicious filenames, quoted URLs, staged collisions, broken links, and other regression bait.
-
-```bash
-pipeline fixture ~/MyVault --adversarial --overwrite --json
-```
-
-## Vault structure
-
-```text
-01-Raw/
-02-Clippings/
-03-Queries/
-04-Wiki/
-├── sources/
-├── entries/
-├── concepts/
-└── mocs/
-05-Outputs/
-06-Config/
-├── wiki-index.md
-├── tag-registry.md
-├── edges.tsv
-├── log.md
-└── schema-version.json
-07-WIP/
-08-Archive-Raw/
-09-Archive-Queries/
-10-Archive-Clippings/
-Meta/
-├── Scripts/
-├── prompts/
-└── Templates/
-```
-
-`07-WIP/` is a hard boundary: automation must not touch it.
-
-## Packaged assets
-
-Canonical default prompts/templates live under:
-
-```text
-pipeline/assets/prompts/
-pipeline/assets/templates/
-```
-
-`pipeline init` seeds runtime copies into:
-
-```text
-Meta/prompts/
-Meta/Templates/
-```
-
-Expected installed-wheel asset counts:
-
-- prompts: `8`
-- templates: `9`
-
-Runtime vault-local assets may override packaged defaults. Repo-root `prompts/` and `templates/` are not canonical and must not be reintroduced.
-
-## Query architecture
-
-`pipeline query` has two modes:
-
-- `--fast`: direct LLM query over wiki index/snippets.
-- default: configured agent command (`AGENT_CMD`) for deeper tool-assisted Q&A.
-
-Empty successful stdout from the non-fast agent path is treated as failure and the query is not archived. Success means usable content exists, not merely `returncode == 0`.
-
-## Release architecture
-
-A green source test suite is necessary but not sufficient. The release artifact must work when installed from a wheel.
-
-Required gates:
-
-```bash
-ruff check .
-pyflakes pipeline tests
-pytest -q
-git diff --check
-python3 -m pip wheel . -w /tmp/obsidian-llm-wiki-wheel --no-deps
-python3 -m venv /tmp/obsidian-llm-wiki-venv
-/tmp/obsidian-llm-wiki-venv/bin/pip install /tmp/obsidian-llm-wiki-wheel/*.whl
-/tmp/obsidian-llm-wiki-venv/bin/pipeline init /tmp/obsidian-llm-wiki-vault
-/tmp/obsidian-llm-wiki-venv/bin/pipeline fixture /tmp/obsidian-llm-wiki-vault --adversarial --overwrite --json
-/tmp/obsidian-llm-wiki-venv/bin/pipeline graph-doctor /tmp/obsidian-llm-wiki-vault --json
-/tmp/obsidian-llm-wiki-venv/bin/pipeline migrate /tmp/obsidian-llm-wiki-vault --yes --json
-```
-
-## Current risks and future work
-
-1. The migration system is intentionally minimal at schema version `1`; future schema-changing features should add named migrations, not ad hoc backfills.
-2. `graph-doctor` reports issues but does not yet offer a repair mode. That is the obvious next product step.
-3. Semantic candidate blocking reduces common-case cost, but very large vaults will eventually need persisted inverted indexes or a proper local search service.
-4. The legacy agent creation path exists for compatibility. It should stay off the default path unless a future release removes it with a migration note.
+- **Removed `pipeline/create/agent.py`** — Hermes subprocess creation path fully removed. The `--agent` flag is no longer supported.
+- **Prompt system overhaul** — All LLM prompts now load from `pipeline/assets/prompts/*.prompt` files. `_load_insight_prompt()` replaces inline hardcoded prompts.
+- **Deterministic fallback chain** — If LLM insight generation fails (structured → raw → timeout), the pipeline extracts first paragraph as summary and first sentences as bullets, ensuring every source gets content.
+- **Template-first creation** — `create_file_templates()` is the only creation path. No more batch agent mode.
+- **Bilingual concept notes** — `_generate_concept_template()` produces `## English` section for non-Chinese content, with `title_en:` frontmatter.
+- **Evergreen concept format** — Concepts use `status: evergreen`, bilingual headings, and flowing prose in Context sections.
+- **Insight depth** — Prompt explicitly requests ALL significant insights, not limited to 3-5 bullets.

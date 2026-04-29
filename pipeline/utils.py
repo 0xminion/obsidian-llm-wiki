@@ -452,8 +452,12 @@ def safe_note_path(base_dir: Path, stem: str, suffix: str = ".md") -> Path:
     return target
 
 
-def title_to_filename(title: str, max_length: int = 120) -> str:
-    """Convert a title to a safe Obsidian filename stem."""
+def title_to_filename(title: str, max_length: int = 255) -> str:
+    """Convert a title to a safe Obsidian filename stem.
+
+    max_length defaults to 255 to preserve full titles (ext4 limit, not 120).
+    Only truncate if explicitly requested.
+    """
     if not title:
         return ""
 

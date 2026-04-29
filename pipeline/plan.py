@@ -451,7 +451,7 @@ def build_plan_prompt(
     sources_block_parts = []
     for i, entry in enumerate(manifest.entries):
         h = entry.hash
-        title = entry.title[:120]
+        title = entry.title  # Do NOT truncate — LLM needs full title for accurate planning
         content_preview = entry.content[:300].replace("\n", " ")
         source_type = entry.type.value if hasattr(entry.type, "value") else str(entry.type)
         author = entry.author or "unknown"
@@ -462,7 +462,7 @@ def build_plan_prompt(
 ---
 Source {i+1}:
   hash: {h}
-  title: {title}
+  title: "{title}"
   type: {source_type}
   author: {author}
   content_preview: {content_preview}
@@ -486,6 +486,7 @@ For EACH source, output a JSON object in a JSON array. Schema per source:
 
 RULES:
 - title: Use the content REAL title. Tweet → first meaningful topic. Blog → article title. YouTube → video title.
+- NEVER truncate titles — preserve the full original title up to 255 chars (ext4 limit)
 - NEVER use: "Tweet - user - ID", "Blog - slug", "YouTube - VIDEO_ID", URL slugs
 - language: Chinese content → "zh". English content → "en". All other languages → translate to English, process in English.
 - template: Data/methodology/findings → "technical". Narrative/philosophical → "standard". Chinese → "chinese".
@@ -573,9 +574,10 @@ def generate_plans(
     from pipeline.models import PlanOutput
 
     # Call LLM directly via llm_client (Ollama / OpenRouter / Hermes)
-    # Call LLM directly via llm_client (Ollama / OpenRouter / Hermes)
     plan_dicts: list[dict] = []
     llm = get_llm_client(cfg)
+    # Use dedicated plan model for structured generation (allows different model for planning vs other tasks)
+    plan_model = getattr(cfg, "ollama_plan_model", cfg.llm_model) or cfg.llm_model
     for attempt in range(cfg.max_retries):
         try:
             log.info("Plan agent attempt %d/%d", attempt + 1, cfg.max_retries)
@@ -584,6 +586,7 @@ def generate_plans(
                 structured = llm.generate_structured(
                     prompt,
                     schema=PlanOutput,
+                    model=plan_model,
                     timeout=cfg.llm_structured_timeout,
                 )
                 if structured is not None and isinstance(structured, PlanOutput):
@@ -603,6 +606,7 @@ def generate_plans(
                 structured = llm.generate_structured(
                     prompt,
                     schema=PlanOutputList,
+                    model=plan_model,
                     timeout=cfg.llm_structured_timeout,
                 )
                 if structured is not None and isinstance(structured, PlanOutputList):
@@ -635,18 +639,25 @@ def generate_plans(
             try:
                 raw = llm.generate(prompt, timeout=cfg.plan_timeout)
                 if raw and raw.strip():
-                    # Reuse the legacy JSON extractor
-                    data = json.loads(raw)
-                    if isinstance(data, list):
+                    # Use _extract_json to handle markdown code blocks and bare JSON
+                    from pipeline.llm_client import _extract_json
+                    data = _extract_json(raw)
+                    if data is None:
+                        log.debug("Fallback attempt %d: no parseable JSON in response", attempt + 1)
+                    elif isinstance(data, list):
                         plan_dicts = [p for p in data if isinstance(p, dict) and "hash" in p]
-                        break
+                        if plan_dicts:
+                            log.info("Fallback: parsed %d plans from JSON array", len(plan_dicts))
+                            break
                     elif isinstance(data, dict):
                         plan_dicts = [data]
                         break
-            except (json.JSONDecodeError, ValueError, TypeError):
-                pass
+            except Exception as e:
+                log.debug("Fallback attempt %d error: %s", attempt + 1, e)
             if attempt < cfg.max_retries - 1:
-                time.sleep(2 ** attempt)
+                delay = 2 ** attempt
+                log.info("Retrying fallback in %ds...", delay)
+                time.sleep(delay)
 
     if not plan_dicts:
         log.error("Could not parse any plans from agent output")

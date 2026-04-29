@@ -1,4 +1,9 @@
-"""Main orchestrator for Stage 3 — create_all entry point."""
+"""Main orchestrator for Stage 3 — create_all entry point.
+
+⚠️ DEPRECATED: This module is superseded by template-based creation.
+Use create_file_templates() from pipeline.create.templates instead.
+Kept for backward compatibility only.
+"""
 
 from __future__ import annotations
 
@@ -13,10 +18,12 @@ from pipeline.config import Config
 from pipeline.models import Plans
 from pipeline.vault import archive_clippings, archive_inbox, reindex
 
-from pipeline.create import agent as _create_agent
 from pipeline.create.validate import validate_batch, validate_output, _repair_violations
 
 log = logging.getLogger(__name__)
+
+# Agent module removed in 0.3.1 — create_all now delegates to create_file_templates
+_create_agent = None
 
 
 def _update_tag_registry(cfg: Config) -> None:
@@ -269,77 +276,19 @@ def postprocess_creation(
 
 
 def create_all(plans: Plans, cfg: Config, parallel: int = 3) -> dict:
-    """Main entry point for Stage 3 creation.
+    """DEPRECATED: Use create_file_templates() directly.
 
-    1. Split plans into batches
-    2. Run concept convergence search
-    3. Spawn parallel agents
-    4. Validate each batch immediately after creation
-    5. Post-processing: global validate → reindex → log → archive → sync
-
-    Returns stats: {"created": N, "failed": N, "sources": N, "entries": N}
+    Delegates to template-based creation for all new work.
+    Kept for backward compatibility only.
     """
-    plan_list = plans.plans
-    plan_count = len(plan_list)
+    from pipeline.create.templates import create_file_templates
+    log.warning("create_all() is deprecated — use create_file_templates()")
+    stats = create_file_templates(plans.plans, cfg, use_agent_insights=True)
 
-    log.info("=== Stage 3: Create Batch (parallel=%d, plans=%d) ===", parallel, plan_count)
+    # Post-processing that create_file_templates doesn't do
+    _sync_vault(cfg)
 
-    if plan_count == 0:
-        log.info("No plans to process")
-        return {"created": 0, "failed": 0, "sources": 0, "entries": 0}
-
-    # Validate parallel is a positive integer
-    if not isinstance(parallel, int) or parallel < 1:
-        raise ValueError(f"PARALLEL must be a positive integer, got: {parallel}")
-
-    # Split into batches (content-size-aware when extract_dir available)
-    batches = plans.split_batches(parallel, extract_dir=cfg.resolved_extract_dir)
-    log.info("Split %d plans into %d batches (content-size-aware)", plan_count, len(batches))
-
-    # ─── Spawn parallel agents ────────────────────────────────────────────
-    results: list[dict] = []
-    failed_count = 0
-
-    with ThreadPoolExecutor(max_workers=parallel) as executor:
-        future_to_idx = {
-            executor.submit(_create_agent.create_batch, batch, idx, cfg): (idx, batch)
-            for idx, batch in enumerate(batches)
-        }
-
-        for future in as_completed(future_to_idx):
-            idx, batch = future_to_idx[future]
-            try:
-                result = future.result()
-
-                # ─── Per-batch validation ─────────────────────────────────
-                if result["status"] == "ok":
-                    validation = _validate_batch_files(batch, cfg)
-                    if not validation["ok"]:
-                        log.warning("Batch %d created files but validation failed (%d violations, %d critical)",
-                                    idx, len(validation["violations"]), len(validation.get("critical", [])))
-                        for v in validation["violations"][:5]:
-                            log.warning("  Validation: %s", v)
-                        # Don't mark as ok if critical violations exist
-                        result["status"] = "validation_failed"
-                        result["validation_violations"] = validation.get("critical", validation["violations"])[:5]
-                        failed_count += 1
-                    else:
-                        log.info("Batch %d validated (%d files OK)", idx, validation["files_checked"])
-
-                if result["status"] != "ok":
-                    if result["status"] != "validation_failed":
-                        failed_count += 1
-                        log.warning("Batch %d failed", idx)
-                else:
-                    log.info("Batch %d completed successfully (%d plans)", idx, result["plans"])
-
-                results.append(result)
-            except Exception:
-                failed_count += 1
-                log.exception("Batch %d raised exception", idx)
-                results.append({"batch_idx": idx, "status": "exception", "plans": len(batch), "hashes": []})
-
-    # ─── Post-processing ──────────────────────────────────────────────────
+    return stats
 
     postprocess_creation(cfg, results, plan_count, failed_count)
 

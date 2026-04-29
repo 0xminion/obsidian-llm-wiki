@@ -48,31 +48,89 @@ class LLMResponse:
 
 
 def _extract_json(text: str) -> dict | None:
-    """Extract the first JSON object or array from raw text."""
-    # Fast path: try the whole text first
+    """Extract the first JSON object or array from raw text.
+
+    Handles markdown code blocks (```json ... ```) and bare JSON.
+    """
+    if not text:
+        return None
+
+    # Strip markdown code fences with optional language tag
+    stripped = text.strip()
+    if stripped.startswith("```"):
+        # Remove first fence line
+        stripped = re.sub(r"^```(?:\w+)?\n?", "", stripped, count=1)
+        # Remove trailing fence
+        stripped = re.sub(r"\n?```\s*$", "", stripped)
+        stripped = stripped.strip()
+
+    # Fast path: try the stripped text first
     try:
-        return json.loads(text)
+        return json.loads(stripped)
     except json.JSONDecodeError:
         pass
-    # Find the first JSON object
-    obj_match = re.search(r"\{[\s\S]*?\}", text)
-    if obj_match:
-        try:
-            return json.loads(obj_match.group())
-        except json.JSONDecodeError:
-            pass
-    # Find the first JSON array
-    arr_match = re.search(r"\[[\s\S]*?\]", text)
-    if arr_match:
-        try:
-            return json.loads(arr_match.group())
-        except json.JSONDecodeError:
-            pass
+
+    # Find the first JSON array (greedy, anchored from first '[' to last ']')
+    arr_start = stripped.find("[")
+    if arr_start >= 0:
+        # Greedy scan: find matching ']' by bracket depth
+        depth = 0
+        for i, ch in enumerate(stripped[arr_start:], start=arr_start):
+            if ch == "[" and (i == 0 or stripped[i - 1] != "\\"):
+                depth += 1
+            elif ch == "]" and (i == 0 or stripped[i - 1] != "\\"):
+                depth -= 1
+                if depth == 0:
+                    try:
+                        return json.loads(stripped[arr_start : i + 1])
+                    except json.JSONDecodeError:
+                        break
+                    break
+
+    # Find the first JSON object (greedy, from first '{' to matching '}')
+    obj_start = stripped.find("{")
+    if obj_start >= 0:
+        depth = 0
+        for i, ch in enumerate(stripped[obj_start:], start=obj_start):
+            if ch == "{" and (i == 0 or stripped[i - 1] != "\\"):
+                depth += 1
+            elif ch == "}" and (i == 0 or stripped[i - 1] != "\\"):
+                depth -= 1
+                if depth == 0:
+                    try:
+                        return json.loads(stripped[obj_start : i + 1])
+                    except json.JSONDecodeError:
+                        break
+                    break
+
     return None
 
 
-def _validate_schema(data: dict, schema: type[T]) -> T | None:
-    """Validate a dict against a dataclass schema (or Pydantic if available)."""
+def _validate_schema(data, schema: type[T]) -> T | None:
+    """Validate data against a dataclass schema (or Pydantic if available).
+
+    Handles special cases:
+    - Raw list -> wraps into dict with the schema's list field name
+    - Recursive validation of list items against their element type annotations.
+    """
+    if not data:
+        return None
+    # Auto-wrap raw list into dict for list-bearing schemas
+    if isinstance(data, list):
+        if hasattr(schema, "__dataclass_fields__"):
+            fields = schema.__dataclass_fields__
+            list_fields = [
+                f for f, v in fields.items()
+                if (v.default_factory is list or "list" in str(v.type).lower())
+            ]
+            if len(fields) == 1 and len(list_fields) == 1:
+                data = {list_fields[0]: data}
+            elif "plans" in fields:
+                data = {"plans": data}
+        else:
+            return None
+    if not isinstance(data, dict):
+        return None
     # Pydantic fallback
     try:
         import pydantic
@@ -80,16 +138,39 @@ def _validate_schema(data: dict, schema: type[T]) -> T | None:
             return schema(**data)  # type: ignore[return-value]
     except Exception:
         pass
-    # Dataclass path (preferred — no heavy deps)
+    # Dataclass path (preferred — recursive)
     if not hasattr(schema, "__dataclass_fields__"):
-        log.debug("Schema %s is not a dataclass; skipping structured validation", schema.__name__)
         return None
     try:
         sig = inspect.signature(schema)
         kwargs: dict = {}
+        import typing
+        hints = typing.get_type_hints(schema)
         for param in sig.parameters.values():
             if param.name in data:
-                kwargs[param.name] = data[param.name]
+                raw_val = data[param.name]
+                # Recursively validate list items if annotation is List[X] where X is a dataclass
+                if isinstance(raw_val, list) and param.name in hints:
+                    list_type = hints[param.name]
+                    args = typing.get_args(list_type)
+                    if args and len(args) == 1:
+                        inner_type = args[0]
+                        if hasattr(inner_type, "__dataclass_fields__"):
+                            validated_items = []
+                            for item in raw_val:
+                                if isinstance(item, inner_type):
+                                    validated_items.append(item)
+                                elif isinstance(item, dict):
+                                    validated_item = _validate_schema(item, inner_type)
+                                    if validated_item is not None:
+                                        validated_items.append(validated_item)
+                            kwargs[param.name] = validated_items
+                        else:
+                            kwargs[param.name] = raw_val
+                    else:
+                        kwargs[param.name] = raw_val
+                else:
+                    kwargs[param.name] = raw_val
             elif param.default is not inspect.Parameter.empty:
                 continue
             else:
@@ -177,6 +258,9 @@ class OllamaProvider(BaseProvider):
                     "model": model,
                     "prompt": prompt,
                     "stream": False,
+                    "options": {
+                        "num_ctx": 131072,  # 128K context window default
+                    },
                 }).encode("utf-8"),
                 headers={"Content-Type": "application/json"},
                 method="POST",
@@ -232,7 +316,9 @@ class OllamaProvider(BaseProvider):
                     "model": model,
                     "prompt": prompt,
                     "stream": False,
-                    "format": "json",
+                    "options": {
+                        "num_ctx": 131072,  # 128K context window default
+                    },
                 }).encode("utf-8"),
                 headers={"Content-Type": "application/json"},
                 method="POST",

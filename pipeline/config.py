@@ -83,10 +83,11 @@ class Config:
     embed_model: str = "qwen3-embedding:0.6b"
     embed_base_url: str = ""  # falls back to ollama_host if empty
 
-    # Legacy Ollama settings (backward compat — used when llm_provider=ollama)
+    # Legacy Ollama settings (backward compat)
     ollama_host: str = "http://localhost:11434"
     ollama_insight_model: str = "minimax-m2.7:cloud"
     ollama_filename_model: str = "minimax-m2.7:cloud"
+    ollama_plan_model: str = "minimax-m2.7:cloud"  # dedicated model for structured plan generation (chunked)
 
     # Structured output
     llm_structured_timeout: int = 90
@@ -108,7 +109,10 @@ class Config:
     min_clipping_quality: float = 0.5
 
     # Whisper
-    whisper_language: str = ""  # empty = auto-detect, "en", "zh", etc.
+    whisper_language: str = ""  # empty = auto-detect
+
+    # QMD MCP — mandatory for Stage 2 semantic search
+    use_qmd_mcp: bool = True
 
     # Merge queue
     max_merge_queue_size: int = 500
@@ -312,7 +316,7 @@ def load_config(
         qmd_cmd=_env("QMD_CMD", "qmd"),
         qmd_collection=_env("QMD_COLLECTION", "concepts"),
         llm_provider=_env("LLM_PROVIDER", "ollama"),
-        llm_model=_env("LLM_MODEL", ""),
+        llm_model=_env("LLM_MODEL", "gemma4:31b-cloud"),
         llm_api_key=_env("LLM_API_KEY", ""),
         llm_base_url=_env("LLM_BASE_URL", ""),
         llm_timeout=_int_env("LLM_TIMEOUT", 60, env_values),
@@ -321,6 +325,7 @@ def load_config(
         ollama_host=_env("OLLAMA_HOST", "http://localhost:11434"),
         ollama_insight_model=_env("OLLAMA_INSIGHT_MODEL", _env("OLLAMA_MODEL", "minimax-m2.7:cloud")),
         ollama_filename_model=_env("OLLAMA_FILENAME_MODEL", _env("OLLAMA_MODEL", "minimax-m2.7:cloud")),
+        ollama_plan_model=_env("OLLAMA_PLAN_MODEL", _env("OLLAMA_MODEL", "minimax-m2.7:cloud")),
         llm_structured_timeout=_int_env("LLM_STRUCTURED_TIMEOUT", 90, env_values),
         extract_timeout=_int_env("EXTRACT_TIMEOUT", 45, env_values),
         agent_timeout=_int_env("AGENT_TIMEOUT", 900, env_values),

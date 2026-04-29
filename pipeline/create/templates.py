@@ -1,17 +1,21 @@
-"""Template-based file creation — deterministic structure, optional agent insights."""
+"""Template-based file creation — deterministic structure, optional agent insights.
+
+Uses prompt files from pipeline/assets/prompts/ for content generation.
+Falls back to deterministic templates when LLM calls fail.
+"""
 
 from __future__ import annotations
 
 import json
 import logging
 import re
-import subprocess
 from datetime import date
+from pathlib import Path
 
 from pipeline.config import Config
 from pipeline.models import Plan
 from pipeline.note_schema import effective_entry_schema
-from pipeline.utils import escape_yaml, safe_note_path, safe_note_stem
+from pipeline.utils import escape_yaml, load_prompt, safe_note_path, safe_note_stem
 
 log = logging.getLogger(__name__)
 
@@ -201,6 +205,36 @@ aliases: []
 {body}"""
 
 
+def _load_insight_prompt(plan: Plan, content: str, cfg: Config) -> str:
+    """Load the insight generation prompt from assets/prompts/, with variable substitution."""
+    prompts_dir = getattr(cfg, "prompts_dir", None)
+    if prompts_dir and isinstance(prompts_dir, Path) and prompts_dir.exists():
+        prompt_text = load_prompt("insight-generation", prompts_dir)
+    else:
+        prompt_text = load_prompt("insight-generation")
+
+    if not prompt_text:
+        # Fallback to inline prompt if file not found
+        return ""
+
+    is_chinese = plan.language.value == "zh" or plan.template.value == "chinese"
+    if is_chinese:
+        vars_map = {
+            "SUMMARY_HEADING": "## 摘要",
+            "SUMMARY_PROMPT": "1-2句中文摘要",
+            "INSIGHTS_HEADING": "## 核心发现",
+            "INSIGHTS_PROMPT": "提取所有重要发现，用破折号列表，数量不限。优先深度和完整性。",
+            "CONTENT": content,
+        }
+    else:
+        vars_map = {
+            "SUMMARY_HEADING": "## Summary",
+            "SUMMARY_PROMPT": "1-2 sentence summary",
+            "INSIGHTS_HEADING": "## Core insights",
+            "INSIGHTS_PROMPT": "Extract ALL significant insights, findings, arguments, claims, and observations — no limit. Prioritize depth and completeness over brevity.",
+            "CONTENT": content,
+        }
+
 def generate_entry_insights(
     plan: Plan,
     extracted: dict,
@@ -210,6 +244,9 @@ def generate_entry_insights(
 
     Uses the provider-agnostic LLMClient and validates against InsightOutput schema.
     Respects source language — Chinese content gets Chinese section headers.
+
+    First tries to load prompt from pipeline/assets/prompts/insight-generation.prompt.
+    Falls back to deterministic template if LLM fails or prompt file is missing.
     """
     from pipeline.llm_client import get_llm_client
     from pipeline.models import InsightOutput
@@ -217,35 +254,36 @@ def generate_entry_insights(
     client = get_llm_client(cfg)
     content = extracted.get("content", "")[:cfg.max_content_insights]
 
-    # Language-aware section headers
-    is_chinese = plan.language.value == "zh" or plan.template.value == "chinese"
-    if is_chinese:
-        summary_heading = "## 摘要"
-        insights_heading = "## 核心发现"
-        summary_prompt = "(1-2句中文摘要)"
-        insights_prompt = "(3-5条关键发现，用破折号列表)"
-        lang_instruction = "请用中文总结以下内容。输出格式必须是中文。"
-    else:
-        summary_heading = "## Summary"
-        insights_heading = "## Core insights"
-        summary_prompt = "(1-2 sentence summary)"
-        insights_prompt = "(3-5 bullet points of key insights)"
-        lang_instruction = "Analyze this content and produce exactly two sections:"
+    # Try to load prompt from assets/prompts/
+    prompt = _load_insight_prompt(plan, content, cfg)
 
-    prompt = f"""{lang_instruction}
+    if not prompt:
+        # Fallback: build inline prompt if file missing
+        is_chinese = plan.language.value == "zh" or plan.template.value == "chinese"
+        if is_chinese:
+            prompt = f"""请用中文总结以下内容。
 
-{summary_heading}
-{summary_prompt}
+## 摘要
+1-2句中文摘要
 
-{insights_heading}
-{insights_prompt}
+## 核心发现
+提取所有重要发现，用破折号列表，数量不限。
 
 CONTENT:
-{content}
+{content}"""
+        else:
+            prompt = f"""Analyze this content and produce exactly two sections:
 
-Output ONLY valid JSON matching this schema:
-{{"summary": "string", "core_insights": ["string", ...]}}"""
+## Summary
+1-2 sentence summary
 
+## Core insights
+Extract ALL significant insights, findings, arguments, claims, and observations — no limit. Prioritize depth and completeness over brevity.
+
+CONTENT:
+{content}"""
+
+    # Try structured output first
     structured = client.generate_structured(
         prompt,
         schema=InsightOutput,
@@ -254,6 +292,9 @@ Output ONLY valid JSON matching this schema:
     )
     if structured is not None and isinstance(structured, InsightOutput):
         parts = []
+        is_chinese = plan.language.value == "zh" or plan.template.value == "chinese"
+        summary_heading = "## 摘要" if is_chinese else "## Summary"
+        insights_heading = "## 核心发现" if is_chinese else "## Core insights"
         if structured.summary:
             parts.append(f"{summary_heading}\n{structured.summary}")
         if structured.core_insights:
@@ -265,45 +306,60 @@ Output ONLY valid JSON matching this schema:
     raw = client.generate(prompt, model=cfg.llm_model or cfg.ollama_insight_model, timeout=60)
     if raw:
         return raw
-    return ""
+
+    # Final fallback: deterministic insights from content
+    log.debug("LLM insight generation failed; falling back to deterministic template")
+    is_chinese = plan.language.value == "zh" or plan.template.value == "chinese"
+    paragraphs = [p.strip() for p in content.split("\n\n") if p.strip() and not p.startswith("#")]
+    summary = paragraphs[0][:300] if paragraphs else ""
+    bullets = []
+    for p in paragraphs[:5]:
+        first_sentence = p.split(".")[0] + "." if "." in p else p[:150]
+        if first_sentence and len(first_sentence) > 20:
+            bullets.append(first_sentence)
+    if not bullets:
+        bullets = ["Key finding from source content."]
+
+    if is_chinese:
+        return f"## 摘要\n{summary}\n\n## 核心发现\n" + "\n".join(f"- {b}" for b in bullets)
+    else:
+        return f"## Summary\n{summary}\n\n## Core insights\n" + "\n".join(f"- {b}" for b in bullets)
 
 
-def generate_entry_insights_legacy(
-    plan: Plan,
-    extracted: dict,
-    cfg: Config,
-) -> str:
-    """Legacy: Generate insights via Hermes subprocess (slow, kept for fallback).
+def _load_insight_prompt(plan: Plan, content: str, cfg: Config) -> str:
+    """Load and substitute the insight generation prompt from assets/prompts/."""
+    prompts_dir = getattr(cfg, "prompts_dir", None)
+    if prompts_dir and isinstance(prompts_dir, Path) and prompts_dir.exists():
+        prompt_text = load_prompt("insight-generation", prompts_dir)
+    else:
+        default_dir = Path(__file__).parent.parent / "assets" / "prompts"
+        prompt_text = load_prompt("insight-generation", default_dir)
 
-    Use generate_entry_insights() instead — it uses the configured LLM provider.
-    """
-    content = extracted.get("content", "")[:cfg.max_content_insights]
-    prompt = f"""Analyze this content and produce exactly two sections:
+    if not prompt_text:
+        return ""
 
-## Summary
-(1-2 sentence summary)
+    is_chinese = plan.language.value == "zh" or plan.template.value == "chinese"
+    vars_map: dict[str, str]
+    if is_chinese:
+        vars_map = {
+            "SUMMARY_HEADING": "## 摘要",
+            "SUMMARY_PROMPT": "1-2句中文摘要",
+            "INSIGHTS_HEADING": "## 核心发现",
+            "INSIGHTS_PROMPT": "提取所有重要发现，用破折号列表，数量不限。优先深度和完整性。",
+            "CONTENT": content,
+        }
+    else:
+        vars_map = {
+            "SUMMARY_HEADING": "## Summary",
+            "SUMMARY_PROMPT": "1-2 sentence summary",
+            "INSIGHTS_HEADING": "## Core insights",
+            "INSIGHTS_PROMPT": "Extract ALL significant insights, findings, arguments, claims, and observations — no limit. Prioritize depth and completeness over brevity.",
+            "CONTENT": content,
+        }
 
-## Core insights
-(3-5 bullet points of key insights)
-
-CONTENT:
-{content}
-
-Output ONLY the two sections above. No preamble."""
-
-    agent_cmd = cfg.agent_cmd
-    try:
-        result = subprocess.run(
-            [agent_cmd, "chat", "-q", prompt, "-Q"],
-            capture_output=True,
-            text=True,
-            timeout=120,
-        )
-        if result.returncode == 0:
-            return result.stdout.strip()
-    except (subprocess.TimeoutExpired, FileNotFoundError):
-        pass
-    return ""
+    for key, val in vars_map.items():
+        prompt_text = prompt_text.replace(f"{{{{{key}}}}}", val)
+    return prompt_text
 
 
 def _generate_concept_template(
@@ -414,9 +470,13 @@ aliases: []{language_line}
 
 # {h1_title}
 
+## English
+
+{core_concept if not is_chinese else name + ' is a core concept introduced in the source.'}
+
 ## {core_heading}
 
-{core_concept}
+{core_concept if is_chinese else ''}
 
 ## {context_heading}
 
@@ -460,18 +520,19 @@ def create_file_templates(
     manifest_path.touch()
 
     def _paired_note_filenames(base_filename: str) -> tuple[str, str]:
-        """Return distinct (source, entry) stems for graph-unambiguous notes."""
+        """Return distinct (source, entry) stems for graph-unambiguous notes.
+        Source and entry share the same base filename — they live in different dirs
+        (sources/ vs entries/), so no suffix needed."""
         safe_base = safe_note_stem(base_filename)
         suffix = 0
         while True:
-            entry_candidate = safe_base if suffix == 0 else f"{safe_base}-{suffix}"
-            source_candidate = f"{entry_candidate}-source"
+            candidate = safe_base if suffix == 0 else f"{safe_base}-{suffix}"
             paths = (
-                cfg.sources_dir / f"{source_candidate}.md",
-                cfg.entries_dir / f"{entry_candidate}.md",
+                cfg.sources_dir / f"{candidate}.md",
+                cfg.entries_dir / f"{candidate}.md",
             )
             if not any(path.exists() for path in paths):
-                return source_candidate, entry_candidate
+                return candidate, candidate
             suffix += 1
 
     # ── Pre-generate filenames for long titles via LLM batch ──────────────

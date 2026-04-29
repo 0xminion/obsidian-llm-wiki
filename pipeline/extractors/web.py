@@ -459,15 +459,18 @@ def _try_camoufox_with_title(url: str, timeout: int = 45) -> tuple[str, str]:
     async def _fetch() -> tuple[str, str]:
         async with AsyncCamoufox(headless=True) as browser:
             page = await browser.new_page()
-            await page.goto(url, wait_until="domcontentloaded", timeout=15_000)
             try:
-                await page.wait_for_load_state("networkidle", timeout=5000)
+                await page.goto(url, wait_until="domcontentloaded", timeout=15_000)
+                try:
+                    await page.wait_for_load_state("networkidle", timeout=5000)
+                except Exception:
+                    pass
+                await asyncio.sleep(2)
+                text = await page.evaluate("() => document.body ? document.body.innerText : ''")
+                title = await page.evaluate("() => document.title")
+                return (text or "").strip(), (title or "").strip()[:120]
             except Exception:
-                pass
-            await asyncio.sleep(2)
-            text = await page.evaluate("() => document.body.innerText")
-            title = await page.evaluate("() => document.title")
-            return (text or "").strip(), (title or "").strip()[:120]
+                return "", ""
 
     try:
         return asyncio.run(_fetch())

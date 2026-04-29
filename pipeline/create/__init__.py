@@ -1,4 +1,4 @@
-"""Stage 3 — Create: batch creation of vault files via parallel agents.
+"""Stage 3 — Create: file creation for the obsidian-llm-wiki pipeline.
 
 This package is split into focused sub-modules:
   - prompts:    Prompt loading and batch prompt construction
@@ -11,7 +11,6 @@ This package is split into focused sub-modules:
 # Re-export everything for backward compatibility
 from pipeline.utils import strip_qmd_noise as _strip_qmd_noise
 from pipeline.create.prompts import _load_prompt, build_batch_prompt
-from pipeline.create.agent import _run_agent, concept_convergence, create_batch
 from pipeline.create.templates import (
     generate_source_content,
     generate_entry_content,
@@ -26,9 +25,6 @@ __all__ = [
     "_strip_qmd_noise",
     "_load_prompt",
     "build_batch_prompt",
-    "_run_agent",
-    "concept_convergence",
-    "create_batch",
     "generate_source_content",
     "generate_entry_content",
     "generate_entry_insights",
