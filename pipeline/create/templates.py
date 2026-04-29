@@ -591,7 +591,7 @@ def create_file_templates(
                     log.debug("Insight generation failed for %s: %s", plan.hash, e)
                     return plan.hash, ""
 
-        with ThreadPoolExecutor(max_workers=cfg.parallel) as executor:
+        with ThreadPoolExecutor(max_workers=min(cfg.parallel, 3)) as executor:
             futures = {
                 executor.submit(_generate_insight_for_plan, plan): plan.hash
                 for plan in plans
