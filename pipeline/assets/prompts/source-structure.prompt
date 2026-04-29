@@ -1,0 +1,36 @@
+# Source Note Structure Prompt
+
+Generate a Source note for the following extracted content.
+
+## Extracted Data
+- URL: {{URL}}
+- Author: {{AUTHOR}}
+- Source Type: {{SOURCE_TYPE}}
+- Title: {{TITLE}}
+- Language: {{LANGUAGE}}
+- Tags: {{TAGS}}
+
+## Content
+{{CONTENT}}
+
+## OUTPUT FORMAT
+
+Generate the full markdown file content including YAML frontmatter and body.
+
+Frontmatter rules:
+- title: the actual content title (NOT url, NOT platform name)
+- source_url: full URL
+- source_type: web / tweet / youtube / podcast / paper / blog
+- author: author name or handle
+- date_captured: today's date in YYYY-MM-DD format
+- tags: always start with "source", then include the topic tags
+- status: processed
+- template: the template type from the plan
+
+Body rules:
+- Start with "# <title>"
+- Include "## Original content" section
+- Preserve the full extracted content underneath
+- Do NOT truncate or summarize the original content
+
+Output ONLY the markdown file content, no explanation.

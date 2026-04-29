@@ -59,9 +59,9 @@ class TestTitleToFilename:
         assert "」" not in result
 
     def test_truncation(self):
-        long_title = "A" * 200
+        long_title = "A" * 300
         result = title_to_filename(long_title)
-        assert len(result) <= 120
+        assert len(result) <= 255
 
     def test_empty(self):
         result = title_to_filename("")

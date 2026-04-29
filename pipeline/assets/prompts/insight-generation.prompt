@@ -1,6 +1,6 @@
-=== INSIGHT GENERATION PROMPT ===
+# Insight Generation Prompt
 
-Analyze this content and produce exactly two sections:
+Analyze the following content and produce structured insights.
 
 {{SUMMARY_HEADING}}
 {{SUMMARY_PROMPT}}
@@ -11,12 +11,17 @@ Analyze this content and produce exactly two sections:
 CONTENT:
 {{CONTENT}}
 
-Instructions for insights section:
-- Extract EVERY significant insight, claim, argument, finding, or observation from the content
-- Do NOT limit yourself to 3-5 points — if there are 10 important insights, list all 10
-- Group related points under sub-headings when appropriate
-- Prioritize depth over brevity: each insight should include supporting evidence or context
-- Include counter-arguments or limitations mentioned in the content
+## OUTPUT FORMAT
 
-Output ONLY valid JSON matching this schema:
-{"summary": "string", "core_insights": ["string", ...]}
+Produce ONLY these two sections. Do NOT add introduction or conclusion paragraphs.
+
+{{SUMMARY_HEADING}}
+[1-2 sentence summary]
+
+{{INSIGHTS_HEADING}}
+- [insight 1]
+- [insight 2]
+- ...
+
+Extract ALL significant insights, findings, arguments, claims, and observations — no limit.
+Prioritize depth and completeness over brevity.

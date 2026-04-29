@@ -86,7 +86,7 @@ class TestChineseFilename:
             "我们需要确保截断逻辑正确"
         )
         filename = title_to_filename(long_zh)
-        assert len(filename) <= 120
+        assert len(filename) <= 255
 
     def test_english_kebab_case(self):
         filename = title_to_filename("The Future of AI in 2026!")
@@ -98,7 +98,7 @@ class TestChineseFilename:
             "and on about nothing in particular and keeps adding more words"
         )
         filename = title_to_filename(long_en)
-        assert len(filename) <= 120
+        assert len(filename) <= 255
 
 
 # ─── Very long content (>100K chars) ────────────────────────────────────────
@@ -185,9 +185,9 @@ class TestLongTitleTruncation:
         assert len(loaded["title"]) == len(long_title)
 
     def test_title_to_filename_truncates(self):
-        long_title = "Word " * 50
+        long_title = "Word " * 100
         filename = title_to_filename(long_title)
-        assert len(filename) <= 120
+        assert len(filename) <= 255
 
 
 # ─── No-stub policy ────────────────────────────────────────────────────────

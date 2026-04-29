@@ -17,6 +17,7 @@ import logging
 import math
 import re
 import time
+from pathlib import Path
 
 from pipeline.config import Config
 from pipeline.lint import _parse_frontmatter
@@ -358,7 +359,7 @@ def generate_plan_heuristic(
 
     return Plan(
         hash=entry.hash,
-        title=title[:120],
+        title=title[:255],
         language=language,
         template=template,
         tags=tags,
@@ -407,17 +408,41 @@ def generate_plans_deterministic(
 
 # ─── Plan prompt builder ─────────────────────────────────────────────────────
 
+def _format_content_for_plan(content: str, max_chars: int = 8000) -> str:
+    """Prepare content for planning prompt -- preserve structure but cap size.
+
+    Removes ALL markdown heading lines to prevent LLM from using first H2 as title.
+    """
+    content = content.strip()
+    # Remove entire lines that are markdown headings (start with #)
+    # This prevents any heading text from leaking into the title extraction
+    lines = []
+    for line in content.split("\n"):
+        stripped = line.lstrip()
+        if not stripped.startswith("#"):
+            lines.append(line)
+    content = "\n".join(lines)
+    if len(content) > max_chars:
+        content = content[:max_chars] + "\n[...content truncated for prompt size]"
+    return content
+
+
 def build_plan_prompt(
     manifest: Manifest,
     concept_matches: dict[str, list[ConceptMatch]],
     cfg: Config,
 ) -> str:
-    """Compose the agent prompt with all extracted data.
+    """Compose the planning prompt by loading plan-structure.prompt with variable substitution.
 
-    Includes rules for language detection, template selection, tag suggestions,
-    and existing concept/MoC context.
+    Uses full content (not truncated previews) for accurate title/concept extraction.
     """
-    # Load vault-customized common instructions first, packaged defaults second.
+    # Load plan structure prompt from assets/prompts/
+    prompt_text = load_prompt("plan-structure", cfg.prompts_dir)
+    if not prompt_text:
+        default_dir = Path(__file__).parent / "assets" / "prompts"
+        prompt_text = load_prompt("plan-structure", default_dir)
+
+    # Load common instructions for additional context
     common = ""
     if cfg.prompts_dir.exists():
         common = load_prompt("common-instructions", cfg.prompts_dir)
@@ -445,65 +470,55 @@ def build_plan_prompt(
             except OSError:
                 continue
     existing_tags.discard("")
-    tag_vocab = sorted(existing_tags)[:50]  # Cap at 50 most relevant
+    tag_vocab = sorted(existing_tags)[:50]
 
-    # Build sources block
+    # Build sources block with FULL content for accurate LLM title extraction
     sources_block_parts = []
+    total_chars = 0
+    max_total = cfg.max_total_content
+
     for i, entry in enumerate(manifest.entries):
         h = entry.hash
-        title = entry.title  # Do NOT truncate — LLM needs full title for accurate planning
-        content_preview = entry.content[:300].replace("\n", " ")
+        title = entry.title
+        # Use FULL content for planning — this fixes bad title extraction
+        content = _format_content_for_plan(entry.content, max_chars=cfg.max_content_per_source)
         source_type = entry.type.value if hasattr(entry.type, "value") else str(entry.type)
         author = entry.author or "unknown"
         matches = concept_matches.get(h, [])
         match_dicts = [{"concept": m.concept, "score": m.score} for m in matches]
 
-        sources_block_parts.append(f"""
+        block = (
+            f"---\nSource {i+1}:\n  hash: {h}\n"
+            f"  title: {title}\n"
+            f"  type: {source_type}\n  author: {author}\n"
+            f"  content:\n{content}\n"
+            f"  concept_matches: {json.dumps(match_dicts)}\n---"
+        )
+        total_chars += len(block)
+        if total_chars > max_total:
+            block = f"""
 ---
 Source {i+1}:
   hash: {h}
-  title: "{title}"
   type: {source_type}
   author: {author}
-  content_preview: {content_preview}
+  content: [Content omitted -- batch size cap]
   concept_matches: {json.dumps(match_dicts)}
-""")
+"""
+        sources_block_parts.append(block)
+
     sources_block = "".join(sources_block_parts)
 
+    # Substitute variables into prompt template
+    prompt = prompt_text
+    prompt = prompt.replace("{{VAULT_PATH}}", str(cfg.vault_path))
+    prompt = prompt.replace("{{CONCEPT_COUNT}}", str(concept_count))
+    prompt = prompt.replace("{{TAG_VOCAB}}", ", ".join(tag_vocab[:30]))
+    prompt = prompt.replace("{{SOURCES_BLOCK}}", sources_block)
+
+    # Prepend common instructions for additional context
     common_section = f"{common}\n\n" if common else ""
-
-    prompt = f"""{common_section}You are a planning agent for an Obsidian wiki pipeline. For each extracted source below, output a creation plan as JSON.
-
-VAULT CONCEPTS DIRECTORY: {concept_count} existing concepts
-EXISTING TAG VOCABULARY (prefer reuse over minting new): {', '.join(tag_vocab[:30])}
-
-SOURCES TO PLAN:{sources_block}
----
-
-For EACH source, output a JSON object in a JSON array. Schema per source:
-
-{{"hash": "<source hash>", "title": "<ACTUAL content title for filename — NOT URL slug, NOT platform name>", "language": "en" or "zh", "template": "standard" or "technical" or "chinese", "tags": ["topic-specific tags in English"], "concept_updates": ["existing concept names to update"], "concept_new": ["new concept names to create"], "moc_targets": ["MoC names this source belongs to"]}}
-
-RULES:
-- title: Use the content REAL title. Tweet → first meaningful topic. Blog → article title. YouTube → video title.
-- NEVER truncate titles — preserve the full original title up to 255 chars (ext4 limit)
-- NEVER use: "Tweet - user - ID", "Blog - slug", "YouTube - VIDEO_ID", URL slugs
-- language: Chinese content → "zh". English content → "en". All other languages → translate to English, process in English.
-- template: Data/methodology/findings → "technical". Narrative/philosophical → "standard". Chinese → "chinese".
-- tags: 3-6 topic-specific tags derived from content:
-  * PREFER reusing tags from EXISTING TAG VOCABULARY above — only mint new tags when content genuinely requires them
-  * Prioritize specific entities (e.g. "bitcoin", "gpt-4") over broad categories (e.g. "crypto", "ai")
-  * Include compound concepts where relevant (e.g. "smart-contracts", "yield-farming", "zero-knowledge")
-  * Lowercase, hyphenated if multi-word
-  * NO generic tags: source, url, content, video, podcast, article, blog, tweet, post
-  * Tags should reflect what the content is ACTUALLY about, not surface-level keywords
-- concept_matches are pre-found via semantic search — rank-sorted by relevance, confirm which are real matches vs tangential
-- concept_new: only if genuinely new concept
-- Be concise. Output ONLY the JSON array, no explanation.
-
-OUTPUT ONLY VALID JSON."""
-
-    return prompt
+    return f"{common_section}{prompt}"
 
 
 # ─── Plan generation via hermes agent ─────────────────────────────────────────
@@ -576,88 +591,162 @@ def generate_plans(
     # Call LLM directly via llm_client (Ollama / OpenRouter / Hermes)
     plan_dicts: list[dict] = []
     llm = get_llm_client(cfg)
-    # Use dedicated plan model for structured generation (allows different model for planning vs other tasks)
     plan_model = getattr(cfg, "ollama_plan_model", cfg.llm_model) or cfg.llm_model
-    for attempt in range(cfg.max_retries):
-        try:
-            log.info("Plan agent attempt %d/%d", attempt + 1, cfg.max_retries)
-            batch_size = len(manifest.entries)
-            if batch_size == 1:
-                structured = llm.generate_structured(
-                    prompt,
-                    schema=PlanOutput,
-                    model=plan_model,
-                    timeout=cfg.llm_structured_timeout,
-                )
-                if structured is not None and isinstance(structured, PlanOutput):
-                    plan_dicts = [{
-                        "hash": structured.hash,
-                        "title": structured.title,
-                        "language": structured.language,
-                        "template": structured.template,
-                        "tags": structured.tags,
-                        "concept_updates": structured.concept_updates,
-                        "concept_new": structured.concept_new,
-                        "moc_targets": structured.moc_targets,
-                    }]
-                    break
-            else:
-                from pipeline.models import PlanOutputList
-                structured = llm.generate_structured(
-                    prompt,
-                    schema=PlanOutputList,
-                    model=plan_model,
-                    timeout=cfg.llm_structured_timeout,
-                )
-                if structured is not None and isinstance(structured, PlanOutputList):
-                    plan_dicts = [
-                        {
-                            "hash": p.hash,
-                            "title": p.title,
-                            "language": p.language,
-                            "template": p.template,
-                            "tags": p.tags,
-                            "concept_updates": p.concept_updates,
-                            "concept_new": p.concept_new,
-                            "moc_targets": p.moc_targets,
-                        }
-                        for p in structured.plans
-                    ]
-                    break
-            log.warning("Plan agent attempt %d produced empty/invalid structured output", attempt + 1)
-            if attempt < cfg.max_retries - 1:
-                time.sleep(2 ** attempt)
-        except (ImportError, ValueError, TypeError, AttributeError) as e:
-            log.warning("Plan agent attempt %d failed: %s", attempt + 1, e)
-            if attempt < cfg.max_retries - 1:
-                time.sleep(2 ** attempt)
 
-    if not plan_dicts:
-        # Fallback to raw text + manual parsing for backwards compat
-        log.warning("Structured output failed; falling back to raw text parsing")
+    # Chunk manifest into batches of 5 — gemma4:31b reliably handles 3-5 plans
+    entries = list(manifest.entries)
+    batch_size = min(5, max(1, len(entries)))
+    all_plans: list[dict] = []
+
+    for batch_idx in range(0, len(entries), batch_size):
+        batch_entries = entries[batch_idx : batch_idx + batch_size]
+        batch_manifest = Manifest(entries=batch_entries)
+        batch_prompt = build_plan_prompt(batch_manifest, concept_matches, cfg)
+
+        batch_plan_dicts: list[dict] = []
         for attempt in range(cfg.max_retries):
             try:
-                raw = llm.generate(prompt, timeout=cfg.plan_timeout)
-                if raw and raw.strip():
-                    # Use _extract_json to handle markdown code blocks and bare JSON
-                    from pipeline.llm_client import _extract_json
-                    data = _extract_json(raw)
-                    if data is None:
-                        log.debug("Fallback attempt %d: no parseable JSON in response", attempt + 1)
-                    elif isinstance(data, list):
-                        plan_dicts = [p for p in data if isinstance(p, dict) and "hash" in p]
-                        if plan_dicts:
-                            log.info("Fallback: parsed %d plans from JSON array", len(plan_dicts))
-                            break
-                    elif isinstance(data, dict):
-                        plan_dicts = [data]
+                log.info(
+                    "Plan agent batch %d/%d (%d sources) attempt %d/%d",
+                    batch_idx // batch_size + 1,
+                    math.ceil(len(entries) / batch_size),
+                    len(batch_entries),
+                    attempt + 1,
+                    cfg.max_retries,
+                )
+                if len(batch_entries) == 1:
+                    from pipeline.models import PlanOutput
+                    structured = llm.generate_structured(
+                        batch_prompt,
+                        schema=PlanOutput,
+                        model=plan_model,
+                        timeout=cfg.llm_structured_timeout,
+                    )
+                    if structured is not None and isinstance(structured, PlanOutput):
+                        batch_plan_dicts = [{
+                            "hash": structured.hash,
+                            "title": structured.title,
+                            "language": structured.language,
+                            "template": structured.template,
+                            "tags": structured.tags,
+                            "concept_updates": structured.concept_updates,
+                            "concept_new": structured.concept_new,
+                            "moc_targets": structured.moc_targets,
+                        }]
                         break
-            except Exception as e:
-                log.debug("Fallback attempt %d error: %s", attempt + 1, e)
-            if attempt < cfg.max_retries - 1:
-                delay = 2 ** attempt
-                log.info("Retrying fallback in %ds...", delay)
-                time.sleep(delay)
+                else:
+                    from pipeline.models import PlanOutputList
+                    structured = llm.generate_structured(
+                        batch_prompt,
+                        schema=PlanOutputList,
+                        model=plan_model,
+                        timeout=cfg.llm_structured_timeout,
+                    )
+                    if structured is not None and isinstance(structured, PlanOutputList):
+                        batch_plan_dicts = [
+                            {
+                                "hash": p.hash,
+                                "title": p.title,
+                                "language": p.language,
+                                "template": p.template,
+                                "tags": p.tags,
+                                "concept_updates": p.concept_updates,
+                                "concept_new": p.concept_new,
+                                "moc_targets": p.moc_targets,
+                            }
+                            for p in structured.plans
+                        ]
+                        if len(batch_plan_dicts) >= len(batch_entries):
+                            log.info(
+                                "Batch %d: got %d/%d plans",
+                                batch_idx // batch_size + 1,
+                                len(batch_plan_dicts),
+                                len(batch_entries),
+                            )
+                            break
+                        else:
+                            log.warning(
+                                "Batch %d: only got %d/%d plans, retrying...",
+                                batch_idx // batch_size + 1,
+                                len(batch_plan_dicts),
+                                len(batch_entries),
+                            )
+                            continue
+                log.warning(
+                    "Plan agent batch %d attempt %d produced empty/invalid output",
+                    batch_idx // batch_size + 1,
+                    attempt + 1,
+                )
+                if attempt < cfg.max_retries - 1:
+                    time.sleep(2 ** attempt)
+            except (ImportError, ValueError, TypeError, AttributeError) as e:
+                log.warning(
+                    "Plan agent batch %d attempt %d failed: %s",
+                    batch_idx // batch_size + 1,
+                    attempt + 1,
+                    e,
+                )
+                if attempt < cfg.max_retries - 1:
+                    time.sleep(2 ** attempt)
+
+        if not batch_plan_dicts:
+            # Fallback for this batch
+            log.warning(
+                "Structured output failed for batch %d; falling back to raw text parsing",
+                batch_idx // batch_size + 1,
+            )
+            for attempt in range(cfg.max_retries):
+                try:
+                    raw = llm.generate(batch_prompt, timeout=cfg.plan_timeout)
+                    if raw and raw.strip():
+                        from pipeline.llm_client import _extract_json
+                        data = _extract_json(raw)
+                        if data is None:
+                            log.warning(
+                                "Batch %d fallback attempt %d: no JSON found",
+                                batch_idx // batch_size + 1,
+                                attempt + 1,
+                            )
+                        elif isinstance(data, list):
+                            batch_plan_dicts = [
+                                p for p in data
+                                if isinstance(p, dict) and "hash" in p
+                            ]
+                            if batch_plan_dicts:
+                                log.info(
+                                    "Batch %d fallback parsed %d plans",
+                                    batch_idx // batch_size + 1,
+                                    len(batch_plan_dicts),
+                                )
+                                break
+                        elif isinstance(data, dict):
+                            batch_plan_dicts = [data]
+                            break
+                except Exception as e:
+                    log.warning(
+                        "Batch %d fallback attempt %d error: %s",
+                        batch_idx // batch_size + 1,
+                        attempt + 1,
+                        e,
+                    )
+                if attempt < cfg.max_retries - 1:
+                    delay = 2 ** attempt
+                    log.info("Retrying batch %d fallback in %ds...", batch_idx // batch_size + 1, delay)
+                    time.sleep(delay)
+
+        if batch_plan_dicts:
+            all_plans.extend(batch_plan_dicts)
+            log.info(
+                "Batch %d complete: %d plans (cumulative %d/%d)",
+                batch_idx // batch_size + 1,
+                len(batch_plan_dicts),
+                len(all_plans),
+                len(entries),
+            )
+        else:
+            log.error("Batch %d: could not parse any plans", batch_idx // batch_size + 1)
+
+    plan_dicts = all_plans
 
     if not plan_dicts:
         log.error("Could not parse any plans from agent output")

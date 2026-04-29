@@ -1,0 +1,27 @@
+# MoC (Map of Content) Structure Prompt
+
+Generate or update a Map of Contents (MoC) note.
+
+## MoC Data
+- MoC Name: {{MOC_NAME}}
+- Tags: {{TAGS}}
+- Entries to Link: {{ENTRIES}}
+- Concepts to Link: {{CONCEPTS}}
+
+## OUTPUT FORMAT
+
+Generate the full markdown file content.
+
+Format rules:
+- type: moc
+- tags: always include "map-of-content" and a topic tag matching the MoC name
+- Use bilingual headings: "## English / 中文"
+- Body sections:
+  - Overview: 1-2 sentence description of what this MoC covers
+  - Entries: list of wikilinks to entry notes
+  - Concepts: list of wikilinks to concept notes
+  - Sources: list of wikilinks to source notes (if available)
+
+If updating an existing MoC, preserve existing content and append new links under the appropriate section.
+
+Output ONLY the markdown file content, no explanation.

@@ -1,154 +1,72 @@
-ENTRY NOTE STRUCTURE — follow EXACTLY for every note in 04-Wiki/entries/:
+# Entry Note Structure Prompt
 
-Check the `template:` field in frontmatter. Default is `standard`.
-Check the `language:` field. If zh, use the Chinese template.
+Generate an Entry note (synthesis/analysis) for the following source.
 
-FILE NAMING:
-- Match source filename — if source is `潮汕钱庄网络.md`, entry should be similar
-- Chinese title → Chinese filename (普通人如何识别庄家：链上信号框架与做空权平权.md)
-- English title → English kebab-case (the-measles-market-on-kalshi-settlement-coin-flip.md)
-- Papers → actual paper title (How manipulable are prediction markets.md)
-- NEVER use URL slugs (X-functionspaceHQ-2039554933024776516)
+## Source Data
+- Title: {{TITLE}}
+- Source Filename: {{SOURCE_FILENAME}}
+- URL: {{URL}}
+- Source Type: {{SOURCE_TYPE}}
+- Author: {{AUTHOR}}
+- Language: {{LANGUAGE}}
+- Template: {{TEMPLATE}}
+- Tags: {{TAGS}}
 
-=== TEMPLATE: standard (default, English) ===
+## Extracted Content
+{{CONTENT}}
 
-Frontmatter (YAML) must include:
-  - title: "<concise title>"
-  - source: "[[<source-note-name>]]"  (MUST be quoted wikilink)
-  - date_entry: YYYY-MM-DD
-  - status: review
-  - reviewed: ""
-  - review_notes: ""
-  - template: standard
-  - aliases: []
-  - tags: minimum 5, maximum 10 topic-specific tags, always start with:
-      tags:
-        - entry
-        - topic-tag-1
-        - topic-tag-2
-        ...
+## Insights (if available)
+{{INSIGHTS}}
 
-BEFORE choosing tags: run 'obsidian tags sort=count counts' and reuse
-existing tags wherever a match exists. Only mint a new tag if nothing fits.
+## OUTPUT FORMAT
 
-FORMAT RULES (CRITICAL):
-- The first line of the body MUST be `# <Title>` (H1 heading matching frontmatter title)
-- There MUST be a blank line after the H1 heading
-- There MUST be a blank line after EVERY `##` or `###` sub-heading (before content)
-- There MUST be a blank line BEFORE every `##` or `###` sub-heading
+Generate the full markdown file content including YAML frontmatter and body.
 
-Body sections IN THIS ORDER (use ## and ### markdown headings):
+Frontmatter rules:
+- title: same as source title
+- source: wikilink to source note "[[filename]]"
+- source_url: full URL
+- type: source type
+- author: author
+- date_entry: today's date in YYYY-MM-DD format
+- status: review
+- template: the template type
+- tags: always include "entry", then the topic tags
+- language: (only if not "en")
 
-## Summary
-3-5 sentence summary of what the source is about. Plain language, no fluff.
+Body rules based on template:
 
-## Core insights
-Key findings and arguments. Simple language, no jargon, concrete examples.
-Use a bullet-point list (dash-prefixed). Extract EVERYTHING significant.
-Each bullet item is substantive with a clear explanation.
+**CRITICAL: NEVER generate stub content, TODO placeholders, or empty sections. Every section must contain substantive, meaningful analysis derived from the source.**
 
-## Other takeaways
-Additional important findings. Bullet-point list. No artificial limits.
+### standard template
+Sections:
+- ## Summary
+- ## Core insights  
+- ## Other takeaways
+- ## Diagrams (mark "n/a" if none)
+- ## Open questions
+- ## Linked concepts (list wikilinks to concept notes)
 
-## Diagrams
-Optional — include ONLY if a diagram genuinely aids understanding (processes,
-relationships, hierarchies, comparisons). Use Obsidian mermaid code blocks.
-If not needed, write: 'n/a'
+### technical template
+Sections:
+- ## Key Findings
+- ## Data/Evidence
+- ## Methodology
+- ## Limitations
+- ## Linked concepts
 
-## Open questions
-Use a bullet-point list. Questions, gaps, assumptions raised by
-the source. What doesn't the source answer? What assumptions does it make?
+### chinese template
+Sections (in Chinese):
+- ## 摘要
+- ## 核心发现
+- ## 其他要点
+- ## 图表 (mark "n/a" if none)
+- ## 开放问题
+- ## 关联概念
 
-## Linked concepts
-Use a bullet-point list (dash-prefixed). Wikilinks to related Concept notes,
-other Entry notes, and MoCs.
-Use 'obsidian search' to find existing related notes in the vault.
-Link to concepts in 04-Wiki/concepts/, entries in 04-Wiki/entries/, and MoCs in 04-Wiki/mocs/.
+For Summary/摘要: provide a 1-2 sentence high-level summary.
+For Core insights/核心发现: extract ALL significant insights, findings, arguments, claims, and observations — no limit. Prioritize depth and completeness.
+For Other takeaways/其他要点: extract secondary insights, interesting quotes, counter-arguments, or edge cases.
+For Linked concepts: list wikilinks to related concept notes (from plan).
 
-=== TEMPLATE: chinese (for Chinese-language sources) ===
-
-Frontmatter must include language: zh:
-  - title: "<Chinese title>"
-  - title_en: "<English title if applicable>"
-  - source: "[[<source-note-name>]]"
-  - date_entry: YYYY-MM-DD
-  - language: zh
-  - status: review
-  - template: chinese
-  - tags: English tag values (tags stay in English always)
-
-Body sections IN THIS ORDER — ALL BODY TEXT IN CHINESE:
-
-## 摘要
-3-5句中文摘要。简洁明了，不要废话。
-
-## 核心发现
-关键发现和论点。通俗易懂，用具体例子。用破折号列表。提取所有重要内容。
-每个项目都要有实质内容。
-
-## 其他要点
-补充重要发现。破折号列表。不要人为限制数量。
-
-## 图表
-可选——仅在图表确实有助于理解时才加入（流程、关系、层级、比较）。
-用Obsidian mermaid代码块。不需要则写：'n/a'
-
-## 开放问题
-破折号列表。源文件提出的问题、缺口、假设。
-
-## 关联概念
-破折号列表。Wikilinks到相关概念笔记、条目笔记和MoC。
-用 'obsidian search' 找现有的相关笔记。
-链接到 04-Wiki/concepts/、04-Wiki/entries/ 和 04-Wiki/mocs/ 中的笔记。
-
-=== TEMPLATE: technical ===
-
-Frontmatter: same as standard, but `template: technical`
-
-Body sections:
-## Summary
-3-5 sentence overview.
-## Key Findings
-Bullet-point list of findings with evidence and data points.
-## Data/Evidence
-Tables, metrics, specific numbers from the source.
-## Methodology
-How was this research conducted? What approach was used?
-## Limitations
-What are the caveats, biases, or gaps in this source?
-## Linked concepts
-Wikilinks to related notes.
-
-=== TEMPLATE: comparison ===
-
-Frontmatter: same as standard, but `template: comparison`
-
-Body sections:
-## Summary
-3-5 sentence overview of what's being compared.
-## Side-by-Side Comparison
-Table or structured comparison of the items.
-## Pros and Cons
-For each item being compared.
-## Verdict
-Which option wins and why, with caveats.
-## Linked concepts
-Wikilinks to related notes.
-
-=== TEMPLATE: procedural ===
-
-Frontmatter: same as standard, but `template: procedural`
-
-Body sections:
-## Summary
-What this procedure achieves.
-## Prerequisites
-What you need before starting.
-## Steps
-Bullet-point step-by-step instructions.
-## Gotchas
-Common mistakes, edge cases, things that break.
-## Linked concepts
-Wikilinks to related notes.
-
-ALL prose must be humanized before writing.
+Output ONLY the markdown file content, no explanation.

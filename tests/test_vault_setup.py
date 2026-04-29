@@ -631,10 +631,10 @@ class TestTitleToFilename:
         assert "Title" in result or "title" in result
 
     def test_long_title_truncation(self):
-        """Truncates long titles to 120 chars."""
-        long = "A" * 200
+        """Truncates long titles to 255 chars."""
+        long = "A" * 300
         result = title_to_filename(long)
-        assert len(result) == 120
+        assert len(result) == 255
 
     def test_custom_max_length(self):
         """Respects custom max_length."""

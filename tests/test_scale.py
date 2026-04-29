@@ -214,9 +214,6 @@ class TestScalePipeline:
         def _fast_insights(*args, **kwargs):
             return ""
 
-        def _fast_convergence(*args, **kwargs):
-            return {}
-
         soft_limit = 8192
         try:
             import resource
@@ -228,8 +225,7 @@ class TestScalePipeline:
         len(os.listdir(f"/proc/{os.getpid()}/fd")) if Path(f"/proc/{os.getpid()}/fd").exists() else 0
 
         t0 = time.monotonic()
-        with patch("pipeline.create.templates.generate_entry_insights", side_effect=_fast_insights), \
-             patch("pipeline.create.agent.concept_convergence", side_effect=_fast_convergence):
+        with patch("pipeline.create.templates.generate_entry_insights", side_effect=_fast_insights):
             result = runner.invoke(app, [
                 "ingest", str(vault),
                 "--resume",

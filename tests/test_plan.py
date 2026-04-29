@@ -403,15 +403,15 @@ class TestBuildPlanPrompt:
 
         manifest = _make_manifest()
         prompt = build_plan_prompt(manifest, {}, cfg)
-        assert "2 existing concepts" in prompt
+        assert "EXISTING CONCEPTS: 2" in prompt
 
-    def test_content_preview_truncated(self, tmp_path):
+    def test_content_preview_respects_config(self, tmp_path):
         cfg = _make_config(tmp_path)
         src = _make_source(content="x" * 500)
         manifest = _make_manifest(src)
         prompt = build_plan_prompt(manifest, {}, cfg)
-        # Preview should be 300 chars max
-        assert "x" * 400 not in prompt
+        # Default max_content_per_source is 8000, so 500 chars should fit entirely
+        assert "x" * 400 in prompt
 
 
 # ─── Parse agent output ───────────────────────────────────────────────────────

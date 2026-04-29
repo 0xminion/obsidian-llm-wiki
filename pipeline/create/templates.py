@@ -1,6 +1,6 @@
-"""Template-based file creation — deterministic structure, optional agent insights.
+"""Template-based file creation — LLM-driven content generation using asset prompts.
 
-Uses prompt files from pipeline/assets/prompts/ for content generation.
+Replaces deterministic templates with LLM calls using prompts from pipeline/assets/prompts/.
 Falls back to deterministic templates when LLM calls fail.
 """
 
@@ -30,6 +30,250 @@ def _wikilink_for_concept(name: str) -> str:
     return f"[[{stem}|{name}]]"
 
 
+def _strip_markdown_fences(text: str) -> str:
+    """Remove markdown code fences if present."""
+    text = text.strip()
+    if text.startswith("```"):
+        # Remove opening fence with optional language
+        text = re.sub(r"^```\w*\n", "", text, count=1)
+    if text.endswith("```"):
+        text = text[:-3].rstrip()
+    return text
+
+
+# ─── LLM-driven content generation ──────────────────────────────────────────
+
+
+def generate_source_content_llm(
+    plan: Plan,
+    extracted: dict,
+    cfg: Config,
+    note_title: str | None = None,
+) -> str | None:
+    """Generate Source note content via LLM using source-structure.prompt.
+
+    Falls back to deterministic template if LLM fails.
+    """
+    from pipeline.llm_client import get_llm_client
+
+    client = get_llm_client(cfg)
+    title = note_title or plan.title
+    url = extracted.get("url", "")
+    source_type = extracted.get("type", "web")
+    author = extracted.get("author", "")
+    content = extracted.get("content", "")
+    tags_yaml = ", ".join(plan.tags) if plan.tags else ""
+    today = date.today().isoformat()
+
+    # Load prompt template
+    prompts_dir = getattr(cfg, "prompts_dir", None)
+    prompt_text = ""
+    if prompts_dir and isinstance(prompts_dir, Path) and prompts_dir.exists():
+        prompt_text = load_prompt("source-structure", prompts_dir)
+    if not prompt_text:
+        default_dir = Path(__file__).parent.parent / "assets" / "prompts"
+        prompt_text = load_prompt("source-structure", default_dir)
+
+    if not prompt_text:
+        log.warning("source-structure.prompt not found, falling back to deterministic")
+        return None
+
+    # Substitute variables
+    prompt = prompt_text
+    prompt = prompt.replace("{{URL}}", url)
+    prompt = prompt.replace("{{AUTHOR}}", author)
+    prompt = prompt.replace("{{SOURCE_TYPE}}", source_type)
+    prompt = prompt.replace("{{TITLE}}", title)
+    prompt = prompt.replace("{{LANGUAGE}}", plan.language.value)
+    prompt = prompt.replace("{{TAGS}}", tags_yaml)
+    prompt = prompt.replace("{{CONTENT}}", content[:10000])  # Cap for LLM context
+    prompt = prompt.replace("{{TODAY}}", today)
+
+    try:
+        raw = client.generate(prompt, model=cfg.llm_model or cfg.ollama_insight_model, timeout=120)
+        if raw:
+            return _strip_markdown_fences(raw)
+    except Exception as e:
+        log.warning("LLM source generation failed for %s: %s", plan.hash, e)
+
+    return None
+
+
+def generate_entry_content_llm(
+    plan: Plan,
+    extracted: dict,
+    cfg: Config,
+    source_filename: str,
+    insights: str = "",
+    note_title: str | None = None,
+) -> str | None:
+    """Generate Entry note content via LLM using entry-structure.prompt.
+
+    Falls back to deterministic template if LLM fails.
+    """
+    from pipeline.llm_client import get_llm_client
+
+    client = get_llm_client(cfg)
+    title = note_title or plan.title
+    url = extracted.get("url", "")
+    source_type = extracted.get("type", "web")
+    author = extracted.get("author", "")
+    content = extracted.get("content", "")
+    tags_yaml = ", ".join(plan.tags) if plan.tags else ""
+    today = date.today().isoformat()
+    language = plan.language.value
+    template = plan.template.value
+
+    # Load prompt template
+    prompts_dir = getattr(cfg, "prompts_dir", None)
+    prompt_text = ""
+    if prompts_dir and isinstance(prompts_dir, Path) and prompts_dir.exists():
+        prompt_text = load_prompt("entry-structure", prompts_dir)
+    if not prompt_text:
+        default_dir = Path(__file__).parent.parent / "assets" / "prompts"
+        prompt_text = load_prompt("entry-structure", default_dir)
+
+    if not prompt_text:
+        log.warning("entry-structure.prompt not found, falling back to deterministic")
+        return None
+
+    # Substitute variables
+    prompt = prompt_text
+    prompt = prompt.replace("{{TITLE}}", title)
+    prompt = prompt.replace("{{SOURCE_FILENAME}}", source_filename)
+    prompt = prompt.replace("{{URL}}", url)
+    prompt = prompt.replace("{{SOURCE_TYPE}}", source_type)
+    prompt = prompt.replace("{{AUTHOR}}", author)
+    prompt = prompt.replace("{{LANGUAGE}}", language)
+    prompt = prompt.replace("{{TEMPLATE}}", template)
+    prompt = prompt.replace("{{TAGS}}", tags_yaml)
+    prompt = prompt.replace("{{CONTENT}}", content[:8000])  # Cap for context
+    prompt = prompt.replace("{{INSIGHTS}}", insights[:3000] if insights else "[No pre-generated insights]")
+    prompt = prompt.replace("{{TODAY}}", today)
+
+    # Add concept info
+    concept_info = ""
+    if plan.concept_updates:
+        concept_info += f"Related concepts: {', '.join(plan.concept_updates)}\n"
+    if plan.concept_new:
+        concept_info += f"New concepts to create: {', '.join(plan.concept_new)}\n"
+    if not concept_info:
+        concept_info = "No specific concepts identified."
+    prompt = prompt.replace("{{CONCEPTS}}", concept_info)
+
+    try:
+        raw = client.generate(prompt, model=cfg.llm_model or cfg.ollama_insight_model, timeout=120)
+        if raw:
+            return _strip_markdown_fences(raw)
+    except Exception as e:
+        log.warning("LLM entry generation failed for %s: %s", plan.hash, e)
+
+    return None
+
+
+def _generate_concept_template_llm(
+    name: str,
+    plan: Plan,
+    cfg: Config,
+    source_note_name: str | None = None,
+    source_display_title: str | None = None,
+) -> str | None:
+    """Generate a Concept note via LLM using concept-structure.prompt.
+
+    Falls back to deterministic template if LLM fails.
+    """
+    from pipeline.llm_client import get_llm_client
+
+    client = get_llm_client(cfg)
+    source_name = source_note_name or plan.title or name
+    display = source_display_title or plan.title or source_name
+    today = date.today().isoformat()
+    tags_yaml = ", ".join(plan.tags) if plan.tags else ""
+    related = ", ".join(plan.concept_updates) if plan.concept_updates else ""
+    mocs = ", ".join(plan.moc_targets) if plan.moc_targets else ""
+
+    # Load prompt template
+    prompts_dir = getattr(cfg, "prompts_dir", None)
+    prompt_text = ""
+    if prompts_dir and isinstance(prompts_dir, Path) and prompts_dir.exists():
+        prompt_text = load_prompt("concept-structure", prompts_dir)
+    if not prompt_text:
+        default_dir = Path(__file__).parent.parent / "assets" / "prompts"
+        prompt_text = load_prompt("concept-structure", default_dir)
+
+    if not prompt_text:
+        log.warning("concept-structure.prompt not found, falling back to deterministic")
+        return None
+
+    prompt = prompt_text
+    prompt = prompt.replace("{{CONCEPT_NAME}}", name)
+    prompt = prompt.replace("{{SOURCE_NOTE_NAME}}", source_name)
+    prompt = prompt.replace("{{SOURCE_DISPLAY_TITLE}}", display)
+    prompt = prompt.replace("{{LANGUAGE}}", plan.language.value)
+    prompt = prompt.replace("{{TAGS}}", tags_yaml)
+    prompt = prompt.replace("{{RELATED_CONCEPTS}}", related)
+    prompt = prompt.replace("{{MOC_TARGETS}}", mocs)
+    prompt = prompt.replace("{{TODAY}}", today)
+
+    try:
+        raw = client.generate(prompt, model=cfg.llm_model or cfg.ollama_insight_model, timeout=120)
+        if raw:
+            return _strip_markdown_fences(raw)
+    except Exception as e:
+        log.warning("LLM concept generation failed for %s: %s", name, e)
+
+    return None
+
+
+def generate_moc_content_llm(
+    moc_name: str,
+    cfg: Config,
+    entries: list[str],
+    concepts: list[str],
+    tags: list[str],
+) -> str | None:
+    """Generate MoC note content via LLM using moc-structure.prompt.
+
+    Falls back to deterministic template if LLM fails.
+    """
+    from pipeline.llm_client import get_llm_client
+
+    client = get_llm_client(cfg)
+    today = date.today().isoformat()
+
+    # Load prompt template
+    prompts_dir = getattr(cfg, "prompts_dir", None)
+    prompt_text = ""
+    if prompts_dir and isinstance(prompts_dir, Path) and prompts_dir.exists():
+        prompt_text = load_prompt("moc-structure", prompts_dir)
+    if not prompt_text:
+        default_dir = Path(__file__).parent.parent / "assets" / "prompts"
+        prompt_text = load_prompt("moc-structure", default_dir)
+
+    if not prompt_text:
+        log.warning("moc-structure.prompt not found, falling back to deterministic")
+        return None
+
+    prompt = prompt_text
+    prompt = prompt.replace("{{MOC_NAME}}", moc_name)
+    prompt = prompt.replace("{{TAGS}}", ", ".join(tags))
+    prompt = prompt.replace("{{ENTRIES}}", "\n".join(f"- {e}" for e in entries))
+    prompt = prompt.replace("{{CONCEPTS}}", "\n".join(f"- {c}" for c in concepts))
+    prompt = prompt.replace("{{TODAY}}", today)
+
+    try:
+        raw = client.generate(prompt, model=cfg.llm_model or cfg.ollama_insight_model, timeout=120)
+        if raw:
+            return _strip_markdown_fences(raw)
+    except Exception as e:
+        log.warning("LLM MoC generation failed for %s: %s", moc_name, e)
+
+    return None
+
+
+# ─── Deterministic fallbacks (kept for resilience) ────────────────────────────
+
+
 def generate_source_content(
     plan: Plan,
     extracted: dict,
@@ -38,7 +282,7 @@ def generate_source_content(
 ) -> str:
     """Generate Source note content deterministically from extracted data.
 
-    No LLM involved — pure template rendering.
+    No LLM involved — pure template rendering. Kept as fallback.
     """
     rendered_title = note_title or plan.title
     title = escape_yaml(rendered_title)
@@ -154,7 +398,7 @@ def generate_entry_content(
 
     if not core_insights_section:
         if plan.language.value == "zh" or plan.template.value == "chinese":
-            core_insights_section = f"- 关于“{escape_yaml(plan.title)}”的关键观点与发现"
+            core_insights_section = f'- 关于"{escape_yaml(plan.title)}"的关键观点与发现'
         elif plan.template.value == "technical":
             core_insights_section = f"- Key findings from \"{escape_yaml(plan.title)}\""
         else:
@@ -206,18 +450,19 @@ aliases: []
 
 
 def _load_insight_prompt(plan: Plan, content: str, cfg: Config) -> str:
-    """Load the insight generation prompt from assets/prompts/, with variable substitution."""
+    """Load and substitute the insight generation prompt from assets/prompts/."""
     prompts_dir = getattr(cfg, "prompts_dir", None)
     if prompts_dir and isinstance(prompts_dir, Path) and prompts_dir.exists():
         prompt_text = load_prompt("insight-generation", prompts_dir)
     else:
-        prompt_text = load_prompt("insight-generation")
+        default_dir = Path(__file__).parent.parent / "assets" / "prompts"
+        prompt_text = load_prompt("insight-generation", default_dir)
 
     if not prompt_text:
-        # Fallback to inline prompt if file not found
         return ""
 
     is_chinese = plan.language.value == "zh" or plan.template.value == "chinese"
+    vars_map: dict[str, str]
     if is_chinese:
         vars_map = {
             "SUMMARY_HEADING": "## 摘要",
@@ -234,6 +479,11 @@ def _load_insight_prompt(plan: Plan, content: str, cfg: Config) -> str:
             "INSIGHTS_PROMPT": "Extract ALL significant insights, findings, arguments, claims, and observations — no limit. Prioritize depth and completeness over brevity.",
             "CONTENT": content,
         }
+
+    for key, val in vars_map.items():
+        prompt_text = prompt_text.replace(f"{{{{{key}}}}}", val)
+    return prompt_text
+
 
 def generate_entry_insights(
     plan: Plan,
@@ -252,7 +502,7 @@ def generate_entry_insights(
     from pipeline.models import InsightOutput
 
     client = get_llm_client(cfg)
-    content = extracted.get("content", "")[:cfg.max_content_insights]
+    content = extracted.get("content", "")[: cfg.max_content_insights]
 
     # Try to load prompt from assets/prompts/
     prompt = _load_insight_prompt(plan, content, cfg)
@@ -326,42 +576,6 @@ CONTENT:
         return f"## Summary\n{summary}\n\n## Core insights\n" + "\n".join(f"- {b}" for b in bullets)
 
 
-def _load_insight_prompt(plan: Plan, content: str, cfg: Config) -> str:
-    """Load and substitute the insight generation prompt from assets/prompts/."""
-    prompts_dir = getattr(cfg, "prompts_dir", None)
-    if prompts_dir and isinstance(prompts_dir, Path) and prompts_dir.exists():
-        prompt_text = load_prompt("insight-generation", prompts_dir)
-    else:
-        default_dir = Path(__file__).parent.parent / "assets" / "prompts"
-        prompt_text = load_prompt("insight-generation", default_dir)
-
-    if not prompt_text:
-        return ""
-
-    is_chinese = plan.language.value == "zh" or plan.template.value == "chinese"
-    vars_map: dict[str, str]
-    if is_chinese:
-        vars_map = {
-            "SUMMARY_HEADING": "## 摘要",
-            "SUMMARY_PROMPT": "1-2句中文摘要",
-            "INSIGHTS_HEADING": "## 核心发现",
-            "INSIGHTS_PROMPT": "提取所有重要发现，用破折号列表，数量不限。优先深度和完整性。",
-            "CONTENT": content,
-        }
-    else:
-        vars_map = {
-            "SUMMARY_HEADING": "## Summary",
-            "SUMMARY_PROMPT": "1-2 sentence summary",
-            "INSIGHTS_HEADING": "## Core insights",
-            "INSIGHTS_PROMPT": "Extract ALL significant insights, findings, arguments, claims, and observations — no limit. Prioritize depth and completeness over brevity.",
-            "CONTENT": content,
-        }
-
-    for key, val in vars_map.items():
-        prompt_text = prompt_text.replace(f"{{{{{key}}}}}", val)
-    return prompt_text
-
-
 def _generate_concept_template(
     name: str,
     plan: Plan,
@@ -383,7 +597,7 @@ def _generate_concept_template(
     source_note_name = source_note_name or plan.title or name
     source_display_title_safe = source_display_title or plan.title or source_note_name
 
-    # ── language + bilingual sections ──────────────────────────────────────
+    # ── language + bilingual sections ────────────────────────────────────────
     is_chinese = plan.language.value == "zh" or plan.template.value == "chinese"
 
     if is_chinese:
@@ -488,52 +702,51 @@ aliases: []{language_line}
 """
 
 
+# ─── Main entry point ──────────────────────────────────────────────────────
+
+
 def create_file_templates(
     plans: list[Plan],
     cfg: Config,
     use_agent_insights: bool = True,
 ) -> dict:
-    """Create vault files using templates + optional agent insights.
+    """Create vault files using LLM-driven content generation with asset prompts.
 
-    Deterministic for structure. Agent only for Summary + Core insights.
+    LLM generates source, entry, and concept content using prompts from
+    pipeline/assets/prompts/. Falls back to deterministic templates on failure.
     Returns stats dict.
     """
     from pipeline.log import set_correlation
+
     set_correlation(stage="create")
     from pipeline.create.orchestrator import postprocess_creation
-    from pipeline.utils import (
-        batch_smart_filenames,
-        is_filename_too_long,
-        smart_filename,
-        title_to_filename,
-    )
-    from pipeline.vault import (
-        resolve_collision,
-        update_moc,
-    )
+    from pipeline.utils import batch_smart_filenames, is_filename_too_long, smart_filename, title_to_filename
+    from pipeline.vault import resolve_collision, update_moc
 
     extract_dir = cfg.resolved_extract_dir
-    stats = {"created": 0, "failed": 0, "sources": 0, "entries": 0}
+    stats = {"created": 0, "failed": 0, "sources": 0, "entries": 0, "llm_sources": 0, "llm_entries": 0, "llm_concepts": 0, "llm_mocs": 0}
     results: list[dict] = []
     manifest_path = extract_dir / ".template-postprocess-manifest"
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
     manifest_path.touch()
 
     def _paired_note_filenames(base_filename: str) -> tuple[str, str]:
-        """Return distinct (source, entry) stems for graph-unambiguous notes.
-        Source and entry share the same base filename — they live in different dirs
-        (sources/ vs entries/), so no suffix needed."""
+        """Return (source, entry) stems with per-directory collision resolution.
+
+        Sources and entries live in different directories, so they can share
+        the same stem. Collisions are resolved independently within each dir.
+        """
         safe_base = safe_note_stem(base_filename)
-        suffix = 0
-        while True:
-            candidate = safe_base if suffix == 0 else f"{safe_base}-{suffix}"
-            paths = (
-                cfg.sources_dir / f"{candidate}.md",
-                cfg.entries_dir / f"{candidate}.md",
-            )
-            if not any(path.exists() for path in paths):
-                return candidate, candidate
-            suffix += 1
+
+        def _resolve(dir_path: Path) -> str:
+            suffix = 0
+            while True:
+                candidate = safe_base if suffix == 0 else f"{safe_base}-{suffix}"
+                if not (dir_path / f"{candidate}.md").exists():
+                    return candidate
+                suffix += 1
+
+        return _resolve(cfg.sources_dir), _resolve(cfg.entries_dir)
 
     # ── Pre-generate filenames for long titles via LLM batch ──────────────
     long_title_items: list[tuple[str, str]] = []
@@ -554,6 +767,7 @@ def create_file_templates(
     if long_title_items:
         log.info("Batch-generating filenames for %d long titles via LLM...", len(long_title_items))
         from pipeline.llm_client import get_llm_client
+
         llm_client = get_llm_client(cfg)
         llm_filenames = batch_smart_filenames(
             long_title_items,
@@ -570,6 +784,7 @@ def create_file_templates(
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
         from pipeline.utils import CircuitBreaker
+
         semaphore = threading.Semaphore(cfg.parallel)
         _insight_breaker = CircuitBreaker(threshold=5, reset_seconds=60)
 
@@ -592,10 +807,7 @@ def create_file_templates(
                     return plan.hash, ""
 
         with ThreadPoolExecutor(max_workers=min(cfg.parallel, 3)) as executor:
-            futures = {
-                executor.submit(_generate_insight_for_plan, plan): plan.hash
-                for plan in plans
-            }
+            futures = {executor.submit(_generate_insight_for_plan, plan): plan.hash for plan in plans}
             for future in as_completed(futures):
                 try:
                     h, insights_text = future.result()
@@ -638,13 +850,26 @@ def create_file_templates(
             source_note_title = plan.title
             try:
                 source_filename, entry_filename = _paired_note_filenames(filename)
-                note_suffix = entry_filename[len(filename):] if entry_filename.startswith(filename) else ""
+                note_suffix = entry_filename[len(filename) :] if entry_filename.startswith(filename) else ""
                 source_note_title = f"{plan.title}{note_suffix}"
-                source_content = generate_source_content(
+
+                # Try LLM-driven source generation first
+                source_content = generate_source_content_llm(
                     plan,
                     extracted,
+                    cfg,
                     note_title=source_note_title,
                 )
+                if source_content:
+                    stats["llm_sources"] += 1
+                    log.debug("Source generated via LLM for %s", plan.hash)
+                else:
+                    source_content = generate_source_content(
+                        plan,
+                        extracted,
+                        note_title=source_note_title,
+                    )
+
                 source_path = safe_note_path(cfg.sources_dir, source_filename)
                 source_path.parent.mkdir(parents=True, exist_ok=True)
                 source_path.write_text(source_content, encoding="utf-8")
@@ -659,14 +884,29 @@ def create_file_templates(
 
             try:
                 entry_link_name = source_note_title
-                entry_content = generate_entry_content(
+
+                # Try LLM-driven entry generation first
+                entry_content = generate_entry_content_llm(
                     plan,
                     extracted,
+                    cfg,
                     source_filename,
                     insights,
-                    include_frontmatter=True,
                     note_title=entry_link_name,
                 )
+                if entry_content:
+                    stats["llm_entries"] += 1
+                    log.debug("Entry generated via LLM for %s", plan.hash)
+                else:
+                    entry_content = generate_entry_content(
+                        plan,
+                        extracted,
+                        source_filename,
+                        insights,
+                        include_frontmatter=True,
+                        note_title=entry_link_name,
+                    )
+
                 entry_path = safe_note_path(cfg.entries_dir, entry_filename)
                 entry_path.parent.mkdir(parents=True, exist_ok=True)
                 entry_path.write_text(entry_content, encoding="utf-8")
@@ -677,12 +917,25 @@ def create_file_templates(
 
             for concept_name in plan.concept_new:
                 try:
-                    concept_content = _generate_concept_template(
+                    # Try LLM-driven concept generation first
+                    concept_content = _generate_concept_template_llm(
                         concept_name,
                         plan,
+                        cfg,
                         source_note_name=entry_filename,
                         source_display_title=entry_link_name,
                     )
+                    if concept_content:
+                        stats["llm_concepts"] += 1
+                        log.debug("Concept generated via LLM for %s", concept_name)
+                    else:
+                        concept_content = _generate_concept_template(
+                            concept_name,
+                            plan,
+                            source_note_name=entry_filename,
+                            source_display_title=entry_link_name,
+                        )
+
                     concept_filename = resolve_collision(cfg.concepts_dir, title_to_filename(concept_name))
                     concept_path = safe_note_path(cfg.concepts_dir, concept_filename)
                     concept_path.parent.mkdir(parents=True, exist_ok=True)
@@ -693,14 +946,42 @@ def create_file_templates(
 
             for moc_name in plan.moc_targets:
                 try:
-                    update_moc(
-                        cfg,
+                    # Try LLM-driven MoC generation
+                    # Gather existing entries and concepts for context
+                    existing_entries: list[str] = []
+                    existing_concepts: list[str] = []
+                    moc_path = cfg.mocs_dir / f"{title_to_filename(moc_name)}.md"
+                    if moc_path.exists():
+                        moc_text = moc_path.read_text(encoding="utf-8", errors="replace")
+                        # Extract existing mentions
+                        for match in re.findall(r'\[\[([^\]]+)\]\]', moc_text):
+                            existing_concepts.append(match.strip())
+                        for match in re.findall(r"- (.+)", moc_text):
+                            existing_entries.append(match.strip())
+
+                    moc_content = generate_moc_content_llm(
                         moc_name,
-                        entry_filename,
-                        f"Related to [[{entry_filename}]]",
-                        entry_display_title=entry_link_name,
+                        cfg,
+                        entries=[entry_link_name] + existing_entries[:10],
+                        concepts=[c for c in plan.concept_new + plan.concept_updates if c] + existing_concepts[:10],
                         tags=plan.tags,
                     )
+                    if moc_content:
+                        stats["llm_mocs"] += 1
+
+                    # Write LLM content or fall back to update_moc for incremental updates
+                    if moc_content and not moc_path.exists():
+                        moc_path.parent.mkdir(parents=True, exist_ok=True)
+                        moc_path.write_text(moc_content, encoding="utf-8")
+                    else:
+                        update_moc(
+                            cfg,
+                            moc_name,
+                            entry_filename,
+                            f"Related to [[{entry_filename}]]",
+                            entry_display_title=entry_link_name,
+                            tags=plan.tags,
+                        )
                 except OSError as e:
                     log.warning("Failed to update MoC %s: %s", moc_name, e)
                     plan_ok = False
@@ -724,4 +1005,14 @@ def create_file_templates(
         stats["failed"],
         manifest_path=manifest_path,
     )
+
+    # Log LLM vs fallback stats
+    log.info(
+        "LLM generation: %d/%d sources, %d/%d entries, %d/%d concepts, %d MoCs",
+        stats.get("llm_sources", 0), stats.get("sources", 0),
+        stats.get("llm_entries", 0), stats.get("entries", 0),
+        stats.get("llm_concepts", 0), len([p for p in plans for _ in p.concept_new]),
+        stats.get("llm_mocs", 0),
+    )
+
     return stats
