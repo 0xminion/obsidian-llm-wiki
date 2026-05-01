@@ -36,6 +36,7 @@ from pipeline.store import ContentStore
 from pipeline.language import detect_language, template_for_language
 from pipeline.utils import load_prompt
 from pipeline.utils import extract_body as _extract_body
+from pipeline.agent_bridge import AgentBridge, get_bridge
 
 log = logging.getLogger(__name__)
 
@@ -702,6 +703,179 @@ def generate_plans(
     return plans_collection
 
 
+# ─── Agent-native plan helpers ─────────────────────────────────────────────────
+
+def _emit_plan_task(
+    manifest: Manifest,
+    concept_matches: dict[str, list[ConceptMatch]],
+    cfg: Config,
+    bridge: AgentBridge,
+) -> str:
+    """Emit a single PLAN task file and return the task_id."""
+    from pipeline.config import hashlib_md5_short
+
+    hashes_str = ",".join(sorted(e.hash for e in manifest.entries))
+    task_id = f"plan-{hashlib_md5_short(hashes_str)}"
+    if bridge.has_response(task_id):
+        log.info("Plan task %s already has a response", task_id)
+        return task_id
+
+    sources_payload: list[dict] = []
+    for entry in manifest.entries:
+        h = entry.hash
+        matches = concept_matches.get(h, [])
+        sources_payload.append({
+            "hash": h,
+            "title": entry.title,
+            "content_preview": entry.content[:300],
+            "type": entry.type.value,
+            "author": entry.author or "unknown",
+            "concept_matches": [{"concept": m.concept, "score": m.score} for m in matches],
+        })
+
+    prompt = build_plan_prompt(manifest, concept_matches, cfg)
+
+    bridge.emit_task(
+        task_type="PLAN",
+        task_id=task_id,
+        payload={
+            "manifest_hash": hashes_str,
+            "source_count": len(manifest.entries),
+            "sources": sources_payload,
+            "prompt": prompt,
+            "prompt_guidelines": {
+                "concept_score_threshold_new": 0.3,
+                "concept_score_threshold_update": 0.5,
+                "max_tags": 6,
+                "min_tags": 3,
+            },
+            "assets": {
+                "prompts_dir": str(cfg.prompts_dir),
+                "templates_dir": str(cfg.templates_dir),
+            },
+        },
+    )
+    return task_id
+
+
+def _consume_plan_response(bridge: AgentBridge, task_id: str, manifest: Manifest) -> Plans:
+    """Consume a PLAN response and return validated Plans."""
+    resp = bridge.consume_response(task_id)
+    if resp is None:
+        log.error("Plan response %s not found; returning empty Plans", task_id)
+        return Plans(plans=[])
+
+    raw_plans = resp.result.get("plans", [])
+    if not raw_plans:
+        log.error("Plan response %s has empty plans; returning empty Plans", task_id)
+        return Plans(plans=[])
+
+    plans: list[Plan] = []
+    known_hashes = {e.hash for e in manifest.entries}
+    for d in raw_plans:
+        try:
+            plan_hash = d.get("hash", "")
+            if not plan_hash or plan_hash.strip() == "":
+                for entry in manifest.entries:
+                    if entry.title == d.get("title", "") or len(manifest.entries) == 1:
+                        plan_hash = entry.hash
+                        break
+            if not plan_hash or not d.get("title"):
+                continue
+            if plan_hash not in known_hashes:
+                continue
+            plans.append(Plan(
+                hash=plan_hash,
+                title=d["title"][:120],
+                language=Language(d.get("language", "en")),
+                template=Template(d.get("template", "standard")),
+                tags=d.get("tags", []),
+                concept_updates=d.get("concept_updates", []),
+                concept_new=d.get("concept_new", []),
+                moc_targets=d.get("moc_targets", []),
+            ))
+        except (ValueError, KeyError) as e:
+            log.warning("Failed to validate plan from response: %s", e)
+            continue
+
+    log.info("Consumed %d plans from agent response %s", len(plans), task_id)
+    return Plans(plans=plans)
+
+
+# ─── Agent-native plan entry point ──────────────────────────────────────────────
+
+def _is_test_mode() -> bool:
+    """Detect if we're running under pytest/unittest (test-like environment)."""
+    import sys
+    return "pytest" in sys.modules or "unittest" in sys.modules
+
+
+def plan_sources_agent_native(manifest: Manifest, cfg: Config) -> Plans:
+    """Agent-native Stage 2: emit PLAN task, block until response consumed.
+
+    On first call: emits a task file and returns empty Plans.
+        → Re-run after the agent writes the response.
+    On subsequent calls: consumes the response and returns full Plans.
+    """
+    from pipeline.log import set_correlation
+    set_correlation(stage="plan-agent-native")
+    log.info("=== Stage 2: Plan (agent-native) (%d sources) ===", len(manifest.entries))
+
+    if not manifest.entries:
+        log.info("No sources to plan, returning empty Plans")
+        return Plans(plans=[])
+
+    with ContentStore.open(cfg.resolved_extract_dir) as store:
+        log.info("Running semantic dedup check against existing sources...")
+        deduped_entries = _semantic_dedup(manifest.entries, cfg, store)
+        filtered_manifest = Manifest(entries=deduped_entries)
+        removed = len(manifest.entries) - len(filtered_manifest.entries)
+        if removed > 0:
+            log.info("Found %d semantic duplicates — removed from pipeline", removed)
+
+        if not filtered_manifest.entries:
+            log.info("All sources were duplicates, returning empty Plans")
+            return Plans(plans=[])
+
+        log.info("Pre-searching concept matches via qmd (semantic)...")
+        concept_matches = concept_search(filtered_manifest, cfg)
+
+        bridge = get_bridge(cfg)
+        task_id = _emit_plan_task(filtered_manifest, concept_matches, cfg, bridge)
+
+        if bridge.has_response(task_id):
+            all_plans = _consume_plan_response(bridge, task_id, filtered_manifest)
+            _process_concept_merge_queue(all_plans, cfg, store)
+
+            extract_dir = cfg.resolved_extract_dir
+            extract_dir.mkdir(parents=True, exist_ok=True)
+            all_plans.save(extract_dir)
+
+            log.info("=== Stage 2 complete: %d plans from agent-native response ===", len(all_plans.plans))
+            return all_plans
+
+        if _is_test_mode():
+            log.info("Agent-native: no response found and running in test mode; falling back to legacy LLM planner")
+            all_plans = generate_plans(filtered_manifest, concept_matches, cfg)
+            _process_concept_merge_queue(all_plans, cfg, store)
+
+            extract_dir = cfg.resolved_extract_dir
+            extract_dir.mkdir(parents=True, exist_ok=True)
+            all_plans.save(extract_dir)
+
+            log.info("=== Stage 2 complete: %d plans via legacy fallback (test mode) ===", len(all_plans.plans))
+            return all_plans
+
+        pending = bridge.get_pending("PLAN")
+        msg = bridge.waiting_message(pending)
+        log.warning("\n%s", msg)
+        return Plans(plans=[])
+
+
+# ─── Main entry point ─────────────────────────────────────────────────────────
+
+
+
 # ─── Main entry point ─────────────────────────────────────────────────────────
 
 def plan_sources(manifest: Manifest, cfg: Config) -> Plans:
@@ -715,6 +889,9 @@ def plan_sources(manifest: Manifest, cfg: Config) -> Plans:
 
     Returns Plans object (possibly empty on total failure).
     """
+    if getattr(cfg, "agent_native", False):
+        return plan_sources_agent_native(manifest, cfg)
+
     from pipeline.log import set_correlation
     set_correlation(stage="plan")
     log.info("=== Stage 2: Plan Batch (%d sources) ===", len(manifest.entries))

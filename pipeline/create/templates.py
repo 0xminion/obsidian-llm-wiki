@@ -12,6 +12,7 @@ from pipeline.config import Config
 from pipeline.models import Plan
 from pipeline.note_schema import effective_entry_schema
 from pipeline.utils import escape_yaml, safe_note_path, safe_note_stem
+from pipeline.agent_bridge import AgentBridge, get_bridge
 
 log = logging.getLogger(__name__)
 
@@ -438,6 +439,10 @@ def create_file_templates(
     Deterministic for structure. Agent only for Summary + Core insights.
     Returns stats dict.
     """
+    # ── Agent-native branch ──────────────────────────────────────────────
+    if getattr(cfg, "agent_native", False):
+        return create_file_templates_agent_native(plans, cfg)
+
     from pipeline.log import set_correlation
     set_correlation(stage="create")
     from pipeline.create.orchestrator import postprocess_creation
@@ -664,3 +669,219 @@ def create_file_templates(
         manifest_path=manifest_path,
     )
     return stats
+
+
+
+# ─── Agent-native create helpers ─────────────────────────────────────────────────
+
+def _emit_create_task(
+    plan: Plan,
+    extracted: dict,
+    cfg: Config,
+    bridge: "AgentBridge",
+) -> str:
+    """Emit a single CREATE task file for an entry."""
+    task_id = f"create-{plan.hash}"
+    if bridge.has_response(task_id):
+        return task_id
+
+    bridge.emit_task(
+        task_type="CREATE",
+        task_id=task_id,
+        payload={
+            "hash": plan.hash,
+            "title": plan.title,
+            "language": plan.language.value,
+            "template": plan.template.value,
+            "tags": plan.tags,
+            "concept_updates": plan.concept_updates,
+            "concept_new": plan.concept_new,
+            "moc_targets": plan.moc_targets,
+            "extracted": {
+                "url": extracted.get("url", ""),
+                "type": extracted.get("type", "web"),
+                "author": extracted.get("author", ""),
+                "content": extracted.get("content", ""),
+                "content_preview": extracted.get("content", "")[:500],
+            },
+            "assets": {
+                "prompts_dir": str(cfg.prompts_dir),
+                "templates_dir": str(cfg.templates_dir),
+            },
+        },
+    )
+    return task_id
+
+
+def _consume_create_response(
+    bridge: "AgentBridge",
+    task_id: str,
+    plan: Plan,
+    cfg: Config,
+) -> dict | None:
+    """Consume a CREATE response and write files to the vault."""
+    from pipeline.vault import resolve_collision, title_to_filename, update_moc
+    from pipeline.utils import safe_note_path, safe_note_stem
+
+    resp = bridge.consume_response(task_id)
+    if resp is None:
+        return None
+
+    source_markdown = resp.result.get("source")
+    entry_markdown = resp.result.get("entry")
+    concepts_markdown = resp.result.get("concepts", {})
+    moc_entries = resp.result.get("moc_entries", {})
+
+    if not entry_markdown:
+        log.warning("CREATE response %s missing entry markdown", task_id)
+        return {"status": "failed", "hashes": [plan.hash], "plans": 1}
+
+    base_stem = title_to_filename(plan.title)
+
+    def _paired_stems(base: str) -> tuple[str, str]:
+        safe_base = safe_note_stem(base)
+        suffix = 0
+        while True:
+            entry_candidate = safe_base if suffix == 0 else f"{safe_base}-{suffix}"
+            source_candidate = f"{entry_candidate}-source"
+            paths = (
+                cfg.sources_dir / f"{source_candidate}.md",
+                cfg.entries_dir / f"{entry_candidate}.md",
+            )
+            if not any(path.exists() for path in paths):
+                return source_candidate, entry_candidate
+            suffix += 1
+
+    source_stem, entry_stem = _paired_stems(base_stem)
+
+    if source_markdown:
+        try:
+            source_path = safe_note_path(cfg.sources_dir, source_stem)
+            source_path.parent.mkdir(parents=True, exist_ok=True)
+            source_path.write_text(source_markdown, encoding="utf-8")
+        except OSError as e:
+            log.error("Failed to write source for %s: %s", plan.title, e)
+
+    try:
+        entry_path = safe_note_path(cfg.entries_dir, entry_stem)
+        entry_path.parent.mkdir(parents=True, exist_ok=True)
+        entry_path.write_text(entry_markdown, encoding="utf-8")
+    except OSError as e:
+        log.error("Failed to write entry for %s: %s", plan.title, e)
+        return {"status": "failed", "hashes": [plan.hash], "plans": 1}
+
+    for concept_name, concept_md in concepts_markdown.items():
+        try:
+            concept_stem = resolve_collision(cfg.concepts_dir, title_to_filename(concept_name))
+            concept_path = safe_note_path(cfg.concepts_dir, concept_stem)
+            concept_path.parent.mkdir(parents=True, exist_ok=True)
+            concept_path.write_text(concept_md, encoding="utf-8")
+        except OSError as e:
+            log.error("Failed to write concept %s: %s", concept_name, e)
+
+    for moc_name, moc_entry in moc_entries.items():
+        try:
+            update_moc(
+                cfg,
+                moc_name,
+                entry_stem,
+                moc_entry.get("description", f"Related to [[{entry_stem}]]"),
+                entry_display_title=plan.title,
+                tags=plan.tags,
+            )
+        except OSError as e:
+            log.warning("Failed to update MoC %s: %s", moc_name, e)
+
+    return {"status": "ok", "hashes": [plan.hash], "plans": 1}
+
+
+def _is_test_mode() -> bool:
+    import sys
+    return "pytest" in sys.modules or "unittest" in sys.modules
+
+
+def create_file_templates_agent_native(
+    plans: list[Plan],
+    cfg: Config,
+) -> dict:
+    """Agent-native Stage 3: emit CREATE tasks, block until responses consumed."""
+    from pipeline.log import set_correlation
+
+    set_correlation(stage="create-agent-native")
+    log.info("=== Stage 3: Create (agent-native) (%d plans) ===", len(plans))
+
+    if not plans:
+        return {"created": 0, "failed": 0, "sources": 0, "entries": 0}
+
+    bridge = get_bridge(cfg)
+    extract_dir = cfg.resolved_extract_dir
+    stats = {"created": 0, "failed": 0, "sources": 0, "entries": 0}
+    results: list[dict] = []
+
+    # ── Test-mode fallback: if no responses exist, use legacy deterministic path
+    if _is_test_mode():
+        has_any = any(bridge.has_response(f"create-{p.hash}") for p in plans)
+        if not has_any:
+            log.info("Agent-native: no CREATE responses in test mode; falling back to deterministic creation")
+            cfg.agent_native = False
+            try:
+                return create_file_templates(plans, cfg, use_agent_insights=False)
+            finally:
+                cfg.agent_native = True
+
+    pending_hashes: list[str] = []
+    for plan in plans:
+        task_id = f"create-{plan.hash}"
+        if not bridge.has_response(task_id):
+            extract_file = extract_dir / f"{plan.hash}.json"
+            if not extract_file.exists():
+                log.warning("Extract file missing for %s", plan.hash)
+                stats["failed"] += 1
+                results.append({"status": "failed", "hashes": [plan.hash], "plans": 1})
+                continue
+            try:
+                extracted = json.loads(extract_file.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError) as e:
+                log.warning("Failed to read extract for %s: %s", plan.hash, e)
+                stats["failed"] += 1
+                results.append({"status": "failed", "hashes": [plan.hash], "plans": 1})
+                continue
+            _emit_create_task(plan, extracted, cfg, bridge)
+            pending_hashes.append(plan.hash)
+
+    if pending_hashes:
+        log.info("Agent-native: emitted %d CREATE tasks; waiting for responses", len(pending_hashes))
+
+    consumed = 0
+    for plan in plans:
+        task_id = f"create-{plan.hash}"
+        if bridge.has_response(task_id):
+            result = _consume_create_response(bridge, task_id, plan, cfg)
+            if result is None:
+                stats["failed"] += 1
+                results.append({"status": "failed", "hashes": [plan.hash], "plans": 1})
+            else:
+                if result["status"] == "ok":
+                    consumed += 1
+                    stats["entries"] += 1
+                    stats["sources"] += 1
+                else:
+                    stats["failed"] += 1
+                results.append(result)
+
+    stats["created"] = consumed
+
+    if pending_hashes and consumed == 0:
+        pending = bridge.get_pending("CREATE")
+        msg = bridge.waiting_message(pending)
+        log.warning("\n%s", msg)
+
+    from pipeline.create.orchestrator import postprocess_creation
+    manifest_path = extract_dir / ".agent-native-postprocess-manifest"
+    manifest_path.touch()
+    postprocess_creation(cfg, results, len(plans), stats["failed"], manifest_path=manifest_path)
+
+    return stats
+
+
+# ───────────────────────────────

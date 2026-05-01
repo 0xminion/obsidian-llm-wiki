@@ -59,6 +59,7 @@ class Config:
     # Agent
     agent_cmd: str = "hermes"
     max_retries: int = 3
+    agent_native: bool = True
 
     # Parallelism
     parallel: int = 3
@@ -330,6 +331,10 @@ def load_config(
         max_content_insights=_int_env("MAX_CONTENT_INSIGHTS", 6000, env_values),
         whisper_language=_env("WHISPER_LANGUAGE", ""),
     )
+    # Override agent_native from env if set
+    agent_native_env = _env("AGENT_NATIVE", "").lower()
+    if agent_native_env in ("1", "true", "yes"):
+        cfg.agent_native = True
 
     # Override extract dir if PIPELINE_TMPDIR is set in environment or .env.
     pipeline_tmpdir = _env("PIPELINE_TMPDIR", "")

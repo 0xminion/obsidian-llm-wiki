@@ -2,7 +2,9 @@
 
 An LLM-assisted knowledge pipeline that turns raw URLs and markdown clippings into a structured Obsidian wiki: Source notes, Entry notes, evergreen Concepts, Maps of Content, typed graph edges, indexes, and reviewable provenance.
 
-The design rule is simple: **Python owns facts and files; LLMs only provide bounded semantic judgment.** That keeps the system inspectable, testable, and safe enough to run as an unattended vault maintenance tool.
+The design rule is simple: **Python owns infrastructure; the running agent owns semantic reasoning.** Stage 1 (Extract) is deterministic Python. Stages 2–4 (Plan, Create, Compile) default to **agent-native mode**: the pipeline emits structured task files to `{extract_dir}/.agent-bridge/tasks/` and pauses for the running agent to write responses. This replaces external LLM calls and subprocess agents with the agent's own reasoning, while keeping the pipeline auditable and testable.
+
+Use `--legacy-llm` (`-L`) to fall back to direct Ollama/OpenRouter LLM calls when a local model is configured.
 
 ```text
 01-Raw/*.url or 02-Clippings/*.md
@@ -75,7 +77,8 @@ Set `USE_QMD_MCP=false` to force local keyword fallback and avoid constructing a
 ## Command surface
 
 ```bash
-pipeline ingest ~/MyVault                  # extract → plan → create
+pipeline ingest ~/MyVault                  # extract → plan → create (agent-native default)
+pipeline ingest ~/MyVault --legacy-llm     # fall back to direct LLM calls
 pipeline ingest ~/MyVault --parallel 5     # tune Stage 3 workers
 pipeline ingest ~/MyVault --dry-run        # preview without writes
 pipeline ingest ~/MyVault --review         # stage plans for human approval
@@ -85,7 +88,8 @@ pipeline approve ~/MyVault --json          # approve staged review queue atomica
 pipeline reject ~/MyVault --json           # reject staged review queue
 pipeline review-status ~/MyVault --json    # inspect pending review rows
 
-pipeline compile ~/MyVault                 # semantic cross-links, merges, MoCs, edges, index
+pipeline compile ~/MyVault                 # semantic cross-links, merges, MoCs (agent-native default)
+pipeline compile ~/MyVault --legacy-llm  # fall back to direct LLM calls
 pipeline lint ~/MyVault                    # vault health checks
 pipeline lint ~/MyVault --fix              # safe auto-fixes
 pipeline validate ~/MyVault                # post-write quality gate
@@ -133,15 +137,20 @@ Network boundaries are hardened:
 
 Planning decides what files should exist and how they should connect.
 
+**Agent-native mode (default):**
 1. Content and URL deduplication via SQLite-backed store.
 2. Concept matching through QMD MCP when available; keyword fallback otherwise.
-3. Deterministic heuristics for obvious plans.
-4. Direct LLM call only for uncertain cases.
-5. Optional human review queue with `--review` / `approve` / `reject`.
+3. The pipeline emits structured task files to `{extract_dir}/.agent-bridge/tasks/`.
+4. The running agent reads tasks, performs semantic planning, and writes response files.
+5. The pipeline consumes responses and produces `plans.json`.
+6. Optional human review queue with `--review` / `approve` / `reject`.
+
+**Legacy mode (`--legacy-llm`):** Direct LLM calls via `llm_client.generate()` and structured output are used for uncertain cases.
 
 ### Stage 3: Create
 
-Creation is template-first. Python builds paths, frontmatter, wikilinks, concept stubs, MoC membership, and collision-safe writes. The LLM is only asked for bounded summaries/insights.
+**Agent-native mode (default):**
+Creation is still template-first and path-safe. Python builds paths, frontmatter, wikilinks, concept stubs, MoC membership, and collision-safe writes. The difference is that *all* semantic work (entry insights, concept definitions, MoC overviews) is produced by the running agent through the task/response bridge, not by external LLM calls. Templates in `pipeline/assets/templates/` and prompts in `pipeline/assets/prompts/` serve as formatting reference points.
 
 Safety properties:
 
@@ -153,23 +162,20 @@ Safety properties:
 
 ### Compile pass
 
-`pipeline compile` combines semantic work with deterministic rebuilds.
+**Agent-native mode (default):**
+`pipeline compile` emits a single COMPILE task containing the vault index, dirty-file previews, and cross-linking guidelines. The running agent performs semantic cross-linking judgment, concept merge proposals, and MoC synthesis, returning structured operations that the pipeline applies deterministically.
 
-Semantic operations:
+**Legacy mode (`--legacy-llm`):**
+Semantic pair generation uses tags, title tokens, and bounded fallback windows before expensive similarity/LLM work. The common path avoids full O(N²) scans. QMD embeddings are consumed when available.
 
-- missing wikilink suggestions from embeddings + LLM validation;
-- near-duplicate concept merge proposals;
-- MoC synthesis from related notes;
-- `semantic_status` and `semantic_degraded_reason` in `CompileResult` so empty/failed LLM responses are not falsely reported as success.
-
-Deterministic operations:
-
+Deterministic operations (both modes):
 - rebuild `wiki-index.md`;
 - rebuild `edges.tsv` from entries, sources, concepts, and MoCs;
-- rewrite duplicate report, including clean “0 duplicates” state;
+- rewrite duplicate report, including clean "0 duplicates" state;
 - clear edge cache after direct edge rewrites.
+- `semantic_status` and `semantic_degraded_reason` in `CompileResult` so empty/failed LLM responses are not falsely reported as success.
 
-Semantic pair generation is blocked by tags, title tokens, and bounded fallback windows before expensive similarity/LLM work. The common path avoids full O(N²) scans.
+Semantic pair generation (legacy mode only) is blocked by tags, title tokens, and bounded fallback windows before expensive similarity/LLM work. The common path avoids full O(N²) scans.
 
 ## Vault structure
 
@@ -260,7 +266,7 @@ The skill’s job is operational, not magical: write inbox files, run `pipeline 
 
 ## Testing and release gates
 
-Current verified baseline: **852 passing tests**.
+Current verified baseline: **853 passing tests** (including agent-native branches; tests auto-fallback to legacy paths).
 
 ```bash
 ruff check .

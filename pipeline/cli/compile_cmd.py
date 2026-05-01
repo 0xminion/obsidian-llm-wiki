@@ -15,6 +15,7 @@ from pipeline.cli._helpers import _load_cfg, app
 def compile_pass(
     vault: Path = typer.Argument(None, help="Vault path (default: ~/MyVault)"),
     dry_run: bool = typer.Option(False, "--dry-run", help="Show what would change without writing"),
+    agent_native: bool = typer.Option(True, "--agent-native/--legacy-llm", "-A/-L", help="Agent-native mode (default). Use --legacy-llm for direct LLM calls."),
 ):
     """Run the compile pass — concept convergence, MoC updates, edge construction."""
     from pipeline._common import VaultLock
@@ -23,11 +24,16 @@ def compile_pass(
     from pipeline.metrics import end_stage, get_metrics, reset_metrics, start_stage
 
     cfg = _load_cfg(vault)
+    if not agent_native:
+        cfg.agent_native = False
     set_correlation(stage="compile")
     if dry_run:
         typer.echo(f"[DRY RUN] Compile pass — vault: {cfg.vault_path}")
     else:
-        typer.echo(f"Compile pass — vault: {cfg.vault_path}")
+        if getattr(cfg, "agent_native", False):
+            typer.echo(f"Compile pass (agent-native) — vault: {cfg.vault_path}")
+        else:
+            typer.echo(f"Compile pass — vault: {cfg.vault_path}")
 
     lock = VaultLock(cfg.vault_path, name="pipeline")
     if not lock.acquire():

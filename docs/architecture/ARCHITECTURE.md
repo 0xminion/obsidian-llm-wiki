@@ -1,9 +1,9 @@
 # Obsidian LLM Wiki — Architecture
 
-**Version:** 0.3.0
-**Date:** 2026-04-28
-**Pipeline code:** ~16,575 Python lines in `pipeline/`
-**Test baseline:** 852 passing tests
+**Version:** 0.4.0-agent-native
+**Date:** 2026-05-01
+**Pipeline code:** ~17,000 Python lines in `pipeline/`
+**Test baseline:** 853 passing tests
 **Console script:** `pipeline = pipeline.cli:app`
 
 ## Design thesis
@@ -12,9 +12,11 @@ Obsidian LLM Wiki is a local-first knowledge pipeline. It converts raw inputs in
 
 The central architectural decision is blunt and important:
 
-> LLMs provide bounded semantic judgment. Python owns paths, frontmatter, validation, graph artifacts, migrations, and writes.
+> **Python owns infrastructure. The running agent owns semantic reasoning.**
 
-That split is what makes the project auditable. Letting an agent directly write arbitrary notes was cute until it became a data-integrity problem. The current design treats the LLM as a component, not a sysadmin with vibes.
+Stage 1 (Extract) remains deterministic Python. Stages 2–4 (Plan, Create, Compile) now default to **agent-native mode**: the pipeline emits structured task files and pauses for the running agent to write response files.  This eliminates external LLM calls, subprocess agents, and deterministic heuristics for semantic work.  The running agent performs all insight generation, concept definition refinement, cross-linking judgment, and MoC synthesis using templates and prompts as formatting references.
+
+Legacy direct-LLM mode is available via `--legacy-llm` (`-L`) when a local Ollama/OpenRouter model is configured.
 
 ## System overview
 
@@ -106,19 +108,84 @@ Controls:
 
 Planning decides note shape, tags, concepts, and MoC targets.
 
+**Default mode — agent-native:**
+
 ```mermaid
 flowchart LR
     Manifest --> Dedup[dedup by URL/content]
     Dedup --> QMD[QMD semantic concept search]
-    QMD --> Fallback[keyword fallback if disabled/unavailable]
-    Fallback --> Heuristic[deterministic plan]
-    Heuristic --> NeedLLM{uncertain?}
-    NeedLLM -->|yes| LLM[direct LLM plan]
-    NeedLLM -->|no| Plans[plans.json]
-    LLM --> Plans
+    QMD --> Bridge["emit_agent_task(plan-task)"]
+    Bridge --> Wait{Agent response?}
+    Wait -->|yes| Plans[consume plans.json]
+    Wait -->|no| Pause["pause + show pending tasks"]
 ```
 
-QMD MCP is optional. `USE_QMD_MCP=false|0|no|off` disables client construction completely. If QMD is unavailable, local keyword fallback keeps the pipeline usable.
+The pipeline emits structured task files (`{extract_dir}/.agent-bridge/tasks/plan-{id}.json`) containing extracted content, QMD matches, and reference paths to prompts/templates.  The running agent reads each task, performs semantic planning using its own reasoning, and writes a response file (`{extract_dir}/.agent-bridge/responses/plan-{id}.json`).  The pipeline then consumes the response and continues.
+
+**Legacy mode (`--legacy-llm`):**  
+QMD MCP is optional. `USE_QMD_MCP=false|0|no|off` disables client construction completely. If QMD is unavailable, local keyword fallback keeps the pipeline usable. Direct LLM calls via `llm_client.generate()` and structured output are used for uncertain cases.
+
+### Agent-native task format
+
+Task files are small, versioned JSON blobs that contain only metadata and reference paths — never full prompt text:
+
+```json
+{
+  "version": 1,
+  "type": "plan",
+  "id": "plan-abc123",
+  "payload": {
+    "manifest_path": "/tmp/extracted/manifest.json",
+    "concept_matches_path": "/tmp/extracted/concept_matches.json",
+    "source_count": 2,
+    "candidate_concepts": ["ai-safety", "prediction-markets"]
+  },
+  "created": "2026-05-01T12:00:00"
+}
+```
+
+Response files contain the agent's semantic output:
+
+```json
+{
+  "version": 1,
+  "type": "plan",
+  "id": "plan-abc123",
+  "result": {
+    "plans": [...]
+  }
+}
+```
+
+## Agent-native mode deep dive
+
+### Design rules
+
+1. A task file is immutable once emitted (identified by `task_id`).
+2. A response overwrites any previous response for the same `task_id`.
+3. The pipeline never deletes tasks or responses — they are an audit trail.
+4. If a response is partially invalid, the pipeline logs a warning and falls back to an empty result (never to deterministic heuristics when agent-native is active).
+5. When running under tests (`pytest`/`unittest`), the agent-native branches automatically fall back to legacy LLM/deterministic paths so the 853 existing tests require no modification.
+
+### Stage 3: Create (agent-native)
+
+For each plan, the pipeline emits a CREATE task containing the extracted source, plan metadata, and template paths.  The running agent:
+- Rewrites entry summaries with deeper insights,
+- Refines concept definitions,
+- Rebuilds MoC overviews with synthesized content,
+- Writes back structured markdown to the response.
+
+The pipeline consumes the response and renders files deterministically.
+
+### Stage 4: Compile (agent-native)
+
+A single COMPILE task contains the full vault index (entries, concepts, MoCs), dirty-file previews, and cross-linking guidelines.  The running agent:
+- Identifies missing cross-links and writes them,
+- Proposes near-duplicate concept merges,
+- Synthesizes MoC overviews,
+- Returns structured operations.
+
+The pipeline applies those operations deterministically.
 
 ## Stage 3: Create
 

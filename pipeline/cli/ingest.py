@@ -28,12 +28,15 @@ def ingest(
     dry_run: bool = typer.Option(False, "--dry-run", help="Run pipeline without writing files"),
     review: bool = typer.Option(False, "--review", help="Stage files for review, skip Stage 3"),
     resume: bool = typer.Option(False, "--resume", help="Resume from saved plans (skip Stages 1+2)"),
-    agent: bool = typer.Option(False, "--agent", "-a", help="Use full agent mode for creation (slower, may timeout — not recommended)"),
+    agent: bool = typer.Option(False, "--agent", "-a", help="DEPRECATED: Use --agent-native (default) instead"),
+    agent_native: bool = typer.Option(True, "--agent-native/--legacy-llm", "-A/-L", help="Agent-native mode (default). Use --legacy-llm for direct LLM calls."),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose logging"),
 ):
     """Process inbox: extract → plan → create."""
     cfg = _load_cfg(vault)
     cfg.parallel = parallel
+    if not agent_native:
+        cfg.agent_native = False
     t0 = time.time()
     if dry_run:
         from pipeline.vault_setup import detect_vault
@@ -192,9 +195,15 @@ def ingest(
                 typer.echo("  [DRY RUN] Would generate plans for extracted sources.")
                 plans = Plans(plans=[])
             else:
+                if getattr(cfg, "agent_native", False):
+                    typer.echo("  [AGENT-NATIVE] Emitting PLAN task...")
                 plans = plan_sources(manifest, cfg)
             elapsed_2 = time.time() - t2
             end_stage("plan")
+            if getattr(cfg, "agent_native", False) and not plans.plans:
+                typer.echo("  AGENT-NATIVE: No plan response found yet.")
+                typer.echo("  Process pending PLAN task, then re-run pipeline.")
+                raise typer.Exit(code=0)
             typer.echo(f"  Generated {len(plans.plans)} plans in {elapsed_2:.1f}s")
 
         if review and resume:
@@ -233,10 +242,18 @@ def ingest(
             typer.echo("  Using full agent mode (heavy — may timeout)")
             stats = create_all(plans, cfg, parallel=parallel)
         else:
-            typer.echo("  Using template-based creation (deterministic + insight agent)")
+            if getattr(cfg, "agent_native", False):
+                typer.echo("  [AGENT-NATIVE] Emitting CREATE tasks...")
+            else:
+                typer.echo("  Using template-based creation (deterministic + insight agent)")
             stats = create_file_templates(plans.plans, cfg, use_agent_insights=True)
         elapsed_3 = time.time() - t3
         end_stage("create")
+        if getattr(cfg, "agent_native", False) and stats.get("created", 0) == 0 and stats.get("failed", 0) == 0:
+            # All tasks emitted, waiting for responses
+            typer.echo("  AGENT-NATIVE: No CREATE responses found yet.")
+            typer.echo("  Process pending CREATE tasks, then re-run pipeline.")
+            raise typer.Exit(code=0)
         typer.echo(f"  Created: {stats['created']}, Failed: {stats['failed']} in {elapsed_3:.1f}s")
 
         elapsed_total = time.time() - t0
