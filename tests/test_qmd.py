@@ -120,10 +120,10 @@ class TestRunQmdConceptSearch:
             assert result[h][0].concept == "test"
 
     @patch("pipeline.qmd._get_client")
-    def test_qmd_unavailable_uses_keyword(self, mock_get_client):
+    def test_qmd_unavailable_uses_keyword(self, mock_get_client, tmp_path: Path):
         mock_get_client.return_value = None
         cfg = MagicMock()
-        cfg.vault_path = Path.home() / "MyVault"
+        cfg.vault_path = tmp_path / "vault"
         cfg.parallel = 4
         cfg.qmd_collection = "concepts"
         result = run_qmd_concept_search({"h1": "alpha"}, cfg)

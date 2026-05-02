@@ -1,11 +1,7 @@
-"""Stage 3 — Create: batch creation of vault files via parallel agents.
+"""Stage 3 — Create: batch creation of vault files via bridge tasks.
 
-This package is split into focused sub-modules:
-  - prompts:    Prompt loading and batch prompt construction
-  - agent:      Agent orchestration, concept convergence, batch execution
-  - templates:  Template-based file creation (deterministic + optional agent insights)
-  - validate:   Output validation and auto-repair
-  - orchestrator: Main entry point (create_all) and post-processing
+All semantic content generation delegated to the running agent.
+Python handles only file I/O, bridge emission, and response consumption.
 """
 
 # Re-export everything for backward compatibility
