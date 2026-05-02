@@ -108,6 +108,18 @@ class Config:
     min_quality: float = 0.0
     min_clipping_quality: float = 0.5
 
+    # llmwiki v2.0
+    prompt_budget_chars: int = 200_000
+    jaccard_dedup_threshold: float = 0.85
+    seed_overviews: bool = True
+    language: str = "zh"
+    language_fallback: list[str] = field(default_factory=lambda: ["zh", "en"])
+    auto_approve: bool = True
+    auto_review: bool = True
+    review_gate: bool = False
+    max_concepts_per_source: int = 10
+    max_moc_depth: int = 7
+
     # Whisper
     whisper_language: str = ""  # empty = auto-detect, "en", "zh", etc.
 

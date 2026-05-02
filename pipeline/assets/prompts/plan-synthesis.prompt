@@ -1,0 +1,12 @@
+---
+name: plan-synthesis
+---
+Synthesize the per-source extracted concepts into unified wiki plans.
+
+For each source, produce a plan with:
+  - hash, title, language, template
+  - concept_updates (existing concepts to update)
+  - concept_new (new concepts to create)
+  - moc_targets (relevant topic areas)
+
+Use Jaccard similarity > 0.85 to deduplicate new concepts against existing ones.
