@@ -156,7 +156,7 @@ async def compile(
             print(f"[compiler] 🗑 Orphaning concepts from deleted source: {del_file}")
             from pipeline.orphan import mark_orphaned
 
-            mark_orphaned(str(root_dir), del_file, state)
+            mark_orphaned(str(config.wiki_dir), del_file, state)
             remove_source_state(state, del_file)
 
         # ── Step 8: Find frozen slugs ───────────────────────────────────────
@@ -220,7 +220,7 @@ async def compile(
             from pipeline.resolver import resolve_links
 
             print("[compiler] 🔗 Resolving wikilinks...")
-            modified = resolve_links(str(root_dir), all_slugs, new_slugs)
+            modified = resolve_links(str(config.wiki_dir), all_slugs, new_slugs)
             if modified:
                 print(f"[compiler]   Updated {modified} page(s) with wikilinks")
 

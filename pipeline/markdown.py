@@ -38,7 +38,7 @@ def slugify(title: str) -> str:
 
 def build_frontmatter(fields: dict[str, Any]) -> str:
     """Build a YAML frontmatter block from key-value pairs."""
-    dumped = yaml.dump(fields, line_width=-1, allow_unicode=True,
+    dumped = yaml.dump(fields, width=float("inf"), allow_unicode=True,
                        default_flow_style=False).rstrip()
     return f"---\n{dumped}\n---"
 

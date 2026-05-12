@@ -213,7 +213,7 @@ async def _run_create_with_review(
 
     # For each concept, stage as a candidate
     for concept in result.concepts:
-        from pipeline.hasher import slugify as _slugify
+        from pipeline.markdown import slugify as _slugify
         slug = _slugify(concept.concept)
         candidate_data = {
             "title": concept.concept,
@@ -309,7 +309,7 @@ async def _compile_with_review(vault: str, options: dict) -> CompileResult:  # n
         config = load_config(env_file=env_file)
 
         for concept in result.concepts:
-            from pipeline.hasher import slugify as _slugify
+            from pipeline.markdown import slugify as _slugify
             slug = _slugify(concept.concept)
             candidate_data = {
                 "title": concept.concept,
