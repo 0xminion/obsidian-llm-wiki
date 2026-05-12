@@ -1,379 +1,185 @@
-"""Core data models for the pipeline.
+"""Data models for the llmwiki knowledge compiler pipeline.
 
-Defines the data structures that flow between stages:
-  Stage 1 (Extract) → ExtractedSource
-  Stage 2 (Plan) → Plan
-  Stage 3 (Create) → writes vault files
+Ported from llm-wiki-compiler/src/utils/types.ts, src/ingest/shared.ts, src/schema/types.ts.
 """
 
-from __future__ import annotations
-
-import hashlib
-import json
-import logging
 from dataclasses import dataclass, field
-from enum import Enum
-from pathlib import Path
-from typing import Optional
+from enum import StrEnum
+from typing import Any
+
+# ── Enums ──────────────────────────────────────────────────────────────
 
 
-log = logging.getLogger(__name__)
-
-
-# ─── Enums ────────────────────────────────────────────────────────────────────
-
-class SourceType(str, Enum):
-    WEB = "web"
-    YOUTUBE = "youtube"
-    PODCAST = "podcast"
-    TWITTER = "twitter"  # Routes through web extractor (x.com/twitter.com)
-    UNKNOWN = "unknown"
-
-
-class Template(str, Enum):
-    STANDARD = "standard"
-    CHINESE = "chinese"
-    TECHNICAL = "technical"
+class PageKind(StrEnum):
+    """All page kinds the schema layer recognises."""
+    CONCEPT = "concept"
+    ENTITY = "entity"
     COMPARISON = "comparison"
-    PROCEDURAL = "procedural"
+    OVERVIEW = "overview"
 
 
-class Language(str, Enum):
-    EN = "en"
-    ZH = "zh"
+class ProvenanceState(StrEnum):
+    """How a concept was produced."""
+    EXTRACTED = "extracted"
+    MERGED = "merged"
+    INFERRED = "inferred"
+    AMBIGUOUS = "ambiguous"
 
 
-class EdgeType(str, Enum):
-    EXTENDS = "extends"
-    CONTRADICTS = "contradicts"
-    SUPPORTS = "supports"
-    SUPERSEDES = "supersedes"
-    TESTED_BY = "tested_by"
-    DEPENDS_ON = "depends_on"
-    INSPIRED_BY = "inspired_by"
-    PART_OF = "part_of"
-    RELATES_TO = "relates_to"
+class SourceStatus(StrEnum):
+    """Change detection status for a source file."""
+    NEW = "new"
+    CHANGED = "changed"
+    UNCHANGED = "unchanged"
+    DELETED = "deleted"
 
 
-# ─── Stage 1: Extracted Source ───────────────────────────────────────────────
+# ── Extraction ─────────────────────────────────────────────────────────
+
 
 @dataclass
-class ExtractedSource:
-    """Output of Stage 1 extraction. Serialized as {hash}.json."""
-
-    url: str
+class IngestedSource:
+    """Raw output from an ingest module (web, file, PDF, etc.)."""
     title: str
     content: str
-    type: SourceType = SourceType.UNKNOWN
-    author: str = ""
-    source_file: str = ""
 
-    @property
-    def hash(self) -> str:
-        """Deterministic 12-char hash of the URL."""
-        return hashlib.md5(self.url.encode()).hexdigest()[:12]
-
-    @property
-    def content_hash(self) -> str:
-        """16-char hash of normalized content for dedup detection."""
-        from pipeline.utils import content_hash
-        return content_hash(self.content)
-
-    @property
-    def content_length(self) -> int:
-        return len(self.content)
-
-    def to_dict(self) -> dict:
-        return {
-            "url": self.url,
-            "title": self.title,
-            "content": self.content,
-            "type": self.type.value,
-            "author": self.author,
-            "source_file": self.source_file,
-        }
-
-    def save(self, extract_dir: Path) -> Path:
-        """Save to extract_dir/{hash}.json."""
-        extract_dir.mkdir(parents=True, exist_ok=True)
-        path = extract_dir / f"{self.hash}.json"
-        path.write_text(json.dumps(self.to_dict(), ensure_ascii=False, indent=2))
-        return path
-
-    @classmethod
-    def load(cls, path: Path) -> ExtractedSource:
-        data = json.loads(path.read_text())
-        return cls(
-            url=data["url"],
-            title=data["title"],
-            content=data.get("content", ""),
-            type=SourceType(data.get("type", "unknown")),
-            author=data.get("author", ""),
-            source_file=data.get("source_file", ""),
-        )
-
-
-# ─── Stage 2: Plan ───────────────────────────────────────────────────────────
 
 @dataclass
-class Plan:
-    """Creation plan for one source. Output of Stage 2."""
-
-    hash: str
-    title: str
-    language: Language = Language.EN
-    template: Template = Template.STANDARD
-    tags: list[str] = field(default_factory=list)
-    concept_updates: list[str] = field(default_factory=list)
-    concept_new: list[str] = field(default_factory=list)
-    moc_targets: list[str] = field(default_factory=list)
-
-    def to_dict(self) -> dict:
-        return {
-            "hash": self.hash,
-            "title": self.title,
-            "language": self.language.value,
-            "template": self.template.value,
-            "tags": self.tags,
-            "concept_updates": self.concept_updates,
-            "concept_new": self.concept_new,
-            "moc_targets": self.moc_targets,
-        }
-
-    @classmethod
-    def from_dict(cls, data: dict) -> Plan:
-        try:
-            lang = Language(data.get("language", "en"))
-        except ValueError:
-            lang = Language.EN
-        try:
-            tmpl = Template(data.get("template", "standard"))
-        except ValueError:
-            tmpl = Template.STANDARD
-        return cls(
-            hash=data["hash"],
-            title=data["title"],
-            language=lang,
-            template=tmpl,
-            tags=data.get("tags", []),
-            concept_updates=data.get("concept_updates", []),
-            concept_new=data.get("concept_new", []),
-            moc_targets=data.get("moc_targets", []),
-        )
+class SourceSlice:
+    """A single source's contribution to per-concept prompt content."""
+    file: str
+    content: str
 
 
-# ─── Manifest ────────────────────────────────────────────────────────────────
+# ── Concepts ───────────────────────────────────────────────────────────
+
 
 @dataclass
-class Manifest:
-    """Collection of extracted sources. Stage 1 output."""
+class ContradictionRef:
+    """Reference to another concept whose evidence contradicts this one."""
+    slug: str
+    reason: str | None = None
 
-    entries: list[ExtractedSource] = field(default_factory=list)
-
-    def save(self, extract_dir: Path) -> Path:
-        extract_dir.mkdir(parents=True, exist_ok=True)
-        path = extract_dir / "manifest.json"
-        data = [e.to_dict() for e in self.entries]
-        path.write_text(json.dumps(data, ensure_ascii=False, indent=2))
-        return path
-
-    @classmethod
-    def load(cls, extract_dir: Path) -> Manifest:
-        path = extract_dir / "manifest.json"
-        if not path.exists():
-            return cls(entries=[])
-        data = json.loads(path.read_text())
-        if not isinstance(data, list):
-            log.warning("Manifest file is not a list; skipping malformed manifest")
-            return cls(entries=[])
-        entries = []
-        for d in data:
-            try:
-                if not isinstance(d, dict):
-                    raise TypeError("manifest entry must be an object")
-                try:
-                    src_type = SourceType(d.get("type", "unknown"))
-                except ValueError:
-                    src_type = SourceType.UNKNOWN
-                entries.append(
-                    ExtractedSource(
-                        url=d["url"],
-                        title=d["title"],
-                        content=d.get("content", ""),
-                        type=src_type,
-                        author=d.get("author", ""),
-                        source_file=d.get("source_file", ""),
-                    )
-                )
-            except (TypeError, ValueError, KeyError):
-                log.warning("Skipping malformed manifest entry: missing or invalid fields")
-                continue
-        return cls(entries=entries)
-
-    @property
-    def hashes(self) -> set[str]:
-        return {e.hash for e in self.entries}
-
-
-# ─── Plans Collection ────────────────────────────────────────────────────────
 
 @dataclass
-class Plans:
-    """Collection of plans. Stage 2 output."""
-
-    plans: list[Plan] = field(default_factory=list)
-
-    def save(self, extract_dir: Path) -> Path:
-        path = extract_dir / "plans.json"
-        data = [p.to_dict() for p in self.plans]
-        path.write_text(json.dumps(data, ensure_ascii=False, indent=2))
-        return path
-
-    @classmethod
-    def load(cls, extract_dir: Path) -> Plans:
-        path = extract_dir / "plans.json"
-        if not path.exists():
-            return cls(plans=[])
-        try:
-            data = json.loads(path.read_text())
-            if not isinstance(data, list):
-                log.warning("plans.json is not a list; returning empty plans")
-                return cls(plans=[])
-            plans = []
-            for d in data:
-                try:
-                    if isinstance(d, dict):
-                        plans.append(Plan.from_dict(d))
-                except (KeyError, ValueError, TypeError) as e:
-                    log.warning("Skipping malformed plan entry: %s", e)
-                    continue
-            return cls(plans=plans)
-        except (json.JSONDecodeError, OSError) as e:
-            log.error("Failed to load plans.json: %s", e)
-            return cls(plans=[])
-
-    def split_batches(self, parallel: int, extract_dir: "Path | None" = None) -> list[list[Plan]]:
-        """Split plans into N batches for parallel processing.
-
-        If extract_dir is provided, uses content-size-aware splitting to avoid
-        blowing the max_total_content budget per batch. Otherwise falls back to
-        simple ceiling division.
-        """
-        if not self.plans:
-            return []
-
-        if extract_dir is None:
-            # Legacy: simple ceiling division
-            batch_size = max(1, -(-len(self.plans) // parallel))
-            batches = []
-            for i in range(0, len(self.plans), batch_size):
-                batches.append(self.plans[i : i + batch_size])
-            return batches
-
-        # Content-size-aware: bin-pack plans into N bins, minimizing max bin size
-        # Read content sizes from extract files
-        import json as _json
-        plan_sizes: list[tuple[Plan, int]] = []
-        for p in self.plans:
-            ext_file = extract_dir / f"{p.hash}.json"
-            if ext_file.exists():
-                try:
-                    ext = _json.loads(ext_file.read_text(encoding="utf-8"))
-                    plan_sizes.append((p, len(ext.get("content", ""))))
-                except (OSError, _json.JSONDecodeError):
-                    plan_sizes.append((p, 0))
-            else:
-                plan_sizes.append((p, 0))
-
-        # Sort descending by size (largest first — LPT bin packing heuristic)
-        plan_sizes.sort(key=lambda x: x[1], reverse=True)
-
-        # Greedy bin packing into N bins
-        bins: list[list[Plan]] = [[] for _ in range(parallel)]
-        bin_sizes = [0] * parallel
-        for plan, size in plan_sizes:
-            # Put into the bin with smallest current total
-            min_bin = min(range(parallel), key=lambda i: bin_sizes[i])
-            bins[min_bin].append(plan)
-            bin_sizes[min_bin] += size
-
-        # Remove empty bins
-        return [b for b in bins if b]
-
-
-# ─── Edge ─────────────────────────────────────────────────────────────────────
-
-@dataclass
-class Edge:
-    """Typed relationship between notes. Appended to edges.tsv."""
-
-    source: str
-    target: str
-    type: EdgeType
-    description: str = ""
-
-    def to_tsv(self) -> str:
-        def _escape(s: str) -> str:
-            # Order matters: backslash must be escaped first
-            return s.replace("\\", "\\\\").replace("\t", "\\t").replace("\n", "\\n")
-        return f"{_escape(self.source)}\t{_escape(self.target)}\t{_escape(self.type.value)}\t{_escape(self.description)}"
-
-    @classmethod
-    def from_tsv(cls, line: str) -> Optional[Edge]:
-        parts = line.strip().split("\t")
-        if len(parts) < 3:
-            return None
-        def _unescape(s: str) -> str:
-            out = []
-            i = 0
-            while i < len(s):
-                if s[i] == "\\" and i + 1 < len(s):
-                    nxt = s[i + 1]
-                    if nxt == "t":
-                        out.append("\t")
-                        i += 2
-                        continue
-                    if nxt == "n":
-                        out.append("\n")
-                        i += 2
-                        continue
-                    if nxt == "\\":
-                        out.append("\\")
-                        i += 2
-                        continue
-                out.append(s[i])
-                i += 1
-            return "".join(out)
-        try:
-            return cls(
-                source=_unescape(parts[0]),
-                target=_unescape(parts[1]),
-                type=EdgeType(_unescape(parts[2])),
-                description=_unescape(parts[3]) if len(parts) > 3 else "",
-            )
-        except ValueError:
-            return None
-
-
-# ─── Concept Match ───────────────────────────────────────────────────────────
-
-@dataclass
-class ConceptMatch:
-    """Result of semantic concept search."""
-
+class ExtractedConcept:
+    """A concept extracted from a source by the LLM."""
     concept: str
-    score: float
+    summary: str
+    is_new: bool
+    tags: list[str] = field(default_factory=list)
+    confidence: float | None = None
+    provenance_state: ProvenanceState | None = None
+    contradicted_by: list[ContradictionRef] | None = None
 
-    @classmethod
-    def from_dict(cls, data: dict) -> ConceptMatch:
-        return cls(concept=data["concept"], score=data["score"])
 
+# ── State ──────────────────────────────────────────────────────────────
 
-# ─── Convergence ─────────────────────────────────────────────────────────────
 
 @dataclass
-class ConvergenceResult:
-    """Concept convergence data for a plan hash."""
-
+class SourceState:
+    """Per-source incremental compilation state."""
     hash: str
-    matches: list[ConceptMatch] = field(default_factory=list)
+    concepts: list[str]
+    compiled_at: str | None = None
+
+
+@dataclass
+class WikiState:
+    """Persisted wiki state (sources + global metadata)."""
+    sources: dict[str, SourceState] = field(default_factory=dict)
+
+
+@dataclass
+class SourceChange:
+    """Detected change for a single source file."""
+    file: str
+    status: SourceStatus
+
+
+# ── Compile Results ────────────────────────────────────────────────────
+
+
+@dataclass
+class PageSummary:
+    """Lightweight page entry for index/MOC generation."""
+    title: str
+    slug: str
+    summary: str
+    tags: list[str] = field(default_factory=list)
+
+
+@dataclass
+class CompileResult:
+    """Structured result from a compilation pass."""
+    compiled: int = 0
+    skipped: int = 0
+    deleted: int = 0
+    concepts: list[ExtractedConcept] = field(default_factory=list)
+    pages: list[str] = field(default_factory=list)
+    errors: list[str] = field(default_factory=list)
+    candidates: list[str] = field(default_factory=list)
+
+
+# ── Review Candidates ──────────────────────────────────────────────────
+
+
+@dataclass
+class ReviewCandidate:
+    """A generated wiki page pending human review."""
+    id: str
+    title: str
+    slug: str
+    summary: str
+    sources: list[str]
+    body: str
+    generated_at: str
+    source_states: dict[str, SourceState] = field(default_factory=dict)
+    schema_violations: list[dict[str, Any]] | None = None
+    provenance_violations: list[dict[str, Any]] | None = None
+
+
+# ── Schema ─────────────────────────────────────────────────────────────
+
+
+@dataclass
+class PageKindRule:
+    """Per-kind policy: minimum cross-links and description."""
+    min_wikilinks: int
+    description: str
+
+
+@dataclass
+class SeedPage:
+    """Declarative seed for non-concept pages."""
+    title: str
+    kind: PageKind
+    summary: str
+    related_slugs: list[str] = field(default_factory=list)
+
+
+@dataclass
+class SchemaConfig:
+    """Resolved schema configuration."""
+    version: int = 1
+    default_kind: PageKind = PageKind.CONCEPT
+    kinds: dict[PageKind, PageKindRule] = field(default_factory=dict)
+    seed_pages: list[SeedPage] = field(default_factory=list)
+    loaded_from: str | None = None
+
+
+# ── Provenance ─────────────────────────────────────────────────────────
+
+
+@dataclass
+class SourceSpan:
+    """A citation span referencing a source file with optional line range."""
+    file: str
+    lines: tuple[int, int] | None = None
+
+
+@dataclass
+class ClaimCitation:
+    """A single ^[...] citation marker parsed from a page body."""
+    raw: str
+    spans: list[SourceSpan]

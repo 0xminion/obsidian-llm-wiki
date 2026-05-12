@@ -1,251 +1,170 @@
-"""Configuration and environment management.
+"""Configuration management for the llmwiki pipeline.
 
-Loads settings from:
-  1. Environment variables
-  2. .env file (if exists)
-  3. Defaults
+Loads settings from environment variables and .env files.
+Ported from llm-wiki-compiler/src/utils/constants.ts.
 """
 
 from __future__ import annotations
 
-import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
 
-log = logging.getLogger(__name__)
-
-try:
-    from dotenv import dotenv_values
-except ImportError:
-    dotenv_values = None
-
-
-def hashlib_md5_short(s: str) -> str:
-    """Portable short MD5 hash (12 chars, consistent across modules)."""
-    import hashlib
-    return hashlib.md5(s.encode()).hexdigest()[:12]
-
-
-def _find_env_file(vault_path: Optional[Path] = None) -> Optional[Path]:
-    """Search for .env in common locations.
-
-    When a vault_path is provided, prefer that vault's local .env first so
-    non-default vaults load their own credentials/configuration.
-    """
-    candidates: list[Path] = []
-    if vault_path is not None:
-        candidates.append(Path(vault_path) / "Meta" / "Scripts" / ".env")
-    candidates.extend([
-        Path.cwd() / ".env",
-        Path.home() / "MyVault" / "Meta" / "Scripts" / ".env",
-        Path(__file__).parent.parent / ".env",
-    ])
-    for p in candidates:
-        if p.exists():
-            return p
-    return None
+from dotenv import load_dotenv
 
 
 @dataclass
 class Config:
-    """Pipeline configuration."""
+    """Pipeline configuration, loaded from environment."""
+    # ── Ollama ──────────────────────────────────────
+    ollama_host: str = "http://localhost:11434"
+    ollama_model: str = "gemma4:31b-cloud"
+    ollama_embed_model: str = "qwen3-embedding:0.6b"
+    ollama_timeout_ms: int = 1_800_000  # 30 minutes
 
-    # Paths
-    vault_path: Path = field(default_factory=lambda: Path.home() / "MyVault")
-    extract_dir: Optional[Path] = None  # auto-derived if None
+    # ── Vault ───────────────────────────────────────
+    vault_path: str = ""
 
-    # Agent
-    agent_cmd: str = "hermes"
-    max_retries: int = 3
+    # ── Content thresholds ──────────────────────────
+    max_source_chars: int = 1_000_000
+    min_source_chars: int = 50
+    prompt_budget_chars: int = 200_000
 
-    # Parallelism
-    parallel: int = 3
+    # ── Concurrency ─────────────────────────────────
+    compile_concurrency: int = 3
 
-    # API keys
-    transcript_api_key: str = ""
-    supadata_api_key: str = ""
-    assemblyai_api_key: str = ""
+    # ── Language ────────────────────────────────────
+    output_language: str = ""
 
-    # QMD
-    qmd_cmd: str = "qmd"
-    qmd_collection: str = "concepts"
+    # ── Provider ────────────────────────────────────
+    provider: str = "ollama"
 
-    # Extraction
-    extract_timeout: int = 45
+    # ── Quality gates ───────────────────────────────
+    concept_min_body_chars: int = 800
+    entry_min_body_chars: int = 500
+    clipping_min_body_chars: int = 500
 
-    # Timeouts
-    agent_timeout: int = 900
-    plan_timeout: int = 600
+    # ── Retry ───────────────────────────────────────
+    retry_count: int = 3
+    retry_base_ms: int = 1_000
+    retry_multiplier: int = 4
 
-    # Content limits (configurable for token optimization)
-    max_content_per_source: int = 8000  # max chars per source in batch prompt
-    max_total_content: int = 15000  # max total content chars in batch prompt
-    max_content_insights: int = 6000  # max chars for insight agent
-
-    # Whisper
-    whisper_language: str = ""  # empty = auto-detect, "en", "zh", etc.
-
-    @property
-    def resolved_extract_dir(self) -> Path:
-        if self.extract_dir:
-            return self.extract_dir
-        vault_hash = hashlib_md5_short(str(self.vault_path))
-        return Path(f"/tmp/obsidian-extracted-{vault_hash}")
+    # ── Derived paths (set after load) ──────────────
+    _vault: Path | None = field(default=None, repr=False)
 
     @property
-    def prompts_dir(self) -> Path:
-        return self.vault_path / "Meta" / "prompts"
+    def vault(self) -> Path:
+        """Resolved vault path."""
+        if self._vault is None:
+            self._vault = Path(os.path.expandvars(self.vault_path)).expanduser().resolve()
+        return self._vault
 
     @property
-    def templates_dir(self) -> Path:
-        return self.vault_path / "Meta" / "Templates"
-
-    @property
-    def lib_dir(self) -> Path:
-        return self.vault_path / "Meta" / "lib"
-
-    @property
-    def scripts_dir(self) -> Path:
-        return self.vault_path / "Meta" / "Scripts"
-
-    @property
-    def log_file(self) -> Path:
-        return self.scripts_dir / "processing.log"
+    def wiki_dir(self) -> Path:
+        return self.vault / "04-Wiki"
 
     @property
     def sources_dir(self) -> Path:
-        return self.vault_path / "04-Wiki" / "sources"
+        return self.wiki_dir / "sources"
 
     @property
     def entries_dir(self) -> Path:
-        return self.vault_path / "04-Wiki" / "entries"
+        return self.wiki_dir / "entries"
 
     @property
     def concepts_dir(self) -> Path:
-        return self.vault_path / "04-Wiki" / "concepts"
+        return self.wiki_dir / "concepts"
 
     @property
     def mocs_dir(self) -> Path:
-        return self.vault_path / "04-Wiki" / "mocs"
+        return self.wiki_dir / "mocs"
 
     @property
-    def inbox_dir(self) -> Path:
-        return self.vault_path / "01-Raw"
+    def clippings_dir(self) -> Path:
+        return self.vault / "02-Clippings"
 
     @property
-    def archive_dir(self) -> Path:
-        return self.vault_path / "08-Archive-Raw"
+    def llmwiki_dir(self) -> Path:
+        return self.wiki_dir / ".llmwiki"
 
     @property
-    def config_dir(self) -> Path:
-        return self.vault_path / "06-Config"
+    def state_file(self) -> Path:
+        return self.llmwiki_dir / "state.json"
 
     @property
-    def edges_file(self) -> Path:
-        return self.config_dir / "edges.tsv"
+    def lock_file(self) -> Path:
+        return self.llmwiki_dir / "lock"
 
     @property
-    def wiki_index(self) -> Path:
-        return self.config_dir / "wiki-index.md"
+    def index_file(self) -> Path:
+        return self.wiki_dir / "index.md"
 
     @property
-    def url_index(self) -> Path:
-        return self.config_dir / "url-index.tsv"
+    def moc_file(self) -> Path:
+        return self.wiki_dir / "MOC.md"
 
     @property
-    def log_md(self) -> Path:
-        return self.config_dir / "log.md"
+    def candidates_dir(self) -> Path:
+        return self.llmwiki_dir / "candidates"
 
-    def validate(self) -> list[str]:
-        """Check for missing required paths and invalid config. Returns list of errors."""
-        errors = []
-        if not self.vault_path.exists():
-            errors.append(f"Vault path does not exist: {self.vault_path}")
-        if not self.sources_dir.parent.exists():
-            errors.append(f"04-Wiki directory missing: {self.sources_dir.parent}")
-        # Numeric bounds
-        if self.parallel < 1:
-            errors.append(f"parallel must be >= 1, got {self.parallel}")
-        if self.parallel > 20:
-            errors.append(f"parallel > 20 is likely a mistake, got {self.parallel}")
-        if self.max_retries < 1:
-            errors.append(f"max_retries must be >= 1, got {self.max_retries}")
-        if self.extract_timeout < 5:
-            errors.append(f"extract_timeout too low (<5s), got {self.extract_timeout}")
-        if self.agent_timeout < 30:
-            errors.append(f"agent_timeout too low (<30s), got {self.agent_timeout}")
-        return errors
+    @property
+    def candidates_archive_dir(self) -> Path:
+        return self.candidates_dir / "archive"
 
 
+def load_config(env_file: str | None = None, **overrides: str) -> Config:
+    """Load configuration from environment and optional .env file.
 
+    Args:
+        env_file: Path to a .env file to load from.
+        **overrides: Additional key-value overrides (e.g., from CLI).
 
-def _int_env(key: str, default: int, env_values: Optional[dict[str, str]] = None) -> int:
-    """Safely parse an integer from environment variables or .env values."""
-    raw = os.environ.get(key)
-    if raw is None and env_values is not None:
-        raw = env_values.get(key)
-    if raw is None:
-        raw = str(default)
-    try:
-        return int(raw)
-    except (ValueError, TypeError):
-        log.warning("Invalid integer for %s, using default %d", key, default)
-        return default
-
-
-def load_config(
-    vault_path: Optional[Path] = None,
-    env_file: Optional[Path] = None,
-) -> Config:
-    """Load configuration from environment + .env file.
-
-    Environment variables override .env values. Reading .env must not mutate the
-    process environment, otherwise one test or one vault can leak configuration
-    into later runs.
+    Returns:
+        Config object with all fields populated.
     """
-    env_values: dict[str, str] = {}
-    if dotenv_values is not None:
-        env_path = env_file or _find_env_file(vault_path=vault_path)
-        if env_path:
-            env_values = {
-                key: value
-                for key, value in dotenv_values(env_path).items()
-                if value is not None
-            }
+    # Load .env if specified, fall back to VAULT_PATH/.env then .env
+    if env_file:
+        load_dotenv(env_file, override=True)
+    else:
+        vault_raw = os.getenv("VAULT_PATH", "")
+        vault_dir = os.path.expandvars(vault_raw)
+        if vault_dir:
+            vault_env = os.path.join(vault_dir, ".env")
+            if os.path.isfile(vault_env):
+                load_dotenv(vault_env, override=True)
+        load_dotenv(override=False)
 
-    def _env(key: str, default: str = "") -> str:
-        return os.environ.get(key, env_values.get(key, default))
+    # Apply CLI overrides
+    for key, val in overrides.items():
+        os.environ[key.upper()] = val
 
-    cfg = Config(
-        vault_path=Path(
-            vault_path
-            or os.environ.get("VAULT_PATH")
-            or os.environ.get("OBSIDIAN_VAULT")
-            or env_values.get("VAULT_PATH")
-            or env_values.get("OBSIDIAN_VAULT")
-            or str(Path.home() / "MyVault")
-        ),
-        agent_cmd=_env("AGENT_CMD", "hermes"),
-        max_retries=_int_env("MAX_RETRIES", 3, env_values),
-        parallel=_int_env("PARALLEL", 3, env_values),
-        transcript_api_key=_env("TRANSCRIPT_API_KEY", ""),
-        supadata_api_key=_env("SUPADATA_API_KEY", ""),
-        assemblyai_api_key=_env("ASSEMBLYAI_API_KEY", ""),
-        qmd_cmd=_env("QMD_CMD", "qmd"),
-        qmd_collection=_env("QMD_COLLECTION", "concepts"),
-        extract_timeout=_int_env("EXTRACT_TIMEOUT", 45, env_values),
-        agent_timeout=_int_env("AGENT_TIMEOUT", 900, env_values),
-        plan_timeout=_int_env("PLAN_TIMEOUT", 600, env_values),
-        max_content_per_source=_int_env("MAX_CONTENT_PER_SOURCE", 8000, env_values),
-        max_total_content=_int_env("MAX_TOTAL_CONTENT", 15000, env_values),
-        max_content_insights=_int_env("MAX_CONTENT_INSIGHTS", 6000, env_values),
-        whisper_language=_env("WHISPER_LANGUAGE", ""),
+    return Config(
+        ollama_host=os.getenv("OLLAMA_HOST", "http://localhost:11434"),
+        ollama_model=os.getenv("OLLAMA_MODEL", "gemma4:31b-cloud"),
+        ollama_embed_model=os.getenv("OLLAMA_EMBED_MODEL", "qwen3-embedding:0.6b"),
+        ollama_timeout_ms=_int_env("OLLAMA_TIMEOUT_MS", 1_800_000),
+        vault_path=os.getenv("VAULT_PATH", str(Path.home() / "MyVault")),
+        max_source_chars=_int_env("MAX_SOURCE_CHARS", 1_000_000),
+        min_source_chars=_int_env("MIN_SOURCE_CHARS", 50),
+        prompt_budget_chars=_int_env("PROMPT_BUDGET_CHARS", 200_000),
+        compile_concurrency=_int_env("COMPILE_CONCURRENCY", 3),
+        output_language=os.getenv("LLMWIKI_OUTPUT_LANGUAGE", ""),
+        provider=os.getenv("LLMWIKI_PROVIDER", "ollama"),
+        concept_min_body_chars=_int_env("CONCEPT_MIN_BODY_CHARS", 800),
+        entry_min_body_chars=_int_env("ENTRY_MIN_BODY_CHARS", 500),
+        clipping_min_body_chars=_int_env("CLIPPING_MIN_BODY_CHARS", 500),
+        retry_count=_int_env("RETRY_COUNT", 3),
+        retry_base_ms=_int_env("RETRY_BASE_MS", 1_000),
+        retry_multiplier=_int_env("RETRY_MULTIPLIER", 4),
     )
 
-    # Override extract dir if PIPELINE_TMPDIR is set
-    if os.environ.get("PIPELINE_TMPDIR"):
-        cfg.extract_dir = Path(os.environ["PIPELINE_TMPDIR"])
 
-    return cfg
+def _int_env(key: str, default: int) -> int:
+    """Parse an integer from environment with fallback."""
+    val = os.getenv(key)
+    if val is None:
+        return default
+    try:
+        return int(val)
+    except ValueError:
+        return default

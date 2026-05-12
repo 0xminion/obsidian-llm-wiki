@@ -1,20 +1,13 @@
-# Secrets
-.env
-
-# OS
-.DS_Store
-Thumbs.db
-
-# Editor
-*.swp
-*.swo
-*~
-
-# Obsidian vault content (scripts operate on vault, don't ship it)
-# Adjust if vault lives inside repo
-
-# Temp files
-/tmp/
-*.tmp
 __pycache__/
 *.pyc
+*.pyo
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+.env
+.llmwiki/
+.vscode/
+.idea/
+*.tmp

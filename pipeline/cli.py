@@ -1,944 +1,782 @@
-"""CLI entry point for the obsidian-llm-wiki pipeline.
+"""Typer CLI for the llmwiki knowledge compiler pipeline.
 
-Provides commands for the full 3-stage pipeline and vault maintenance:
-  ingest  — extract → plan → create (full pipeline)
-  lint    — vault health checks
-  reindex — rebuild wiki-index.md
-  stats   — show vault statistics
-  validate — validate pipeline output
+Sources in, interlinked wiki out. All commands are real implementations
+connected to the pipeline modules.
 """
 
 from __future__ import annotations
 
-import logging
-import re
-import shutil
-import time
-from datetime import datetime, timezone
+import asyncio
 from pathlib import Path
-from typing import Optional
 
 import typer
 
-from pipeline._common import VaultLock
-from pipeline.config import Config, load_config
-from pipeline.extract import extract_all
-from pipeline.plan import plan_sources
-from pipeline.create import create_all, create_file_templates
-from pipeline.models import Manifest, Plans
-from pipeline.utils import extract_body, parse_url_file_content
-from pipeline.vault import reindex as vault_reindex
-
 app = typer.Typer(
-    name="pipeline",
-    help="Obsidian wiki pipeline — extract, plan, create.",
+    name="llmwiki",
+    help="Knowledge compiler CLI. Sources in, interlinked wiki out.",
     no_args_is_help=True,
 )
 
-log = logging.getLogger(__name__)
+
+# ── Shared helpers ────────────────────────────────────────────────────────
 
 
-def check_dependencies(agent_cmd: str = "hermes") -> list[str]:
-    """Check for baseline CLI tools needed before ingest starts.
+def _resolve_vault(vault: str) -> tuple[Path, Config]:  # noqa: F821
+    """Resolve vault path and load config. Returns (vault_path, config)."""
+    from pipeline.config import load_config
 
-    Do not preflight the agent binary here.
-    Agent-backed stages handle missing binaries at the actual call path so
-    dry runs, empty inboxes, mocked tests, and resume flows without real agent
-    execution do not fail early for the wrong reason.
-    """
-    missing = []
-    required_cmds = ["curl", "python3"]
-    for cmd in required_cmds:
-        if not shutil.which(cmd):
-            missing.append(cmd)
-    return missing
-
-
-class PipelineLock(VaultLock):
-    """Directory-based lock file for pipeline runs (delegates to VaultLock)."""
-
-    def __init__(self, vault_path: Path):
-        super().__init__(vault_path, name="pipeline")
+    vault_path = Path(vault).expanduser().resolve()
+    env_file = str(vault_path / ".env") if (vault_path / ".env").exists() else None
+    config = load_config(env_file=env_file)
+    # Override vault_path if env didn't have one or user specified a different one
+    if config.vault_path and Path(config.vault_path).expanduser().resolve() != vault_path or not config.vault_path:
+        import os
+        os.environ["VAULT_PATH"] = str(vault_path)
+        config = load_config(env_file=env_file, VAULT_PATH=str(vault_path))
+    return vault_path, config
 
 
-def _setup_logging(verbose: bool = False, log_file: Optional[Path] = None) -> None:
-    """Configure root logger for CLI output."""
-    level = logging.DEBUG if verbose else logging.INFO
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s [%(levelname)s] %(message)s",
-        datefmt="%H:%M:%S",
+def _print_result_summary(result: CompileResult) -> None:  # noqa: F821
+    """Pretty-print a CompileResult."""
+    typer.echo(
+        f"\n✅ Compilation complete: "
+        f"{result.compiled} compiled, "
+        f"{len(result.concepts)} concepts, "
+        f"{result.deleted} deleted"
     )
-    if log_file:
-        log_file.parent.mkdir(parents=True, exist_ok=True)
-        file_handler = logging.FileHandler(log_file, encoding="utf-8")
-        file_handler.setLevel(level)
-        file_handler.setFormatter(logging.Formatter(
-            "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
-        ))
-        logging.getLogger().addHandler(file_handler)
+    if result.skipped:
+        typer.echo(f"   Skipped: {result.skipped} (unchanged)")
+    if result.errors:
+        typer.echo(f"   Errors:  {len(result.errors)}")
+        for err in result.errors[:10]:
+            typer.echo(f"     - {err}")
+        if len(result.errors) > 10:
+            typer.echo(f"     ... and {len(result.errors) - 10} more")
+    if result.candidates:
+        typer.echo(f"   Candidates (pending review): {len(result.candidates)}")
 
 
-def _resolve_vault(vault: Optional[Path]) -> Path:
-    """Resolve vault path from argument or default."""
-    if vault is not None:
-        return vault
-    return Path.home() / "MyVault"
+# ── Commands ──────────────────────────────────────────────────────────────
 
-
-def _load_cfg(vault: Optional[Path]) -> Config:
-    """Load config with resolved vault path."""
-    vault_path = _resolve_vault(vault)
-    return load_config(vault_path=vault_path)
-
-
-def _collect_url_files(inbox_dir: Path) -> list[tuple[Path, str]]:
-    """Scan inbox for .url files, return list of (filepath, url) tuples."""
-    results = []
-    if not inbox_dir.exists():
-        return results
-    for url_file in sorted(inbox_dir.glob("*.url")):
-        content = url_file.read_text(encoding="utf-8", errors="replace")
-        url = parse_url_file_content(content)
-        if url:
-            results.append((url_file, url))
-    return results
-
-
-def _query_keywords(question: str) -> set[str]:
-    """Extract meaningful keywords from a question for note retrieval."""
-    stopwords = {
-        "about", "this", "that", "what", "which", "when", "where", "who",
-        "does", "with", "from", "into", "your", "their", "there", "have",
-        "vault",
-    }
-    return {
-        w.lower() for w in re.split(r"[^\w]+", question)
-        if len(w) > 3 and w.lower() not in stopwords
-    }
-
-
-def _gather_query_note_context(cfg: Config, question: str, limit: int = 6) -> str:
-    """Gather relevant note snippets from entries, sources, concepts, and MoCs."""
-    keywords = _query_keywords(question)
-
-    def _display_name(raw: str, fallback: str) -> str:
-        body = extract_body(raw)
-        for line in body.splitlines():
-            stripped = line.strip()
-            if stripped.startswith("# ") and len(stripped) > 2:
-                return stripped[2:].strip()
-        return fallback
-
-    candidates: list[tuple[int, str, str]] = []
-    note_dirs = [
-        (cfg.entries_dir, "entry"),
-        (cfg.sources_dir, "source"),
-        (cfg.concepts_dir, "concept"),
-        (cfg.mocs_dir, "moc"),
-    ]
-
-    for directory, label in note_dirs:
-        if not directory.is_dir():
-            continue
-        for md in directory.glob("*.md"):
-            try:
-                raw = md.read_text(encoding="utf-8", errors="replace")
-            except OSError:
-                continue
-            body = extract_body(raw).strip()
-            display_name = _display_name(raw, md.stem)
-            haystack = f"{display_name}\n{body}".lower()
-            # Simple keyword scoring normalized by document length to avoid long-note bias
-            raw_score = sum(1 for kw in keywords if kw in haystack)
-            if raw_score <= 0:
-                continue
-            score = raw_score / (len(haystack) / 2000 + 1)
-            snippet = re.sub(r"\s+", " ", body)[:600]
-            candidates.append((score, md.stem, f"- [[{md.stem}]] ({display_name}; {label}): {snippet}"))
-
-    candidates.sort(key=lambda item: (-item[0], item[1]))
-    if not candidates:
-        # Fallback: most recently modified notes (more relevant than alphabetical)
-        for directory, label in note_dirs:
-            if not directory.is_dir():
-                continue
-            recent = sorted(
-                directory.glob("*.md"),
-                key=lambda p: p.stat().st_mtime if p.exists() else 0,
-                reverse=True,
-            )[:2]
-            for md in recent:
-                try:
-                    raw = md.read_text(encoding="utf-8", errors="replace")
-                except OSError:
-                    continue
-                body = extract_body(raw).strip()
-                display_name = _display_name(raw, md.stem)
-                snippet = re.sub(r"\s+", " ", body)[:600]
-                candidates.append((0, md.stem, f"- [[{md.stem}]] ({display_name}; {label}): {snippet}"))
-
-    if not candidates:
-        return ""
-
-    lines = ["Relevant note excerpts:"]
-    seen: set[str] = set()
-    for _, stem, line in candidates:
-        if stem in seen:
-            continue
-        seen.add(stem)
-        lines.append(line)
-        if len(seen) >= limit:
-            break
-    return "\n".join(lines)
-
-
-def _build_query_prompt(cfg: Config, question: str) -> str:
-    """Build a retrieval-augmented prompt for vault Q&A."""
-    vault_summary = ""
-    if cfg.wiki_index.exists():
-        vault_summary = cfg.wiki_index.read_text(encoding="utf-8", errors="replace")[:2500]
-
-    note_context = _gather_query_note_context(cfg, question)
-    sections = [
-        "You are querying an Obsidian wiki knowledge base.",
-        "",
-        "VAULT INDEX:",
-        vault_summary,
-    ]
-    if note_context:
-        sections.extend(["", note_context])
-    sections.extend([
-        "",
-        f"QUESTION: {question}",
-        "",
-        "Answer based on the vault content. Cite notes using [[wikilinks]]. If the vault is incomplete, say so.",
-    ])
-    return "\n".join(sections)
-
-
-@app.command()
-def init(
-    vault: Path = typer.Argument(None, help="Vault path (default: ~/MyVault)"),
-    force: bool = typer.Option(False, "--force", "-f", help="Auto-migrate without prompting"),
-    quiet: bool = typer.Option(False, "--quiet", "-q", help="Minimal output"),
-):
-    """Initialize or migrate vault structure."""
-    from pipeline.vault_setup import detect_vault, setup_vault, migrate_vault
-
-    vault_path = vault or Path.home() / "MyVault"
-    repo_root = Path(__file__).parent.parent
-
-    state = detect_vault(vault_path)
-
-    if state.state == "existing":
-        typer.echo(f"Vault ready: {vault_path}")
-        raise typer.Exit(code=0)
-
-    if state.state == "new":
-        typer.echo(f"Setting up new vault at {vault_path}")
-        actions = setup_vault(vault_path, repo_root=repo_root, quiet=quiet)
-        if not quiet:
-            for a in actions:
-                typer.echo(f"  + {a}")
-        typer.echo(f"\nSetup complete: {len(actions)} actions.")
-        raise typer.Exit(code=0)
-
-    # Incomplete
-    typer.echo(f"Incomplete vault at {vault_path}:")
-    if state.missing_dirs:
-        typer.echo(f"  Missing dirs: {', '.join(state.missing_dirs)}")
-    if state.missing_files:
-        typer.echo(f"  Missing files: {', '.join(state.missing_files)}")
-
-    if not force:
-        response = typer.confirm("Migrate vault structure?", default=True)
-        if not response:
-            typer.echo("Migration skipped.")
-            raise typer.Exit(code=1)
-
-    actions = migrate_vault(vault_path, state, repo_root=repo_root)
-    if not quiet:
-        for a in actions:
-            typer.echo(f"  + {a}")
-    typer.echo(f"\nMigration complete: {len(actions)} actions.")
-    raise typer.Exit(code=0)
-
-
-def _auto_setup(vault_path: Path) -> str:
-    """Auto-detect and setup/migrate vault. Returns state string."""
-    from pipeline.vault_setup import ensure_vault_ready
-    repo_root = Path(__file__).parent.parent
-    return ensure_vault_ready(vault_path, repo_root=repo_root, force=True)
-
-
-# ─── Main: ingest ─────────────────────────────────────────────────────────────
 
 @app.command()
 def ingest(
-    vault: Path = typer.Argument(None, help="Vault path (default: ~/MyVault)"),
-    parallel: int = typer.Option(3, "--parallel", "-p", help="Parallel workers per stage"),
-    dry_run: bool = typer.Option(False, "--dry-run", help="Run pipeline without writing files"),
-    review: bool = typer.Option(False, "--review", help="Stage files for review, skip Stage 3"),
-    resume: bool = typer.Option(False, "--resume", help="Resume from saved plans (skip Stages 1+2)"),
-    template: bool = typer.Option(False, "--template", "-t", help="Use template-based creation (deterministic + insight agent)"),
-    verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose logging"),
+    vault: str = typer.Argument(..., help="Path to Obsidian vault"),
+    urls: list[str] | None = typer.Option(
+        None, "--url", "-u", help="URLs to ingest (can be repeated)"
+    ),
+    parallel: int = typer.Option(
+        3, "--parallel", "-p", help="Concurrent LLM calls during create phase"
+    ),
+    review: bool = typer.Option(
+        False, "--review", help="Stage generated pages as candidates for manual review"
+    ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Preview extraction without writing any files"
+    ),
+    skip_compile: bool = typer.Option(
+        False,
+        "--skip-compile",
+        help="Only extract sources; skip concept extraction and page generation",
+    ),
 ):
-    """Process inbox: extract → plan → create."""
-    cfg = _load_cfg(vault)
-    t0 = time.time()
+    """Ingest URLs and generate wiki pages from them.
+
+    Extracts full content from URLs, writes source files, then optionally
+    runs the LLM compilation pipeline to generate entries, concepts, and MoCs.
+
+    Clippings in 02-Clippings/ that pass the quality gate are included
+    automatically (no Stage 1 extraction needed for them).
+
+    Examples:
+        llmwiki ingest ~/MyVault --url https://example.com/article
+        llmwiki ingest ~/MyVault -u URL1 -u URL2 --parallel 5 --review
+        llmwiki ingest ~/MyVault -u URL1 --dry-run
+    """
+    from pipeline.clippings import collect_clippings
+    from pipeline.config import load_config
+    from pipeline.extract import run_extraction
+
+    vault_path = Path(vault).expanduser().resolve()
+    env_file = str(vault_path / ".env") if (vault_path / ".env").exists() else None
+    config = load_config(env_file=env_file)
+    # Ensure vault_path is set
+    import os
+    if not config.vault_path or Path(config.vault_path).expanduser().resolve() != vault_path:
+        os.environ["VAULT_PATH"] = str(vault_path)
+        config = load_config(env_file=env_file, VAULT_PATH=str(vault_path))
+
+    if parallel:
+        os.environ["COMPILE_CONCURRENCY"] = str(parallel)
+        config = load_config(env_file=env_file, VAULT_PATH=str(vault_path), COMPILE_CONCURRENCY=str(parallel))
+
+    typer.echo(f"📂 Vault: {config.vault}")
+    typer.echo(f"🤖 Model: {config.ollama_model}")
+
+    # ── Collect clippings that pass the quality gate ──────────────────
+    clipping_sources: dict[str, IngestedSource] = {}  # noqa: F821
+    passed_clippings = collect_clippings(config)
+    if passed_clippings:
+        typer.echo(f"\n📋 Clippings passing quality gate: {len(passed_clippings)}")
+        for clip_path, source in passed_clippings:
+            key = clip_path.name
+            clipping_sources[key] = source
+            typer.echo(f"   ✅ {source.title[:60]} ({len(source.content)} chars)")
+
+    # ── Extract URLs ─────────────────────────────────────────────────
+    extracted_sources: dict[str, IngestedSource] = {}  # noqa: F821
+    if urls:
+        typer.echo(f"\n🌐 Extracting {len(urls)} URL(s)...")
+        if dry_run:
+            typer.echo("   🔍 Dry run — would extract:")
+            for url in urls:
+                typer.echo(f"      {url}")
+        else:
+            extracted_sources = run_extraction(list(urls), config)
+            if not extracted_sources:
+                typer.echo("   ⚠ No URLs were extracted (all skipped or failed)")
+
+    # ── Combine sources ──────────────────────────────────────────────
+    all_sources = {**clipping_sources, **extracted_sources}
+    if not all_sources:
+        typer.echo("\n⚠ No sources to process (no URLs extracted, no clippings passed).")
+        if not urls and not passed_clippings:
+            typer.echo("   Tip: Use --url to add URLs or add .md files to 02-Clippings/")
+        return
+
+    typer.echo(f"\n📦 Total sources to compile: {len(all_sources)}")
+
+    if skip_compile:
+        typer.echo("   ⏭ Skipping compilation (--skip-compile)")
+        return
 
     if dry_run:
-        from pipeline.vault_setup import detect_vault
+        typer.echo("   🔍 Dry run — would compile these sources:")
+        for key, source in sorted(all_sources.items()):
+            typer.echo(f"      {source.title[:60]} ← {key}")
+        return
 
-        if verbose:
-            _setup_logging(True, None)
+    # ── Run create pipeline ──────────────────────────────────────────
+    typer.echo("\n🤖 Running LLM creation phase...")
+    from pipeline.create.orchestrator import run_create
+    from pipeline.state import read_state
 
-        state = detect_vault(cfg.vault_path)
-        typer.echo(f"Pipeline ingest — vault: {cfg.vault_path}")
+    state = read_state(config.state_file)
 
-        if state.state == "new":
-            typer.echo("[DRY RUN] Vault does not exist; would initialize it during a real ingest.")
-            typer.echo("[DRY RUN] No files were created.")
-            raise typer.Exit(code=0)
+    if review:
+        # In review mode, render pages but stage as candidates
+        result = asyncio.run(
+            _run_create_with_review(config, all_sources, state)
+        )
+    else:
+        result = asyncio.run(run_create(config, all_sources, state))
 
-        if state.state == "incomplete":
-            typer.echo(state.summary)
-            typer.echo("[DRY RUN] Vault is incomplete; would migrate missing directories/files during a real ingest.")
-            typer.echo("[DRY RUN] No files were created.")
-            raise typer.Exit(code=0)
+    # ── Post-compile: resolve links, indexes ─────────────────────────
+    from pipeline.hasher import slugify as _slugify
+    from pipeline.indexgen import generate_index, generate_moc
+    from pipeline.resolver import resolve_links
+    from pipeline.state import write_state
 
-        typer.echo(f"Extract dir: {cfg.resolved_extract_dir}")
-        url_entries = _collect_url_files(cfg.inbox_dir)
-        urls = [u for _, u in url_entries]
-        if not urls and not resume:
-            typer.echo("No .url files found in inbox.")
-            raise typer.Exit(code=0)
-        typer.echo(f"Found {len(urls)} URL(s) in inbox.")
-        typer.echo("  [DRY RUN] Would extract the following URLs:")
-        for url in urls:
-            typer.echo(f"    - {url}")
-        typer.echo("  [DRY RUN] Would generate plans for extracted sources.")
-        if review and not resume:
-            typer.echo("  [DRY RUN] Would stage generated files for review.")
-        else:
-            typer.echo("  [DRY RUN] Would create vault files for generated plans.")
-        typer.echo("[DRY RUN] No files were created.")
-        raise typer.Exit(code=0)
+    # Collect concept slugs
+    all_slugs = [_slugify(c.concept) for c in result.concepts]
+    new_slugs = [_slugify(c.concept) for c in result.concepts if c.is_new]
 
-    _setup_logging(verbose, cfg.log_file)
+    if all_slugs:
+        typer.echo("🔗 Resolving wikilinks...")
+        modified = resolve_links(str(config.wiki_dir), all_slugs, new_slugs)
+        if modified:
+            typer.echo(f"   Updated {modified} page(s)")
 
-    # Auto-setup vault if new or incomplete
-    vault_state = _auto_setup(cfg.vault_path)
-    if vault_state == "new":
-        typer.echo(f"New vault initialized at {cfg.vault_path}")
-    elif vault_state == "migrated":
-        typer.echo(f"Vault structure migrated at {cfg.vault_path}")
+    typer.echo("📇 Generating index...")
+    idx_path = generate_index(config.wiki_dir, config.concepts_dir)
+    typer.echo(f"   → {idx_path}")
 
-    typer.echo(f"Pipeline ingest — vault: {cfg.vault_path}")
-    typer.echo(f"Extract dir: {cfg.resolved_extract_dir}")
+    typer.echo("🗺 Generating MOC...")
+    moc_path = generate_moc(config.wiki_dir, config.concepts_dir)
+    typer.echo(f"   → {moc_path}")
 
-    # Validate vault structure
-    errors = cfg.validate()
-    if errors:
-        for e in errors:
-            typer.echo(f"ERROR: {e}", err=True)
-        raise typer.Exit(code=1)
+    write_state(config.state_file, state)
+    typer.echo(f"💾 State persisted ({len(state.sources)} sources)")
 
-    # Check dependencies
-    missing = check_dependencies(cfg.agent_cmd)
-    if missing:
-        typer.echo(f"ERROR: Missing required commands: {', '.join(missing)}", err=True)
-        raise typer.Exit(code=1)
-
-    # Acquire lock
-    lock = PipelineLock(cfg.vault_path)
-    if not lock.acquire():
-        typer.echo("ERROR: Another pipeline run is in progress. If stale, delete: "
-                    f"{lock.lock_dir}", err=True)
-        raise typer.Exit(code=1)
-
-    try:
-        extract_dir = cfg.resolved_extract_dir
-        extract_dir.mkdir(parents=True, exist_ok=True)
-
-        # ─── Metrics ────────────────────────────────────────────────────────
-        from pipeline.metrics import reset_metrics, start_stage, end_stage, get_metrics
-        reset_metrics()
-
-        # ─── Collect URLs ──────────────────────────────────────────────────
-        url_entries = _collect_url_files(cfg.inbox_dir)
-        urls = [u for _, u in url_entries]
-
-        if not urls and not resume:
-            typer.echo("No .url files found in inbox.")
-            raise typer.Exit(code=0)
-
-        typer.echo(f"Found {len(urls)} URL(s) in inbox.")
-
-        # ─── Stage 1: Extract ──────────────────────────────────────────────
-        t1 = time.time()
-        if resume:
-            typer.echo("Stage 1: SKIPPED (--resume)")
-            manifest = Manifest.load(extract_dir)
-            if not manifest.entries:
-                typer.echo("ERROR: No manifest found for --resume. Run without --resume first.", err=True)
-                raise typer.Exit(code=1)
-            typer.echo(f"  Loaded {len(manifest.entries)} sources from saved manifest.")
-            t1 = t0  # stage was skipped, elapsed is 0
-        else:
-            typer.echo("Stage 1: Extracting...")
-            start_stage("extract")
-            if dry_run:
-                typer.echo("  [DRY RUN] Would extract the following URLs:")
-                for url in urls:
-                    typer.echo(f"    - {url}")
-                manifest = Manifest(entries=[])
-            else:
-                manifest = extract_all(urls, cfg, parallel=parallel)
-            elapsed_1 = time.time() - t1
-            end_stage("extract")
-            typer.echo(f"  Extracted {len(manifest.entries)} sources in {elapsed_1:.1f}s")
-
-        # ─── Stage 2: Plan ─────────────────────────────────────────────────
-        t2 = time.time()
-        if resume:
-            typer.echo("Stage 2: SKIPPED (--resume)")
-            plans = Plans.load(extract_dir)
-            if not plans.plans:
-                typer.echo("ERROR: No plans found for --resume. Run without --resume first.", err=True)
-                raise typer.Exit(code=1)
-            typer.echo(f"  Loaded {len(plans.plans)} plans from saved file.")
-            t2 = t1  # stage was skipped, elapsed is 0
-        else:
-            typer.echo("Stage 2: Planning...")
-            start_stage("plan")
-            if dry_run:
-                typer.echo("  [DRY RUN] Would generate plans for extracted sources.")
-                plans = Plans(plans=[])
-            else:
-                plans = plan_sources(manifest, cfg)
-            elapsed_2 = time.time() - t2
-            end_stage("plan")
-            typer.echo(f"  Generated {len(plans.plans)} plans in {elapsed_2:.1f}s")
-
-        if review and resume:
-            typer.echo("Review mode with --resume: staging saved plans for approval...")
-            from pipeline.review import stage_for_review
-            t_review = time.time()
-            review_stats = stage_for_review(plans, cfg)
-            elapsed_review = time.time() - t_review
-            typer.echo(f"  Staged: {review_stats['staged']}, Failed: {review_stats['failed']} in {elapsed_review:.1f}s")
-            typer.echo("  Run 'pipeline approve' to write to vault or 'pipeline reject' to discard.")
-            elapsed_total = time.time() - t0
-            typer.echo(f"Done (review mode, resumed) in {elapsed_total:.1f}s")
-            raise typer.Exit(code=0)
-
-        if review and not resume:
-            typer.echo("Review mode: staging files for approval...")
-            from pipeline.review import stage_for_review
-            t_review = time.time()
-            review_stats = stage_for_review(plans, cfg)
-            elapsed_review = time.time() - t_review
-            typer.echo(f"  Staged: {review_stats['staged']}, Failed: {review_stats['failed']} in {elapsed_review:.1f}s")
-            typer.echo("  Run 'pipeline approve' to write to vault or 'pipeline reject' to discard.")
-            elapsed_total = time.time() - t0
-            typer.echo(f"Done (review mode) in {elapsed_total:.1f}s")
-            raise typer.Exit(code=0)
-
-        # ─── Stage 3: Create ───────────────────────────────────────────────
-        typer.echo("Stage 3: Creating vault files...")
-        start_stage("create")
-        t3 = time.time()
-        if dry_run:
-            typer.echo("  [DRY RUN] Would create vault files for plans.")
-            stats = {"created": 0, "failed": 0, "sources": 0, "entries": 0}
-        elif template:
-            typer.echo("  Using template-based creation (deterministic + insight agent)")
-            stats = create_file_templates(plans.plans, cfg, use_agent_insights=True)
-        else:
-            stats = create_all(plans, cfg, parallel=parallel)
-        elapsed_3 = time.time() - t3
-        end_stage("create")
-        typer.echo(f"  Created: {stats['created']}, Failed: {stats['failed']} in {elapsed_3:.1f}s")
-
-        # ─── Summary ───────────────────────────────────────────────────────
-        elapsed_total = time.time() - t0
-        typer.echo("")
-        typer.echo("─── Timing Summary ───")
-        if not resume:
-            typer.echo(f"  Stage 1 (Extract):  {t2 - t1:.1f}s")
-            typer.echo(f"  Stage 2 (Plan):     {t3 - t2:.1f}s")
-        typer.echo(f"  Stage 3 (Create):   {elapsed_3:.1f}s")
-        typer.echo(f"  Total:              {elapsed_total:.1f}s")
-        typer.echo("")
-
-        # Agent metrics
-        metrics = get_metrics()
-        if metrics.total_agent_calls > 0:
-            typer.echo(metrics.summary())
-            typer.echo("")
-
-        typer.echo(f"Done in {elapsed_total:.1f}s")
-
-    finally:
-        lock.release()
+    _print_result_summary(result)
 
 
-# ─── lint ──────────────────────────────────────────────────────────────────────
+async def _run_create_with_review(
+    config: Config, sources: dict, state: WikiState  # noqa: F821
+) -> CompileResult:  # noqa: F821
+    """Run create and stage outputs as review candidates instead of writing."""
+    from pipeline.candidates import write_candidate
+    from pipeline.create.orchestrator import run_create
+
+    # First run normally to get the result
+    result = await run_create(config, sources, state)
+
+    # For each concept, stage as a candidate
+    for concept in result.concepts:
+        from pipeline.hasher import slugify as _slugify
+        slug = _slugify(concept.concept)
+        candidate_data = {
+            "title": concept.concept,
+            "slug": slug,
+            "summary": concept.summary,
+            "sources": list(sources.keys()),
+            "body": f"# {concept.concept}\n\n{concept.summary}\n\n"
+                    f"*Tags: {', '.join(concept.tags)}*",
+        }
+        try:
+            candidate = write_candidate(str(config.vault), candidate_data)
+            result.candidates.append(candidate.id)
+        except Exception as exc:
+            result.errors.append(f"candidate:{concept.concept}:{exc}")
+
+    return result
+
+
+@app.command()
+def compile_cmd(
+    vault: str = typer.Argument(..., help="Path to Obsidian vault"),
+    review: bool = typer.Option(
+        False, "--review", help="Write generated pages to candidates/ instead of wiki/"
+    ),
+    force: bool = typer.Option(
+        False, "--force", "-f", help="Force recompilation of all sources"
+    ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Detect changes but skip compilation"
+    ),
+    model: str | None = typer.Option(
+        None, "--model", "-m", help="Override the LLM model"
+    ),
+    concurrency: int | None = typer.Option(
+        None, "--concurrency", "-c", help="Override compile concurrency"
+    ),
+    files: list[str] | None = typer.Option(
+        None, "--file", help="Compile only these specific source files"
+    ),
+):
+    """Run the full compilation pipeline.
+
+    Detects changes in sources/, generates entry and concept pages via LLM,
+    resolves wikilinks, and rebuilds the index and MOC.
+
+    Examples:
+        llmwiki compile ~/MyVault
+        llmwiki compile ~/MyVault --force
+        llmwiki compile ~/MyVault --dry-run
+        llmwiki compile ~/MyVault --file article1.md --file article2.md
+    """
+    from pipeline.compiler import compile as compile_pipeline
+
+    options: dict = {
+        "force": force,
+        "dry_run": dry_run,
+    }
+    if model:
+        options["model"] = model
+    if concurrency:
+        options["concurrency"] = concurrency
+    if files:
+        options["files"] = list(files)
+
+    if review:
+        # In review mode, compile first, then stage outputs as candidates
+        result = asyncio.run(
+            _compile_with_review(vault, options)
+        )
+    else:
+        result = asyncio.run(compile_pipeline(vault, options))
+
+    if not dry_run and not force and result.compiled == 0 and not result.errors:
+        typer.echo("✅ Already up-to-date.")
+        return
+
+    _print_result_summary(result)
+
+
+async def _compile_with_review(vault: str, options: dict) -> CompileResult:  # noqa: F821
+    """Compile and stage all generated pages as review candidates."""
+    from pipeline.candidates import write_candidate
+    from pipeline.compiler import compile as compile_pipeline
+    from pipeline.config import load_config
+
+    # Run the normal pipeline
+    result = await compile_pipeline(vault, options)
+
+    # Stage each generated concept as a review candidate
+    if result.concepts:
+        vault_path = Path(vault).expanduser().resolve()
+        env_file = str(vault_path / ".env") if (vault_path / ".env").exists() else None
+        config = load_config(env_file=env_file)
+
+        for concept in result.concepts:
+            from pipeline.hasher import slugify as _slugify
+            slug = _slugify(concept.concept)
+            candidate_data = {
+                "title": concept.concept,
+                "slug": slug,
+                "summary": concept.summary,
+                "sources": [],  # Source names are captured during compilation
+                "body": f"# {concept.concept}\n\n{concept.summary}\n\n"
+                        f"*Tags: {', '.join(concept.tags)}*",
+            }
+            try:
+                candidate = write_candidate(str(config.vault), candidate_data)
+                result.candidates.append(candidate.id)
+            except Exception as exc:
+                result.errors.append(f"candidate:{concept.concept}:{exc}")
+
+    return result
+
 
 @app.command()
 def lint(
-    vault: Path = typer.Argument(None, help="Vault path (default: ~/MyVault)"),
-    fix: bool = typer.Option(False, "--fix", help="Auto-fix safe issues (frontmatter, format, banned tags)"),
+    vault: str = typer.Argument(..., help="Path to Obsidian vault"),
+    strict: bool = typer.Option(
+        False, "--strict", "-s", help="Treat warnings as errors"
+    ),
+    json_output: bool = typer.Option(
+        False, "--json", "-j", help="Output results as JSON"
+    ),
 ):
-    """Run comprehensive vault health checks (15 checks)."""
-    from pipeline.lint import run_lint
+    """Run lint checks on the vault.
 
-    cfg = _load_cfg(vault)
-    result = run_lint(cfg.vault_path, fix=fix)
+    Checks for:
+      - Malformed frontmatter
+      - Broken wikilinks (targets that don't exist)
+      - Orphaned pages with no incoming links
+      - Missing or malformed citations (^[...])
+      - Pages below minimum content thresholds
+      - Empty source files
 
-    typer.echo(f"Files checked: {result.files_checked}")
-    typer.echo(f"Total issues:  {result.total_issues}")
-    if result.fixes_applied:
-        typer.echo(f"Fixes applied: {result.fixes_applied}")
+    Examples:
+        llmwiki lint ~/MyVault
+        llmwiki lint ~/MyVault --strict
+        llmwiki lint ~/MyVault --json
+    """
+    import json
 
-    if result.total_issues == 0:
-        typer.echo("Vault health check passed ✓")
-        raise typer.Exit(code=0)
+    from pipeline.config import load_config
+    from pipeline.markdown import (
+        is_malformed_citation_entry,
+        parse_frontmatter,
+        safe_read_file,
+        slugify,
+    )
 
-    for check_name, count in sorted(result.issues_by_check.items()):
-        if count:
-            typer.echo(f"  ⚠ {check_name}: {count}")
+    vault_path = Path(vault).expanduser().resolve()
+    env_file = str(vault_path / ".env") if (vault_path / ".env").exists() else None
+    config = load_config(env_file=env_file)
 
-    report_path = cfg.vault_path / "Meta" / "Scripts" / "lint-report.md"
-    typer.echo(f"\nFull report: {report_path}")
-    raise typer.Exit(code=1)
+    issues: list[dict] = []
+    warnings: list[dict] = []
+    errors: list[dict] = []
 
+    sources_dir = config.sources_dir
+    concepts_dir = config.concepts_dir
+    entries_dir = config.entries_dir
 
-# ─── reindex ───────────────────────────────────────────────────────────────────
+    # ── Check sources ─────────────────────────────────────────────────
+    if sources_dir.exists():
+        for f in sources_dir.glob("*.md"):
+            raw = safe_read_file(f)
+            if not raw.strip():
+                issues.append({
+                    "file": str(f.relative_to(config.vault)),
+                    "severity": "warning",
+                    "rule": "empty-source",
+                    "message": f"Source file is empty: {f.name}",
+                })
+                continue
+            meta, body = parse_frontmatter(raw)
+            if not meta.get("title"):
+                issues.append({
+                    "file": str(f.relative_to(config.vault)),
+                    "severity": "warning",
+                    "rule": "missing-title",
+                    "message": f"Source file missing title in frontmatter: {f.name}",
+                })
+            if len(body.strip()) < config.min_source_chars:
+                issues.append({
+                    "file": str(f.relative_to(config.vault)),
+                    "severity": "warning",
+                    "rule": "short-source",
+                    "message": (
+                        f"Source body too short: {len(body.strip())} chars "
+                        f"(min: {config.min_source_chars})"
+                    ),
+                })
 
-@app.command()
-def reindex(
-    vault: Path = typer.Argument(None, help="Vault path (default: ~/MyVault)"),
-):
-    """Rebuild wiki-index.md."""
-    cfg = _load_cfg(vault)
-    content = vault_reindex(cfg)
-    lines = content.count("\n")
-    typer.echo(f"Rebuilt wiki-index.md ({lines} lines)")
-    typer.echo(f"  Location: {cfg.wiki_index}")
+    # ── Check concepts ───────────────────────────────────────────────
+    all_concept_slugs: set[str] = set()
+    if concepts_dir.exists():
+        for f in concepts_dir.glob("*.md"):
+            raw = safe_read_file(f)
+            if not raw.strip():
+                issues.append({
+                    "file": str(f.relative_to(config.vault)),
+                    "severity": "warning",
+                    "rule": "empty-concept",
+                    "message": f"Concept page is empty: {f.name}",
+                })
+                continue
+            meta, body = parse_frontmatter(raw)
+            slug = meta.get("slug", f.stem)
+            all_concept_slugs.add(slug)
 
+            if not meta.get("title"):
+                issues.append({
+                    "file": str(f.relative_to(config.vault)),
+                    "severity": "error",
+                    "rule": "missing-title",
+                    "message": f"Concept page missing title: {f.name}",
+                })
 
-# ─── stats ─────────────────────────────────────────────────────────────────────
+            if len(body.strip()) < config.concept_min_body_chars:
+                issues.append({
+                    "file": str(f.relative_to(config.vault)),
+                    "severity": "warning",
+                    "rule": "short-concept",
+                    "message": (
+                        f"Concept body too short: {len(body.strip())} chars "
+                        f"(min: {config.concept_min_body_chars})"
+                    ),
+                })
 
-@app.command()
-def stats(
-    vault: Path = typer.Argument(None, help="Vault path (default: ~/MyVault)"),
-):
-    """Generate vault dashboard with growth, review status, and health metrics."""
-    from pipeline.stats import run_stats
+            # Check for malformed citations
+            import re
+            for match in re.finditer(r"\^\[([^\]]+)\]", body):
+                raw_cite = match.group(1)
+                for part in raw_cite.split(","):
+                    part = part.strip()
+                    if part and is_malformed_citation_entry(part):
+                        issues.append({
+                            "file": str(f.relative_to(config.vault)),
+                            "severity": "warning",
+                            "rule": "malformed-citation",
+                            "message": f"Malformed citation entry: {part}",
+                        })
 
-    cfg = _load_cfg(vault)
-    summary = run_stats(cfg)
+    # ── Check entries ────────────────────────────────────────────────
+    if entries_dir.exists():
+        for f in entries_dir.glob("*.md"):
+            raw = safe_read_file(f)
+            if not raw.strip():
+                issues.append({
+                    "file": str(f.relative_to(config.vault)),
+                    "severity": "warning",
+                    "rule": "empty-entry",
+                    "message": f"Entry page is empty: {f.name}",
+                })
+                continue
+            meta, body = parse_frontmatter(raw)
+            if len(body.strip()) < config.entry_min_body_chars:
+                issues.append({
+                    "file": str(f.relative_to(config.vault)),
+                    "severity": "warning",
+                    "rule": "short-entry",
+                    "message": (
+                        f"Entry body too short: {len(body.strip())} chars "
+                        f"(min: {config.entry_min_body_chars})"
+                    ),
+                })
 
-    typer.echo(f"Vault: {cfg.vault_path}")
-    typer.echo(f"  Entries:  {summary['entries']}")
-    typer.echo(f"  Concepts: {summary['concepts']}")
-    typer.echo(f"  Sources:  {summary['sources']}")
-    typer.echo(f"  MoCs:     {summary['mocs']}")
-    typer.echo(f"  Total:    {summary['total']}")
-    typer.echo(f"\nDashboard written to: {summary['dashboard_path']}")
+    # ── Check for broken wikilinks ───────────────────────────────────
+    import re as _re
+    _WIKILINK_RE = _re.compile(r"\[\[([^\]|#]+)(?:[|#][^\]]+)?\]\]")
+    if concepts_dir.exists():
+        for f in concepts_dir.glob("*.md"):
+            raw = safe_read_file(f)
+            if not raw.strip():
+                continue
+            for match in _WIKILINK_RE.finditer(raw):
+                target = match.group(1).strip()
+                target_slug = slugify(target)
+                if target_slug not in all_concept_slugs:
+                    # Check if it might exist as an entry or source
+                    entry_exists = (entries_dir / f"{target_slug}.md").exists() if entries_dir.exists() else False
+                    source_exists = (sources_dir / f"{target_slug}.md").exists() if sources_dir.exists() else False
+                    if not entry_exists and not source_exists:
+                        issues.append({
+                            "file": str(f.relative_to(config.vault)),
+                            "severity": "warning",
+                            "rule": "broken-wikilink",
+                            "message": f"Broken wikilink: [[{target}]] — target not found",
+                        })
 
+    # ── Separate errors and warnings ─────────────────────────────────
+    for issue in issues:
+        if issue["severity"] == "error":
+            errors.append(issue)
+        else:
+            warnings.append(issue)
 
-# ─── validate ──────────────────────────────────────────────────────────────────
-
-@app.command()
-def validate(
-    vault: Path = typer.Argument(None, help="Vault path (default: ~/MyVault)"),
-    fix: bool = typer.Option(False, "--fix", help="Auto-fix safe issues"),
-):
-    """Validate pipeline output (frontmatter, sections, stubs, tags, format)."""
-    from pipeline.lint import run_validate
-
-    cfg = _load_cfg(vault)
-    result = run_validate(cfg.vault_path, fix=fix)
-
-    typer.echo(f"Files checked: {result.files_checked}")
-    if result.fixes_applied:
-        typer.echo(f"Fixes applied:  {result.fixes_applied}")
-
-    if result.total_issues == 0:
-        typer.echo("Output validation passed ✓")
-        raise typer.Exit(code=0)
-
-    typer.echo(f"Violations:    {result.total_issues}")
-    for issue in result.issues:
-        prefix = {"error": "✗", "warning": "⚠", "info": "ℹ"}[issue.severity.value]
-        typer.echo(f"  {prefix} [{issue.check}] {issue.note}: {issue.detail}")
-
-    raise typer.Exit(code=1)
-
-
-# ─── compile ──────────────────────────────────────────────────────────────────
-
-@app.command(name="compile")
-def compile_pass(
-    vault: Path = typer.Argument(None, help="Vault path (default: ~/MyVault)"),
-):
-    """Run the compile pass — concept convergence, MoC updates, edge construction."""
-    from pipeline.compile import run_compile
-    from pipeline.metrics import reset_metrics, start_stage, end_stage, get_metrics
-
-    cfg = _load_cfg(vault)
-    typer.echo(f"Compile pass — vault: {cfg.vault_path}")
-
-    reset_metrics()
-    start_stage("compile")
-    result = run_compile(cfg)
-    end_stage("compile")
-
-    if result["success"]:
-        typer.echo(f"Compile pass complete. ({result['entries']} entries, "
-                    f"{result['concepts']} concepts, {result['mocs']} MoCs)")
-        # Reindex after compile
-        content = vault_reindex(cfg)
-        typer.echo(f"Reindexed wiki-index.md ({content.count(chr(10))} lines)")
-
-        metrics = get_metrics()
-        if metrics.total_agent_calls > 0:
-            typer.echo("")
-            typer.echo(metrics.summary())
+    # ── Output ───────────────────────────────────────────────────────
+    if json_output:
+        result = {
+            "errors": len(errors),
+            "warnings": len(warnings),
+            "issues": issues,
+        }
+        typer.echo(json.dumps(result, indent=2))
     else:
-        error = result.get("error", "Unknown error")
-        typer.echo(f"Compile pass failed: {error}", err=True)
+        if errors:
+            typer.echo(f"\n❌ {len(errors)} error(s):")
+            for e in errors:
+                typer.echo(f"  {e['file']}: {e['message']}")
+
+        if warnings:
+            typer.echo(f"\n⚠ {len(warnings)} warning(s):")
+            for w in warnings:
+                typer.echo(f"  {w['file']}: {w['message']}")
+
+        if not errors and not warnings:
+            typer.echo("✅ No issues found.")
+
+        if strict and warnings:
+            typer.echo("\n❌ Strict mode: warnings treated as errors. Exiting with failure.")
+            raise typer.Exit(code=1)
+
+    if errors:
         raise typer.Exit(code=1)
 
-
-# ─── approve ──────────────────────────────────────────────────────────────────
-
-@app.command()
-def approve(
-    vault: Path = typer.Argument(None, help="Vault path (default: ~/MyVault)"),
-    dry_run: bool = typer.Option(False, "--dry-run", help="Show what would be written"),
-):
-    """Approve pending reviews and write files to the vault."""
-    from pipeline.review import show_pending, approve_reviews
-
-    cfg = _load_cfg(vault)
-    pending = show_pending(cfg)
-
-    if not pending:
-        typer.echo("No pending reviews.")
-        raise typer.Exit(code=0)
-
-    typer.echo(f"Pending reviews: {len(pending)}")
-    for r in pending:
-        typer.echo(f"  [{r['file_type']}] {Path(r['file_path']).name}")
-
-    if dry_run:
-        typer.echo("\nDry run — no files written.")
-        raise typer.Exit(code=0)
-
-    stats = approve_reviews(cfg)
-    typer.echo(f"\nApproved: {stats['approved']}, Written: {stats['written']}, Failed: {stats['failed']}")
-
-
-# ─── reject ───────────────────────────────────────────────────────────────────
-
-@app.command()
-def reject(
-    vault: Path = typer.Argument(None, help="Vault path (default: ~/MyVault)"),
-):
-    """Reject and discard all pending reviews."""
-    from pipeline.review import reject_reviews, show_pending
-
-    cfg = _load_cfg(vault)
-    pending = show_pending(cfg)
-
-    if not pending:
-        typer.echo("No pending reviews.")
-        raise typer.Exit(code=0)
-
-    count = reject_reviews(cfg)
-    typer.echo(f"Rejected {count} pending reviews.")
-
-
-# ─── dlq ──────────────────────────────────────────────────────────────────────
-
-@app.command()
-def dlq(
-    vault: Path = typer.Argument(None, help="Vault path (default: ~/MyVault)"),
-    clear: bool = typer.Option(False, "--clear", help="Clear all pending DLQ items"),
-    reason: str = typer.Option("", "--reason", help="Filter/clear by reason"),
-):
-    """Show or manage the dead letter queue (failed extractions)."""
-    from pipeline.store import ContentStore
-
-    cfg = _load_cfg(vault)
-    store = ContentStore.open(cfg.resolved_extract_dir)
-
-    if clear:
-        cleared = store.dlq_clear(reason=reason or None)
-        typer.echo(f"Cleared {cleared} DLQ items.")
-        store.close()
-        raise typer.Exit(code=0)
-
-    pending = store.dlq_get_pending()
-    store.close()
-
-    if not pending:
-        typer.echo("Dead letter queue is empty.")
-        raise typer.Exit(code=0)
-
-    typer.echo(f"Dead letter queue: {len(pending)} items")
-    for item in pending:
-        typer.echo(f"\n  URL: {item['url']}")
-        typer.echo(f"  Reason: {item['reason']}")
-        typer.echo(f"  Attempts: {item['attempts']}")
-        if item.get("last_error"):
-            typer.echo(f"  Error: {item['last_error'][:100]}")
-
-
-# ─── store ────────────────────────────────────────────────────────────────────
-
-@app.command()
-def store_stats(
-    vault: Path = typer.Argument(None, help="Vault path (default: ~/MyVault)"),
-):
-    """Show content store statistics."""
-    from pipeline.store import ContentStore
-
-    cfg = _load_cfg(vault)
-    store = ContentStore.open(cfg.resolved_extract_dir)
-    stats = store.get_stats()
-    store.close()
-
-    typer.echo(f"Content Store: {cfg.resolved_extract_dir / 'store.db'}")
-    typer.echo(f"  URLs:    {stats['urls_total']} total ({stats['urls_ok']} ok, {stats['urls_failed']} failed)")
-    typer.echo(f"  Content: {stats['content_total']} entries")
-    typer.echo(f"  DLQ:     {stats['dlq_pending']} pending")
-    typer.echo(f"  Reviews: {stats['reviews_pending']} pending")
-
-
-# ─── tags ────────────────────────────────────────────────────────────────────
-
-@app.command(name="tags")
-def update_tags(
-    vault: Path = typer.Argument(None, help="Vault path (default: ~/MyVault)"),
-):
-    """Rebuild tag-registry.md from actual tag usage across all notes."""
-    from collections import Counter
-    from pipeline.utils import extract_tags
-
-    cfg = _load_cfg(vault)
-    registry_path = cfg.config_dir / "tag-registry.md"
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-
-    entry_tags = Counter()
-    concept_tags = Counter()
-    moc_tags = Counter()
-    source_tags = Counter()
-
-    if cfg.entries_dir.exists():
-        for md in cfg.entries_dir.glob("*.md"):
-            try:
-                content = md.read_text(encoding="utf-8", errors="replace")
-                entry_tags.update(extract_tags(content))
-            except OSError:
-                continue
-
-    if cfg.concepts_dir.exists():
-        for md in cfg.concepts_dir.glob("*.md"):
-            try:
-                content = md.read_text(encoding="utf-8", errors="replace")
-                concept_tags.update(extract_tags(content))
-            except OSError:
-                continue
-
-    if cfg.mocs_dir.exists():
-        for md in cfg.mocs_dir.glob("*.md"):
-            try:
-                content = md.read_text(encoding="utf-8", errors="replace")
-                moc_tags.update(extract_tags(content))
-            except OSError:
-                continue
-
-    if cfg.sources_dir.exists():
-        for md in cfg.sources_dir.glob("*.md"):
-            try:
-                content = md.read_text(encoding="utf-8", errors="replace")
-                source_tags.update(extract_tags(content))
-            except OSError:
-                continue
-
-    lines = [
-        "# Tag Registry", "",
-        "Canonical list of tags used in this wiki. Before minting a new tag,",
-        "check this registry and prefer reuse.", "",
-        f"Auto-updated on {now}", "",
-    ]
-
-    if entry_tags:
-        lines.append("## Entry Tags")
-        lines.append("")
-        for tag, count in entry_tags.most_common():
-            lines.append(f"- `{tag}` ({count} uses)")
-        lines.append("")
-
-    if concept_tags:
-        lines.append("## Concept Tags")
-        lines.append("")
-        for tag, count in concept_tags.most_common():
-            lines.append(f"- `{tag}` ({count} uses)")
-        lines.append("")
-
-    if moc_tags:
-        lines.append("## MoC Tags")
-        lines.append("")
-        for tag, count in moc_tags.most_common():
-            lines.append(f"- `{tag}` ({count} uses)")
-        lines.append("")
-
-    if source_tags:
-        lines.append("## Source Tags")
-        lines.append("")
-        for tag, count in source_tags.most_common():
-            lines.append(f"- `{tag}` ({count} uses)")
-        lines.append("")
-
-    lines.extend([
-        "---", "",
-        f"*Updated on {now}: {len(entry_tags)} entry tags, {len(concept_tags)} concept tags, "
-        f"{len(moc_tags)} MoC tags, {len(source_tags)} source tags*",
-        "",
-    ])
-
-    registry_path.parent.mkdir(parents=True, exist_ok=True)
-    registry_path.write_text("\n".join(lines), encoding="utf-8")
-    typer.echo(f"Tag registry: {len(entry_tags)} entry, {len(concept_tags)} concept, {len(moc_tags)} MoC tags")
-    typer.echo(f"  Written to: {registry_path}")
-
-
-# ─── query ───────────────────────────────────────────────────────────────────
 
 @app.command()
 def query(
-    vault: Path = typer.Argument(None, help="Vault path (default: ~/MyVault)"),
-    question: str = typer.Option("", "--ask", "-q", help="Question to ask the vault"),
-    all_queries: bool = typer.Option(False, "--all", "-a", help="Process all pending queries"),
+    vault: str = typer.Argument(..., help="Path to Obsidian vault"),
+    ask: str = typer.Option(..., "--ask", "-a", help="Question to ask the knowledge wiki"),
+    model: str | None = typer.Option(
+        None, "--model", "-m", help="Override the LLM model"
+    ),
+    max_results: int = typer.Option(
+        10, "--max-results", "-n", help="Maximum number of relevant pages to retrieve"
+    ),
 ):
-    """Query the vault wiki with a question (compound-back Q&A).
+    """Query the knowledge wiki using LLM with retrieval-augmented generation.
 
-    Drop query .md files in 03-Queries/. Answers are written to 05-Outputs/
-    and queries are archived to 09-Archive-Queries/.
+    Searches concept pages, entries, and sources for relevant content, then
+    uses the LLM to answer your question grounded in the retrieved context.
+
+    Examples:
+        llmwiki query ~/MyVault --ask "What is a transformer model?"
+        llmwiki query ~/MyVault -a "Compare RAG vs fine-tuning" -n 5
     """
-    import subprocess
+    from pipeline.config import load_config
+    from pipeline.llm_client import call_llm
+    from pipeline.markdown import parse_frontmatter, safe_read_file
 
-    cfg = _load_cfg(vault)
-    queries_dir = cfg.vault_path / "03-Queries"
-    outputs_dir = cfg.vault_path / "05-Outputs"
-    archive_dir = cfg.vault_path / "09-Archive-Queries"
-    archive_dir.mkdir(parents=True, exist_ok=True)
-    outputs_dir.mkdir(parents=True, exist_ok=True)
-    had_failures = False
+    vault_path = Path(vault).expanduser().resolve()
+    env_file = str(vault_path / ".env") if (vault_path / ".env").exists() else None
+    config = load_config(env_file=env_file)
 
-    # Build file-based query list
-    query_files: list[Path] = []
-    if question:
-        query_files = [Path("__command_line__")]
-    else:
-        if not queries_dir.exists():
-            typer.echo("No query files found. Use --ask 'your question'")
-            raise typer.Exit(code=0)
-        query_files = sorted(queries_dir.glob("*.md"))
-        if not query_files:
-            typer.echo("No query files found. Use --ask 'your question'")
-            raise typer.Exit(code=0)
-        if not all_queries:
-            query_files = query_files[:1]
+    if model:
+        import os
+        os.environ["OLLAMA_MODEL"] = model
+        config = load_config(env_file=env_file, OLLAMA_MODEL=model)
 
-    for qf in query_files:
-        if str(qf) == "__command_line__":
-            qtext = question
-            qname = "cli-query"
+    typer.echo(f"🔍 Searching for: \"{ask}\"")
+    typer.echo(f"🤖 Model: {config.ollama_model}")
+
+    # ── Gather context from wiki pages ───────────────────────────────
+    context_parts: list[str] = []
+    pages_scanned = 0
+
+    # Scan concepts for keyword matches
+    query_lower = ask.lower()
+    query_words = set(query_lower.split())
+
+    scored_pages: list[tuple[int, str, str]] = []  # (score, filepath, content_snippet)
+
+    for dir_path, _label in [
+        (config.concepts_dir, "concept"),
+        (config.entries_dir, "entry"),
+        (config.sources_dir, "source"),
+    ]:
+        if not dir_path.exists():
+            continue
+        for f in dir_path.glob("*.md"):
+            raw = safe_read_file(f)
+            if not raw.strip():
+                continue
+            meta, body = parse_frontmatter(raw)
+            title = meta.get("title", f.stem)
+
+            # Simple TF scoring: count query word occurrences
+            body_lower = body.lower()
+            score = sum(body_lower.count(w) for w in query_words if len(w) > 2)
+            # Title matches get a bonus
+            title_lower = title.lower()
+            score += sum(10 for w in query_words if len(w) > 2 and w in title_lower)
+
+            if score > 0:
+                snippet = body[:800] if len(body) > 800 else body
+                scored_pages.append((score, str(f.relative_to(config.vault)), snippet))
+
+    # Sort by score descending, take top N
+    scored_pages.sort(key=lambda x: x[0], reverse=True)
+    top_pages = scored_pages[:max_results]
+
+    if not top_pages:
+        typer.echo("⚠ No relevant pages found in the wiki.")
+        typer.echo("   Try ingesting some sources first with: llmwiki ingest")
+        return
+
+    # Build context
+    for score, relpath, snippet in top_pages:
+        context_parts.append(f"--- PAGE: {relpath} (relevance: {score}) ---\n{snippet}")
+
+    context = "\n\n".join(context_parts)
+    pages_scanned = len(top_pages)
+
+    typer.echo(f"📄 Retrieved {pages_scanned} relevant page(s)")
+
+    # ── Build prompt ─────────────────────────────────────────────────
+    system = (
+        "You are a knowledgeable assistant answering questions based on a "
+        "personal knowledge wiki. Ground your answer in the provided context. "
+        "If the context doesn't contain enough information, say so honestly. "
+        "Cite the specific pages you used.\n\n"
+        f"--- KNOWLEDGE WIKI CONTEXT ---\n{context}\n--- END CONTEXT ---"
+    )
+
+    messages: list[dict] = [
+        {
+            "role": "user",
+            "content": ask,
+        }
+    ]
+
+    typer.echo("\n💭 Thinking...\n")
+
+    try:
+        answer = asyncio.run(call_llm(system, messages, config, max_tokens=2048))
+        typer.echo(answer)
+        typer.echo(
+            f"\n---\n*Answer based on {pages_scanned} wiki page(s). "
+            f"Model: {config.ollama_model}*"
+        )
+    except Exception as exc:
+        typer.echo(f"❌ Query failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+
+@app.command()
+def setup():
+    """Interactive setup wizard — configure LLM provider, vault path, API keys.
+
+    Runs through a series of prompts to configure your llmwiki environment.
+    Validates connectivity and writes a .env file to your vault.
+
+    Example:
+        llmwiki setup
+    """
+    from pipeline.setup import run_setup
+    run_setup()
+
+
+@app.command()
+def candidates(
+    vault: str = typer.Argument(..., help="Path to Obsidian vault"),
+    action: str = typer.Argument(
+        "list", help="Action: list, approve, reject, show"
+    ),
+    candidate_id: str | None = typer.Argument(
+        None, help="Candidate ID (required for approve/reject/show)"
+    ),
+):
+    """Manage review candidates — draft pages awaiting human approval.
+
+    Actions:
+      list    — Show all pending candidates
+      show    — Display a candidate's full content
+      approve — Approve and publish a candidate to the wiki
+      reject  — Reject and archive a candidate
+
+    Examples:
+        llmwiki candidates ~/MyVault list
+        llmwiki candidates ~/MyVault show my-concept-a1b2c3d4
+        llmwiki candidates ~/MyVault approve my-concept-a1b2c3d4
+        llmwiki candidates ~/MyVault reject my-concept-a1b2c3d4
+    """
+    from pipeline.candidates import (
+        approve_candidate,
+        list_candidates,
+        read_candidate,
+        reject_candidate,
+    )
+
+    vault_path = Path(vault).expanduser().resolve()
+
+    if action == "list":
+        cands = list_candidates(str(vault_path))
+        if not cands:
+            typer.echo("No pending candidates.")
+            return
+        typer.echo(f"\n📋 {len(cands)} pending candidate(s):\n")
+        for c in cands:
+            typer.echo(f"  [{c.id}] {c.title}")
+            typer.echo(f"       Summary: {c.summary[:100]}{'...' if len(c.summary) > 100 else ''}")
+            typer.echo(f"       Sources: {', '.join(c.sources) if c.sources else '(none)'}")
+            typer.echo(f"       Generated: {c.generated_at}")
+            if c.schema_violations:
+                typer.echo(f"       ⚠ Schema violations: {len(c.schema_violations)}")
+            typer.echo()
+
+    elif action == "show":
+        if not candidate_id:
+            typer.echo("❌ Candidate ID required for 'show'.", err=True)
+            raise typer.Exit(code=1)
+        cand = read_candidate(str(vault_path), candidate_id)
+        if cand is None:
+            typer.echo(f"❌ Candidate not found: {candidate_id}", err=True)
+            raise typer.Exit(code=1)
+        typer.echo(f"\n# {cand.title}")
+        typer.echo(f"ID: {cand.id}")
+        typer.echo(f"Slug: {cand.slug}")
+        typer.echo(f"Generated: {cand.generated_at}")
+        if cand.sources:
+            typer.echo(f"Sources: {', '.join(cand.sources)}")
+        typer.echo(f"\n{cand.body}")
+        if cand.schema_violations:
+            typer.echo("\n--- Schema Violations ---")
+            for v in cand.schema_violations:
+                typer.echo(f"  - {v}")
+        if cand.provenance_violations:
+            typer.echo("\n--- Provenance Violations ---")
+            for v in cand.provenance_violations:
+                typer.echo(f"  - {v}")
+
+    elif action == "approve":
+        if not candidate_id:
+            typer.echo("❌ Candidate ID required for 'approve'.", err=True)
+            raise typer.Exit(code=1)
+        from pipeline.config import load_config
+        env_file = str(vault_path / ".env") if (vault_path / ".env").exists() else None
+        config = load_config(env_file=env_file)
+        ok = approve_candidate(str(vault_path), candidate_id, str(config.wiki_dir))
+        if ok:
+            typer.echo(f"✅ Approved: {candidate_id}")
         else:
-            qtext = qf.read_text(encoding="utf-8").strip()
-            qname = qf.stem
+            typer.echo(f"❌ Candidate not found: {candidate_id}", err=True)
+            raise typer.Exit(code=1)
 
-        prompt = _build_query_prompt(cfg, qtext)
+    elif action == "reject":
+        if not candidate_id:
+            typer.echo("❌ Candidate ID required for 'reject'.", err=True)
+            raise typer.Exit(code=1)
+        ok = reject_candidate(str(vault_path), candidate_id)
+        if ok:
+            typer.echo(f"🗑 Rejected and archived: {candidate_id}")
+        else:
+            typer.echo(f"❌ Candidate not found: {candidate_id}", err=True)
+            raise typer.Exit(code=1)
 
-        try:
-            result = subprocess.run(
-                [cfg.agent_cmd, "chat", "-q", prompt, "-Q"],
-                cwd=str(cfg.vault_path), capture_output=True, text=True, timeout=300,
-            )
-            if result.returncode == 0:
-                answer = result.stdout.strip()
-                typer.echo(f"\n--- Answer ({qname}) ---\n")
-                typer.echo(answer)
-                # Write to 05-Outputs/
-                out_file = outputs_dir / f"{qname}.md"
-                out_file.write_text(
-                    f"# Query: {qname}\n\n"
-                    f"**Question:**\n{qtext}\n\n"
-                    f"**Answer:**\n{answer}\n",
-                    encoding="utf-8",
-                )
-                typer.echo(f"\nWritten to: {out_file}")
-                # Archive original query
-                if str(qf) != "__command_line__":
-                    archive_path = archive_dir / qf.name
-                    if archive_path.exists():
-                        # Collision: append timestamp
-                        archive_path = archive_dir / f"{qf.stem}-{int(time.time())}{qf.suffix}"
-                    qf.rename(archive_path)
-                    typer.echo(f"Archived to: {archive_path}")
-            else:
-                had_failures = True
-                typer.echo(f"Agent failed for {qname}: {result.stderr[:200]}", err=True)
-        except subprocess.TimeoutExpired:
-            had_failures = True
-            typer.echo(f"Agent timed out for {qname}", err=True)
-        except FileNotFoundError:
-            typer.echo(f"Agent command not found: {cfg.agent_cmd}", err=True)
-            raise typer.Exit(code=127)
-
-    if had_failures:
+    else:
+        typer.echo(f"❌ Unknown action: {action}. Valid: list, show, approve, reject", err=True)
         raise typer.Exit(code=1)
 
 
-# ─── setup-qmd ────────────────────────────────────────────────────────────────
-
-@app.command(name="setup-qmd")
-def setup_qmd_cmd(
-    vault: Path = typer.Argument(None, help="Vault path (default: ~/MyVault)"),
-):
-    """Install and configure qmd for semantic concept search."""
-    from pipeline.setup import setup_qmd
-
-    vault_path = _resolve_vault(vault)
-    setup_qmd(vault_path)
-
-
-# ─── setup-hooks ──────────────────────────────────────────────────────────────
-
-@app.command(name="setup-hooks")
-def setup_hooks_cmd(
-    vault: Path = typer.Argument(None, help="Vault path (default: ~/MyVault)"),
-):
-    """Install git hooks (pre-commit, commit-msg) in the vault repo."""
-    from pipeline.setup import setup_git_hooks
-
-    vault_path = _resolve_vault(vault)
-    setup_git_hooks(vault_path)
-
-
-# ─── Entry point ───────────────────────────────────────────────────────────────
-
-def main():
-    app()
+# ── Entry point ───────────────────────────────────────────────────────────
 
 
 if __name__ == "__main__":
-    main()
+    app()

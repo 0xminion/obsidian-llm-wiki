@@ -1,227 +1,302 @@
-"""Web content extraction with Cloudflare detection and fallback chain.
+"""Web URL extraction — Stage 1 deterministic ingest.
 
-Chain: defuddle → curl+liteparse → defuddle --json → archive.org.
-Detects and retries on Cloudflare challenge pages.
-Handles arxiv specially via alphaxiv.org.
+Primary: defuddle CLI for content extraction (title + markdown).
+Fallback 1: curl + regex-based HTML-to-text conversion.
+Fallback 2: archive.org Wayback Machine snapshot.
+
+Never truncates content. Always returns full IngestedSource.
 """
 
 from __future__ import annotations
 
 import json
-import logging
-import os
 import re
 import subprocess
-import tempfile
-from pathlib import Path
+import sys
 
-from pipeline.config import Config
-from pipeline.models import ExtractedSource, SourceType
-from pipeline.extractors._shared import (
-    _curl_get,
-    _run,
-    _ARXIV_PATTERN,
-    _extract_arxiv_paper_id,
-    _is_challenge_page,
-    extract_title,
-)
+from pipeline.models import IngestedSource
 
-log = logging.getLogger(__name__)
+# ── Constants ──────────────────────────────────────────────────────────
+
+_DEFUDDLE_BIN = "defuddle"
+_CURL_BIN = "curl"
+_TIMEOUT = 45
 
 
-def extract_web(url: str, cfg: Config, source_type: SourceType = SourceType.WEB) -> ExtractedSource:
-    """Extract web content via defuddle CLI with curl fallback and retry logic.
+# ── Public API ─────────────────────────────────────────────────────────
 
-    Chain: defuddle → curl+liteparse → defuddle --json → archive.org
-    Detects and retries on Cloudflare challenge pages.
+
+def extract_web(url: str, timeout: int = _TIMEOUT) -> IngestedSource:
+    """Extract full article content from a web URL.
+
+    Strategy:
+      1. defuddle --json <url>  (primary)
+      2. curl <url> + strip HTML tags  (fallback 1)
+      3. archive.org Wayback Machine via curl  (fallback 2)
+
+    Args:
+        url: The web URL to extract content from.
+        timeout: Subprocess timeout in seconds (default 45).
+
+    Returns:
+        IngestedSource with title and full content.
+
+    Raises:
+        RuntimeError: When all extraction strategies fail.
     """
-    timeout = cfg.extract_timeout
-    max_retries = cfg.max_retries
+    errors: list[str] = []
 
-    content = ""
-    for attempt in range(max_retries):
-        content = _extract_web_content(url, timeout, attempt=attempt)
+    # ── Strategy 1: defuddle ─────────────────────────────────────
+    try:
+        return _extract_defuddle(url, timeout)
+    except Exception as exc:
+        errors.append(f"defuddle: {exc}")
 
-        if not content:
-            log.warning("Web extraction attempt %d returned empty for %s", attempt + 1, url)
-            continue
+    # ── Strategy 2: curl + regex ─────────────────────────────────
+    try:
+        return _extract_curl_regex(url, timeout)
+    except Exception as exc:
+        errors.append(f"curl+regex: {exc}")
 
-        if _is_challenge_page(content):
-            log.warning("Web extraction attempt %d got Cloudflare challenge for %s", attempt + 1, url)
-            content = ""
-            continue
+    # ── Strategy 3: archive.org ──────────────────────────────────
+    try:
+        return _extract_wayback(url, timeout)
+    except Exception as exc:
+        errors.append(f"wayback: {exc}")
 
-        if len(content.strip()) < 20:
-            log.warning("Web extraction attempt %d too short (%d chars) for %s", attempt + 1, len(content), url)
-            content = ""
-            continue
-
-        break  # Success
-
-    # If all retries failed, try archive.org
-    if not content or _is_challenge_page(content):
-        content = _try_archive_extract(url, timeout)
-        if content:
-            log.info("Archive.org extraction succeeded for %s", url)
-
-    if not content:
-        log.warning("All web extraction methods failed for %s", url)
-        content = f"URL: {url}\n\nNote: Content extraction failed (all methods exhausted)."
-
-    title = extract_title(content)
-
-    return ExtractedSource(
-        url=url,
-        title=title or url,
-        content=content,
-        type=source_type,
+    raise RuntimeError(
+        f"All extraction strategies failed for {url}:\n  "
+        + "\n  ".join(errors)
     )
 
 
-def _extract_web_content(url: str, timeout: int = 45, attempt: int = 0) -> str:
-    """Extract web content. Tries defuddle → curl fallback.
-
-    attempt > 0 rotates user-agents for retry.
-    Handles arxiv specially via alphaxiv.org.
-    """
-    # Arxiv special handling
-    if _ARXIV_PATTERN.search(url):
-        paper_id = _extract_arxiv_paper_id(url)
-        if paper_id:
-            # Try arxiv HTML first
-            html_url = f"https://arxiv.org/html/{paper_id}v1"
-            content = _try_defuddle(html_url, timeout)
-            if content and len(content) > 500:
-                return content
-
-            # Try alphaxiv full text
-            content = _curl_get(
-                f"https://www.alphaxiv.org/abs/{paper_id}.md",
-                timeout=timeout,
-            )
-            if content and len(content) > 500:
-                return content
-
-            # Try alphaxiv overview
-            content = _curl_get(
-                f"https://www.alphaxiv.org/overview/{paper_id}.md",
-                timeout=timeout,
-            )
-            if content and len(content) > 200 and "No intermediate report" not in content:
-                return content
-
-    # Standard defuddle extraction
-    content = _try_defuddle(url, timeout)
-    if content and len(content) > 100 and not _is_challenge_page(content):
-        return content
-
-    # Fallback: curl + liteparse (rotates user-agent on retry)
-    content = _try_curl_extract(url, timeout, attempt=attempt)
-    if content and len(content) > 200 and not _is_challenge_page(content):
-        return content
-
-    # Last resort: defuddle --json
-    content = _try_defuddle_json(url, timeout)
-    if content and len(content) > 200 and not _is_challenge_page(content):
-        return content
-
-    return ""
+# ── Strategy implementations ───────────────────────────────────────────
 
 
-def _try_defuddle(url: str, timeout: int = 45) -> str:
-    """Try defuddle parse --markdown URL -o tmpfile."""
-    try:
-        with tempfile.NamedTemporaryFile(suffix=".md", delete=False) as f:
-            tmpfile = f.name
-        try:
-            result = _run(
-                ["defuddle", "parse", "--markdown", url, "-o", tmpfile],
-                timeout=timeout,
-            )
-            if result.returncode == 0 and os.path.exists(tmpfile) and os.path.getsize(tmpfile) > 0:
-                return Path(tmpfile).read_text(encoding="utf-8", errors="replace")
-        finally:
-            if os.path.exists(tmpfile):
-                os.unlink(tmpfile)
-    except (subprocess.TimeoutExpired, FileNotFoundError):
-        pass
-    return ""
-
-
-def _try_defuddle_json(url: str, timeout: int = 45) -> str:
-    """Try defuddle parse --json URL."""
-    try:
-        result = _run(
-            ["defuddle", "parse", "--json", url],
-            timeout=timeout,
+def _extract_defuddle(url: str, timeout: int) -> IngestedSource:
+    """Extract via defuddle CLI (--json)."""
+    result = subprocess.run(
+        [_DEFUDDLE_BIN, "parse", "-j", url],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"defuddle exited {result.returncode}: {result.stderr.strip()}"
         )
-        if result.returncode == 0 and result.stdout:
-            data = json.loads(result.stdout)
-            content = data.get("content", "")
-            if content and len(content) > 200:
-                return content
-    except (subprocess.TimeoutExpired, FileNotFoundError, json.JSONDecodeError):
-        pass
-    return ""
+
+    data = json.loads(result.stdout)
+
+    title = (data.get("title") or "").strip()
+    # Prefer markdown rendering; fall back to raw HTML content
+    content = (data.get("contentMarkdown") or data.get("content") or "").strip()
+
+    if not content:
+        raise RuntimeError("defuddle returned empty content")
+
+    return IngestedSource(title=title, content=content)
 
 
-def _try_curl_extract(url: str, timeout: int = 45, attempt: int = 0) -> str:
-    """Try liteparse: curl download → liteparse parse --format text.
+def _extract_curl_regex(url: str, timeout: int) -> IngestedSource:
+    """Extract via curl + regex HTML-to-text conversion."""
+    # Fetch raw HTML
+    result = subprocess.run(
+        [
+            _CURL_BIN, "-sSL", "--max-time", str(timeout),
+            "-A", "Mozilla/5.0 (compatible; llmwiki-bot/1.0)",
+            url,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=timeout + 5,
+    )
+    if result.returncode != 0 and not result.stdout:
+        raise RuntimeError(
+            f"curl exited {result.returncode}: {result.stderr.strip()}"
+        )
 
-    Rotates user-agents on retry to bypass simple bot detection.
+    html = result.stdout
+    if not html.strip():
+        raise RuntimeError("curl returned empty response")
+
+    # Extract <title>
+    title = ""
+    title_match = re.search(r"<title[^>]*>(.*?)</title>", html, re.IGNORECASE | re.DOTALL)
+    if title_match:
+        title = _decode_html_entities(title_match.group(1).strip())
+
+    # If no title tag, try og:title or first h1
+    if not title:
+        og_match = re.search(
+            r'<meta\s[^>]*property="og:title"\s[^>]*content="([^"]*)"',
+            html, re.IGNORECASE,
+        )
+        if og_match:
+            title = _decode_html_entities(og_match.group(1))
+    if not title:
+        h1_match = re.search(r"<h1[^>]*>(.*?)</h1>", html, re.IGNORECASE | re.DOTALL)
+        if h1_match:
+            title = _strip_tags(h1_match.group(1)).strip()
+
+    # Strip tags to get body text
+    content = _strip_tags(html)
+
+    # Normalise whitespace
+    content = re.sub(r"\n{3,}", "\n\n", content)
+    content = content.strip()
+
+    if not content:
+        raise RuntimeError("curl+regex produced empty content")
+
+    return IngestedSource(title=title, content=content)
+
+
+def _extract_wayback(url: str, timeout: int) -> IngestedSource:
+    """Extract via archive.org Wayback Machine snapshot."""
+    wayback_url = f"https://web.archive.org/web/2/{url}"
+
+    # Fetch the Wayback snapshot
+    result = subprocess.run(
+        [
+            _CURL_BIN, "-sSL", "--max-time", str(timeout + 15),
+            "-A", "Mozilla/5.0 (compatible; llmwiki-bot/1.0)",
+            "-o", "-",
+            wayback_url,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=timeout + 20,
+    )
+    if result.returncode != 0 and not result.stdout:
+        raise RuntimeError(
+            f"Wayback curl exited {result.returncode}: {result.stderr.strip()}"
+        )
+
+    html = result.stdout
+    if not html.strip():
+        raise RuntimeError("Wayback machine returned empty response")
+
+    # Wayback wraps content — try to extract just the archived page body.
+    # Remove Wayback toolbar/header scripts.
+    # Wayback inserts banners like "<!-- BEGIN WAYBACK TOOLBAR INSERT -->"
+    html = re.sub(
+        r"<!--\s*BEGIN WAYBACK TOOLBAR.*?END WAYBACK TOOLBAR.*?-->",
+        "", html, flags=re.IGNORECASE | re.DOTALL,
+    )
+    # Remove Wayback-specific scripts
+    html = re.sub(
+        r'<script[^>]*archive\.org[^>]*>.*?</script>',
+        "", html, flags=re.IGNORECASE | re.DOTALL,
+    )
+    # Remove Wayback toolbar divs
+    html = re.sub(
+        r'<div[^>]*id="wm-ipp[^"]*"[^>]*>.*?</div>',
+        "", html, flags=re.IGNORECASE | re.DOTALL,
+    )
+
+    # Extract title
+    title = ""
+    title_match = re.search(r"<title[^>]*>(.*?)</title>", html, re.IGNORECASE | re.DOTALL)
+    if title_match:
+        title = _decode_html_entities(title_match.group(1).strip())
+    if not title:
+        og_match = re.search(
+            r'<meta\s[^>]*property="og:title"\s[^>]*content="([^"]*)"',
+            html, re.IGNORECASE,
+        )
+        if og_match:
+            title = _decode_html_entities(og_match.group(1))
+
+    content = _strip_tags(html)
+    content = re.sub(r"\n{3,}", "\n\n", content)
+    content = content.strip()
+
+    if not content:
+        raise RuntimeError("Wayback produced empty content")
+
+    return IngestedSource(title=title, content=content)
+
+
+# ── HTML helpers ───────────────────────────────────────────────────────
+
+
+def _strip_tags(html: str) -> str:
+    """Strip HTML tags and return plain text.
+
+    Handles line-breaking for block-level elements, removes scripts/styles,
+    and decodes common entities.
     """
-    user_agents = [
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Safari/605.1.15",
-    ]
-    ua = user_agents[attempt % len(user_agents)]
+    # Remove scripts, styles, and comments
+    cleaned = re.sub(
+        r"<(script|style|noscript|iframe)[^>]*>.*?</\1>",
+        "", html, flags=re.IGNORECASE | re.DOTALL,
+    )
+    cleaned = re.sub(r"<!--.*?-->", "", cleaned, flags=re.DOTALL)
+
+    # Replace block-level tags with newlines
+    cleaned = re.sub(
+        r"</?(?:div|p|h[1-6]|li|tr|br|hr|section|article|header|footer|nav|main|aside|blockquote|pre|table|ul|ol|dl|figure|figcaption)[^>]*>",
+        "\n", cleaned, flags=re.IGNORECASE,
+    )
+
+    # Remove remaining tags
+    cleaned = re.sub(r"<[^>]+>", "", cleaned)
+
+    # Decode HTML entities
+    cleaned = _decode_html_entities(cleaned)
+
+    # Collapse whitespace
+    cleaned = re.sub(r"[ \t]+", " ", cleaned)
+    cleaned = re.sub(r"\n +", "\n", cleaned)
+    cleaned = re.sub(r" *\n *", "\n", cleaned)
+
+    return cleaned.strip()
+
+
+def _decode_html_entities(text: str) -> str:
+    """Decode common HTML entities."""
+    entities = {
+        "&amp;": "&", "&lt;": "<", "&gt;": ">",
+        "&quot;": '"', "&#39;": "'", "&apos;": "'",
+        "&nbsp;": " ", "&#160;": " ",
+        "&ndash;": "–", "&mdash;": "—",
+        "&lsquo;": "'", "&rsquo;": "'",
+        "&ldquo;": '"', "&rdquo;": '"',
+        "&hellip;": "…", "&trade;": "™", "&reg;": "®",
+        "&copy;": "©", "&deg;": "°",
+        "&euro;": "€", "&pound;": "£", "&yen;": "¥",
+    }
+    for entity, char in entities.items():
+        text = text.replace(entity, char)
+
+    # Numeric entities
+    text = re.sub(
+        r"&#x([0-9a-fA-F]+);",
+        lambda m: chr(int(m.group(1), 16)),
+        text,
+    )
+    text = re.sub(
+        r"&#(\d+);",
+        lambda m: chr(int(m.group(1))),
+        text,
+    )
+    return text
+
+
+# ── CLI entry point (for testing) ──────────────────────────────────────
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        print(f"Usage: python {__file__} <url>", file=sys.stderr)
+        sys.exit(1)
+
     try:
-        with tempfile.NamedTemporaryFile(suffix=".html", delete=False) as f:
-            tmpfile = f.name
-        try:
-            dl = _run(
-                ["curl", "-sL", "--max-time", str(timeout),
-                 "-H", f"User-Agent: {ua}",
-                 "-H", "Accept: text/html,application/xhtml+xml",
-                 "-H", "Accept-Language: en-US,en;q=0.9",
-                 url, "-o", tmpfile],
-                timeout=timeout + 5,
-            )
-            if dl.returncode == 0 and os.path.exists(tmpfile) and os.path.getsize(tmpfile) > 0:
-                parse = _run(
-                    ["liteparse", "parse", "--format", "text", tmpfile],
-                    timeout=timeout,
-                )
-                if parse.returncode == 0 and parse.stdout:
-                    return parse.stdout[:5000]
-        finally:
-            if os.path.exists(tmpfile):
-                os.unlink(tmpfile)
-    except (subprocess.TimeoutExpired, FileNotFoundError):
-        pass
-    return ""
-
-
-def _try_archive_extract(url: str, timeout: int = 45) -> str:
-    """Try archive.org Wayback Machine as last resort.
-
-    Fetches the most recent archived version of the page.
-    """
-    from datetime import datetime
-    archive_url = f"https://web.archive.org/web/{datetime.now().year}/{url}"
-    try:
-        content = _try_defuddle(archive_url, timeout)
-        if content and len(content) > 200:
-            # Strip archive.org header
-            if "Wayback Machine" in content[:500]:
-                for marker in ["<!DOCTYPE", "<html", "<article", "<main"]:
-                    idx = content.find(marker)
-                    if idx > 0:
-                        content = content[idx:]
-                        break
-            return content
-    except Exception as e:
-        log.debug("Archive.org extract failed: %s", e)
-    return ""
+        source = extract_web(sys.argv[1])
+        print(f"Title: {source.title}")
+        print(f"Content length: {len(source.content)} chars")
+        print("---")
+        print(source.content[:500])
+    except Exception as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        sys.exit(1)

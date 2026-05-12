@@ -1,1 +1,1 @@
-"""obsidian-llm-wiki pipeline — Python rewrite."""
+# pipeline package

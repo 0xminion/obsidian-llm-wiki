@@ -1,272 +1,322 @@
-"""Setup utilities for qmd and git hooks.
+"""Interactive setup wizard for llmwiki pipeline configuration.
 
-Ports setup-qmd.sh and setup-git-hooks.sh to Python.
+Guides the user through configuring their LLM provider, vault path,
+and API keys, validates connectivity, and writes a .env file.
 """
 
 from __future__ import annotations
 
-import json
-import subprocess
 import sys
 from pathlib import Path
 
-from pipeline._common import append_log_md
 
-
-def _run(cmd: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
-    """Run a subprocess with sensible defaults."""
-    return subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-        timeout=kwargs.get("timeout", 300),
-        cwd=kwargs.get("cwd"),
-    )
-
-
-def _has_cmd(name: str) -> bool:
-    """Check if a command is available on PATH."""
-    return subprocess.run(
-        ["which", name],
-        capture_output=True,
-        text=True,
-    ).returncode == 0
-
-
-def setup_qmd(vault_path: Path) -> None:
-    """Install and configure qmd for semantic concept search.
+def run_setup() -> None:
+    """Interactive setup: ask user for config, validate, write .env.
 
     Steps:
-    1. Install qmd via npm (if not present)
-    2. Configure Qwen3-Embedding-0.6B-Q8 embedding model
-    3. Index the concepts collection
-    4. Generate embeddings
-    5. Print verification
-
-    Args:
-        vault_path: Path to the Obsidian vault.
+      1. Ask for Ollama host (default: http://localhost:11434)
+      2. Ask for LLM model (default: gemma4:31b-cloud)
+      3. Ask for embedding model (default: qwen3-embedding:0.6b)
+      4. Ask for vault path (default: ~/MyVault)
+      5. Ask for output language (default: auto)
+      6. Validate: check vault path exists (or create), check Ollama reachable
+      7. Write .env file to vault path
+      8. Print success + next steps
     """
-    vault_path = Path(vault_path)
-
-    print("╔══════════════════════════════════════════════╗")
-    print("║  QMD Setup — Semantic Concept Search         ║")
-    print("╚══════════════════════════════════════════════╝")
+    print()
+    print("=" * 60)
+    print("  🧠 llmwiki Setup Wizard")
+    print("  Configure your knowledge compiler pipeline")
+    print("=" * 60)
     print()
 
-    # ── Step 1: Install qmd ──────────────────────────────────────────────
-    if _has_cmd("qmd"):
-        version_result = _run(["qmd", "--version"])
-        version = version_result.stdout.strip() or "unknown"
-        print(f"✓ qmd already installed: {version}")
-    else:
-        print("Installing qmd via npm...")
-        result = _run(["npm", "install", "-g", "@tobilu/qmd"])
-        if _has_cmd("qmd"):
-            version_result = _run(["qmd", "--version"])
-            version = version_result.stdout.strip()
-            print(f"✓ qmd installed: {version}")
+    # ── Helper: prompt with default ────────────────────────────────────
+    def _ask(prompt: str, default: str) -> str:
+        """Ask the user for input with a default value."""
+        if default:
+            result = input(f"{prompt} [{default}]: ").strip()
+            return result if result else default
         else:
-            print("ERROR: Failed to install qmd. Ensure Node.js >= 22 is installed.")
-            print(result.stderr[-300:] if result.stderr else "(no stderr)")
-            sys.exit(1)
+            return input(f"{prompt}: ").strip()
 
-    # ── Step 2: Configure embedding model ────────────────────────────────
-    print()
-    print("Configuring Qwen3-Embedding-0.6B-Q8 model...")
-    config_dir = Path.home() / ".config" / "qmd"
-    config_dir.mkdir(parents=True, exist_ok=True)
-    index_yml = config_dir / "index.yml"
+    def _ask_required(prompt: str) -> str:
+        """Ask a required question; repeat until non-empty."""
+        while True:
+            result = input(f"{prompt}: ").strip()
+            if result:
+                return result
+            print("  ⚠ This field is required. Please enter a value.")
 
-    model_config = (
-        'models:\n'
-        '  embed: "hf:Qwen/Qwen3-Embedding-0.6B-GGUF/Qwen3-Embedding-0.6B-Q8_0.gguf"\n'
+    # ── Step 1: Ollama host ───────────────────────────────────────────
+    print("📡 LLM Provider Configuration")
+    print("-" * 40)
+    ollama_host = _ask(
+        "Ollama host URL",
+        "http://localhost:11434",
     )
+    print(f"   → Host: {ollama_host}")
+    print()
 
-    if index_yml.exists() and "Qwen3-Embedding-0.6B" in index_yml.read_text():
-        print("✓ Model already configured")
+    # ── Step 2: LLM model ─────────────────────────────────────────────
+    ollama_model = _ask(
+        "LLM model name",
+        "gemma4:31b-cloud",
+    )
+    print(f"   → Model: {ollama_model}")
+    print()
+
+    # ── Step 3: Embedding model ───────────────────────────────────────
+    ollama_embed_model = _ask(
+        "Embedding model name",
+        "qwen3-embedding:0.6b",
+    )
+    print(f"   → Embedding model: {ollama_embed_model}")
+    print()
+
+    # ── Step 4: Vault path ────────────────────────────────────────────
+    print("📂 Vault Configuration")
+    print("-" * 40)
+    default_vault = str(Path.home() / "MyVault")
+    vault_raw = _ask(
+        "Vault path (where your Obsidian/wiki files live)",
+        default_vault,
+    )
+    vault_path = Path(vault_raw).expanduser().resolve()
+    print(f"   → Vault: {vault_path}")
+    print()
+
+    # ── Step 5: Output language ───────────────────────────────────────
+    print("🌐 Language Settings")
+    print("-" * 40)
+    output_language = _ask(
+        "Output language (en / zh / auto — leave empty for auto-detect)",
+        "auto",
+    )
+    if output_language.lower() == "auto":
+        output_language = ""
+    print(f"   → Language: {output_language if output_language else 'auto-detect'}")
+    print()
+
+    # ── Step 6: Validation ────────────────────────────────────────────
+    print("🔍 Validating configuration...")
+    print("-" * 40)
+
+    all_ok = True
+
+    # 6a: Check vault path
+    if not vault_path.exists():
+        create_choice = _ask(
+            f"   Vault path '{vault_path}' does not exist. Create it?",
+            "Y",
+        )
+        if create_choice.lower() in ("y", "yes", ""):
+            try:
+                vault_path.mkdir(parents=True, exist_ok=True)
+                print(f"   ✅ Created: {vault_path}")
+            except OSError as exc:
+                print(f"   ❌ Could not create vault path: {exc}")
+                all_ok = False
+        else:
+            print("   ⚠ Vault path will not be created. You can create it later.")
     else:
-        index_yml.write_text(model_config)
-        print(f"✓ Model config written to {index_yml}")
+        print(f"   ✅ Vault path exists: {vault_path}")
 
-    # ── Step 3: Index concepts collection ────────────────────────────────
-    concepts_dir = vault_path / "04-Wiki" / "concepts"
+    # Create expected directory structure
+    for subdir in ["02-Clippings", "04-Wiki"]:
+        sub = vault_path / subdir
+        if not sub.exists():
+            sub.mkdir(parents=True, exist_ok=True)
+            print(f"   ✅ Created: {sub}")
+        else:
+            print(f"   ✅ Directory exists: {sub}")
 
-    if not concepts_dir.is_dir():
-        print(f"ERROR: Concepts directory not found: {concepts_dir}")
+    # 6b: Check Ollama reachable
+    print()
+    print("   Checking Ollama connectivity...")
+    ollama_reachable = _check_ollama(ollama_host)
+    if ollama_reachable:
+        print(f"   ✅ Ollama is reachable at {ollama_host}")
+    else:
+        print(f"   ⚠ Could not reach Ollama at {ollama_host}")
+        print("     Make sure Ollama is running. You can continue anyway.")
+        # Not blocking — user might start Ollama later
+
+    # 6c: Check model availability
+    if ollama_reachable:
+        model_available = _check_model(ollama_host, ollama_model)
+        if model_available:
+            print(f"   ✅ Model '{ollama_model}' is available")
+        else:
+            print(f"   ⚠ Model '{ollama_model}' not found on Ollama host")
+            print(f"     Run: ollama pull {ollama_model}")
+            # Not blocking
+
+        embed_available = _check_model(ollama_host, ollama_embed_model)
+        if embed_available:
+            print(f"   ✅ Embedding model '{ollama_embed_model}' is available")
+        else:
+            print(f"   ⚠ Embedding model '{ollama_embed_model}' not found")
+            print(f"     Run: ollama pull {ollama_embed_model}")
+
+    print()
+
+    if not all_ok:
+        print("❌ Setup could not be completed due to validation failures.")
+        print("   Please fix the issues above and run 'llmwiki setup' again.")
         sys.exit(1)
 
-    concept_count = len(list(concepts_dir.glob("**/*.md")))
-    print()
-    print(f"Indexing {concept_count} concept files from: {concepts_dir}")
+    # ── Step 7: Write .env file ───────────────────────────────────────
+    env_path = vault_path / ".env"
+    env_content = _build_env_content(
+        ollama_host=ollama_host,
+        ollama_model=ollama_model,
+        ollama_embed_model=ollama_embed_model,
+        vault_path=str(vault_path),
+        output_language=output_language,
+    )
 
-    status_result = _run(["qmd", "status"])
-    if "concepts" in status_result.stdout:
-        print("Collection 'concepts' already exists, updating...")
-        update_result = _run(["qmd", "update"])
-        for line in update_result.stdout.splitlines():
-            if any(line.startswith(p) for p in ("Indexed", "Collection", "✓")):
-                print(line)
+    if env_path.exists():
+        overwrite = _ask(
+            f"   .env file already exists at {env_path}. Overwrite?",
+            "N",
+        )
+        if overwrite.lower() not in ("y", "yes"):
+            backup_path = env_path.with_suffix(".env.backup")
+            env_path.rename(backup_path)
+            print(f"   📋 Backed up existing .env to {backup_path}")
+            env_path.write_text(env_content)
+            print(f"   ✅ Written: {env_path}")
+        else:
+            env_path.write_text(env_content)
+            print(f"   ✅ Overwritten: {env_path}")
     else:
-        add_result = _run([
-            "qmd", "collection", "add", str(concepts_dir),
-            "--name", "concepts", "--mask", "**/*.md",
-        ])
-        for line in add_result.stdout.splitlines():
-            if any(line.startswith(p) for p in ("Indexed", "Collection", "Creating", "✓")):
-                print(line)
+        env_path.write_text(env_content)
+        print(f"   ✅ Written: {env_path}")
 
-    # ── Step 4: Generate embeddings ──────────────────────────────────────
+    # ── Step 8: Print success + next steps ────────────────────────────
     print()
-    print("Generating embeddings (this may take a few minutes on CPU)...")
+    print("=" * 60)
+    print("  ✅ Setup complete!")
+    print("=" * 60)
+    print()
+    print("  Next steps:")
+    print()
+    print("  1. Ingest some sources:")
+    print(f"     llmwiki ingest {vault_path} --url https://example.com/article")
+    print()
+    print("  2. Or use your own clippings:")
+    print(f"     Drop .md files into {vault_path / '02-Clippings'}")
+    print()
+    print("  3. Compile:")
+    print(f"     llmwiki compile {vault_path}")
+    print()
+    print("  4. Query your knowledge:")
+    print(f"     llmwiki query {vault_path} --ask \"your question\"")
+    print()
+    print("  📖 Docs: https://hermes-agent.nousresearch.com/docs")
+    print()
 
-    noisy_patterns = (
-        "cmake", "CMAKE", "Vulkan", "vulkan", "node-llama-cpp",
-        "Cloning", "NOT searching", "C compiler", "Check for working",
-        "Detecting", "Found", "Including", "Adding", "Performing", "Configuring",
-    )
 
-    embed_result = _run(["qmd", "embed", "-f"])
-    for line in embed_result.stdout.splitlines():
-        if not any(p in line for p in noisy_patterns):
-            print(line)
-    # Show last 5 lines of filtered output
-    filtered = [
-        l for l in embed_result.stdout.splitlines()
-        if not any(p in l for p in noisy_patterns)
+# ── Helpers ────────────────────────────────────────────────────────────────
+
+
+def _build_env_content(
+    ollama_host: str,
+    ollama_model: str,
+    ollama_embed_model: str,
+    vault_path: str,
+    output_language: str,
+) -> str:
+    """Build the .env file content from configuration values."""
+    lines = [
+        "# llmwiki configuration",
+        "# Generated by llmwiki setup wizard",
+        "",
+        "# ── Ollama ──────────────────────────────────────",
+        f"OLLAMA_HOST={ollama_host}",
+        f"OLLAMA_MODEL={ollama_model}",
+        f"OLLAMA_EMBED_MODEL={ollama_embed_model}",
+        "",
+        "# ── Vault ───────────────────────────────────────",
+        f"VAULT_PATH={vault_path}",
+        "",
+        "# ── Content thresholds ──────────────────────────",
+        "MAX_SOURCE_CHARS=1000000",
+        "MIN_SOURCE_CHARS=50",
+        "PROMPT_BUDGET_CHARS=200000",
+        "",
+        "# ── Concurrency ─────────────────────────────────",
+        "COMPILE_CONCURRENCY=3",
+        "",
     ]
-    for line in filtered[-5:]:
-        print(line)
+    if output_language:
+        lines.append(f"LLMWIKI_OUTPUT_LANGUAGE={output_language}")
+    else:
+        lines.append("# LLMWIKI_OUTPUT_LANGUAGE=  (auto-detect)")
 
-    # ── Step 5: Verify ──────────────────────────────────────────────────
-    print()
-    print("━━━ Verification ━━━")
-    status_result = _run(["qmd", "status"])
-    for line in status_result.stdout.splitlines():
-        if any(kw in line for kw in ("Documents", "Vectors", "Collection", "Embedding")):
-            print(line)
+    lines.append("")
+    return "\n".join(lines) + "\n"
 
-    print()
-    print("Test query (semantic search):")
-    query_result = _run([
-        "qmd", "query", "prediction markets",
-        "--json", "-n", "3", "--min-score", "0.3",
-        "-c", "concepts", "--no-rerank",
-    ])
 
+def _check_ollama(host: str) -> bool:
+    """Check if Ollama is reachable at the given host."""
     try:
-        results = json.loads(query_result.stdout)
-        for r in results:
-            f = r.get("file", "").split("/")[-1].replace(".md", "")
-            s = r.get("score", 0)
-            print(f"  {s:.2f}  {f}")
-        print(f"\n✓ {len(results)} semantic matches found")
-    except (json.JSONDecodeError, TypeError):
-        print("  (query test skipped — first run may need model download)")
+        import urllib.request
+        url = f"{host.rstrip('/')}/api/tags"
+        req = urllib.request.Request(url, method="GET")
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return resp.status == 200
+    except Exception:
+        # Try httpx if available
+        try:
+            import asyncio
 
-    # ── Summary ─────────────────────────────────────────────────────────
-    print()
-    print("╔══════════════════════════════════════════════╗")
-    print("║  QMD Setup Complete                          ║")
-    print("╠══════════════════════════════════════════════╣")
-    print("║  Model:   Qwen3-Embedding-0.6B-Q8 (639MB)   ║")
-    print(f"║  Concepts: {concept_count} files indexed        ║")
-    print("║  Search:  qmd query '<text>' -c concepts     ║")
-    print("╚══════════════════════════════════════════════╝")
+            import httpx
 
-    # Log the operation
-    append_log_md(
-        vault_path,
-        "setup",
-        "QMD semantic search setup",
-        f"- Model: Qwen3-Embedding-0.6B-Q8\n- Concepts indexed: {concept_count}",
-    )
+            async def _check():
+                async with httpx.AsyncClient(timeout=5) as client:
+                    resp = await client.get(f"{host.rstrip('/')}/api/tags")
+                    return resp.status_code == 200
+
+            return asyncio.run(_check())
+        except Exception:
+            return False
 
 
-# ── Git hook scripts ──────────────────────────────────────────────────────────
+def _check_model(host: str, model: str) -> bool:
+    """Check if a specific model is available on the Ollama host."""
+    try:
+        import json
+        import urllib.request
 
-_PRE_COMMIT_HOOK = """\
-#!/usr/bin/env bash
-# Prevent committing files from 07-WIP/
-if git diff --cached --name-only | grep -q "^07-WIP/"; then
-  echo "ERROR: Cannot commit files from 07-WIP/ — this is user territory."
-  echo "Use 'git reset HEAD 07-WIP/' to unstage."
-  exit 1
-fi
-"""
+        url = f"{host.rstrip('/')}/api/tags"
+        req = urllib.request.Request(url, method="GET")
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read())
+            models = [m.get("name", "") for m in data.get("models", [])]
+            # Check exact match or prefix match (e.g. "gemma4:31b-cloud" vs "gemma4:latest")
+            return any(m == model or m.startswith(model.split(":")[0]) for m in models)
+    except Exception:
+        # Try httpx
+        try:
+            import asyncio
 
-_COMMIT_MSG_HOOK = """\
-#!/usr/bin/env bash
-# Allow structured messages: "operation: description (date)"
-# Also allow merge commits and reverts
-msg=$(cat "$1")
-if [[ ! "$msg" =~ ^(ingest|compile|query|lint|review|reindex|setup|Merge|Revert): ]] \\
-    && [[ ! "$msg" =~ ^Initial ]]; then
-  echo "Warning: commit message should follow 'operation: description (date)' format"
-  echo "Got: $msg"
-  # Don't block — just warn
-fi
-"""
+            import httpx
+
+            async def _check():
+                async with httpx.AsyncClient(timeout=5) as client:
+                    resp = await client.get(f"{host.rstrip('/')}/api/tags")
+                    data = resp.json()
+                    models = [m.get("name", "") for m in data.get("models", [])]
+                    return any(m == model or m.startswith(model.split(":")[0]) for m in models)
+
+            return asyncio.run(_check())
+        except Exception:
+            return False
 
 
-def setup_git_hooks(vault_path: Path) -> None:
-    """Initialize git repo (if needed) and install pre-commit/commit-msg hooks.
+# ── CLI entry point (for standalone testing) ──────────────────────────────
 
-    Hooks installed:
-    - pre-commit: blocks commits from 07-WIP/
-    - commit-msg: warns on non-structured commit messages
 
-    Args:
-        vault_path: Path to the Obsidian vault.
-    """
-    vault_path = Path(vault_path)
-
-    # ── Init git repo if needed ─────────────────────────────────────────
-    git_dir = vault_path / ".git"
-    if not git_dir.is_dir():
-        print(f"Vault at {vault_path} is not a git repository.")
-        print("Initializing...")
-        _run(["git", "init"], timeout=30, cwd=vault_path)
-        gitignore = vault_path / ".gitignore"
-        gitignore.write_text("# Wiki Vault\n.DS_Store\n*.tmp\n")
-        _run(["git", "add", "-A"], cwd=vault_path)
-        _run(["git", "commit", "-m", "Initial vault commit", "--quiet"], cwd=vault_path)
-
-    # ── Write hooks ─────────────────────────────────────────────────────
-    hooks_dir = vault_path / ".git" / "hooks"
-    hooks_dir.mkdir(parents=True, exist_ok=True)
-
-    pre_commit_path = hooks_dir / "pre-commit"
-    pre_commit_path.write_text(_PRE_COMMIT_HOOK)
-    pre_commit_path.chmod(0o755)
-
-    commit_msg_path = hooks_dir / "commit-msg"
-    commit_msg_path.write_text(_COMMIT_MSG_HOOK)
-    commit_msg_path.chmod(0o755)
-
-    print(f"Git hooks installed in {hooks_dir}")
-    print("  pre-commit: blocks 07-WIP/ commits")
-    print("  commit-msg: warns on non-structured messages")
-
-    # ── Commit current state if needed ──────────────────────────────────
-    diff_result = _run(["git", "diff", "--quiet"], cwd=vault_path)
-    cached_diff_result = _run(["git", "diff", "--cached", "--quiet"], cwd=vault_path)
-    if diff_result.returncode != 0 or cached_diff_result.returncode != 0:
-        _run(["git", "add", "-A"], cwd=vault_path)
-        from datetime import datetime
-        date_str = datetime.now().strftime("%Y-%m-%d")
-        _run([
-            "git", "commit", "-m",
-            f"setup: Install git hooks ({date_str})",
-            "--quiet",
-        ], cwd=vault_path)
-        print("Committed current state.")
-
-    print("Done. Vault is now git-tracked with auto-commit support.")
-
-    # Log the operation
-    append_log_md(
-        vault_path,
-        "setup",
-        "Git hooks installed",
-        "- pre-commit: blocks 07-WIP/ commits\n- commit-msg: warns on non-structured messages",
-    )
+if __name__ == "__main__":
+    run_setup()
