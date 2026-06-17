@@ -27,6 +27,8 @@ EXCLUDED_NAMES: frozenset[str] = frozenset({
     "__pycache__",    # Python bytecode cache
     "compile.lock",   # compile-time PID lock file
     "lock",           # generic lock file
+    "state.json",     # pipeline state file (redundant safety net)
+    "candidates",     # review candidates directory content
 })
 
 

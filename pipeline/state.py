@@ -11,8 +11,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from pipeline.markdown import safe_read_file
-from pipeline.models import SourceState, WikiState
+from pipeline.okf_markdown import safe_read_file
+from pipeline.okf_models import SourceState, WikiState
 
 
 def read_state(state_file: str | Path) -> WikiState:
@@ -40,7 +40,7 @@ def read_state(state_file: str | Path) -> WikiState:
 
 def write_state(state_file: str | Path, state: WikiState) -> None:
     """Persist wiki state to disk atomically."""
-    from pipeline.markdown import atomic_write
+    from pipeline.okf_markdown import atomic_write
 
     data: dict[str, object] = {
         "sources": {

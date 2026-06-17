@@ -47,7 +47,7 @@ class TestHashFile:
         Here we test valid UTF-8 with high bytes to confirm no crash on non-ASCII content."""
         f = tmp_path / "binary.md"
         # Write bytes that are valid UTF-8 (emoji + accented chars)
-        f.write_bytes("héllo wörld 🌍".encode("utf-8"))
+        f.write_bytes("héllo wörld 🌍".encode())
         result = hash_file(f)
         assert len(result) == 64
 

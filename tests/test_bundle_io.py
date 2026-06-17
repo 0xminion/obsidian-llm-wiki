@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io
 import tarfile
 from pathlib import Path
 
@@ -51,6 +52,12 @@ def _make_full_bundle(bundle_dir: Path) -> None:
     git_dir = bundle_dir / ".git"
     git_dir.mkdir(parents=True, exist_ok=True)
     (git_dir / "HEAD").write_text("ref: refs/heads/main", encoding="utf-8")
+    # Standalone state.json at bundle root — must be excluded.
+    (bundle_dir / "state.json").write_text('{"sources": {}}', encoding="utf-8")
+    # Candidates directory — must be excluded.
+    candidates_dir = bundle_dir / "candidates"
+    candidates_dir.mkdir(parents=True, exist_ok=True)
+    (candidates_dir / "draft.md").write_text("# Draft", encoding="utf-8")
 
 
 def _archive_contains(tarball: Path, member_name: str) -> bool:
@@ -146,6 +153,22 @@ def test_export_bundle_excludes_compile_lock_and_pycache(tmp_path: Path):
     assert any("index.md" in m for m in names)
 
 
+def test_export_bundle_excludes_state_and_candidates(tmp_path: Path):
+    """state.json and candidates/ must be excluded from the tarball."""
+    bundle_dir = tmp_path / "mybundle"
+    _make_full_bundle(bundle_dir)
+
+    tarball = export_bundle(bundle_dir)
+
+    with tarfile.open(str(tarball), "r:gz") as tar:
+        names = {m.name for m in tar.getmembers()}
+
+    assert not any("state.json" in m for m in names)
+    assert not any("candidates" in m for m in names)
+    # Sanity: the real bundle content is still there.
+    assert any("index.md" in m for m in names)
+
+
 # ── import_bundle ───────────────────────────────────────────────────────
 
 
@@ -232,6 +255,34 @@ def test_roundtrip_preserves_content(tmp_path: Path):
     # index.md content should be preserved.
     content = (bundle_path / "index.md").read_text(encoding="utf-8")
     assert "okf_version" in content
+
+
+def test_import_bundle_multiple_top_level(tmp_path: Path):
+    """import_bundle should use target itself when the tarball has multiple
+    top-level entries (files + dirs), not just a single wrapping directory."""
+    # Build a tarball with multiple top-level entries (no wrapping dir).
+    target = tmp_path / "imported"
+    target.mkdir(parents=True)
+
+    tarball = tmp_path / "multi.tar"
+    with tarfile.open(str(tarball), "w") as tar:
+        # Add a top-level file.
+        data1 = b"---\nokf_version: '0.1'\n---\n# Knowledge Bundle\n"
+        info1 = tarfile.TarInfo(name="index.md")
+        info1.size = len(data1)
+        tar.addfile(info1, io.BytesIO(data1))
+        # Add a top-level directory with a concept file.
+        data2 = b"---\ntype: Concept\ntitle: Foo\n---\n# Foo\n"
+        info2 = tarfile.TarInfo(name="concepts/foo.md")
+        info2.size = len(data2)
+        tar.addfile(info2, io.BytesIO(data2))
+
+    result = import_bundle(tarball, target, verify=False)
+    bundle_path = Path(result["bundle_path"])
+    # With multiple top-level entries, bundle_path should be target itself.
+    assert bundle_path == target
+    assert (bundle_path / "index.md").exists()
+    assert (bundle_path / "concepts" / "foo.md").exists()
 
 
 # ── pytest entry ─────────────────────────────────────────────────────────

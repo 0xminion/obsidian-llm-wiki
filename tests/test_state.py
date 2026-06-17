@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from pipeline.models import SourceState, WikiState
+from pipeline.okf_models import SourceState, WikiState
 from pipeline.state import read_state, remove_source_state, write_state
 
 

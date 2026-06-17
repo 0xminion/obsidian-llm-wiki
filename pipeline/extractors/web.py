@@ -49,18 +49,24 @@ def extract_web(url: str, timeout: int = _TIMEOUT) -> IngestedSource:
     # ── Strategy 1: defuddle ─────────────────────────────────────
     try:
         return _extract_defuddle(url, timeout)
+    except subprocess.TimeoutExpired as exc:
+        errors.append(f"defuddle: timed out after {exc.timeout}s — {url}")
     except Exception as exc:
         errors.append(f"defuddle: {exc}")
 
     # ── Strategy 2: curl + regex ─────────────────────────────────
     try:
         return _extract_curl_regex(url, timeout)
+    except subprocess.TimeoutExpired as exc:
+        errors.append(f"curl+regex: timed out after {exc.timeout}s — {url}")
     except Exception as exc:
         errors.append(f"curl+regex: {exc}")
 
     # ── Strategy 3: archive.org ──────────────────────────────────
     try:
         return _extract_wayback(url, timeout)
+    except subprocess.TimeoutExpired as exc:
+        errors.append(f"wayback: timed out after {exc.timeout}s — {url}")
     except Exception as exc:
         errors.append(f"wayback: {exc}")
 

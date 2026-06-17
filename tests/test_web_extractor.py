@@ -208,9 +208,8 @@ class TestExtractWeb:
         with patch(
             "pipeline.extractors.web.subprocess.run",
             side_effect=[mock_result, mock_curl_fail, mock_curl_fail],
-        ):
-            with pytest.raises(RuntimeError, match="All extraction strategies failed"):
-                extract_web("https://example.com/empty")
+        ), pytest.raises(RuntimeError, match="All extraction strategies failed"):
+            extract_web("https://example.com/empty")
 
     def test_extract_defuddle_nonzero_returncode_falls_through(self) -> None:
         """defuddle exiting non-zero should trigger curl fallback."""
@@ -245,6 +244,5 @@ class TestExtractWeb:
         with patch(
             "pipeline.extractors.web.subprocess.run",
             side_effect=[mock_fail, mock_fail, mock_fail],
-        ):
-            with pytest.raises(RuntimeError, match="All extraction strategies failed"):
-                extract_web("https://example.com/broken")
+        ), pytest.raises(RuntimeError, match="All extraction strategies failed"):
+            extract_web("https://example.com/broken")

@@ -26,7 +26,7 @@ app = typer.Typer(
 # ── Shared helpers ────────────────────────────────────────────────────────
 
 
-def _resolve_vault(vault: str) -> tuple[Path, "Config"]:  # noqa: F821
+def _resolve_vault(vault: str) -> tuple[Path, Config]:  # noqa: F821
     """Resolve vault path and load config. Returns (vault_path, config)."""
     from pipeline.config import load_config
 
@@ -42,7 +42,7 @@ def _resolve_vault(vault: str) -> tuple[Path, "Config"]:  # noqa: F821
     return vault_path, config
 
 
-def _print_result_summary(result: "CompileResult") -> None:  # noqa: F821
+def _print_result_summary(result: CompileResult) -> None:  # noqa: F821
     """Pretty-print a CompileResult."""
     typer.echo(
         f"\n✅ Compilation complete: "
@@ -180,9 +180,10 @@ def ingest(
         result = asyncio.run(run_create(config, all_sources, state))
 
     # ── Post-compile: resolve links, indexes ─────────────────────────
+    from pipeline.okf_indexgen import generate_bundle_index
+    from pipeline.okf_markdown import atomic_write
     from pipeline.okf_markdown import slugify as _slugify
-    from pipeline.indexgen import generate_index, generate_moc
-    from pipeline.resolver import resolve_links
+    from pipeline.okf_resolver import resolve_links
     from pipeline.state import write_state
 
     # Collect concept slugs
@@ -195,13 +196,11 @@ def ingest(
         if modified:
             typer.echo(f"   Updated {modified} page(s)")
 
-    typer.echo("📇 Generating index...")
-    idx_path = generate_index(config.wiki_dir, config.concepts_dir)
+    typer.echo("📇 Generating OKF bundle index...")
+    idx_content = generate_bundle_index(config.bundle_dir, config.okf_version)
+    idx_path = config.bundle_dir / "index.md"
+    atomic_write(idx_path, idx_content)
     typer.echo(f"   → {idx_path}")
-
-    typer.echo("🗺 Generating MOC...")
-    moc_path = generate_moc(config.wiki_dir, config.concepts_dir)
-    typer.echo(f"   → {moc_path}")
 
     write_state(config.state_file, state)
     typer.echo(f"💾 State persisted ({len(state.sources)} sources)")
