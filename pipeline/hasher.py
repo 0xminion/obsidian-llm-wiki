@@ -11,7 +11,7 @@ from __future__ import annotations
 import hashlib
 from pathlib import Path
 
-from pipeline.models import SourceChange, SourceStatus, WikiState
+from pipeline.okf_models import SourceChange, SourceStatus, WikiState
 
 
 def hash_file(file_path: str | Path) -> str:

@@ -3,12 +3,15 @@
 These dataclasses define the OKF (Open Knowledge Format) v0.1 compliant
 representation alongside the incremental-compile primitives that feed it.
 
-The legacy ``pipeline/models.py`` is retained for the transition period;
-this module is additive — it does not replace the old models yet.
+This module is the single source of truth for pipeline data models — the
+legacy ``pipeline/models.py`` has been removed.
 """
+
+from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import StrEnum
+from typing import Any
 
 # ── Enums ──────────────────────────────────────────────────────────────
 
@@ -21,6 +24,24 @@ class OKFConceptType(StrEnum):
     CONCEPT = "Concept"
     MOC = "Map of Content"
     REFERENCE = "Reference"
+
+
+class PageKind(StrEnum):
+    """All page kinds the schema layer recognises."""
+
+    CONCEPT = "concept"
+    ENTITY = "entity"
+    COMPARISON = "comparison"
+    OVERVIEW = "overview"
+
+
+class ProvenanceState(StrEnum):
+    """How a concept was produced."""
+
+    EXTRACTED = "extracted"
+    MERGED = "merged"
+    INFERRED = "inferred"
+    AMBIGUOUS = "ambiguous"
 
 
 class SourceStatus(StrEnum):
@@ -162,6 +183,8 @@ class ExtractedConcept:
     tags: list[str] = field(default_factory=list)
     confidence: float | None = None
     type: str = "Concept"
+    provenance_state: ProvenanceState | None = None
+    contradicted_by: list["ContradictionRef"] | None = None
 
 
 # ── State ──────────────────────────────────────────────────────────────
@@ -221,6 +244,9 @@ class ReviewCandidate:
     sources: list[str]
     body: str
     generated_at: str
+    source_states: dict[str, SourceState] = field(default_factory=dict)
+    schema_violations: list[dict[str, Any]] | None = None
+    provenance_violations: list[dict[str, Any]] | None = None
 
 
 @dataclass
@@ -247,3 +273,62 @@ class LogEntry:
     concept_id: str
     description: str
     timestamp: str = ""
+
+
+# ── Provenance ─────────────────────────────────────────────────────────
+
+
+@dataclass
+class ContradictionRef:
+    """Reference to another concept whose evidence contradicts this one."""
+
+    slug: str
+    reason: str | None = None
+
+
+@dataclass
+class SourceSpan:
+    """A citation span referencing a source file with optional line range."""
+
+    file: str
+    lines: tuple[int, int] | None = None
+
+
+@dataclass
+class ClaimCitation:
+    """A single ^[...] citation marker parsed from a page body."""
+
+    raw: str
+    spans: list[SourceSpan]
+
+
+# ── Schema ─────────────────────────────────────────────────────────────
+
+
+@dataclass
+class PageKindRule:
+    """Per-kind policy: minimum cross-links and description."""
+
+    min_wikilinks: int
+    description: str
+
+
+@dataclass
+class SeedPage:
+    """Declarative seed for non-concept pages."""
+
+    title: str
+    kind: PageKind
+    summary: str
+    related_slugs: list[str] = field(default_factory=list)
+
+
+@dataclass
+class SchemaConfig:
+    """Resolved schema configuration."""
+
+    version: int = 1
+    default_kind: PageKind = PageKind.CONCEPT
+    kinds: dict[PageKind, PageKindRule] = field(default_factory=dict)
+    seed_pages: list[SeedPage] = field(default_factory=list)
+    loaded_from: str | None = None

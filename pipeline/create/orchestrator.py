@@ -5,13 +5,11 @@ concept pages, then groups into MoCs.  Uses configurable concurrency.
 
 Ported from llm-wiki-compiler/src/compiler/index.ts.
 
-OKF migration (Task 12): page rendering now uses the OKF-native renderers
+OKF migration: page rendering uses the OKF-native renderers
 (``pipeline.okf_renderer``) which produce OKF v0.1 frontmatter.  The LLM
 call pattern (one call per item) is preserved — the LLM generates the
 *body* content, and the OKF renderer wraps it with conformant frontmatter.
-Data models are imported from ``pipeline.okf_models``; ``ProvenanceState``
-is retained from the legacy ``pipeline.models`` module because it has no
-OKF equivalent yet.
+Data models are imported from ``pipeline.okf_models``.
 """
 
 from __future__ import annotations
@@ -23,16 +21,14 @@ from datetime import UTC, datetime
 
 from pipeline.config import Config
 from pipeline.hasher import hash_content
-from pipeline.llm_client import call_llm
-
-# ProvenanceState has no OKF equivalent — keep from legacy models.
-from pipeline.models import ProvenanceState
+from pipeline.llm.providers import acall_llm
 from pipeline.okf_markdown import atomic_write, parse_frontmatter, safe_read_file, slugify
 from pipeline.okf_models import (
     CompileResult,
     ExtractedConcept,
     IngestedSource,
     PageSummary,
+    ProvenanceState,
     WikiState,
 )
 from pipeline.okf_renderer import (
@@ -253,7 +249,7 @@ async def _generate_entry_body(
         }
     ]
 
-    result = await call_llm(system_prompt, messages, config)
+    result = await acall_llm(system_prompt, messages, config)
 
     body = _extract_body(result)
     if len(body) >= config.entry_min_body_chars:
@@ -275,7 +271,7 @@ async def _generate_entry_body(
         + "Do NOT produce stubs or shallow summaries. Surface ALL available insights."
     )
 
-    result2 = await call_llm(stronger_system, messages, config)
+    result2 = await acall_llm(stronger_system, messages, config)
     body2 = _extract_body(result2)
 
     if len(body2) < config.entry_min_body_chars:
@@ -313,7 +309,7 @@ async def _extract_concepts(
     ]
 
     try:
-        raw = await call_llm(system, messages, config, tools=EXTRACTION_TOOLS)
+        raw = await acall_llm(system, messages, config, tools=EXTRACTION_TOOLS)
     except Exception:
         logger.warning("LLM call for concept extraction failed", exc_info=True)
         return []
@@ -482,7 +478,7 @@ async def _generate_concept_body(
         }
     ]
 
-    result = await call_llm(system_prompt, messages, config)
+    result = await acall_llm(system_prompt, messages, config)
 
     body = _extract_body(result)
     if len(body) >= config.concept_min_body_chars:
@@ -504,7 +500,7 @@ async def _generate_concept_body(
         + "This is evergreen content — standalone, self-contained, insightful."
     )
 
-    result2 = await call_llm(stronger_system, messages, config)
+    result2 = await acall_llm(stronger_system, messages, config)
     body2 = _extract_body(result2)
 
     if len(body2) < config.concept_min_body_chars:
@@ -602,7 +598,7 @@ async def _generate_moc_body(
         }
     ]
 
-    result = await call_llm(system_prompt, messages, config)
+    result = await acall_llm(system_prompt, messages, config)
 
     # Must NOT be stub — enforce meaningful content
     body = _extract_body(result)
@@ -621,7 +617,7 @@ async def _generate_moc_body(
         + "other concepts. This is NOT a simple list — it's a cartographic overview."
     )
 
-    result2 = await call_llm(stronger_system, messages, config)
+    result2 = await acall_llm(stronger_system, messages, config)
     body2 = _extract_body(result2)
 
     if _is_stub(body2):

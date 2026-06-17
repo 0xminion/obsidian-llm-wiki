@@ -220,7 +220,7 @@ async def _run_create_with_review(
 
     # For each concept, stage as a candidate
     for concept in result.concepts:
-        from pipeline.markdown import slugify as _slugify
+        from pipeline.okf_markdown import slugify as _slugify
         slug = _slugify(concept.concept)
         candidate_data = {
             "title": concept.concept,
@@ -316,7 +316,7 @@ async def _compile_with_review(vault: str, options: dict):
         config = load_config(env_file=env_file)
 
         for concept in result.concepts:
-            from pipeline.markdown import slugify as _slugify
+            from pipeline.okf_markdown import slugify as _slugify
             slug = _slugify(concept.concept)
             candidate_data = {
                 "title": concept.concept,
@@ -439,8 +439,8 @@ def query(
         okf query ~/MyVault -a "Compare RAG vs fine-tuning" -n 5
     """
     from pipeline.config import load_config
-    from pipeline.llm_client import call_llm
-    from pipeline.markdown import parse_frontmatter, safe_read_file
+    from pipeline.llm.providers import call_llm
+    from pipeline.okf_markdown import parse_frontmatter, safe_read_file
 
     vault_path = Path(vault).expanduser().resolve()
     env_file = str(vault_path / ".env") if (vault_path / ".env").exists() else None
@@ -525,7 +525,7 @@ def query(
     typer.echo("\n💭 Thinking...\n")
 
     try:
-        answer = asyncio.run(call_llm(system, messages, config, max_tokens=2048))
+        answer = call_llm(system, messages, config, max_tokens=2048)
         typer.echo(answer)
         typer.echo(
             f"\n---\n*Answer based on {pages_scanned} wiki page(s). "

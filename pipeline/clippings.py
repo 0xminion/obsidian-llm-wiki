@@ -10,8 +10,8 @@ from __future__ import annotations
 from pathlib import Path
 
 from pipeline.config import Config
-from pipeline.markdown import parse_frontmatter, safe_read_file
-from pipeline.models import IngestedSource
+from pipeline.okf_markdown import parse_frontmatter, safe_read_file
+from pipeline.okf_models import IngestedSource
 
 # ── Public API ─────────────────────────────────────────────────────────
 

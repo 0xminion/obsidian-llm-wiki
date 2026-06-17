@@ -12,7 +12,7 @@ from __future__ import annotations
 import os
 
 from pipeline.config import Config
-from pipeline.models import SourceSlice
+from pipeline.okf_models import SourceSlice
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Budgeted content assembly

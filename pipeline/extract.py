@@ -11,8 +11,8 @@ from typing import TYPE_CHECKING
 from pipeline.config import Config
 from pipeline.extractors.web import extract_web
 from pipeline.hasher import hash_content
-from pipeline.markdown import atomic_write, parse_frontmatter, safe_read_file, slugify
-from pipeline.models import IngestedSource
+from pipeline.okf_markdown import atomic_write, parse_frontmatter, safe_read_file, slugify
+from pipeline.okf_models import IngestedSource
 
 if TYPE_CHECKING:
     pass

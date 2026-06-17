@@ -16,8 +16,8 @@ import shutil
 from datetime import UTC, datetime
 from pathlib import Path
 
-from pipeline.markdown import atomic_write, safe_read_file, slugify
-from pipeline.models import ReviewCandidate, SourceState
+from pipeline.okf_markdown import atomic_write, build_frontmatter, safe_read_file, slugify
+from pipeline.okf_models import ReviewCandidate, SourceState
 from pipeline.state import read_state, write_state
 
 # ── Candidate I/O ───────────────────────────────────────────────────────
@@ -168,8 +168,6 @@ def approve_candidate(root_dir: str | Path, candidate_id: str,
     concepts_dir.mkdir(parents=True, exist_ok=True)
 
     # Write the page
-    from pipeline.markdown import build_frontmatter
-
     fm = {
         "title": candidate.title,
         "slug": candidate.slug,

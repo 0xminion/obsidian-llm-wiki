@@ -1,7 +1,7 @@
 """Prompt builders for the LLM knowledge compilation pipeline.
 
 Each function constructs a system prompt + user message pair suitable for
-sending to the LLM via ``pipeline.llm_client.call_llm``.
+sending to the LLM via ``pipeline.llm.providers.call_llm``.
 
 Ported from llm-wiki-compiler/src/compiler/prompts.ts.
 """

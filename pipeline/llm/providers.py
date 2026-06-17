@@ -4,9 +4,9 @@ Concrete implementations for Ollama's native API and any OpenAI-compatible
 endpoint.  Use ``create_llm_client`` to get the right client for a given
 :class:`~pipeline.config.LLMProviderConfig`.
 
-This module is additive to the existing ``pipeline.llm_client`` — the old
-async helper is preserved for backward compatibility while new code should
-prefer the ``LLMClient`` interface defined here.
+The module-level :func:`call_llm` / :func:`acall_llm` helpers provide a
+drop-in replacement for the removed ``pipeline.llm_client.call_llm`` with
+exponential-backoff retry logic.
 """
 
 from __future__ import annotations
@@ -219,3 +219,114 @@ def create_llm_client(config: LLMProviderConfig) -> LLMClient:
         f"Unknown LLM provider: {config.provider!r}. "
         "Supported: 'ollama', 'openai'."
     )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Convenience wrapper with retry logic
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def _resolve_llm_config(config: Any) -> LLMProviderConfig:
+    """Return the LLMProviderConfig from a Config or pass through if already one."""
+    llm = getattr(config, "llm", None)
+    if llm is not None and hasattr(llm, "provider"):
+        return llm
+    if hasattr(config, "provider"):
+        return config  # type: ignore[return-value]
+    raise TypeError(f"Cannot derive LLMProviderConfig from {type(config)!r}")
+
+
+def _extract_user_content(messages: list[dict] | str) -> str:
+    """Extract the user message content from a messages list or plain string.
+
+    The legacy ``call_llm`` accepted ``messages`` as a list of role/content
+    dicts.  The new sync clients take a single ``user`` string.  This helper
+    joins all ``user``-role messages (or returns the string unchanged) so the
+    new clients can be used as a drop-in replacement.
+    """
+    if isinstance(messages, str):
+        return messages
+    parts: list[str] = []
+    for msg in messages:
+        role = msg.get("role", "")
+        content = msg.get("content", "")
+        if role == "user":
+            parts.append(content)
+    if not parts:
+        # Fall back to joining everything (no user-role messages found).
+        parts = [msg.get("content", "") for msg in messages]
+    return "\n\n".join(parts)
+
+
+def call_llm(
+    system: str,
+    messages: list[dict] | str,
+    config: Any,
+    **kwargs: Any,
+) -> str:
+    """Synchronous LLM call with exponential-backoff retry.
+
+    Drop-in replacement for the legacy ``pipeline.llm_client.call_llm``.
+    Accepts the same ``(system, messages, config)`` signature but routes
+    through the new sync :class:`LLMClient` implementations.
+
+    Args:
+        system: System-level instruction for the model.
+        messages: Conversation messages as a list of role/content dicts, or
+            a plain user-content string.
+        config: Pipeline :class:`Config` or :class:`LLMProviderConfig`.
+        **kwargs: Passed through to ``client.chat`` (e.g. ``tools``,
+            ``max_tokens``).
+
+    Returns:
+        The full text content of the model response.
+
+    Raises:
+        Exception: When all retry attempts are exhausted.
+    """
+    import time
+
+    llm_config = _resolve_llm_config(config)
+    client = create_llm_client(llm_config)
+    max_retries = getattr(config, "retry_count", 3)
+    user = _extract_user_content(messages)
+
+    # Filter out kwargs the sync clients don't understand (e.g. tools, on_token).
+    chat_kwargs = {k: v for k, v in kwargs.items() if k not in ("tools", "on_token")}
+
+    for attempt in range(max_retries):
+        try:
+            return client.chat(system, user, **chat_kwargs)
+        except Exception:
+            if attempt == max_retries - 1:
+                raise
+            delay = (
+                getattr(config, "retry_base_ms", 1000)
+                * (getattr(config, "retry_multiplier", 4) ** attempt)
+            ) / 1000.0
+            logger.warning(
+                "LLM call attempt %d/%d failed. Retrying in %.1fs…",
+                attempt + 1,
+                max_retries,
+                delay,
+            )
+            time.sleep(delay)
+
+    # Unreachable — the loop either returns or raises on the last attempt.
+    raise RuntimeError("LLM call exhausted retries without returning")  # pragma: no cover
+
+
+async def acall_llm(
+    system: str,
+    messages: list[dict] | str,
+    config: Any,
+    **kwargs: Any,
+) -> str:
+    """Async wrapper around :func:`call_llm`.
+
+    Uses :func:`asyncio.to_thread` to run the blocking sync client in a
+    thread.  Drop-in replacement for ``await pipeline.llm_client.call_llm(...)``.
+    """
+    import asyncio
+
+    return await asyncio.to_thread(call_llm, system, messages, config, **kwargs)

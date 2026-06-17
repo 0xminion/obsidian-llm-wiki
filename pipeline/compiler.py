@@ -5,12 +5,6 @@ runCompilePipeline(). Handles the full pipeline: change detection, concept
 extraction, page generation, wikilink resolution, index/MOC generation,
 and state persistence.
 
-OKF migration (Task 12): imports now prefer the OKF-native modules
-(``pipeline.okf_models``, ``pipeline.okf_markdown``, ``pipeline.okf_resolver``,
-``pipeline.okf_indexgen``) while retaining backward-compat fallbacks to the
-legacy modules for symbols that have no OKF equivalent yet (``SchemaConfig``,
-``PageKind``).
-
 Usage:
     import asyncio
     from pipeline.compiler import compile
@@ -27,16 +21,13 @@ from pipeline.config import Config, load_config
 from pipeline.hasher import detect_changes
 from pipeline.lock import acquire_lock, release_lock
 
-# SchemaConfig / PageKind are schema-layer types that have not yet been
-# migrated to okf_models — keep importing from the legacy models module.
-from pipeline.models import SchemaConfig  # noqa: F401  (re-exported)
-
-# ── OKF-preferred imports (with legacy fallback) ────────────────────────
-# OKF models carry the same names for the core pipeline dataclasses.
+# SchemaConfig / PageKind are schema-layer types now defined in okf_models.
 from pipeline.okf_markdown import parse_frontmatter, safe_read_file, slugify
 from pipeline.okf_models import (
     CompileResult,
     IngestedSource,
+    PageKind,
+    SchemaConfig,
     SourceChange,
     SourceStatus,
     WikiState,
@@ -279,20 +270,10 @@ async def compile(
         atomic_write(bundle_index_path, bundle_idx)
         print(f"[compiler]   → {bundle_index_path}")
 
-        # ── Step 14: Generate MOC ───────────────────────────────────────────
+        # ── Step 14: MOC (removed) ─────────────────────────────────────
         # The OKF indexgen module does not produce a separate MOC.md —
-        # MoC pages are generated as concept files during the create phase
-        # (see orchestrator).  We keep the legacy MOC generation as a
-        # backward-compat courtesy so existing consumers that read
-        # wiki/MOC.md still work.
-        try:
-            from pipeline.indexgen import generate_moc
-
-            print("[compiler] 🗺 Generating MOC (legacy)...")
-            moc_path = generate_moc(config.wiki_dir, config.concepts_dir)
-            print(f"[compiler]   → {moc_path}")
-        except Exception as exc:
-            print(f"[compiler] ⚠ MOC generation failed: {exc}")
+        # per-directory index.md files (Step 13) replace the legacy MOC.
+        # MoC pages are generated as concept files during the create phase.
 
         # ── Step 15: Persist state ──────────────────────────────────────────
         write_state(config.state_file, state)
@@ -530,8 +511,8 @@ async def _generate_seed_pages(
 
 def _kind_to_dir(kind, config: Config) -> Path:
     """Map a PageKind to the appropriate wiki subdirectory."""
-    # PageKind is still a legacy-model enum; import from legacy models.
-    from pipeline.models import PageKind
+    # PageKind is now defined in okf_models.
+    from pipeline.okf_models import PageKind
 
     if kind == PageKind.CONCEPT:
         return config.concepts_dir

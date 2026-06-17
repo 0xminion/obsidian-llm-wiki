@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import logging
 
-from pipeline.models import SourceChange, SourceStatus, WikiState
+from pipeline.okf_models import SourceChange, SourceStatus, WikiState
 
 logger = logging.getLogger("llmwiki.deps")
 

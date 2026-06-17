@@ -14,7 +14,7 @@ import re
 import subprocess
 import sys
 
-from pipeline.models import IngestedSource
+from pipeline.okf_models import IngestedSource
 
 # ── Constants ──────────────────────────────────────────────────────────
 

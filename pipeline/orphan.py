@@ -12,8 +12,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from pipeline.markdown import atomic_write, build_frontmatter, parse_frontmatter, safe_read_file
-from pipeline.models import WikiState
+from pipeline.okf_markdown import atomic_write, build_frontmatter, parse_frontmatter, safe_read_file
+from pipeline.okf_models import WikiState
 
 # ── Public API ──────────────────────────────────────────────────────────
 

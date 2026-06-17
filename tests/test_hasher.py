@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from pipeline.hasher import detect_changes, hash_content, hash_file
-from pipeline.models import SourceState, WikiState
+from pipeline.okf_models import SourceState, WikiState
 
 
 class TestHashFile:

@@ -100,7 +100,7 @@ async def run_enrichment(
         :class:`EnrichmentResult` with aggregate counts.
     """
     from pipeline.extractors.web import extract_web
-    from pipeline.llm_client import call_llm
+    from pipeline.llm.providers import acall_llm
 
     bd = Path(bundle_dir)
     bd.mkdir(parents=True, exist_ok=True)
@@ -143,7 +143,7 @@ async def run_enrichment(
             {"role": "user", "content": f"Enrichment decision for {url}"},
         ]
         try:
-            response = await call_llm(prompt, messages, config)
+            response = await acall_llm(prompt, messages, config)
         except Exception as exc:
             logger.warning("LLM call failed for %s: %s", url, exc)
             result.errors.append(f"llm {url}: {exc}")
