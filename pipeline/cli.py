@@ -34,10 +34,8 @@ def _resolve_vault(vault: str) -> tuple[Path, "Config"]:  # noqa: F821
     env_file = str(vault_path / ".env") if (vault_path / ".env").exists() else None
     config = load_config(env_file=env_file)
     # Override vault_path if env didn't have one or user specified a different one
-    if (
-        config.vault_path
-        and Path(config.vault_path).expanduser().resolve() != vault_path
-        or not config.vault_path
+    if (config.vault_path and Path(config.vault_path).expanduser().resolve() != vault_path) or (
+        not config.vault_path
     ):
         os.environ["VAULT_PATH"] = str(vault_path)
         config = load_config(env_file=env_file, VAULT_PATH=str(vault_path))
@@ -182,7 +180,7 @@ def ingest(
         result = asyncio.run(run_create(config, all_sources, state))
 
     # ── Post-compile: resolve links, indexes ─────────────────────────
-    from pipeline.hasher import slugify as _slugify
+    from pipeline.okf_markdown import slugify as _slugify
     from pipeline.indexgen import generate_index, generate_moc
     from pipeline.resolver import resolve_links
     from pipeline.state import write_state

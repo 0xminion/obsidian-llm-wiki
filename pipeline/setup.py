@@ -357,7 +357,7 @@ def _build_env_content(
         lines.extend([
             "# ── OpenAI / Custom Provider ─────────────────────",
             f"LLM_API_KEY={llm_api_key}",
-            f"LLM_HOST_URL={llm_host_url}",
+            f"LLM_HOST={llm_host_url}",
             "",
         ])
 

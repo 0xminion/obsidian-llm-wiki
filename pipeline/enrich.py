@@ -327,9 +327,12 @@ def _mint_reference(
         slug = "reference"
     ref_path = refs_dir / f"{slug}.md"
 
+    # Fallback title chain: dec.title → source_url-derived slug → source_url.
+    title = dec.title or slug if slug != "reference" else dec.title or source_url
+
     meta = {
         "type": "Reference",
-        "title": dec.title or slug,
+        "title": title,
         "description": dec.summary or "",
         "tags": dec.tags,
         "timestamp": datetime.now(UTC).strftime("%Y-%m-%d"),
@@ -338,7 +341,7 @@ def _mint_reference(
 
     body = dec.body or dec.summary or ""
     if not body.strip():
-        body = f"Reference page for [{dec.title or source_url}]({source_url})."
+        body = f"Reference page for [{title}]({source_url})."
 
     content = f"{build_frontmatter(meta)}\n\n{body}\n"
     atomic_write(ref_path, content)

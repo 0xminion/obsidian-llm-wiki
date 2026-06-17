@@ -254,6 +254,18 @@ def _strip_tags(html: str) -> str:
     return cleaned.strip()
 
 
+def _safe_chr(codepoint: int, original: str) -> str:
+    """Safely convert a codepoint to a character.
+
+    Returns the original entity text if the codepoint is outside the
+    valid Unicode range (> 0x10FFFF), avoiding a ValueError from chr().
+    """
+    try:
+        return chr(codepoint)
+    except (ValueError, OverflowError):
+        return original
+
+
 def _decode_html_entities(text: str) -> str:
     """Decode common HTML entities."""
     entities = {
@@ -273,12 +285,12 @@ def _decode_html_entities(text: str) -> str:
     # Numeric entities
     text = re.sub(
         r"&#x([0-9a-fA-F]+);",
-        lambda m: chr(int(m.group(1), 16)),
+        lambda m: _safe_chr(int(m.group(1), 16), m.group(0)),
         text,
     )
     text = re.sub(
         r"&#(\d+);",
-        lambda m: chr(int(m.group(1))),
+        lambda m: _safe_chr(int(m.group(1)), m.group(0)),
         text,
     )
     return text

@@ -266,10 +266,13 @@ def _render_html(
 
     # Serialise data as JSON. We use json.dumps with ensure_ascii=False so
     # unicode titles survive. The JSON is embedded in a <script> block.
-    nodes_json = json.dumps(nodes, ensure_ascii=False)
-    edges_json = json.dumps(edges, ensure_ascii=False)
-    backlinks_json = json.dumps(backlinks, ensure_ascii=False)
-    concepts_json = json.dumps(concept_map, ensure_ascii=False)
+    # Escape '<' and '>' to prevent XSS via '</script>' injection — replace
+    # them with their JSON unicode escape sequences so the browser's HTML
+    # parser never sees a literal '</script>' inside the script block.
+    nodes_json = json.dumps(nodes, ensure_ascii=False).replace("<", "\\u003c").replace(">", "\\u003e")
+    edges_json = json.dumps(edges, ensure_ascii=False).replace("<", "\\u003c").replace(">", "\\u003e")
+    backlinks_json = json.dumps(backlinks, ensure_ascii=False).replace("<", "\\u003c").replace(">", "\\u003e")
+    concepts_json = json.dumps(concept_map, ensure_ascii=False).replace("<", "\\u003c").replace(">", "\\u003e")
 
     return _HTML_TEMPLATE.format(
         name=name,

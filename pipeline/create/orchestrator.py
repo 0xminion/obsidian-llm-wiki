@@ -548,7 +548,7 @@ async def _render_and_write_moc(
 
     # Build concept dicts for prompt
     related = [
-        {"title": s.title, "summary": s.summary, "tags": s.tags}
+        {"title": s.title, "summary": s.description, "tags": s.tags}
         for s in summaries
     ]
 

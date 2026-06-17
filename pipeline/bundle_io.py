@@ -123,6 +123,40 @@ def _lint_report_to_dict(report) -> dict:
     }
 
 
+def _safe_extract(tar: tarfile.TarFile, target: str) -> None:
+    """Extract a tarball safely, rejecting members with unsafe paths.
+
+    This is a manual mitigation for CVE-2007-4559 (path traversal via
+    tarfile.extractall) used as a fallback on Python 3.11 where the
+    built-in ``filter`` parameter is not available.
+
+    Rejects any member whose name:
+      - Is an absolute path (starts with ``/``).
+      - Contains a ``..`` path component (which could escape the target).
+      - Contains a Windows-style drive prefix (e.g. ``C:\\``).
+    """
+    base = Path(target).resolve()
+    for member in tar.getmembers():
+        # Reject absolute paths.
+        member_path = member.name
+        if member_path.startswith("/") or member_path.startswith("\\"):
+            raise ValueError(f"Refusing to extract absolute path: {member.name!r}")
+        # Reject Windows drive letters (e.g. C:\foo).
+        if len(member_path) > 1 and member_path[1] == ":" and member_path[2] in ("\\", "/"):
+            raise ValueError(f"Refusing to extract drive-prefixed path: {member.name!r}")
+        # Reject path-traversal via .. components.
+        parts = member_path.replace("\\", "/").split("/")
+        if ".." in parts:
+            raise ValueError(f"Refusing to extract path with '..' component: {member.name!r}")
+        # Verify the resolved destination stays within the target directory.
+        dest = (base / member_path).resolve()
+        try:
+            dest.relative_to(base)
+        except ValueError:
+            raise ValueError(f"Refusing to extract outside target: {member.name!r}")
+    tar.extractall(str(target))
+
+
 def import_bundle(
     tarball: str | Path,
     target_dir: str | Path,
@@ -160,12 +194,25 @@ def import_bundle(
         try:
             tar.extractall(str(target), filter="data")  # py3.12+
         except TypeError:
-            tar.extractall(str(target))  # py3.11 fallback
+            # py3.11 fallback — use a manual filter to reject path traversal.
+            _safe_extract(tar, str(target))
 
-    # Determine the extracted bundle directory (first path component).
+    # Determine the extracted bundle directory.
+    # The tarball may contain a single top-level directory (the bundle) or
+    # multiple top-level entries (files + dirs).  If there's exactly one
+    # top-level entry and it's a directory, use it; otherwise the bundle
+    # root *is* the target directory itself.
     if names:
-        top = names[0].split("/")[0]
-        extracted = target / top
+        top_components = {n.split("/")[0] for n in names if n}
+        if len(top_components) == 1:
+            candidate = target / next(iter(top_components))
+            # Only treat the single top-level entry as the bundle dir if it
+            # is actually a directory; if it's a file, the bundle root is
+            # the target itself.
+            extracted = candidate if candidate.is_dir() else target
+        else:
+            # Multiple top-level entries — the bundle root is target itself.
+            extracted = target
     else:
         extracted = target
 

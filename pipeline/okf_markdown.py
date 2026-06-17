@@ -61,7 +61,11 @@ def slugify(text: str) -> str:
     # Collapse repeated hyphens.
     cleaned = re.sub(r"-+", "-", cleaned)
     # Trim leading/trailing hyphens and lowercase.
-    return cleaned.strip("-").lower()
+    slug = cleaned.strip("-").lower()
+    # Fallback for empty input or input that becomes empty after cleaning.
+    if not slug:
+        return "untitled"
+    return slug
 
 
 # ── Frontmatter ────────────────────────────────────────────────────────

@@ -251,16 +251,17 @@ async def compile(
                 new_slugs.append(slug)
 
         if all_slugs:
-            # Prefer OKF resolver; fall back to legacy if unavailable.
+            # Fully OKF now — no legacy resolver fallback.
             try:
                 from pipeline.okf_resolver import resolve_links
             except ImportError:  # pragma: no cover
-                from pipeline.resolver import resolve_links
+                resolve_links = None
 
-            print("[compiler] 🔗 Resolving wikilinks...")
-            modified = resolve_links(str(config.wiki_dir), all_slugs, new_slugs)
-            if modified:
-                print(f"[compiler]   Updated {modified} page(s) with wikilinks")
+            if resolve_links is not None:
+                print("[compiler] 🔗 Resolving wikilinks...")
+                modified = resolve_links(str(config.wiki_dir), all_slugs, new_slugs)
+                if modified:
+                    print(f"[compiler]   Updated {modified} page(s) with wikilinks")
 
         # ── Step 13: Generate index ─────────────────────────────────────────
         # OKF: generate per-directory index.md + bundle-root index.md.
@@ -290,8 +291,8 @@ async def compile(
             print("[compiler] 🗺 Generating MOC (legacy)...")
             moc_path = generate_moc(config.wiki_dir, config.concepts_dir)
             print(f"[compiler]   → {moc_path}")
-        except Exception:
-            print("[compiler] ⚠ MOC generation skipped (legacy indexgen unavailable)")
+        except Exception as exc:
+            print(f"[compiler] ⚠ MOC generation failed: {exc}")
 
         # ── Step 15: Persist state ──────────────────────────────────────────
         write_state(config.state_file, state)

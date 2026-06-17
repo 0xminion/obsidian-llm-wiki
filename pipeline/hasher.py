@@ -15,9 +15,17 @@ from pipeline.models import SourceChange, SourceStatus, WikiState
 
 
 def hash_file(file_path: str | Path) -> str:
-    """Read a file and compute its SHA-256 hash."""
-    content = Path(file_path).read_text(encoding="utf-8")
-    return hashlib.sha256(content.encode("utf-8")).hexdigest()
+    """Read a file and compute its SHA-256 hash.
+
+    Falls back to reading raw bytes when the file is not valid UTF-8
+    (e.g. binary files), hashing the byte contents directly.
+    """
+    try:
+        content = Path(file_path).read_text(encoding="utf-8")
+        return hashlib.sha256(content.encode("utf-8")).hexdigest()
+    except UnicodeDecodeError:
+        raw = Path(file_path).read_bytes()
+        return hashlib.sha256(raw).hexdigest()
 
 
 def hash_content(content: str) -> str:
