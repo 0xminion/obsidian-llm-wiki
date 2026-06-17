@@ -1,7 +1,8 @@
 """Interactive setup wizard for llmwiki pipeline configuration.
 
-Guides the user through configuring their LLM provider, vault path,
-and API keys, validates connectivity, and writes a .env file.
+Guides the user through configuring their LLM provider (ollama / openai /
+custom), vault path, OKF bundle path, and API keys, validates connectivity,
+writes a .env file, and scaffolds the initial OKF bundle structure.
 """
 
 from __future__ import annotations
@@ -14,14 +15,17 @@ def run_setup() -> None:
     """Interactive setup: ask user for config, validate, write .env.
 
     Steps:
-      1. Ask for Ollama host (default: http://localhost:11434)
-      2. Ask for LLM model (default: gemma4:31b-cloud)
-      3. Ask for embedding model (default: qwen3-embedding:0.6b)
+      1. Ask for LLM provider (ollama / openai / custom)
+      2. If openai/custom: ask for API key and host URL
+      3. If ollama: ask for Ollama host, LLM model, embedding model
       4. Ask for vault path (default: ~/MyVault)
-      5. Ask for output language (default: auto)
-      6. Validate: check vault path exists (or create), check Ollama reachable
-      7. Write .env file to vault path
-      8. Print success + next steps
+      5. Ask for OKF bundle path (default: vault/04-Wiki)
+      6. Ask for output language (default: auto)
+      7. Validate: check vault path, check provider reachable
+      8. Write .env file with LLM_PROVIDER, LLM_API_KEY, OKF_VERSION
+      9. Create initial bundle structure (sources/, entries/, concepts/,
+         mocs/, references/, index.md)
+     10. Print success + next steps
     """
     print()
     print("=" * 60)
@@ -47,30 +51,71 @@ def run_setup() -> None:
                 return result
             print("  ⚠ This field is required. Please enter a value.")
 
-    # ── Step 1: Ollama host ───────────────────────────────────────────
+    def _ask_choice(prompt: str, choices: list[str], default: str) -> str:
+        """Ask for a choice among a list of options."""
+        choices_display = "/".join(choices)
+        while True:
+            result = input(f"{prompt} [{choices_display}] [{default}]: ").strip().lower()
+            if not result:
+                return default
+            if result in choices:
+                return result
+            print(f"  ⚠ Please choose one of: {choices_display}")
+
+    # ── Step 1: LLM Provider selection ─────────────────────────────────
     print("📡 LLM Provider Configuration")
     print("-" * 40)
-    ollama_host = _ask(
-        "Ollama host URL",
-        "http://localhost:11434",
+    print("   ollama  — local Ollama instance (default)")
+    print("   openai  — OpenAI API or compatible endpoint")
+    print("   custom  — custom LLM endpoint with OpenAI-compatible API")
+    print()
+    llm_provider = _ask_choice(
+        "Select LLM provider",
+        ["ollama", "openai", "custom"],
+        "ollama",
     )
-    print(f"   → Host: {ollama_host}")
+    print(f"   → Provider: {llm_provider}")
     print()
 
-    # ── Step 2: LLM model ─────────────────────────────────────────────
-    ollama_model = _ask(
-        "LLM model name",
-        "gemma4:31b-cloud",
-    )
-    print(f"   → Model: {ollama_model}")
-    print()
+    # Provider-specific configuration
+    ollama_host = ""
+    ollama_model = ""
+    ollama_embed_model = ""
+    llm_api_key = ""
+    llm_host_url = ""
 
-    # ── Step 3: Embedding model ───────────────────────────────────────
-    ollama_embed_model = _ask(
-        "Embedding model name",
-        "qwen3-embedding:0.6b",
-    )
-    print(f"   → Embedding model: {ollama_embed_model}")
+    if llm_provider == "ollama":
+        # ── Ollama host ────────────────────────────────────────────────
+        ollama_host = _ask(
+            "Ollama host URL",
+            "http://localhost:11434",
+        )
+        print(f"   → Host: {ollama_host}")
+
+        # ── LLM model ──────────────────────────────────────────────────
+        ollama_model = _ask(
+            "LLM model name",
+            "gemma4:31b-cloud",
+        )
+        print(f"   → Model: {ollama_model}")
+
+        # ── Embedding model ────────────────────────────────────────────
+        ollama_embed_model = _ask(
+            "Embedding model name",
+            "qwen3-embedding:0.6b",
+        )
+        print(f"   → Embedding model: {ollama_embed_model}")
+    else:
+        # ── OpenAI / custom: ask for API key and host URL ───────────────
+        llm_api_key = _ask_required("API key")
+        print(f"   → API key: {'*' * len(llm_api_key)}")
+
+        default_host = "https://api.openai.com/v1" if llm_provider == "openai" else ""
+        if default_host:
+            llm_host_url = _ask("LLM host URL", default_host)
+        else:
+            llm_host_url = _ask_required("LLM host URL")
+        print(f"   → Host URL: {llm_host_url}")
     print()
 
     # ── Step 4: Vault path ────────────────────────────────────────────
@@ -85,7 +130,19 @@ def run_setup() -> None:
     print(f"   → Vault: {vault_path}")
     print()
 
-    # ── Step 5: Output language ───────────────────────────────────────
+    # ── Step 5: OKF bundle path ────────────────────────────────────────
+    print("📦 OKF Bundle Configuration")
+    print("-" * 40)
+    default_bundle = str(vault_path / "04-Wiki")
+    bundle_raw = _ask(
+        "OKF bundle path (where the compiled knowledge bundle lives)",
+        default_bundle,
+    )
+    bundle_path = Path(bundle_raw).expanduser().resolve()
+    print(f"   → Bundle: {bundle_path}")
+    print()
+
+    # ── Step 6: Output language ───────────────────────────────────────
     print("🌐 Language Settings")
     print("-" * 40)
     output_language = _ask(
@@ -97,13 +154,13 @@ def run_setup() -> None:
     print(f"   → Language: {output_language if output_language else 'auto-detect'}")
     print()
 
-    # ── Step 6: Validation ────────────────────────────────────────────
+    # ── Step 7: Validation ────────────────────────────────────────────
     print("🔍 Validating configuration...")
     print("-" * 40)
 
     all_ok = True
 
-    # 6a: Check vault path
+    # 7a: Check vault path
     if not vault_path.exists():
         create_choice = _ask(
             f"   Vault path '{vault_path}' does not exist. Create it?",
@@ -121,7 +178,7 @@ def run_setup() -> None:
     else:
         print(f"   ✅ Vault path exists: {vault_path}")
 
-    # Create expected directory structure
+    # Create expected vault directory structure
     for subdir in ["02-Clippings", "04-Wiki"]:
         sub = vault_path / subdir
         if not sub.exists():
@@ -130,33 +187,39 @@ def run_setup() -> None:
         else:
             print(f"   ✅ Directory exists: {sub}")
 
-    # 6b: Check Ollama reachable
-    print()
-    print("   Checking Ollama connectivity...")
-    ollama_reachable = _check_ollama(ollama_host)
-    if ollama_reachable:
-        print(f"   ✅ Ollama is reachable at {ollama_host}")
+    # 7b: Provider-specific connectivity check
+    if llm_provider == "ollama":
+        print()
+        print("   Checking Ollama connectivity...")
+        ollama_reachable = _check_ollama(ollama_host)
+        if ollama_reachable:
+            print(f"   ✅ Ollama is reachable at {ollama_host}")
+        else:
+            print(f"   ⚠ Could not reach Ollama at {ollama_host}")
+            print("     Make sure Ollama is running. You can continue anyway.")
+            # Not blocking — user might start Ollama later
+
+        # 7c: Check model availability
+        if ollama_reachable:
+            model_available = _check_model(ollama_host, ollama_model)
+            if model_available:
+                print(f"   ✅ Model '{ollama_model}' is available")
+            else:
+                print(f"   ⚠ Model '{ollama_model}' not found on Ollama host")
+                print(f"     Run: ollama pull {ollama_model}")
+                # Not blocking
+
+            embed_available = _check_model(ollama_host, ollama_embed_model)
+            if embed_available:
+                print(f"   ✅ Embedding model '{ollama_embed_model}' is available")
+            else:
+                print(f"   ⚠ Embedding model '{ollama_embed_model}' not found")
+                print(f"     Run: ollama pull {ollama_embed_model}")
     else:
-        print(f"   ⚠ Could not reach Ollama at {ollama_host}")
-        print("     Make sure Ollama is running. You can continue anyway.")
-        # Not blocking — user might start Ollama later
-
-    # 6c: Check model availability
-    if ollama_reachable:
-        model_available = _check_model(ollama_host, ollama_model)
-        if model_available:
-            print(f"   ✅ Model '{ollama_model}' is available")
-        else:
-            print(f"   ⚠ Model '{ollama_model}' not found on Ollama host")
-            print(f"     Run: ollama pull {ollama_model}")
-            # Not blocking
-
-        embed_available = _check_model(ollama_host, ollama_embed_model)
-        if embed_available:
-            print(f"   ✅ Embedding model '{ollama_embed_model}' is available")
-        else:
-            print(f"   ⚠ Embedding model '{ollama_embed_model}' not found")
-            print(f"     Run: ollama pull {ollama_embed_model}")
+        # For openai/custom, we could do a lightweight API ping, but we
+        # keep it simple: no blocking validation for the API key.
+        print(f"   ℹ Provider '{llm_provider}' configured. Connectivity will be")
+        print(f"     validated on first run. Host URL: {llm_host_url}")
 
     print()
 
@@ -165,13 +228,17 @@ def run_setup() -> None:
         print("   Please fix the issues above and run 'llmwiki setup' again.")
         sys.exit(1)
 
-    # ── Step 7: Write .env file ───────────────────────────────────────
+    # ── Step 8: Write .env file ────────────────────────────────────────
     env_path = vault_path / ".env"
     env_content = _build_env_content(
+        llm_provider=llm_provider,
         ollama_host=ollama_host,
         ollama_model=ollama_model,
         ollama_embed_model=ollama_embed_model,
+        llm_api_key=llm_api_key,
+        llm_host_url=llm_host_url,
         vault_path=str(vault_path),
+        bundle_path=str(bundle_path),
         output_language=output_language,
     )
 
@@ -193,7 +260,14 @@ def run_setup() -> None:
         env_path.write_text(env_content)
         print(f"   ✅ Written: {env_path}")
 
-    # ── Step 8: Print success + next steps ────────────────────────────
+    # ── Step 9: Create initial OKF bundle structure ────────────────────
+    print()
+    print("📦 Creating initial OKF bundle structure...")
+    print("-" * 40)
+    _create_bundle_structure(bundle_path)
+    print(f"   ✅ Bundle structure created at: {bundle_path}")
+
+    # ── Step 10: Print success + next steps ────────────────────────────
     print()
     print("=" * 60)
     print("  ✅ Setup complete!")
@@ -219,12 +293,44 @@ def run_setup() -> None:
 
 # ── Helpers ────────────────────────────────────────────────────────────────
 
+# OKF bundle subdirectories that are always created at setup time.
+_BUNDLE_SUBDIRS = ["sources", "entries", "concepts", "mocs", "references"]
+
+# Frontmatter for the bundle-root index.md.
+_INDEX_FRONTMATTER = "---\nokf_version: '0.1'\n---\n"
+
+
+def _create_bundle_structure(bundle_path: Path) -> None:
+    """Create the initial OKF bundle directory tree under ``bundle_path``.
+
+    Creates ``sources/``, ``entries/``, ``concepts/``, ``mocs/``, and
+    ``references/`` directories, then writes a root ``index.md`` with an
+    ``okf_version: '0.1'`` frontmatter block. Existing files/directories
+    are left untouched (idempotent).
+    """
+    bundle_path.mkdir(parents=True, exist_ok=True)
+
+    for subdir in _BUNDLE_SUBDIRS:
+        (bundle_path / subdir).mkdir(parents=True, exist_ok=True)
+
+    index_path = bundle_path / "index.md"
+    if not index_path.exists():
+        index_path.write_text(
+            _INDEX_FRONTMATTER + "\n# Knowledge Bundle\n\n"
+            "This is the root index of your OKF v0.1 knowledge bundle.\n",
+            encoding="utf-8",
+        )
+
 
 def _build_env_content(
+    llm_provider: str,
     ollama_host: str,
     ollama_model: str,
     ollama_embed_model: str,
+    llm_api_key: str,
+    llm_host_url: str,
     vault_path: str,
+    bundle_path: str,
     output_language: str,
 ) -> str:
     """Build the .env file content from configuration values."""
@@ -232,10 +338,33 @@ def _build_env_content(
         "# llmwiki configuration",
         "# Generated by llmwiki setup wizard",
         "",
-        "# ── Ollama ──────────────────────────────────────",
-        f"OLLAMA_HOST={ollama_host}",
-        f"OLLAMA_MODEL={ollama_model}",
-        f"OLLAMA_EMBED_MODEL={ollama_embed_model}",
+        "# ── LLM Provider ──────────────────────────────",
+        f"LLM_PROVIDER={llm_provider}",
+        "",
+    ]
+
+    # Provider-specific fields
+    if llm_provider == "ollama":
+        lines.extend([
+            "# ── Ollama ──────────────────────────────────────",
+            f"OLLAMA_HOST={ollama_host}",
+            f"OLLAMA_MODEL={ollama_model}",
+            f"OLLAMA_EMBED_MODEL={ollama_embed_model}",
+            "",
+        ])
+    else:
+        # openai / custom
+        lines.extend([
+            "# ── OpenAI / Custom Provider ─────────────────────",
+            f"LLM_API_KEY={llm_api_key}",
+            f"LLM_HOST_URL={llm_host_url}",
+            "",
+        ])
+
+    lines.extend([
+        "# ── OKF Bundle ──────────────────────────────────",
+        f"OKF_BUNDLE_PATH={bundle_path}",
+        "OKF_VERSION=0.1",
         "",
         "# ── Vault ───────────────────────────────────────",
         f"VAULT_PATH={vault_path}",
@@ -248,7 +377,8 @@ def _build_env_content(
         "# ── Concurrency ─────────────────────────────────",
         "COMPILE_CONCURRENCY=3",
         "",
-    ]
+    ])
+
     if output_language:
         lines.append(f"LLMWIKI_OUTPUT_LANGUAGE={output_language}")
     else:

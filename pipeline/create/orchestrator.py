@@ -4,6 +4,14 @@ Processes each ingested source: renders entry, extracts concepts, renders
 concept pages, then groups into MoCs.  Uses configurable concurrency.
 
 Ported from llm-wiki-compiler/src/compiler/index.ts.
+
+OKF migration (Task 12): page rendering now uses the OKF-native renderers
+(``pipeline.okf_renderer``) which produce OKF v0.1 frontmatter.  The LLM
+call pattern (one call per item) is preserved — the LLM generates the
+*body* content, and the OKF renderer wraps it with conformant frontmatter.
+Data models are imported from ``pipeline.okf_models``; ``ProvenanceState``
+is retained from the legacy ``pipeline.models`` module because it has no
+OKF equivalent yet.
 """
 
 from __future__ import annotations
@@ -16,17 +24,28 @@ from datetime import UTC, datetime
 from pipeline.config import Config
 from pipeline.hasher import hash_content
 from pipeline.llm_client import call_llm
-from pipeline.markdown import atomic_write, safe_read_file, slugify
-from pipeline.models import (
+
+# ProvenanceState has no OKF equivalent — keep from legacy models.
+from pipeline.models import ProvenanceState
+from pipeline.okf_markdown import atomic_write, parse_frontmatter, safe_read_file, slugify
+from pipeline.okf_models import (
     CompileResult,
     ExtractedConcept,
     IngestedSource,
     PageSummary,
-    ProvenanceState,
     WikiState,
 )
-from pipeline.page_renderer import render_concept, render_entry, render_moc
-from pipeline.prompts import EXTRACTION_TOOLS
+from pipeline.okf_renderer import (
+    render_concept_page,
+    render_entry_page,
+    render_moc_page,
+)
+from pipeline.prompts import (
+    EXTRACTION_TOOLS,
+    build_concept_prompt,
+    build_entry_prompt,
+    build_moc_prompt,
+)
 from pipeline.state import update_source_state
 
 logger = logging.getLogger("llmwiki.orchestrator")
@@ -58,12 +77,12 @@ async def run_create(
     """Run the Stage 2 compilation pipeline.
 
     For each source:
-      1. Render entry note via LLM → write to entries_dir.
+      1. Render entry note via LLM → wrap with OKF frontmatter → write to entries_dir.
       2. Extract concepts via LLM tool-calling.
       3. Render each concept page (in parallel) → write to concepts_dir.
     Then:
       4. Group concepts by tags → determine MoC topics.
-      5. Render each MoC → write to mocs_dir.
+      5. Render each MoC → wrap with OKF frontmatter → write to mocs_dir.
 
     Args:
         config: Pipeline configuration.
@@ -98,16 +117,19 @@ async def run_create(
                 source = sources[filename]
                 compiled_at = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-                # 1. Render entry
+                # 1. Render entry — LLM call produces body, OKF renderer wraps it
                 concept_context = _format_concept_context(existing_index)
-                entry_md = await render_entry(
-                    config,
-                    filename,
-                    source.title,
-                    source.content,
-                    concept_context,
+                entry_body = await _generate_entry_body(
+                    config, filename, source.title, source.content, concept_context
                 )
                 entry_slug = slugify(source.title)
+                entry_md = render_entry_page(
+                    title=source.title,
+                    summary=_extract_first_paragraph(entry_body),
+                    source_concept_id=f"sources/{filename}",
+                    body=entry_body,
+                    timestamp=compiled_at,
+                )
                 entry_path = config.entries_dir / f"{entry_slug}.md"
                 atomic_write(entry_path, entry_md)
                 result.pages.append(str(entry_path))
@@ -124,7 +146,7 @@ async def run_create(
                     summary = PageSummary(
                         title=c.concept,
                         slug=slug,
-                        summary=c.summary,
+                        description=c.summary,
                         tags=c.tags,
                     )
                     concept_names.append(c.concept)
@@ -204,6 +226,65 @@ async def run_create(
 
 
 # ── Internal helpers ────────────────────────────────────────────────────
+
+
+async def _generate_entry_body(
+    config: Config,
+    source_filename: str,
+    source_title: str,
+    source_content: str,
+    concept_context: str,
+) -> str:
+    """Call the LLM to generate the entry note body (one LLM call per source).
+
+    This preserves the legacy "one call per item" pattern.  The LLM produces
+    raw markdown; the OKF renderer (:func:`render_entry_page`) wraps it with
+    OKF frontmatter afterward.
+
+    Raises:
+        ValueError: If both attempts produce content below the minimum threshold.
+    """
+    system_prompt = build_entry_prompt(source_title, source_content, concept_context)
+
+    messages: list[dict] = [
+        {
+            "role": "user",
+            "content": f"Analyse the source document '{source_title}' and write the entry note.",
+        }
+    ]
+
+    result = await call_llm(system_prompt, messages, config)
+
+    body = _extract_body(result)
+    if len(body) >= config.entry_min_body_chars:
+        return result
+
+    logger.warning(
+        "Entry for '%s' is too short (%d chars, need %d). Retrying with stronger prompt.",
+        source_title,
+        len(body),
+        config.entry_min_body_chars,
+    )
+
+    # Retry with stronger prompt
+    stronger_system = (
+        system_prompt
+        + "\n\n**CRITICAL:** Your previous response was too short. "
+        + "You MUST produce a comprehensive, detailed entry with substantive findings. "
+        + f"The body must be at least {config.entry_min_body_chars} characters. "
+        + "Do NOT produce stubs or shallow summaries. Surface ALL available insights."
+    )
+
+    result2 = await call_llm(stronger_system, messages, config)
+    body2 = _extract_body(result2)
+
+    if len(body2) < config.entry_min_body_chars:
+        raise ValueError(
+            f"Entry for '{source_title}' failed minimum body check "
+            f"after retry ({len(body2)} < {config.entry_min_body_chars})"
+        )
+
+    return result2
 
 
 async def _extract_concepts(
@@ -309,14 +390,22 @@ def _parse_raw_json_concepts(raw: str) -> list[ExtractedConcept] | None:
 
 
 def _build_concepts_from_list(raw_list: list[dict]) -> list[ExtractedConcept]:
-    """Build ExtractedConcept objects from raw dict list."""
+    """Build ExtractedConcept objects from raw dict list.
+
+    The OKF :class:`ExtractedConcept` does not have a ``provenance_state``
+    field (unlike the legacy model), so we validate the value but do not
+    pass it to the constructor.  This keeps the parsing logic backward
+    compatible with LLM responses that include ``provenance_state``.
+    """
     concepts: list[ExtractedConcept] = []
     for item in raw_list:
+        # Validate provenance_state for logging / future use, but don't
+        # pass it to the OKF ExtractedConcept (no such field).
         prov_raw = item.get("provenance_state", "extracted")
         try:
-            prov = ProvenanceState(prov_raw)
+            ProvenanceState(prov_raw)  # validate
         except ValueError:
-            prov = ProvenanceState.EXTRACTED
+            pass  # ignore invalid values silently
 
         concepts.append(
             ExtractedConcept(
@@ -325,7 +414,6 @@ def _build_concepts_from_list(raw_list: list[dict]) -> list[ExtractedConcept]:
                 is_new=item.get("is_new", True),
                 tags=item.get("tags", []),
                 confidence=item.get("confidence"),
-                provenance_state=prov,
             )
         )
     return concepts
@@ -337,7 +425,11 @@ async def _render_and_write_concept(
     source_content: str,
     existing_index: str,
 ) -> str:
-    """Render a concept page and write to disk."""
+    """Render a concept page and write to disk.
+
+    The LLM call generates the concept body (one call per concept), then the
+    OKF renderer (:func:`render_concept_page`) wraps it with OKF frontmatter.
+    """
     slug = slugify(concept.concept)
 
     # Check for existing page
@@ -347,16 +439,81 @@ async def _render_and_write_concept(
     # Build related pages context
     related_pages = existing_index
 
-    markdown = await render_concept(
-        config,
-        concept.concept,
-        source_content,
-        existing_page=existing_page,
-        related_pages=related_pages,
+    # One LLM call per concept — generates the body markdown.
+    concept_body = await _generate_concept_body(
+        config, concept.concept, source_content, existing_page, related_pages
+    )
+
+    # Wrap with OKF frontmatter
+    markdown = render_concept_page(
+        title=concept.concept,
+        summary=concept.summary,
+        body=_extract_body(concept_body),
+        tags=concept.tags,
+        timestamp=datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
     )
 
     atomic_write(concept_path, markdown)
     return slug
+
+
+async def _generate_concept_body(
+    config: Config,
+    concept_name: str,
+    source_content: str,
+    existing_page: str,
+    related_pages: str,
+) -> str:
+    """Call the LLM to generate a concept page body (one call per concept).
+
+    Preserves the legacy retry-with-stronger-prompt pattern.
+
+    Raises:
+        ValueError: If both attempts produce content below the minimum threshold.
+    """
+    system_prompt = build_concept_prompt(
+        concept_name, source_content, existing_page, related_pages
+    )
+
+    messages: list[dict] = [
+        {
+            "role": "user",
+            "content": f"Write the concept note for '{concept_name}'.",
+        }
+    ]
+
+    result = await call_llm(system_prompt, messages, config)
+
+    body = _extract_body(result)
+    if len(body) >= config.concept_min_body_chars:
+        return result
+
+    logger.warning(
+        "Concept '%s' is too short (%d chars, need %d). Retrying with stronger prompt.",
+        concept_name,
+        len(body),
+        config.concept_min_body_chars,
+    )
+
+    stronger_system = (
+        system_prompt
+        + "\n\n**CRITICAL:** Your previous response was a stub — it was far too short. "
+        + "You MUST produce a comprehensive concept page with substantive prose. "
+        + f"The body must be at least {config.concept_min_body_chars} characters. "
+        + "Write 2-4 flowing prose paragraphs for each section. "
+        + "This is evergreen content — standalone, self-contained, insightful."
+    )
+
+    result2 = await call_llm(stronger_system, messages, config)
+    body2 = _extract_body(result2)
+
+    if len(body2) < config.concept_min_body_chars:
+        raise ValueError(
+            f"Concept '{concept_name}' failed minimum body check "
+            f"after retry ({len(body2)} < {config.concept_min_body_chars})"
+        )
+
+    return result2
 
 
 def _determine_moc_topics(
@@ -382,7 +539,11 @@ async def _render_and_write_moc(
     topic: str,
     summaries: list[PageSummary],
 ) -> str:
-    """Render a MoC page and write to disk."""
+    """Render a MoC page and write to disk.
+
+    The LLM call generates the MoC body (one call per MoC), then the OKF
+    renderer (:func:`render_moc_page`) wraps it with OKF frontmatter.
+    """
     slug = slugify(topic)
 
     # Build concept dicts for prompt
@@ -399,11 +560,77 @@ async def _render_and_write_moc(
         if page:
             concept_pages_text += f"\n\n--- {s.title} ---\n{page[:2000]}"
 
-    markdown = await render_moc(config, topic, related, concept_pages_text)
+    # One LLM call per MoC — generates the body markdown
+    moc_body = await _generate_moc_body(config, topic, related, concept_pages_text)
+
+    # Build concept_links for OKF renderer: (concept_id, display_text)
+    concept_links: list[tuple[str, str]] = [
+        (f"concepts/{s.slug}", s.title) for s in summaries
+    ]
+
+    markdown = render_moc_page(
+        title=topic,
+        summary=_extract_first_paragraph(_extract_body(moc_body)) or topic,
+        concept_links=concept_links,
+        timestamp=datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    )
 
     moc_path = config.mocs_dir / f"{slug}.md"
     atomic_write(moc_path, markdown)
     return slug
+
+
+async def _generate_moc_body(
+    config: Config,
+    topic: str,
+    related_concepts: list[dict],
+    concept_pages: str,
+) -> str:
+    """Call the LLM to generate a MoC body (one call per MoC).
+
+    Preserves the legacy retry-with-stronger-prompt pattern.
+
+    Raises:
+        ValueError: If the generated MoC is a stub.
+    """
+    system_prompt = build_moc_prompt(topic, related_concepts, concept_pages)
+
+    messages: list[dict] = [
+        {
+            "role": "user",
+            "content": f"Create the Map of Content for '{topic}'.",
+        }
+    ]
+
+    result = await call_llm(system_prompt, messages, config)
+
+    # Must NOT be stub — enforce meaningful content
+    body = _extract_body(result)
+    if not _is_stub(body):
+        return result
+
+    logger.warning(
+        "MoC '%s' appears to be a stub. Retrying with stronger prompt.", topic
+    )
+
+    stronger_system = (
+        system_prompt
+        + "\n\n**CRITICAL:** Your previous response was a stub — it was far too short. "
+        + "You MUST provide genuine synthesis, showing how concepts relate to each other. "
+        + "Each concept needs a summary, its relation to the topic, and connections to "
+        + "other concepts. This is NOT a simple list — it's a cartographic overview."
+    )
+
+    result2 = await call_llm(stronger_system, messages, config)
+    body2 = _extract_body(result2)
+
+    if _is_stub(body2):
+        raise ValueError(
+            f"MoC '{topic}' is still a stub after retry — "
+            "could not generate meaningful content"
+        )
+
+    return result2
 
 
 def _build_existing_index(state: WikiState) -> str:
@@ -427,3 +654,41 @@ def _build_existing_index(state: WikiState) -> str:
 def _format_concept_context(existing_index: str) -> str:
     """Format concept context for entry prompts."""
     return existing_index
+
+
+# ── Markdown helpers (OKF-aware) ─────────────────────────────────────────
+
+
+def _extract_body(markdown: str) -> str:
+    """Extract body text from markdown, stripping frontmatter."""
+    _meta, body = parse_frontmatter(markdown)
+    return body.strip()
+
+
+def _extract_first_paragraph(markdown: str) -> str:
+    """Extract the first non-empty, non-header paragraph from ``markdown``.
+
+    Used as a summary/description field for OKF frontmatter when the LLM
+    output doesn't already provide an explicit summary.
+    """
+    if not markdown:
+        return ""
+    for para in markdown.strip().split("\n\n"):
+        stripped = para.strip()
+        if not stripped:
+            continue
+        # Skip headers, blockquotes, code fences, horizontal rules
+        if stripped.startswith("#") or stripped.startswith(">"):
+            continue
+        if stripped.startswith("```") or stripped.startswith("---"):
+            continue
+        # Truncate to a reasonable description length
+        if len(stripped) > 200:
+            return stripped[:197] + "..."
+        return stripped
+    return ""
+
+
+def _is_stub(body: str) -> bool:
+    """Check if the body text looks like a stub (very short or placeholder)."""
+    return len(body) < 200

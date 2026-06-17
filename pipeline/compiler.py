@@ -5,6 +5,12 @@ runCompilePipeline(). Handles the full pipeline: change detection, concept
 extraction, page generation, wikilink resolution, index/MOC generation,
 and state persistence.
 
+OKF migration (Task 12): imports now prefer the OKF-native modules
+(``pipeline.okf_models``, ``pipeline.okf_markdown``, ``pipeline.okf_resolver``,
+``pipeline.okf_indexgen``) while retaining backward-compat fallbacks to the
+legacy modules for symbols that have no OKF equivalent yet (``SchemaConfig``,
+``PageKind``).
+
 Usage:
     import asyncio
     from pipeline.compiler import compile
@@ -14,16 +20,23 @@ Usage:
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime
 from pathlib import Path
 
 from pipeline.config import Config, load_config
 from pipeline.hasher import detect_changes
 from pipeline.lock import acquire_lock, release_lock
-from pipeline.markdown import parse_frontmatter, safe_read_file, slugify
-from pipeline.models import (
+
+# SchemaConfig / PageKind are schema-layer types that have not yet been
+# migrated to okf_models — keep importing from the legacy models module.
+from pipeline.models import SchemaConfig  # noqa: F401  (re-exported)
+
+# ── OKF-preferred imports (with legacy fallback) ────────────────────────
+# OKF models carry the same names for the core pipeline dataclasses.
+from pipeline.okf_markdown import parse_frontmatter, safe_read_file, slugify
+from pipeline.okf_models import (
     CompileResult,
     IngestedSource,
-    SchemaConfig,
     SourceChange,
     SourceStatus,
     WikiState,
@@ -56,9 +69,11 @@ async def compile(
       12. Resolve wikilinks
       13. Generate index
       14. Generate MOC
-      15. Persist state
-      16. Release lock
-      17. Return CompileResult
+      15. Generate per-directory index.md files (OKF)
+      16. Generate/update log.md (OKF)
+      17. Persist state
+      18. Release lock
+      19. Return CompileResult
 
     Args:
         root_dir: Path to the Obsidian vault root.
@@ -152,12 +167,16 @@ async def compile(
             )
 
         # ── Step 7: Mark deleted sources as orphaned ────────────────────────
+        log_entries = []  # collected for log.md generation (Step 16)
         for del_file in sorted(deleted):
             print(f"[compiler] 🗑 Orphaning concepts from deleted source: {del_file}")
             from pipeline.orphan import mark_orphaned
 
             mark_orphaned(str(config.wiki_dir), del_file, state)
             remove_source_state(state, del_file)
+            log_entries.append(
+                _make_log_entry("deleted", f"sources/{del_file}", del_file)
+            )
 
         # ── Step 8: Find frozen slugs ───────────────────────────────────────
         from pipeline.deps import find_frozen_slugs
@@ -206,6 +225,21 @@ async def compile(
         print("[compiler] 🤖 Running LLM creation phase...")
         result = await run_create(config, sources_dict, state)
 
+        # Collect log entries for compiled sources
+        for filename in sorted(to_compile):
+            log_entries.append(
+                _make_log_entry("compiled", f"sources/{filename}", filename)
+            )
+        for concept in result.concepts:
+            slug = slugify(concept.concept)
+            log_entries.append(
+                _make_log_entry(
+                    "created" if getattr(concept, "is_new", False) else "updated",
+                    f"concepts/{slug}",
+                    concept.concept,
+                )
+            )
+
         # ── Step 12: Resolve wikilinks ──────────────────────────────────────
         # Collect all concept slugs from this run
         all_slugs: list[str] = []
@@ -217,7 +251,11 @@ async def compile(
                 new_slugs.append(slug)
 
         if all_slugs:
-            from pipeline.resolver import resolve_links
+            # Prefer OKF resolver; fall back to legacy if unavailable.
+            try:
+                from pipeline.okf_resolver import resolve_links
+            except ImportError:  # pragma: no cover
+                from pipeline.resolver import resolve_links
 
             print("[compiler] 🔗 Resolving wikilinks...")
             modified = resolve_links(str(config.wiki_dir), all_slugs, new_slugs)
@@ -225,22 +263,48 @@ async def compile(
                 print(f"[compiler]   Updated {modified} page(s) with wikilinks")
 
         # ── Step 13: Generate index ─────────────────────────────────────────
-        from pipeline.indexgen import generate_index
+        # OKF: generate per-directory index.md + bundle-root index.md.
+        from pipeline.okf_indexgen import (
+            generate_bundle_index,
+        )
+        from pipeline.okf_markdown import atomic_write
 
-        print("[compiler] 📇 Generating index...")
-        idx_path = generate_index(config.wiki_dir, config.concepts_dir)
-        print(f"[compiler]   → {idx_path}")
+        print("[compiler] 📇 Generating OKF directory indexes...")
+        _generate_all_directory_indexes(config, atomic_write)
+
+        print("[compiler] 📇 Generating OKF bundle index...")
+        bundle_idx = generate_bundle_index(config.bundle_dir, config.okf_version)
+        bundle_index_path = config.bundle_dir / "index.md"
+        atomic_write(bundle_index_path, bundle_idx)
+        print(f"[compiler]   → {bundle_index_path}")
 
         # ── Step 14: Generate MOC ───────────────────────────────────────────
-        from pipeline.indexgen import generate_moc
+        # The OKF indexgen module does not produce a separate MOC.md —
+        # MoC pages are generated as concept files during the create phase
+        # (see orchestrator).  We keep the legacy MOC generation as a
+        # backward-compat courtesy so existing consumers that read
+        # wiki/MOC.md still work.
+        try:
+            from pipeline.indexgen import generate_moc
 
-        print("[compiler] 🗺 Generating MOC...")
-        moc_path = generate_moc(config.wiki_dir, config.concepts_dir)
-        print(f"[compiler]   → {moc_path}")
+            print("[compiler] 🗺 Generating MOC (legacy)...")
+            moc_path = generate_moc(config.wiki_dir, config.concepts_dir)
+            print(f"[compiler]   → {moc_path}")
+        except Exception:
+            print("[compiler] ⚠ MOC generation skipped (legacy indexgen unavailable)")
 
         # ── Step 15: Persist state ──────────────────────────────────────────
         write_state(config.state_file, state)
         print(f"[compiler] 💾 State persisted ({len(state.sources)} sources)")
+
+        # ── Step 16: Generate/update log.md ─────────────────────────────────
+        from pipeline.okf_indexgen import generate_log
+
+        print("[compiler] 📝 Generating log.md...")
+        log_md = generate_log(log_entries)
+        log_path = config.bundle_dir / "log.md"
+        atomic_write(log_path, log_md)
+        print(f"[compiler]   → {log_path}")
 
         # ── Result summary ──────────────────────────────────────────────────
         print(
@@ -254,8 +318,58 @@ async def compile(
         return result
 
     finally:
-        # ── Step 16: Release lock ───────────────────────────────────────────
+        # ── Step 18: Release lock ───────────────────────────────────────────
         release_lock(config.lock_file)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# OKF index/log helpers
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def _generate_all_directory_indexes(config: Config, atomic_write) -> None:
+    """Generate ``index.md`` for each OKF bundle sub-directory.
+
+    Covers: sources/, entries/, concepts/, mocs/, references/.
+    Directories that do not exist are silently skipped.
+    """
+    from pipeline.okf_indexgen import generate_directory_index
+
+    dir_map = {
+        "sources": config.sources_dir,
+        "entries": config.entries_dir,
+        "concepts": config.concepts_dir,
+        "mocs": config.mocs_dir,
+        "references": config.references_dir,
+    }
+
+    for dir_name, dir_path in dir_map.items():
+        if not dir_path.is_dir():
+            continue
+        md_files = sorted(dir_path.glob("*.md"))
+        # Skip index.md / log.md themselves
+        md_files = [
+            f for f in md_files if f.name not in {"index.md", "log.md"}
+        ]
+        if not md_files:
+            continue
+        content = generate_directory_index(dir_path, md_files)
+        index_path = dir_path / "index.md"
+        atomic_write(index_path, content)
+
+
+def _make_log_entry(action: str, concept_id: str, description: str):
+    """Build a :class:`LogEntry` for the compilation change log."""
+    from pipeline.okf_models import LogEntry
+
+    now = datetime.now(UTC)
+    return LogEntry(
+        date=now.strftime("%Y-%m-%d"),
+        action=action,
+        concept_id=concept_id,
+        description=description,
+        timestamp=now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+    )
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -371,8 +485,8 @@ async def _generate_seed_pages(
 
         page_path = kind_dir / f"{slug}.md"
 
-        # Build frontmatter + body
-        from pipeline.markdown import atomic_write, build_frontmatter
+        # Build frontmatter + body — prefer OKF markdown helpers.
+        from pipeline.okf_markdown import atomic_write, build_frontmatter
 
         meta: dict = {
             "title": seed.title,
@@ -415,6 +529,7 @@ async def _generate_seed_pages(
 
 def _kind_to_dir(kind, config: Config) -> Path:
     """Map a PageKind to the appropriate wiki subdirectory."""
+    # PageKind is still a legacy-model enum; import from legacy models.
     from pipeline.models import PageKind
 
     if kind == PageKind.CONCEPT:

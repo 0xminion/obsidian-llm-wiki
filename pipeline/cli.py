@@ -1,19 +1,24 @@
-"""Typer CLI for the llmwiki knowledge compiler pipeline.
+"""Typer CLI for the OKF knowledge compiler pipeline.
 
-Sources in, interlinked wiki out. All commands are real implementations
-connected to the pipeline modules.
+OKF (Open Knowledge Format) v0.1 — sources in, interlinked OKF bundle out.
+
+All 11 commands:
+  setup, ingest, compile, lint, query, candidates,
+  visualize, enrich, export, import, (help)
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
+import os
 from pathlib import Path
 
 import typer
 
 app = typer.Typer(
-    name="llmwiki",
-    help="Knowledge compiler CLI. Sources in, interlinked wiki out.",
+    name="okf",
+    help="OKF knowledge compiler CLI. Sources in, interlinked OKF bundle out.",
     no_args_is_help=True,
 )
 
@@ -21,7 +26,7 @@ app = typer.Typer(
 # ── Shared helpers ────────────────────────────────────────────────────────
 
 
-def _resolve_vault(vault: str) -> tuple[Path, Config]:  # noqa: F821
+def _resolve_vault(vault: str) -> tuple[Path, "Config"]:  # noqa: F821
     """Resolve vault path and load config. Returns (vault_path, config)."""
     from pipeline.config import load_config
 
@@ -29,14 +34,17 @@ def _resolve_vault(vault: str) -> tuple[Path, Config]:  # noqa: F821
     env_file = str(vault_path / ".env") if (vault_path / ".env").exists() else None
     config = load_config(env_file=env_file)
     # Override vault_path if env didn't have one or user specified a different one
-    if config.vault_path and Path(config.vault_path).expanduser().resolve() != vault_path or not config.vault_path:
-        import os
+    if (
+        config.vault_path
+        and Path(config.vault_path).expanduser().resolve() != vault_path
+        or not config.vault_path
+    ):
         os.environ["VAULT_PATH"] = str(vault_path)
         config = load_config(env_file=env_file, VAULT_PATH=str(vault_path))
     return vault_path, config
 
 
-def _print_result_summary(result: CompileResult) -> None:  # noqa: F821
+def _print_result_summary(result: "CompileResult") -> None:  # noqa: F821
     """Pretty-print a CompileResult."""
     typer.echo(
         f"\n✅ Compilation complete: "
@@ -89,32 +97,34 @@ def ingest(
     automatically (no Stage 1 extraction needed for them).
 
     Examples:
-        llmwiki ingest ~/MyVault --url https://example.com/article
-        llmwiki ingest ~/MyVault -u URL1 -u URL2 --parallel 5 --review
-        llmwiki ingest ~/MyVault -u URL1 --dry-run
+        okf ingest ~/MyVault --url https://example.com/article
+        okf ingest ~/MyVault -u URL1 -u URL2 --parallel 5 --review
+        okf ingest ~/MyVault -u URL1 --dry-run
     """
     from pipeline.clippings import collect_clippings
     from pipeline.config import load_config
     from pipeline.extract import run_extraction
+    from pipeline.okf_models import IngestedSource
 
     vault_path = Path(vault).expanduser().resolve()
     env_file = str(vault_path / ".env") if (vault_path / ".env").exists() else None
     config = load_config(env_file=env_file)
     # Ensure vault_path is set
-    import os
     if not config.vault_path or Path(config.vault_path).expanduser().resolve() != vault_path:
         os.environ["VAULT_PATH"] = str(vault_path)
         config = load_config(env_file=env_file, VAULT_PATH=str(vault_path))
 
     if parallel:
         os.environ["COMPILE_CONCURRENCY"] = str(parallel)
-        config = load_config(env_file=env_file, VAULT_PATH=str(vault_path), COMPILE_CONCURRENCY=str(parallel))
+        config = load_config(
+            env_file=env_file, VAULT_PATH=str(vault_path), COMPILE_CONCURRENCY=str(parallel)
+        )
 
     typer.echo(f"📂 Vault: {config.vault}")
     typer.echo(f"🤖 Model: {config.ollama_model}")
 
     # ── Collect clippings that pass the quality gate ──────────────────
-    clipping_sources: dict[str, IngestedSource] = {}  # noqa: F821
+    clipping_sources: dict[str, IngestedSource] = {}
     passed_clippings = collect_clippings(config)
     if passed_clippings:
         typer.echo(f"\n📋 Clippings passing quality gate: {len(passed_clippings)}")
@@ -124,7 +134,7 @@ def ingest(
             typer.echo(f"   ✅ {source.title[:60]} ({len(source.content)} chars)")
 
     # ── Extract URLs ─────────────────────────────────────────────────
-    extracted_sources: dict[str, IngestedSource] = {}  # noqa: F821
+    extracted_sources: dict[str, IngestedSource] = {}
     if urls:
         typer.echo(f"\n🌐 Extracting {len(urls)} URL(s)...")
         if dry_run:
@@ -202,8 +212,8 @@ def ingest(
 
 
 async def _run_create_with_review(
-    config: Config, sources: dict, state: WikiState  # noqa: F821
-) -> CompileResult:  # noqa: F821
+    config, sources: dict, state
+):
     """Run create and stage outputs as review candidates instead of writing."""
     from pipeline.candidates import write_candidate
     from pipeline.create.orchestrator import run_create
@@ -221,7 +231,7 @@ async def _run_create_with_review(
             "summary": concept.summary,
             "sources": list(sources.keys()),
             "body": f"# {concept.concept}\n\n{concept.summary}\n\n"
-                    f"*Tags: {', '.join(concept.tags)}*",
+            f"*Tags: {', '.join(concept.tags)}*",
         }
         try:
             candidate = write_candidate(str(config.vault), candidate_data)
@@ -232,7 +242,7 @@ async def _run_create_with_review(
     return result
 
 
-@app.command()
+@app.command(name="compile")
 def compile_cmd(
     vault: str = typer.Argument(..., help="Path to Obsidian vault"),
     review: bool = typer.Option(
@@ -260,10 +270,10 @@ def compile_cmd(
     resolves wikilinks, and rebuilds the index and MOC.
 
     Examples:
-        llmwiki compile ~/MyVault
-        llmwiki compile ~/MyVault --force
-        llmwiki compile ~/MyVault --dry-run
-        llmwiki compile ~/MyVault --file article1.md --file article2.md
+        okf compile ~/MyVault
+        okf compile ~/MyVault --force
+        okf compile ~/MyVault --dry-run
+        okf compile ~/MyVault --file article1.md --file article2.md
     """
     from pipeline.compiler import compile as compile_pipeline
 
@@ -293,7 +303,7 @@ def compile_cmd(
     _print_result_summary(result)
 
 
-async def _compile_with_review(vault: str, options: dict) -> CompileResult:  # noqa: F821
+async def _compile_with_review(vault: str, options: dict):
     """Compile and stage all generated pages as review candidates."""
     from pipeline.candidates import write_candidate
     from pipeline.compiler import compile as compile_pipeline
@@ -317,7 +327,7 @@ async def _compile_with_review(vault: str, options: dict) -> CompileResult:  # n
                 "summary": concept.summary,
                 "sources": [],  # Source names are captured during compilation
                 "body": f"# {concept.concept}\n\n{concept.summary}\n\n"
-                        f"*Tags: {', '.join(concept.tags)}*",
+                f"*Tags: {', '.join(concept.tags)}*",
             }
             try:
                 candidate = write_candidate(str(config.vault), candidate_data)
@@ -338,205 +348,76 @@ def lint(
         False, "--json", "-j", help="Output results as JSON"
     ),
 ):
-    """Run lint checks on the vault.
+    """Run OKF lint checks on the vault bundle.
 
     Checks for:
-      - Malformed frontmatter
-      - Broken wikilinks (targets that don't exist)
-      - Orphaned pages with no incoming links
-      - Missing or malformed citations (^[...])
-      - Pages below minimum content thresholds
-      - Empty source files
+      - OKF-001: Missing YAML frontmatter (error)
+      - OKF-002: Missing/empty ``type`` field in frontmatter (error)
+      - OKF-003: Invalid ISO 8601 ``timestamp`` (warning)
+      - OKF-004: ``tags`` not a YAML list (warning)
+      - OKF-005: Broken markdown cross-link (info)
+      - OKF-006: Unexpected frontmatter on index.md (warning)
+      - OKF-007: Invalid log.md date headings (warning)
 
     Examples:
-        llmwiki lint ~/MyVault
-        llmwiki lint ~/MyVault --strict
-        llmwiki lint ~/MyVault --json
+        okf lint ~/MyVault
+        okf lint ~/MyVault --strict
+        okf lint ~/MyVault --json
     """
-    import json
+    from pipeline.okf_lint import lint_bundle
 
-    from pipeline.config import load_config
-    from pipeline.markdown import (
-        is_malformed_citation_entry,
-        parse_frontmatter,
-        safe_read_file,
-        slugify,
-    )
+    vault_path, config = _resolve_vault(vault)
+    bundle_dir = config.bundle_dir
 
-    vault_path = Path(vault).expanduser().resolve()
-    env_file = str(vault_path / ".env") if (vault_path / ".env").exists() else None
-    config = load_config(env_file=env_file)
+    typer.echo(f"🔍 Linting OKF bundle: {bundle_dir}")
 
-    issues: list[dict] = []
-    warnings: list[dict] = []
-    errors: list[dict] = []
+    report = lint_bundle(bundle_dir)
 
-    sources_dir = config.sources_dir
-    concepts_dir = config.concepts_dir
-    entries_dir = config.entries_dir
-
-    # ── Check sources ─────────────────────────────────────────────────
-    if sources_dir.exists():
-        for f in sources_dir.glob("*.md"):
-            raw = safe_read_file(f)
-            if not raw.strip():
-                issues.append({
-                    "file": str(f.relative_to(config.vault)),
-                    "severity": "warning",
-                    "rule": "empty-source",
-                    "message": f"Source file is empty: {f.name}",
-                })
-                continue
-            meta, body = parse_frontmatter(raw)
-            if not meta.get("title"):
-                issues.append({
-                    "file": str(f.relative_to(config.vault)),
-                    "severity": "warning",
-                    "rule": "missing-title",
-                    "message": f"Source file missing title in frontmatter: {f.name}",
-                })
-            if len(body.strip()) < config.min_source_chars:
-                issues.append({
-                    "file": str(f.relative_to(config.vault)),
-                    "severity": "warning",
-                    "rule": "short-source",
-                    "message": (
-                        f"Source body too short: {len(body.strip())} chars "
-                        f"(min: {config.min_source_chars})"
-                    ),
-                })
-
-    # ── Check concepts ───────────────────────────────────────────────
-    all_concept_slugs: set[str] = set()
-    if concepts_dir.exists():
-        for f in concepts_dir.glob("*.md"):
-            raw = safe_read_file(f)
-            if not raw.strip():
-                issues.append({
-                    "file": str(f.relative_to(config.vault)),
-                    "severity": "warning",
-                    "rule": "empty-concept",
-                    "message": f"Concept page is empty: {f.name}",
-                })
-                continue
-            meta, body = parse_frontmatter(raw)
-            slug = meta.get("slug", f.stem)
-            all_concept_slugs.add(slug)
-
-            if not meta.get("title"):
-                issues.append({
-                    "file": str(f.relative_to(config.vault)),
-                    "severity": "error",
-                    "rule": "missing-title",
-                    "message": f"Concept page missing title: {f.name}",
-                })
-
-            if len(body.strip()) < config.concept_min_body_chars:
-                issues.append({
-                    "file": str(f.relative_to(config.vault)),
-                    "severity": "warning",
-                    "rule": "short-concept",
-                    "message": (
-                        f"Concept body too short: {len(body.strip())} chars "
-                        f"(min: {config.concept_min_body_chars})"
-                    ),
-                })
-
-            # Check for malformed citations
-            import re
-            for match in re.finditer(r"\^\[([^\]]+)\]", body):
-                raw_cite = match.group(1)
-                for part in raw_cite.split(","):
-                    part = part.strip()
-                    if part and is_malformed_citation_entry(part):
-                        issues.append({
-                            "file": str(f.relative_to(config.vault)),
-                            "severity": "warning",
-                            "rule": "malformed-citation",
-                            "message": f"Malformed citation entry: {part}",
-                        })
-
-    # ── Check entries ────────────────────────────────────────────────
-    if entries_dir.exists():
-        for f in entries_dir.glob("*.md"):
-            raw = safe_read_file(f)
-            if not raw.strip():
-                issues.append({
-                    "file": str(f.relative_to(config.vault)),
-                    "severity": "warning",
-                    "rule": "empty-entry",
-                    "message": f"Entry page is empty: {f.name}",
-                })
-                continue
-            meta, body = parse_frontmatter(raw)
-            if len(body.strip()) < config.entry_min_body_chars:
-                issues.append({
-                    "file": str(f.relative_to(config.vault)),
-                    "severity": "warning",
-                    "rule": "short-entry",
-                    "message": (
-                        f"Entry body too short: {len(body.strip())} chars "
-                        f"(min: {config.entry_min_body_chars})"
-                    ),
-                })
-
-    # ── Check for broken wikilinks ───────────────────────────────────
-    import re as _re
-    _WIKILINK_RE = _re.compile(r"\[\[([^\]|#]+)(?:[|#][^\]]+)?\]\]")
-    if concepts_dir.exists():
-        for f in concepts_dir.glob("*.md"):
-            raw = safe_read_file(f)
-            if not raw.strip():
-                continue
-            for match in _WIKILINK_RE.finditer(raw):
-                target = match.group(1).strip()
-                target_slug = slugify(target)
-                if target_slug not in all_concept_slugs:
-                    # Check if it might exist as an entry or source
-                    entry_exists = (entries_dir / f"{target_slug}.md").exists() if entries_dir.exists() else False
-                    source_exists = (sources_dir / f"{target_slug}.md").exists() if sources_dir.exists() else False
-                    if not entry_exists and not source_exists:
-                        issues.append({
-                            "file": str(f.relative_to(config.vault)),
-                            "severity": "warning",
-                            "rule": "broken-wikilink",
-                            "message": f"Broken wikilink: [[{target}]] — target not found",
-                        })
-
-    # ── Separate errors and warnings ─────────────────────────────────
-    for issue in issues:
-        if issue["severity"] == "error":
-            errors.append(issue)
-        else:
-            warnings.append(issue)
-
-    # ── Output ───────────────────────────────────────────────────────
     if json_output:
         result = {
-            "errors": len(errors),
-            "warnings": len(warnings),
-            "issues": issues,
+            "errors": report.errors,
+            "warnings": report.warnings,
+            "files_checked": report.files_checked,
+            "issues": [
+                {
+                    "severity": issue.severity,
+                    "file": issue.file,
+                    "line": issue.line,
+                    "rule": issue.rule,
+                    "message": issue.message,
+                }
+                for issue in report.issues
+            ],
         }
         typer.echo(json.dumps(result, indent=2))
     else:
-        if errors:
-            typer.echo(f"\n❌ {len(errors)} error(s):")
-            for e in errors:
-                typer.echo(f"  {e['file']}: {e['message']}")
+        if report.errors:
+            typer.echo(f"\n❌ {report.errors} error(s):")
+            for issue in report.issues:
+                if issue.severity == "error":
+                    typer.echo(f"  {issue.file}: [{issue.rule}] {issue.message}")
 
-        if warnings:
-            typer.echo(f"\n⚠ {len(warnings)} warning(s):")
-            for w in warnings:
-                typer.echo(f"  {w['file']}: {w['message']}")
+        if report.warnings:
+            typer.echo(f"\n⚠ {report.warnings} warning(s):")
+            for issue in report.issues:
+                if issue.severity == "warning":
+                    typer.echo(f"  {issue.file}: [{issue.rule}] {issue.message}")
 
-        if not errors and not warnings:
+        # Info-level issues (OKF-005 broken links)
+        info_issues = [i for i in report.issues if i.severity == "info"]
+        if info_issues:
+            typer.echo(f"\nℹ {len(info_issues)} info(s):")
+            for issue in info_issues:
+                typer.echo(f"  {issue.file}: [{issue.rule}] {issue.message}")
+
+        if not report.errors and not report.warnings and not info_issues:
             typer.echo("✅ No issues found.")
 
-        if strict and warnings:
+        if strict and report.warnings:
             typer.echo("\n❌ Strict mode: warnings treated as errors. Exiting with failure.")
             raise typer.Exit(code=1)
 
-    if errors:
+    if report.errors:
         raise typer.Exit(code=1)
 
 
@@ -557,8 +438,8 @@ def query(
     uses the LLM to answer your question grounded in the retrieved context.
 
     Examples:
-        llmwiki query ~/MyVault --ask "What is a transformer model?"
-        llmwiki query ~/MyVault -a "Compare RAG vs fine-tuning" -n 5
+        okf query ~/MyVault --ask "What is a transformer model?"
+        okf query ~/MyVault -a "Compare RAG vs fine-tuning" -n 5
     """
     from pipeline.config import load_config
     from pipeline.llm_client import call_llm
@@ -569,7 +450,6 @@ def query(
     config = load_config(env_file=env_file)
 
     if model:
-        import os
         os.environ["OLLAMA_MODEL"] = model
         config = load_config(env_file=env_file, OLLAMA_MODEL=model)
 
@@ -617,7 +497,7 @@ def query(
 
     if not top_pages:
         typer.echo("⚠ No relevant pages found in the wiki.")
-        typer.echo("   Try ingesting some sources first with: llmwiki ingest")
+        typer.echo("   Try ingesting some sources first with: okf ingest")
         return
 
     # Build context
@@ -663,11 +543,11 @@ def query(
 def setup():
     """Interactive setup wizard — configure LLM provider, vault path, API keys.
 
-    Runs through a series of prompts to configure your llmwiki environment.
+    Runs through a series of prompts to configure your OKF environment.
     Validates connectivity and writes a .env file to your vault.
 
     Example:
-        llmwiki setup
+        okf setup
     """
     from pipeline.setup import run_setup
     run_setup()
@@ -692,10 +572,10 @@ def candidates(
       reject  — Reject and archive a candidate
 
     Examples:
-        llmwiki candidates ~/MyVault list
-        llmwiki candidates ~/MyVault show my-concept-a1b2c3d4
-        llmwiki candidates ~/MyVault approve my-concept-a1b2c3d4
-        llmwiki candidates ~/MyVault reject my-concept-a1b2c3d4
+        okf candidates ~/MyVault list
+        okf candidates ~/MyVault show my-concept-a1b2c3d4
+        okf candidates ~/MyVault approve my-concept-a1b2c3d4
+        okf candidates ~/MyVault reject my-concept-a1b2c3d4
     """
     from pipeline.candidates import (
         approve_candidate,
@@ -772,6 +652,255 @@ def candidates(
 
     else:
         typer.echo(f"❌ Unknown action: {action}. Valid: list, show, approve, reject", err=True)
+        raise typer.Exit(code=1)
+
+
+# ── New OKF commands ──────────────────────────────────────────────────────
+
+
+@app.command()
+def visualize(
+    vault: str = typer.Argument(..., help="Path to Obsidian vault"),
+    output: str | None = typer.Option(
+        None, "--output", "-o", help="Output HTML path (default: <bundle>/viz.html)"
+    ),
+    name: str | None = typer.Option(
+        None, "--name", "-n", help="Display name for the wiki (default: bundle dir name)"
+    ),
+):
+    """Generate an interactive HTML graph visualization of the OKF bundle.
+
+    Scans all concept .md files in the bundle, builds a node/edge graph from
+    their cross-links, and writes a self-contained Cytoscape.js HTML file.
+
+    Examples:
+        okf visualize ~/MyVault
+        okf visualize ~/MyVault --output ~/graph.html
+        okf visualize ~/MyVault --name "My Knowledge Base"
+    """
+    from pipeline.okf_visualizer import generate_visualization
+
+    _vault_path, config = _resolve_vault(vault)
+    bundle_dir = config.bundle_dir
+
+    typer.echo(f"📊 Generating visualization for: {bundle_dir}")
+
+    try:
+        out_path = generate_visualization(bundle_dir, output, name)
+        typer.echo(f"✅ Visualization written: {out_path}")
+        typer.echo(f"   Open in browser: file://{out_path.resolve()}")
+    except FileNotFoundError as exc:
+        typer.echo(f"❌ {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+
+@app.command()
+def enrich(
+    vault: str = typer.Argument(..., help="Path to Obsidian vault"),
+    web_seed: list[str] | None = typer.Option(
+        None, "--web-seed", help="Seed URLs to crawl (can be repeated)"
+    ),
+    web_seed_file: str | None = typer.Option(
+        None, "--web-seed-file", help="File containing seed URLs (one per line)"
+    ),
+    web_allowed_host: str | None = typer.Option(
+        None, "--web-allowed-host", help="Only follow links on this host"
+    ),
+    web_max_pages: int = typer.Option(
+        20, "--web-max-pages", help="Maximum pages to fetch during crawl"
+    ),
+    no_web: bool = typer.Option(
+        False, "--no-web", help="Skip all web fetching (dry-run / LLM-only mode)"
+    ),
+):
+    """Enrich the OKF bundle by crawling web seeds and minting reference pages.
+
+    Fetches seed URLs, asks the LLM whether to enrich existing concepts or
+    mint new reference pages, writes results to ``references/``, and follows
+    outbound links within the allowed host for further crawling.
+
+    Examples:
+        okf enrich ~/MyVault --web-seed https://example.com/article
+        okf enrich ~/MyVault --web-seed-file seeds.txt --web-allowed-host example.com
+        okf enrich ~/MyVault --no-web  # dry-run, no network calls
+    """
+    from pipeline.enrich import EnrichOptions, run_enrichment
+
+    _vault_path, config = _resolve_vault(vault)
+    bundle_dir = config.bundle_dir
+
+    # ── Gather seed URLs ─────────────────────────────────────────────
+    seed_urls: list[str] = list(web_seed) if web_seed else []
+    if web_seed_file:
+        seed_path = Path(web_seed_file).expanduser().resolve()
+        if not seed_path.is_file():
+            typer.echo(f"❌ Seed file not found: {seed_path}", err=True)
+            raise typer.Exit(code=1)
+        for line in seed_path.read_text(encoding="utf-8").splitlines():
+            url = line.strip()
+            if url and not url.startswith("#"):
+                seed_urls.append(url)
+
+    if not seed_urls and not no_web:
+        typer.echo("⚠ No seed URLs provided. Use --web-seed or --web-seed-file, or --no-web.")
+        raise typer.Exit(code=1)
+
+    typer.echo(f"🔬 Enriching bundle: {bundle_dir}")
+    typer.echo(f"   Seeds: {len(seed_urls)} URL(s)")
+    typer.echo(f"   Max pages: {web_max_pages}")
+    if web_allowed_host:
+        typer.echo(f"   Allowed host: {web_allowed_host}")
+    if no_web:
+        typer.echo("   ⚠ --no-web: skipping all web fetches")
+
+    options = EnrichOptions(
+        seed_urls=seed_urls,
+        allowed_host=web_allowed_host or "",
+        max_pages=web_max_pages,
+        no_web=no_web,
+    )
+
+    try:
+        result = asyncio.run(run_enrichment(bundle_dir, config, options))
+    except Exception as exc:
+        typer.echo(f"❌ Enrichment failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    typer.echo("\n✅ Enrichment complete:")
+    typer.echo(f"   Pages fetched:     {result.pages_fetched}")
+    typer.echo(f"   References created: {result.references_created}")
+    typer.echo(f"   Concepts enriched:  {result.concepts_enriched}")
+    typer.echo(f"   Pages skipped:      {result.pages_skipped}")
+    if result.errors:
+        typer.echo(f"   Errors: {len(result.errors)}")
+        for err in result.errors[:10]:
+            typer.echo(f"     - {err}")
+        if len(result.errors) > 10:
+            typer.echo(f"     ... and {len(result.errors) - 10} more")
+
+
+@app.command()
+def export(
+    vault: str = typer.Argument(..., help="Path to Obsidian vault"),
+    output: str | None = typer.Option(
+        None, "--output", "-o", help="Output tarball path (default: <bundle>.tar.gz)"
+    ),
+    no_compress: bool = typer.Option(
+        False, "--no-compress", help="Write uncompressed .tar instead of .tar.gz"
+    ),
+):
+    """Export the OKF bundle to a portable tarball.
+
+    Packs the entire ``04-Wiki/`` bundle directory into a gzipped tarball
+    (or uncompressed with --no-compress) for sharing or backup.
+    Internal state (``.llmwiki/``), caches, and lock files are excluded.
+
+    Examples:
+        okf export ~/MyVault
+        okf export ~/MyVault --output ~/backup.tar.gz
+        okf export ~/MyVault --no-compress
+    """
+    from pipeline.bundle_io import export_bundle
+
+    _vault_path, config = _resolve_vault(vault)
+    bundle_dir = config.bundle_dir
+
+    typer.echo(f"📦 Exporting bundle: {bundle_dir}")
+
+    try:
+        out_path = export_bundle(bundle_dir, output, compress=not no_compress)
+        typer.echo(f"✅ Exported: {out_path}")
+    except FileNotFoundError as exc:
+        typer.echo(f"❌ {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    except Exception as exc:
+        typer.echo(f"❌ Export failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+
+@app.command(name="import")
+def import_cmd(
+    tarball: str = typer.Argument(..., help="Path to OKF tarball to import"),
+    target: str = typer.Argument(..., help="Target directory to extract into"),
+    no_verify: bool = typer.Option(
+        False, "--no-verify", help="Skip lint verification after extraction"
+    ),
+):
+    """Import an OKF tarball into a target directory.
+
+    Extracts the tarball, initialises the internal ``.llmwiki/`` state
+    directory, then runs the OKF linter to verify conformance.  Lint
+    errors are reported but do not block the import (use --no-verify to
+    skip the lint check entirely).
+
+    Examples:
+        okf import ~/backup.tar.gz ~/restored-vault
+        okf import ~/bundle.tar ~/target --no-verify
+    """
+    from pipeline.bundle_io import import_bundle
+
+    typer.echo(f"📥 Importing: {tarball} → {target}")
+
+    try:
+        result = import_bundle(tarball, target, verify=not no_verify)
+        bundle_path = Path(result["bundle_path"])
+        typer.echo(f"✅ Imported to: {bundle_path}")
+        if "lint_report" in result:
+            report = result["lint_report"]
+            typer.echo(
+                f"   Lint: {report['errors']} error(s), "
+                f"{report['warnings']} warning(s), "
+                f"{report['files_checked']} file(s) checked"
+            )
+            if report["passed"]:
+                typer.echo("   ✅ Bundle passes OKF lint.")
+            else:
+                typer.echo("   ⚠ Bundle has lint errors — review before use.")
+    except FileNotFoundError as exc:
+        typer.echo(f"❌ {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    except Exception as exc:
+        typer.echo(f"❌ Import failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+
+@app.command()
+def migrate(
+    vault: str = typer.Argument(..., help="Path to legacy Obsidian vault to migrate"),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Preview migration without writing any files"
+    ),
+):
+    """Migrate a legacy Obsidian vault to OKF v0.1 format.
+
+    Rewrites [[wikilinks]] to standard markdown links, extracts inline
+    ^[citations] to a Citations section, adds missing 'type' frontmatter,
+    removes Obsidian-specific keys (aliases, orphaned), deletes legacy
+    root index.md/MOC.md, and regenerates per-directory index.md and log.md.
+
+    Examples:
+        okf migrate ~/MyVault
+        okf migrate ~/MyVault --dry-run
+    """
+    from pipeline.migrate import migrate_vault
+
+    vault_path = Path(vault).expanduser().resolve()
+    typer.echo(f"🔧 Migrating vault: {vault_path}")
+
+    result = migrate_vault(vault_path, dry_run=dry_run)
+
+    typer.echo("\n✅ Migration complete:")
+    typer.echo(f"   Files migrated:      {result['files_migrated']}")
+    typer.echo(f"   Wikilinks converted: {result['wikilinks_converted']}")
+    typer.echo(f"   Files deleted:       {result['files_deleted']}")
+    typer.echo(f"   Indexes generated:   {result['indexes_generated']}")
+    typer.echo(f"   Log created:         {result['log_created']}")
+    if result["errors"]:
+        typer.echo(f"   Errors: {len(result['errors'])}")
+        for err in result["errors"][:10]:
+            typer.echo(f"     - {err}")
+        if len(result["errors"]) > 10:
+            typer.echo(f"     ... and {len(result['errors']) - 10} more")
         raise typer.Exit(code=1)
 
 
