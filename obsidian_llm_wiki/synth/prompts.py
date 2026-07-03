@@ -1,0 +1,137 @@
+"""Synthesis prompt builder — produces a single LLM call per source.
+
+The prompt asks the LLM to return a JSON object matching the SourceSynthesis
+schema: source summary, tags, key points, concepts (with sections, tags,
+claims, relationships), and MOCs.  All markdown rendering is done
+deterministically by the renderers — the LLM never writes markdown.
+"""
+
+from __future__ import annotations
+
+import json
+from typing import Any
+
+__all__ = [
+    "build_synthesis_prompt",
+    "SYNTHESIS_SCHEMA",
+]
+
+
+# ── JSON schema shown to the LLM ────────────────────────────────────────
+
+SYNTHESIS_SCHEMA: dict[str, Any] = {
+    "source_title": "string — the title of the source document",
+    "source_summary": "string — 2-3 sentence high-level overview of the source's key contributions",
+    "source_tags": ["string — 2-4 lowercase categorical tags for the source"],
+    "key_points": ["string — the most important substantive findings (each 80+ chars, evidence-backed)"],
+    "open_questions": ["string — unanswered questions, limitations, or areas for further exploration"],
+    "language": "string — ISO 639-1 language code of the source (en, zh, etc.)",
+    "concepts": [
+        {
+            "title": "string — concise descriptive title (3-8 words)",
+            "slug": "string — filename-safe slug (lowercase, hyphens, no spaces)",
+            "summary": "string — 1-2 sentence summary capturing the essential meaning",
+            "tags": ["string — 2-4 lowercase categorical tags"],
+            "aliases": ["string — alternative names for this concept"],
+            "sections": [
+                {
+                    "heading": "string — section heading (e.g. 'Core concept', 'Context')",
+                    "points": ["string — substantive bullet points for this section"],
+                    "prose": "string — optional flowing prose instead of points (use one or the other)"
+                }
+            ],
+            "claims": [
+                {
+                    "text": "string — a factual claim derived from the source",
+                    "source_ref": "string — where in the source this claim appears"
+                }
+            ],
+            "related": [
+                {
+                    "slug": "string — slug of a related concept",
+                    "relation": "variant_of | depends_on | contrasts_with | related_to | prerequisite_of | example_of",
+                    "display": "string — display text for the link (optional)"
+                }
+            ],
+            "confidence": "number — confidence in this extraction (0.0-1.0)",
+            "provenance": "extracted | merged | inferred | ambiguous",
+            "is_new": "boolean — true if this concept does not appear in the existing index"
+        }
+    ],
+    "maps": [
+        {
+            "title": "string — MOC topic title",
+            "slug": "string — filename-safe slug",
+            "summary": "string — what this MOC covers and why the topic matters",
+            "tags": ["string — lowercase tags"],
+            "concept_slugs": ["string — slugs of concepts grouped under this MOC"]
+        }
+    ]
+}
+
+
+# ── Prompt builder ──────────────────────────────────────────────────────
+
+
+def build_synthesis_prompt(
+    source_title: str,
+    source_content: str,
+    existing_concepts: list[str] | None = None,
+    language: str = "",
+) -> str:
+    """Build the single-call synthesis prompt for one source.
+
+    Args:
+        source_title: Title of the source document.
+        source_content: Full text content of the source.
+        existing_concepts: Slugs of already-known concepts (for dedup).
+        language: Preferred output language (empty = auto-detect).
+
+    Returns:
+        The complete system prompt string.  The user message should be a
+        simple instruction like "Synthesise the source document above."
+    """
+    existing_str = (
+        "\n".join(f"  - {s}" for s in existing_concepts)
+        if existing_concepts
+        else "(none yet — this is the first source)"
+    )
+
+    schema_json = json.dumps(SYNTHESIS_SCHEMA, indent=2, ensure_ascii=False)
+
+    lang_instruction = ""
+    if language:
+        lang_instruction = f"\nWrite all summaries and content in **{language}**."
+
+    return f"""You are a knowledge synthesis engine.  Analyse the source document \
+and produce a structured JSON synthesis.
+
+Your output must be a single JSON object matching this schema (return ONLY \
+the JSON, no prose, no code fences):
+
+{schema_json}
+
+Rules:
+* Identify 3-8 distinct, meaningful concepts from the source.
+* Each concept must have a slug (lowercase, hyphens, no spaces, no special chars).
+* Each concept must have at least one section with substantive content \
+(either points or prose — not both empty).
+* Tags must be lowercase, 2-4 per concept.
+* Use the "related" field to link concepts to each other by slug.  Be \
+generous with cross-references — a good knowledge graph has many edges.
+* Create 1-3 MOCs (Maps of Content) that group related concepts by topic. \
+Only create a MOC if 2+ concepts share a theme.
+* Review the existing concept index below to avoid duplicates.  Set \
+"is_new" to false for concepts that already exist.
+* Surface ALL available insights — do not produce stubs or shallow summaries.
+* Claims should be specific, evidence-backed statements from the source.{lang_instruction}
+
+--- EXISTING CONCEPT INDEX ---
+{existing_str}
+
+--- SOURCE DOCUMENT ---
+Title: {source_title}
+
+{source_content}
+
+Now produce the JSON synthesis for this source."""
