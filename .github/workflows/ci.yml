@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+permissions:
+  contents: read
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+
+      - name: Create venv and install dependencies
+        run: |
+          uv venv
+          uv pip install -e ".[dev]"
+          uv pip install trafilatura
+
+      - name: Ruff check
+        run: |
+          source .venv/bin/activate
+          ruff check obsidian_llm_wiki pipeline
+
+      - name: Pytest
+        run: |
+          source .venv/bin/activate
+          python -m pytest tests/ tests/new/ -v --tb=short
