@@ -4,7 +4,7 @@ Tracks concept ownership across sources, determines which sources are
 affected by changes, and identifies frozen slugs (concepts that must not
 be deleted because they are shared with live sources).
 
-Ported from llm-wiki-compiler source-state logic.
+Ported from obsidian-llm-wiki source-state logic.
 """
 
 from __future__ import annotations
@@ -13,7 +13,7 @@ import logging
 
 from pipeline.okf_models import SourceChange, SourceStatus, WikiState
 
-logger = logging.getLogger("llmwiki.deps")
+logger = logging.getLogger("obswiki.deps")
 
 
 # ── Shared concepts ─────────────────────────────────────────────────────

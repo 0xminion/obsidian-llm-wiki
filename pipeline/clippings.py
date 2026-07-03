@@ -143,7 +143,10 @@ def _title_from_url(url: str) -> str:
         return ""
 
     # Take the last meaningful segment
-    segments = [s for s in path.split("/") if s and not s.endswith((".html", ".htm", ".php", ".asp"))]
+    segments = [
+            s for s in path.split("/")
+            if s and not s.endswith((".html", ".htm", ".php", ".asp"))
+        ]
     if not segments:
         # Maybe it's a bare filename with extension
         segments = path.split("/")

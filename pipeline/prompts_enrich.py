@@ -28,7 +28,7 @@ __all__ = [
     "parse_enrich_response",
 ]
 
-logger = logging.getLogger("llmwiki.enrich.prompts")
+logger = logging.getLogger("obswiki.enrich.prompts")
 
 
 # ── Decision dataclass ──────────────────────────────────────────────────────

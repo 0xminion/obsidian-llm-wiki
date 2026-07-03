@@ -1,6 +1,6 @@
 """PID-based lock file for preventing concurrent compilation.
 
-Ported from llm-wiki-compiler/src/utils/lock.ts.
+Ported from obsidian-llm-wiki/src/utils/lock.ts.
 
 Uses O_CREAT | O_EXCL for atomic lock creation. Handles stale lock
 reclamation via a two-lock protocol to serialize cleanup.

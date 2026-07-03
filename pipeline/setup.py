@@ -372,7 +372,6 @@ def _build_env_content(
         "# ── Content thresholds ──────────────────────────",
         "MAX_SOURCE_CHARS=1000000",
         "MIN_SOURCE_CHARS=50",
-        "PROMPT_BUDGET_CHARS=200000",
         "",
         "# ── Concurrency ─────────────────────────────────",
         "COMPILE_CONCURRENCY=3",

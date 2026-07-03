@@ -3,7 +3,7 @@
 Processes each ingested source: renders entry, extracts concepts, renders
 concept pages, then groups into MoCs.  Uses configurable concurrency.
 
-Ported from llm-wiki-compiler/src/compiler/index.ts.
+Ported from obsidian-llm-wiki/src/compiler/index.ts.
 
 OKF migration: page rendering uses the OKF-native renderers
 (``pipeline.okf_renderer``) which produce OKF v0.1 frontmatter.  The LLM
@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from contextlib import suppress
 from datetime import UTC, datetime
 
 from pipeline.config import Config
@@ -44,7 +45,7 @@ from pipeline.prompts import (
 )
 from pipeline.state import update_source_state
 
-logger = logging.getLogger("llmwiki.orchestrator")
+logger = logging.getLogger("obswiki.orchestrator")
 
 
 # ── Concept extraction prompt (tool-calling) ────────────────────────────
@@ -398,10 +399,8 @@ def _build_concepts_from_list(raw_list: list[dict]) -> list[ExtractedConcept]:
         # Validate provenance_state for logging / future use, but don't
         # pass it to the OKF ExtractedConcept (no such field).
         prov_raw = item.get("provenance_state", "extracted")
-        try:
+        with suppress(ValueError):
             ProvenanceState(prov_raw)  # validate
-        except ValueError:
-            pass  # ignore invalid values silently
 
         concepts.append(
             ExtractedConcept(

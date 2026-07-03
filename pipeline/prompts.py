@@ -3,7 +3,7 @@
 Each function constructs a system prompt + user message pair suitable for
 sending to the LLM via ``pipeline.llm.providers.call_llm``.
 
-Ported from llm-wiki-compiler/src/compiler/prompts.ts.
+Ported from obsidian-llm-wiki/src/compiler/prompts.ts.
 """
 
 from __future__ import annotations
@@ -26,21 +26,33 @@ EXTRACTION_TOOLS: list[dict[str, Any]] = [
                 "properties": {
                     "concepts": {
                         "type": "array",
-                        "description": "3-8 distinct, meaningful concepts extracted from the source.",
+                        "description": (
+                        "3-8 distinct, meaningful concepts "
+                        "extracted from the source."
+                    ),
                         "items": {
                             "type": "object",
                             "properties": {
                                 "title": {
                                     "type": "string",
-                                    "description": "A concise, descriptive title for the concept (3-8 words).",
+                                    "description": (
+                            "A concise, descriptive title for "
+                            "the concept (3-8 words)."
+                        ),
                                 },
                                 "summary": {
                                     "type": "string",
-                                    "description": "A 1-2 sentence summary capturing the essential meaning.",
+                                    "description": (
+                            "A 1-2 sentence summary capturing "
+                            "the essential meaning."
+                        ),
                                 },
                                 "is_new": {
                                     "type": "boolean",
-                                    "description": "True if this concept does NOT appear in the existing index.",
+                                    "description": (
+                            "True if this concept does NOT appear "
+                            "in the existing index."
+                        ),
                                 },
                                 "tags": {
                                     "type": "array",
@@ -57,7 +69,10 @@ EXTRACTION_TOOLS: list[dict[str, Any]] = [
                                 },
                                 "provenance_state": {
                                     "type": "string",
-                                    "description": "Provenance state: extracted, merged, inferred, or ambiguous.",
+                                    "description": (
+                            "Provenance state: extracted, merged, "
+                            "inferred, or ambiguous."
+                        ),
                                     "enum": ["extracted", "merged", "inferred", "ambiguous"],
                                 },
                             },
@@ -180,8 +195,8 @@ def build_entry_prompt(
         "by this source.\n"
         "\n"
         "## Linked Concepts\n"
-        "Cross-reference with relevant concepts from the context below using standard markdown links "
-        "of the form [text](/concepts/concept-name.md).\n"
+        "Cross-reference with relevant concepts from the context below using "
+        "standard markdown links of the form [text](/concepts/concept-name.md).\n"
         "\n"
         "**Requirements:**\n"
         "- Every output document MUST have YAML frontmatter with a non-empty type field "
@@ -343,8 +358,9 @@ def build_moc_prompt(
         "- Meaningful, not a stub — show how concepts relate to each other.\n"
         "- Every output document MUST have YAML frontmatter with a non-empty type field "
         "(e.g. type: Map of Content).\n"
-        "- Use standard markdown links [text](/concepts/concept-name.md) for all concept references. "
-        "Use absolute bundle-relative links starting with / (e.g. [text](/concepts/foo.md)).\n"
+        "- Use standard markdown links [text](/concepts/concept-name.md) for all "
+        "concept references. Use absolute bundle-relative links starting with "
+        "/ (e.g. [text](/concepts/foo.md)).\n"
         "- Do NOT use Obsidian-specific features (wikilinks, aliases, #hashtag tags, etc). "
         "Use standard markdown only.\n"
         "- Provide genuine synthesis, not a simple list.\n"

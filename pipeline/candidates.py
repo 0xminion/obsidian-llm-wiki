@@ -1,6 +1,6 @@
 """Review candidate system for pending wiki pages.
 
-Ported from llm-wiki-compiler/src/compiler/candidates.ts.
+Ported from obsidian-llm-wiki/src/compiler/candidates.ts.
 
 Manages draft pages that need human review:
   - Writing candidates as JSON to .llmwiki/candidates/

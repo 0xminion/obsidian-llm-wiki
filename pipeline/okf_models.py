@@ -83,12 +83,12 @@ class OKFFrontmatter:
             "timestamp": self.timestamp,
         }
         # Merge extensions last so they win on key collision.
-        merged = {k: v for k, v in core.items()}
+        merged = dict(core)
         merged.update(self.extensions)
         return merged
 
     @classmethod
-    def from_dict(cls, data: dict) -> "OKFFrontmatter":
+    def from_dict(cls, data: dict) -> OKFFrontmatter:
         """Reconstruct an :class:`OKFFrontmatter` from a flat dict.
 
         Known core keys are pulled out explicitly; any remaining keys are
@@ -165,13 +165,6 @@ class IngestedSource:
     url: str | None = None
 
 
-@dataclass
-class SourceSlice:
-    """A single source's contribution to per-concept prompt content."""
-
-    file: str
-    content: str
-
 
 @dataclass
 class ExtractedConcept:
@@ -184,7 +177,7 @@ class ExtractedConcept:
     confidence: float | None = None
     type: str = "Concept"
     provenance_state: ProvenanceState | None = None
-    contradicted_by: list["ContradictionRef"] | None = None
+    contradicted_by: list[ContradictionRef] | None = None
 
 
 # ── State ──────────────────────────────────────────────────────────────

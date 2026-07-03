@@ -154,8 +154,8 @@ def _safe_extract(tar: tarfile.TarFile, target: str) -> None:
         dest = (base / member_path).resolve()
         try:
             dest.relative_to(base)
-        except ValueError:
-            raise ValueError(f"Refusing to extract outside target: {member.name!r}")
+        except ValueError as exc:
+            raise ValueError(f"Refusing to extract outside target: {member.name!r}") from exc
     tar.extractall(str(target))
 
 

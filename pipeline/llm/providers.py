@@ -19,7 +19,7 @@ import httpx
 
 from pipeline.config import LLMProviderConfig
 
-logger = logging.getLogger("llmwiki.llm.providers")
+logger = logging.getLogger("obswiki.llm.providers")
 
 
 # ──────────────────────────────────────────────────────────────────────────────

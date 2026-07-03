@@ -1,6 +1,6 @@
 """Compile orchestrator — ties all pipeline stages together.
 
-Central orchestration modelled on llm-wiki-compiler/src/compiler/index.ts
+Central orchestration modelled on obsidian-llm-wiki/src/compiler/index.ts
 runCompilePipeline(). Handles the full pipeline: change detection, concept
 extraction, page generation, wikilink resolution, index/MOC generation,
 and state persistence.
@@ -325,7 +325,7 @@ def _generate_all_directory_indexes(config: Config, atomic_write) -> None:
         "references": config.references_dir,
     }
 
-    for dir_name, dir_path in dir_map.items():
+    for _dir_name, dir_path in dir_map.items():
         if not dir_path.is_dir():
             continue
         md_files = sorted(dir_path.glob("*.md"))
@@ -512,7 +512,6 @@ async def _generate_seed_pages(
 def _kind_to_dir(kind, config: Config) -> Path:
     """Map a PageKind to the appropriate wiki subdirectory."""
     # PageKind is now defined in okf_models.
-    from pipeline.okf_models import PageKind
 
     if kind == PageKind.CONCEPT:
         return config.concepts_dir

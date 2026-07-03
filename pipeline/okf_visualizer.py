@@ -62,10 +62,7 @@ def generate_visualization(
     if not bd.is_dir():
         raise FileNotFoundError(f"Bundle directory not found: {bd}")
 
-    if output_path is None:
-        out = bd / "viz.html"
-    else:
-        out = Path(output_path)
+    out = bd / "viz.html" if output_path is None else Path(output_path)
 
     if name is None:
         name = bd.name
@@ -269,10 +266,13 @@ def _render_html(
     # Escape '<' and '>' to prevent XSS via '</script>' injection — replace
     # them with their JSON unicode escape sequences so the browser's HTML
     # parser never sees a literal '</script>' inside the script block.
-    nodes_json = json.dumps(nodes, ensure_ascii=False).replace("<", "\\u003c").replace(">", "\\u003e")
-    edges_json = json.dumps(edges, ensure_ascii=False).replace("<", "\\u003c").replace(">", "\\u003e")
-    backlinks_json = json.dumps(backlinks, ensure_ascii=False).replace("<", "\\u003c").replace(">", "\\u003e")
-    concepts_json = json.dumps(concept_map, ensure_ascii=False).replace("<", "\\u003c").replace(">", "\\u003e")
+    def _safe_json(obj):
+        return json.dumps(obj, ensure_ascii=False).replace("<", "\\u003c").replace(">", "\\u003e")
+
+    nodes_json = _safe_json(nodes)
+    edges_json = _safe_json(edges)
+    backlinks_json = _safe_json(backlinks)
+    concepts_json = _safe_json(concept_map)
 
     return _HTML_TEMPLATE.format(
         name=name,

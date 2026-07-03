@@ -1,6 +1,6 @@
 """Wiki state persistence for incremental compilation.
 
-Ported from llm-wiki-compiler/src/utils/state.ts and src/compiler/source-state.ts.
+Ported from obsidian-llm-wiki/src/utils/state.ts and src/compiler/source-state.ts.
 
 Reads/writes .llmwiki/state.json for source hash tracking, concept
 ownership, and change detection across compilation runs.

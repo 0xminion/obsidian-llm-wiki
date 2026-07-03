@@ -1,6 +1,6 @@
 """Source file hashing for change detection.
 
-Ported from llm-wiki-compiler/src/compiler/hasher.ts.
+Ported from obsidian-llm-wiki/src/compiler/hasher.ts.
 
 Computes SHA-256 hashes of source files and compares them against
 previously stored state to determine which files need recompilation.

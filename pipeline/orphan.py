@@ -1,6 +1,6 @@
 """Orphan management (deterministic, no LLM).
 
-Ported from llm-wiki-compiler/src/compiler/orphan.ts.
+Ported from obsidian-llm-wiki/src/compiler/orphan.ts.
 
 Handles:
   - Marking concepts as orphaned when their exclusive owner source is deleted.

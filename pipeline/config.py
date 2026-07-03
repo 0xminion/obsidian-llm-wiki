@@ -1,7 +1,7 @@
 """Configuration management for the llmwiki pipeline.
 
 Loads settings from environment variables and .env files.
-Ported from llm-wiki-compiler/src/utils/constants.ts.
+Ported from obsidian-llm-wiki/src/utils/constants.ts.
 """
 
 from __future__ import annotations
@@ -50,7 +50,6 @@ class Config:
     # ── Content thresholds ──────────────────────────
     max_source_chars: int = 1_000_000
     min_source_chars: int = 50
-    prompt_budget_chars: int = 200_000
 
     # ── Concurrency ─────────────────────────────────
     compile_concurrency: int = 3
@@ -224,7 +223,6 @@ def load_config(env_file: str | None = None, **overrides: str) -> Config:
         okf_version=os.getenv("OKF_VERSION", "0.1"),
         max_source_chars=_int_env("MAX_SOURCE_CHARS", 1_000_000),
         min_source_chars=_int_env("MIN_SOURCE_CHARS", 50),
-        prompt_budget_chars=_int_env("PROMPT_BUDGET_CHARS", 200_000),
         compile_concurrency=_int_env("COMPILE_CONCURRENCY", 3),
         output_language=os.getenv("LLMWIKI_OUTPUT_LANGUAGE", ""),
         concept_min_body_chars=_int_env("CONCEPT_MIN_BODY_CHARS", 800),

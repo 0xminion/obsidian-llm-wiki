@@ -45,7 +45,7 @@ __all__ = [
     "run_enrichment",
 ]
 
-logger = logging.getLogger("llmwiki.enrich")
+logger = logging.getLogger("obswiki.enrich")
 
 
 # ── Dataclasses ───────────────────────────────────────────────────────────
@@ -112,8 +112,6 @@ async def run_enrichment(
     queue: list[str] = list(options.seed_urls)
 
     registry = _build_concept_registry(bd)
-    existing_ids = list(registry.values())
-
     while queue and result.pages_fetched < options.max_pages:
         url = queue.pop(0)
         if url in visited:
@@ -307,10 +305,7 @@ def _enrich_existing_concept(
         body = f"{body}{sep}{section_header}\n{citation}"
 
     # Rebuild the file with frontmatter + updated body.
-    if meta:
-        new_content = f"{build_frontmatter(meta)}\n\n{body}"
-    else:
-        new_content = body
+    new_content = f"{build_frontmatter(meta)}\n\n{body}" if meta else body
 
     atomic_write(concept_path, new_content)
 
@@ -372,8 +367,6 @@ def _extract_outbound_links(
     if not content:
         return []
 
-    base = urlparse(base_url)
-    base_scheme = base.scheme or "http"
     links: list[str] = []
     seen: set[str] = set()
 

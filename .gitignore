@@ -1,6 +1,5 @@
 __pycache__/
 *.pyc
-*.pyo
 .pytest_cache/
 .ruff_cache/
 *.egg-info/
@@ -11,3 +10,5 @@ build/
 .vscode/
 .idea/
 *.tmp
+*.log
+.venv/
