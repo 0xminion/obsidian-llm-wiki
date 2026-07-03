@@ -73,56 +73,6 @@ def test_extract_links():
     assert not any(text == "" for text, _ in links)
 
 
-# ── extract_wikilinks ──────────────────────────────────────────────────
-
-
-def test_extract_wikilinks_plain():
-    body = "Link to [[foo]] and [[bar]]."
-    links = om.extract_wikilinks(body)
-    assert ("foo", None) in links
-    assert ("bar", None) in links
-
-
-def test_extract_wikilinks_alias():
-    body = "See [[foo|display]] here."
-    links = om.extract_wikilinks(body)
-    assert links == [("foo", "display")]
-
-
-# ── convert_wikilink_to_okf ─────────────────────────────────────────────
-
-
-def test_convert_wikilink_plain():
-    assert om.convert_wikilink_to_okf("foo") == "[foo](/concepts/foo.md)"
-
-
-def test_convert_wikilink_alias():
-    assert om.convert_wikilink_to_okf("foo", alias="Foo Bar") == \
-        "[Foo Bar](/concepts/foo.md)"
-
-
-def test_convert_wikilink_custom_directory():
-    assert om.convert_wikilink_to_okf("foo", directory="notes") == \
-        "[foo](/notes/foo.md)"
-
-
-# ── rewrite_wikilinks ──────────────────────────────────────────────────
-
-
-def test_rewrite_wikilinks_plain():
-    body = "See [[foo]] and [[bar]] in the text."
-    out = om.rewrite_wikilinks(body)
-    assert "[foo](/concepts/foo.md)" in out
-    assert "[bar](/concepts/bar.md)" in out
-    assert "[[" not in out
-
-
-def test_rewrite_wikilinks_alias():
-    body = "See [[foo|My Foo]] here."
-    out = om.rewrite_wikilinks(body)
-    assert out == "See [My Foo](/concepts/foo.md) here."
-
-
 # ── make_absolute_link / make_relative_link ────────────────────────────
 
 

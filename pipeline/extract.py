@@ -123,7 +123,14 @@ def _write_source_file(source: IngestedSource, url: str, config: Config) -> None
         slug = f"{base}-{counter}"
         counter += 1
 
-    frontmatter = f"---\ntitle: {source.title}\nurl: {url}\nextracted_at: {extracted_at}\n---\n\n"
+    frontmatter = (
+        f"---\n"
+        f"type: Source\n"
+        f"title: {source.title}\n"
+        f"url: {url}\n"
+        f"extracted_at: {extracted_at}\n"
+        f"---\n\n"
+    )
     full_md = frontmatter + source.content
 
     atomic_write(filepath, full_md)

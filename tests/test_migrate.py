@@ -9,9 +9,62 @@ import pytest
 from pipeline.migrate import (
     _convert_inline_citations,
     _infer_type_from_path,
+    convert_wikilink_to_okf,
+    extract_wikilinks,
     migrate_vault,
+    rewrite_wikilinks,
 )
 from pipeline.okf_markdown import parse_frontmatter
+
+
+# ── extract_wikilinks (moved from okf_markdown) ─────────────────────────
+
+
+def test_extract_wikilinks_plain():
+    body = "Link to [[foo]] and [[bar]]."
+    links = extract_wikilinks(body)
+    assert ("foo", None) in links
+    assert ("bar", None) in links
+
+
+def test_extract_wikilinks_alias():
+    body = "See [[foo|display]] here."
+    links = extract_wikilinks(body)
+    assert links == [("foo", "display")]
+
+
+# ── convert_wikilink_to_okf (moved from okf_markdown) ───────────────────
+
+
+def test_convert_wikilink_plain():
+    assert convert_wikilink_to_okf("foo") == "[foo](/concepts/foo.md)"
+
+
+def test_convert_wikilink_alias():
+    assert convert_wikilink_to_okf("foo", alias="Foo Bar") == \
+        "[Foo Bar](/concepts/foo.md)"
+
+
+def test_convert_wikilink_custom_directory():
+    assert convert_wikilink_to_okf("foo", directory="notes") == \
+        "[foo](/notes/foo.md)"
+
+
+# ── rewrite_wikilinks (moved from okf_markdown) ─────────────────────────
+
+
+def test_rewrite_wikilinks_plain():
+    body = "See [[foo]] and [[bar]] in the text."
+    out = rewrite_wikilinks(body)
+    assert "[foo](/concepts/foo.md)" in out
+    assert "[bar](/concepts/bar.md)" in out
+    assert "[[" not in out
+
+
+def test_rewrite_wikilinks_alias():
+    body = "See [[foo|My Foo]] here."
+    out = rewrite_wikilinks(body)
+    assert out == "See [My Foo](/concepts/foo.md) here."
 
 # ── Helpers ─────────────────────────────────────────────────────────────
 

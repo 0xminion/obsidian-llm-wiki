@@ -22,7 +22,7 @@ from pipeline.hasher import detect_changes
 from pipeline.lock import acquire_lock, release_lock
 
 # SchemaConfig / PageKind are schema-layer types now defined in okf_models.
-from pipeline.okf_markdown import parse_frontmatter, safe_read_file, slugify
+from pipeline.okf_markdown import make_absolute_link, parse_frontmatter, safe_read_file, slugify
 from pipeline.okf_models import (
     CompileResult,
     IngestedSource,
@@ -494,7 +494,7 @@ async def _generate_seed_pages(
             body_lines.append("## Related Concepts")
             body_lines.append("")
             for rel_slug in seed.related_slugs:
-                body_lines.append(f"- [[{rel_slug}]]")
+                body_lines.append(f"- {make_absolute_link(f'concepts/{rel_slug}', rel_slug)}")
             body_lines.append("")
 
         body_lines.append(

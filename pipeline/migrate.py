@@ -32,15 +32,54 @@ from pipeline.okf_markdown import (
     atomic_write,
     build_frontmatter,
     parse_frontmatter,
-    rewrite_wikilinks,
 )
 from pipeline.okf_models import LogEntry, OKFConceptType
 
 __all__ = [
     "migrate_vault",
+    "extract_wikilinks",
+    "convert_wikilink_to_okf",
+    "rewrite_wikilinks",
     "_infer_type_from_path",
     "_convert_inline_citations",
 ]
+
+# ── Wikilink utilities (moved from okf_markdown) ────────────────────────
+
+# Legacy wikilink: [[slug]] or [[slug|alias]].
+_WIKILINK_RE = re.compile(r"\[\[([^\]\|]+)(?:\|([^\]]+))?\]\]")
+
+
+def extract_wikilinks(body: str) -> list[tuple[str, str | None]]:
+    """Extract legacy ``[[slug]]`` / ``[[slug|alias]]`` wikilinks from ``body``.
+
+    Returns a list of ``(slug, alias)`` tuples where ``alias`` is ``None``
+    when no alias was given.
+    """
+    return [(m.group(1).strip(), m.group(2).strip() if m.group(2) else None)
+            for m in _WIKILINK_RE.finditer(body)]
+
+
+def convert_wikilink_to_okf(
+    slug: str, alias: str | None = None, directory: str = "concepts"
+) -> str:
+    """Convert a single wikilink target to an OKF markdown link.
+
+    ``[[slug]]``      → ``[slug](/concepts/slug.md)``
+    ``[[slug|alias]]`` → ``[alias](/concepts/slug.md)``
+    """
+    display = alias if alias else slug
+    return f"[{display}](/{directory}/{slug}.md)"
+
+
+def rewrite_wikilinks(body: str, directory: str = "concepts") -> str:
+    """Replace every ``[[wikilink]]`` in ``body`` with an OKF markdown link."""
+    def _replace(match: re.Match[str]) -> str:
+        slug = match.group(1).strip()
+        alias = match.group(2).strip() if match.group(2) else None
+        return convert_wikilink_to_okf(slug, alias=alias, directory=directory)
+
+    return _WIKILINK_RE.sub(_replace, body)
 
 # Directory-name → OKFConceptType mapping.  Keyed on the *leaf* directory
 # name so that ``04-Wiki/concepts/foo.md`` resolves to "Concept" etc.

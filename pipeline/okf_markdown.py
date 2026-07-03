@@ -30,9 +30,6 @@ __all__ = [
     "parse_frontmatter",
     "build_frontmatter",
     "extract_links",
-    "extract_wikilinks",
-    "convert_wikilink_to_okf",
-    "rewrite_wikilinks",
     "make_absolute_link",
     "make_relative_link",
     "safe_read_file",
@@ -126,8 +123,7 @@ def build_frontmatter(fm_dict: dict) -> str:
 # images ![alt](url).
 _LINK_RE = re.compile(r"(?<!\!)\[([^\]]*)\]\(([^)]*)\)")
 
-# Legacy wikilink: [[slug]] or [[slug|alias]].
-_WIKILINK_RE = re.compile(r"\[\[([^\]\|]+)(?:\|([^\]]+))?\]\]")
+# Legacy wikilink regex moved to pipeline.migrate.
 
 
 def extract_links(body: str) -> list[tuple[str, str]]:
@@ -139,44 +135,7 @@ def extract_links(body: str) -> list[tuple[str, str]]:
     return [(m.group(1), m.group(2)) for m in _LINK_RE.finditer(body)]
 
 
-def extract_wikilinks(body: str) -> list[tuple[str, str | None]]:
-    """Extract legacy ``[[slug]]`` / ``[[slug|alias]]`` wikilinks from ``body``.
-
-    Returns a list of ``(slug, alias)`` tuples where ``alias`` is ``None``
-    when no alias was given.
-    """
-    return [(m.group(1).strip(), m.group(2).strip() if m.group(2) else None)
-            for m in _WIKILINK_RE.finditer(body)]
-
-
-# ── Wikilink → OKF conversion ──────────────────────────────────────────
-
-
-def convert_wikilink_to_okf(slug: str, alias: str | None = None,
-                           directory: str = "concepts") -> str:
-    """Convert a single wikilink target to an OKF markdown link.
-
-    ``[[slug]]``      → ``[slug](/concepts/slug.md)``
-    ``[[slug|alias]]`` → ``[alias](/concepts/slug.md)``
-
-    The display text is ``alias`` when provided, otherwise ``slug``. The
-    link target is always ``/<directory>/<slug>.md``.
-    """
-    display = alias if alias else slug
-    return f"[{display}](/{directory}/{slug}.md)"
-
-
-def rewrite_wikilinks(body: str, directory: str = "concepts") -> str:
-    """Replace every ``[[wikilink]]`` in ``body`` with an OKF markdown link.
-
-    Both ``[[slug]]`` and ``[[slug|alias]]`` forms are handled.
-    """
-    def _replace(match: re.Match[str]) -> str:
-        slug = match.group(1).strip()
-        alias = match.group(2).strip() if match.group(2) else None
-        return convert_wikilink_to_okf(slug, alias=alias, directory=directory)
-
-    return _WIKILINK_RE.sub(_replace, body)
+# ── Wikilink → OKF conversion (moved to pipeline.migrate) ───────────────
 
 
 # ── Link construction ──────────────────────────────────────────────────

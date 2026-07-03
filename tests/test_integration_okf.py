@@ -28,7 +28,8 @@ from pipeline.okf_indexgen import (
     generate_log,
 )
 from pipeline.okf_lint import lint_bundle
-from pipeline.okf_markdown import atomic_write, extract_wikilinks, parse_frontmatter
+from pipeline.migrate import extract_wikilinks
+from pipeline.okf_markdown import atomic_write, parse_frontmatter
 from pipeline.okf_models import LogEntry
 from pipeline.okf_renderer import (
     render_concept_page,
