@@ -41,6 +41,7 @@ __all__ = [
     "render_directory_index",
     "build_frontmatter",
     "parse_frontmatter",
+    "extract_links",
     "safe_read_file",
     "atomic_write",
     "slugify",
@@ -104,6 +105,18 @@ def parse_frontmatter(raw: str) -> tuple[dict, str]:
         meta = {}
     body = body.lstrip("\n")
     return meta, body
+
+
+# Standard markdown link: [text](url). Excludes images ![alt](url).
+_LINK_RE = re.compile(r"(?<!\!)\[([^\]]*)\]\(([^)]*)\)")
+
+
+def extract_links(body: str) -> list[tuple[str, str]]:
+    """Extract standard markdown ``[text](url)`` links from ``body``.
+
+    Returns a list of ``(text, url)`` tuples in document order.
+    """
+    return [(m.group(1), m.group(2)) for m in _LINK_RE.finditer(body)]
 
 
 def safe_read_file(path: str | Path) -> str:
