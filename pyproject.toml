@@ -45,5 +45,5 @@ select = ["E", "F", "W", "I", "N", "UP", "B", "C4", "SIM"]
 "obsidian_llm_wiki/synth/prompts.py" = ["E501"]
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+testpaths = ["tests", "tests/new"]
 asyncio_mode = "auto"
