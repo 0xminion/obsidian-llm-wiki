@@ -57,6 +57,24 @@ class RelationType(StrEnum):
     RELATED_TO = "related_to"
     PREREQUISITE_OF = "prerequisite_of"
     EXAMPLE_OF = "example_of"
+    COMPONENT_OF = "component_of"
+    CAUSES = "causes"
+    ENABLES = "enables"
+    PART_OF = "part_of"
+    EXPLAINS = "explains"
+
+
+#: Valid relation values (for normalisation).
+VALID_RELATIONS: frozenset[str] = frozenset(r.value for r in RelationType)
+
+
+def normalize_relation(value: str) -> str:
+    """Normalise a relation string to a valid RelationType value.
+
+    Non-matching values fall back to ``related_to``.
+    """
+    cleaned = (value or "related_to").strip().lower().replace("-", "_").replace(" ", "_")
+    return cleaned if cleaned in VALID_RELATIONS else RelationType.RELATED_TO.value
 
 
 # ── Ingest ──────────────────────────────────────────────────────────────
@@ -154,6 +172,7 @@ class SourceSynthesis:
     language: str = ""
     concepts: list[ConceptNote] = field(default_factory=list)
     maps: list[MapOfContent] = field(default_factory=list)
+    source_file: str = ""  # filename this synthesis was derived from
 
 
 @dataclass
@@ -212,7 +231,6 @@ class CompileResult:
     concepts: list[ConceptNote] = field(default_factory=list)
     pages: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
-    candidates: list[str] = field(default_factory=list)
 
 
 # ── JSON ↔ dataclass conversion ─────────────────────────────────────────
@@ -242,6 +260,7 @@ def source_synthesis_from_dict(data: dict[str, Any]) -> SourceSynthesis:
         language=data.get("language", ""),
         concepts=concepts,
         maps=maps,
+        source_file=data.get("source_file", ""),
     )
 
 
@@ -268,7 +287,7 @@ def _concept_from_dict(data: dict[str, Any]) -> ConceptNote:
     related = [
         ConceptLink(
             slug=r.get("slug", ""),
-            relation=r.get("relation", "related_to"),
+            relation=normalize_relation(r.get("relation", "related_to")),
             display=r.get("display", ""),
         )
         for r in data.get("related", [])
@@ -298,3 +317,62 @@ def _moc_from_dict(data: dict[str, Any]) -> MapOfContent:
         tags=list(data.get("tags", []) or []),
         concept_slugs=list(data.get("concept_slugs", []) or []),
     )
+
+
+# ── Serialization (for synthesis cache) ──────────────────────────────────
+
+
+def concept_note_to_dict(c: ConceptNote) -> dict[str, Any]:
+    """Serialize a ConceptNote to a plain dict."""
+    return {
+        "title": c.title,
+        "slug": c.slug,
+        "summary": c.summary,
+        "tags": c.tags,
+        "aliases": c.aliases,
+        "sections": [
+            {"heading": section.heading, "points": section.points, "prose": section.prose}
+            for section in c.sections
+        ],
+        "claims": [
+            {
+                "text": claim.text,
+                "concept_slug": claim.concept_slug,
+                "source_ref": claim.source_ref,
+            }
+            for claim in c.claims
+        ],
+        "related": [
+            {"slug": link.slug, "relation": link.relation, "display": link.display}
+            for link in c.related
+        ],
+        "confidence": c.confidence,
+        "provenance": c.provenance,
+        "is_new": c.is_new,
+    }
+
+
+def moc_to_dict(m: MapOfContent) -> dict[str, Any]:
+    """Serialize a MapOfContent to a plain dict."""
+    return {
+        "title": m.title,
+        "slug": m.slug,
+        "summary": m.summary,
+        "tags": m.tags,
+        "concept_slugs": m.concept_slugs,
+    }
+
+
+def source_synthesis_to_dict(s: SourceSynthesis) -> dict[str, Any]:
+    """Serialize a SourceSynthesis to a plain dict (for cache persistence)."""
+    return {
+        "source_title": s.source_title,
+        "source_summary": s.source_summary,
+        "source_tags": s.source_tags,
+        "key_points": s.key_points,
+        "open_questions": s.open_questions,
+        "language": s.language,
+        "concepts": [concept_note_to_dict(c) for c in s.concepts],
+        "maps": [moc_to_dict(m) for m in s.maps],
+        "source_file": s.source_file,
+    }

@@ -19,7 +19,6 @@ from obsidian_llm_wiki.core.models import SourceDoc
 from obsidian_llm_wiki.core.pipeline import run_pipeline
 from obsidian_llm_wiki.render.obsidian import parse_frontmatter, safe_read_file
 
-
 # ── Fake LLM response matching the SynthesisBundle schema ───────────────
 
 FAKE_LLM_RESPONSE = json.dumps({
@@ -241,7 +240,11 @@ async def test_golden_pipeline_incremental_skip(tmp_path: Path):
     config = load_config(env_file=str(vault / ".env"))
 
     sources = {
-        "test.md": SourceDoc(title="Test", content="Content here"),
+        "test.md": SourceDoc(
+            title="Test",
+            content="This is a test document with enough content to pass the length gate. "
+            * 3,
+        ),
     }
 
     # First run.

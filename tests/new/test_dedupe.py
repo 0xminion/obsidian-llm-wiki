@@ -16,7 +16,6 @@ from obsidian_llm_wiki.synth.dedupe import (
     slugify,
 )
 
-
 # ── normalise_tags ───────────────────────────────────────────────────────
 
 

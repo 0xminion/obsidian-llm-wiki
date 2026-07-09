@@ -4,8 +4,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import yaml
-
 from obsidian_llm_wiki.core.models import (
     BodySection,
     ConceptLink,
@@ -13,7 +11,6 @@ from obsidian_llm_wiki.core.models import (
     MapOfContent,
     SourceDoc,
     SourceSynthesis,
-    SynthesisBundle,
 )
 from obsidian_llm_wiki.render.obsidian import (
     atomic_write,
@@ -27,7 +24,6 @@ from obsidian_llm_wiki.render.obsidian import (
     render_vault,
     slugify,
 )
-
 
 # ── Utilities ────────────────────────────────────────────────────────────
 

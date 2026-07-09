@@ -5,10 +5,9 @@ from __future__ import annotations
 import json
 
 from obsidian_llm_wiki.synth.parser import (
-    parse_synthesis_response,
     parse_single_source_synthesis,
+    parse_synthesis_response,
 )
-
 
 # ── parse_single_source_synthesis ────────────────────────────────────────
 
