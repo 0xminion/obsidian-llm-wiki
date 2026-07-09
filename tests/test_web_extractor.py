@@ -222,7 +222,7 @@ class TestExtractWeb:
         # curl succeeds with HTML
         mock_curl_ok = MagicMock()
         mock_curl_ok.returncode = 0
-        mock_curl_ok.stdout = "<html><head><title>Curl Title</title></head><body><p>Curl content here</p></body></html>"
+        mock_curl_ok.stdout = "<html><head><title>Curl Title</title></head><body><p>Curl content here</p></body></html>"  # noqa: E501
         mock_curl_ok.stderr = ""
 
         with patch(

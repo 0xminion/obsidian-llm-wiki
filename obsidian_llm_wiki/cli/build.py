@@ -8,8 +8,7 @@ import typer
 
 from obsidian_llm_wiki.cli import app
 from obsidian_llm_wiki.cli._helpers import print_result_summary, resolve_vault
-from obsidian_llm_wiki.core.models import SourceDoc
-from obsidian_llm_wiki.render.obsidian import parse_frontmatter, safe_read_file
+from obsidian_llm_wiki.ingest.sources import load_sources_from_dir
 
 
 @app.command()
@@ -28,7 +27,8 @@ def build(
     """Re-synthesise changed sources and re-render the vault.
 
     Detects changes in sources/, runs the LLM synthesis pipeline on changed
-    sources, and re-renders the vault.
+    sources, and re-renders the vault.  Unchanged sources reuse their cached
+    synthesis so the full corpus is always rendered.
 
     Examples:
         olw build ~/MyVault
@@ -45,17 +45,8 @@ def build(
     print(f"📂 Vault: {vault_path}")
     print(f"🤖 Model: {config.llm.model}")
 
-    # ── Read source files from sources/ ────────────────────────────────
-    sources: dict[str, SourceDoc] = {}
-    if config.sources_dir.exists():
-        for f in sorted(config.sources_dir.glob("*.md")):
-            raw = safe_read_file(f)
-            if not raw.strip():
-                continue
-            meta, body = parse_frontmatter(raw)
-            title = meta.get("title", f.stem)
-            url = meta.get("url")
-            sources[f.name] = SourceDoc(title=title, content=body, url=url)
+    # ── Load the FULL corpus from sources/ ──────────────────────────────
+    sources = load_sources_from_dir(config.sources_dir)
 
     if not sources:
         print("⚠ No source files found. Run 'olw ingest' first.")
@@ -67,7 +58,7 @@ def build(
         print("   🔍 Dry run — would synthesise changed sources")
         return
 
-    # ── Run pipeline ───────────────────────────────────────────────────
+    # ── Run pipeline with the full corpus ───────────────────────────────
     print("\n🤖 Running synthesis pipeline...")
     from obsidian_llm_wiki.core.pipeline import run_pipeline
 

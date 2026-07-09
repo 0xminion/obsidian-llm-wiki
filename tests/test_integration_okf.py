@@ -22,13 +22,13 @@ from pathlib import Path
 import pytest
 
 from pipeline.bundle_io import export_bundle, import_bundle
+from pipeline.migrate import extract_wikilinks
 from pipeline.okf_indexgen import (
     generate_bundle_index,
     generate_directory_index,
     generate_log,
 )
 from pipeline.okf_lint import lint_bundle
-from pipeline.migrate import extract_wikilinks
 from pipeline.okf_markdown import atomic_write, parse_frontmatter
 from pipeline.okf_models import LogEntry
 from pipeline.okf_renderer import (

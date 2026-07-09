@@ -16,7 +16,6 @@ from pipeline.migrate import (
 )
 from pipeline.okf_markdown import parse_frontmatter
 
-
 # ── extract_wikilinks (moved from okf_markdown) ─────────────────────────
 
 

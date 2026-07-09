@@ -117,8 +117,8 @@ def test_extract_outbound_links_html_content():
     assert "https://example.com/page1" in links
     assert "https://example.com/page2" in links
     # Fragment and mailto links should be excluded.
-    assert not any("#fragment" in l for l in links)
-    assert not any("mailto" in l for l in links)
+    assert not any("#fragment" in l for l in links)  # noqa: E741
+    assert not any("mailto" in l for l in links)  # noqa: E741
 
 
 def test_extract_outbound_links_markdown_content():
@@ -141,7 +141,7 @@ def test_extract_outbound_links_host_filter():
         content, "https://example.com/", "example.com"
     )
     assert "https://example.com/a" in links
-    assert not any("other.com" in l for l in links)
+    assert not any("other.com" in l for l in links)  # noqa: E741
 
 
 def test_extract_outbound_links_no_host_filter():
@@ -354,7 +354,7 @@ def test_parse_enrich_response_valid_array():
     response = '''[
       {"action": "enrich", "concept_id": "alpha", "addition": "new info"},
       {"action": "mint", "concept_id": "new-ref", "title": "New Ref", "body": "body", "tags": ["t1"]}
-    ]'''
+    ]'''  # noqa: E501
     decisions = parse_enrich_response(response)
     assert len(decisions) == 2
     assert decisions[0].action == "enrich"

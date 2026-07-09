@@ -52,6 +52,11 @@ class Config:
     # ── Language ────────────────────────────────────
     output_language: str = ""
 
+    # ── Synthesis mode ──────────────────────────────
+    # "single" = one LLM call per source (default, fast)
+    # "two_pass" = extract skeleton + expand each concept (deep, slow)
+    synthesis_mode: str = "single"
+
     # ── Quality gates ───────────────────────────────
     concept_min_body_chars: int = 800
     entry_min_body_chars: int = 500
@@ -153,6 +158,7 @@ def load_config(env_file: str | None = None, **overrides: str) -> Config:
         min_source_chars=_int_env("MIN_SOURCE_CHARS", 50),
         compile_concurrency=_int_env("COMPILE_CONCURRENCY", 3),
         output_language=os.getenv("OUTPUT_LANGUAGE", ""),
+        synthesis_mode=os.getenv("SYNTHESIS_MODE", "single"),
         concept_min_body_chars=_int_env("CONCEPT_MIN_BODY_CHARS", 800),
         entry_min_body_chars=_int_env("ENTRY_MIN_BODY_CHARS", 500),
         clipping_min_body_chars=_int_env("CLIPPING_MIN_BODY_CHARS", 500),

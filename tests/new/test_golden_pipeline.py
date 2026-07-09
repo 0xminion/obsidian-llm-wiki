@@ -19,12 +19,11 @@ from obsidian_llm_wiki.core.models import SourceDoc
 from obsidian_llm_wiki.core.pipeline import run_pipeline
 from obsidian_llm_wiki.render.obsidian import parse_frontmatter, safe_read_file
 
-
 # ── Fake LLM response matching the SynthesisBundle schema ───────────────
 
 FAKE_LLM_RESPONSE = json.dumps({
     "source_title": "Attention Is All You Need",
-    "source_summary": "Introduces the Transformer architecture, replacing recurrence with self-attention.",
+    "source_summary": "Introduces the Transformer architecture, replacing recurrence with self-attention.",  # noqa: E501
     "source_tags": ["deep-learning", "attention", "transformers"],
     "key_points": [
         "Self-attention mechanism eliminates recurrence entirely",
@@ -52,14 +51,14 @@ FAKE_LLM_RESPONSE = json.dumps({
                 },
                 {
                     "heading": "Context",
-                    "prose": "Self-attention allows each position to attend to all positions in the sequence, enabling long-range dependencies without recurrence.",
+                    "prose": "Self-attention allows each position to attend to all positions in the sequence, enabling long-range dependencies without recurrence.",  # noqa: E501
                 },
             ],
             "claims": [
-                {"text": "Self-attention complexity is O(n^2) in sequence length", "source_ref": "section 3.2"},
+                {"text": "Self-attention complexity is O(n^2) in sequence length", "source_ref": "section 3.2"},  # noqa: E501
             ],
             "related": [
-                {"slug": "multi-head-attention", "relation": "component_of", "display": "Multi-Head Attention"},
+                {"slug": "multi-head-attention", "relation": "component_of", "display": "Multi-Head Attention"},  # noqa: E501
                 {"slug": "positional-encoding", "relation": "depends_on"},
             ],
             "confidence": 0.95,
@@ -90,7 +89,7 @@ FAKE_LLM_RESPONSE = json.dumps({
         {
             "title": "Positional Encoding",
             "slug": "positional-encoding",
-            "summary": "Injects position information into the input embeddings using sinusoidal functions.",
+            "summary": "Injects position information into the input embeddings using sinusoidal functions.",  # noqa: E501
             "tags": ["embeddings", "transformers"],
             "sections": [
                 {
@@ -241,7 +240,11 @@ async def test_golden_pipeline_incremental_skip(tmp_path: Path):
     config = load_config(env_file=str(vault / ".env"))
 
     sources = {
-        "test.md": SourceDoc(title="Test", content="Content here"),
+        "test.md": SourceDoc(
+            title="Test",
+            content="This is a test document with enough content to pass the length gate. "
+            * 3,
+        ),
     }
 
     # First run.

@@ -9,9 +9,7 @@ import typer
 
 from obsidian_llm_wiki.cli import app
 from obsidian_llm_wiki.cli._helpers import print_result_summary, resolve_vault
-from obsidian_llm_wiki.core.models import SourceDoc
-from obsidian_llm_wiki.ingest.clippings import collect_clippings
-from obsidian_llm_wiki.ingest.web import extract_web
+from obsidian_llm_wiki.ingest.sources import load_sources_from_dir
 from obsidian_llm_wiki.render.obsidian import atomic_write, slugify
 
 
@@ -36,8 +34,9 @@ def ingest(
     """Ingest URLs and clippings, then synthesise + render the vault.
 
     Extracts full content from URLs, collects clippings from 02-Clippings/,
-    then runs the LLM synthesis pipeline to generate concepts, MOCs, and
-    entries.
+    writes them to sources/, then runs the LLM synthesis pipeline on the
+    FULL corpus (existing + new).  Unchanged sources reuse their cached
+    synthesis; only new/changed sources trigger LLM calls.
 
     Examples:
         olw ingest ~/MyVault --url https://example.com/article
@@ -49,74 +48,86 @@ def ingest(
     if parallel:
         import os
         os.environ["COMPILE_CONCURRENCY"] = str(parallel)
-        config = load_config_with_concurrency(vault_path, parallel)
+        config = _reload_config_with_concurrency(vault_path, parallel)
 
     print(f"📂 Vault: {vault_path}")
     print(f"🤖 Model: {config.llm.model}")
 
     # ── Collect clippings ──────────────────────────────────────────────
-    sources: dict[str, SourceDoc] = {}
+    from obsidian_llm_wiki.ingest.clippings import collect_clippings
+
+    new_count = 0
 
     passed_clippings = collect_clippings(config)
     if passed_clippings:
         print(f"\n📋 Clippings passing quality gate: {len(passed_clippings)}")
         for clip_path, source in passed_clippings:
-            key = clip_path.name
-            sources[key] = source
+            if not dry_run:
+                config.sources_dir.mkdir(parents=True, exist_ok=True)
+                from obsidian_llm_wiki.render.obsidian import render_source_page
+                page = render_source_page(source)
+                atomic_write(config.sources_dir / clip_path.name, page)
+            new_count += 1
             print(f"   ✅ {source.title[:60]} ({len(source.content)} chars)")
 
-    # ── Extract URLs ───────────────────────────────────────────────────
+    # ── Extract URLs and write to sources/ ──────────────────────────────
     if urls:
         print(f"\n🌐 Extracting {len(urls)} URL(s)...")
-        if dry_run:
-            print("   🔍 Dry run — would extract:")
-            for url in urls:
-                print(f"      {url}")
-        else:
-            for url in urls:
-                try:
-                    source = extract_web(url)
-                    filename = f"{slugify(source.title)}.md"
-                    filepath = config.sources_dir / filename
-                    if not dry_run:
-                        config.sources_dir.mkdir(parents=True, exist_ok=True)
-                        # Write source page with frontmatter.
-                        from obsidian_llm_wiki.render.obsidian import render_source_page
-                        page = render_source_page(source)
-                        atomic_write(filepath, page)
-                    sources[filename] = source
-                    print(f"   ✅ {source.title[:60]} ({len(source.content)} chars)")
-                except Exception as exc:
-                    print(f"   ❌ {url}: {exc}")
+        from obsidian_llm_wiki.ingest.extractors import extract
+        from obsidian_llm_wiki.render.obsidian import render_source_page
 
-    if not sources:
-        print("\n⚠ No sources to process.")
-        if not urls and not passed_clippings:
-            print("   Tip: Use --url to add URLs or add .md files to 02-Clippings/")
-        return
+        for url in urls:
+            if dry_run:
+                print(f"   🔍 Would extract: {url}")
+                continue
+            try:
+                source = extract(url)
+                filename = f"{slugify(source.title)}.md"
+                filepath = config.sources_dir / filename
+                config.sources_dir.mkdir(parents=True, exist_ok=True)
+                page = render_source_page(source)
+                atomic_write(filepath, page)
+                new_count += 1
+                print(f"   ✅ {source.title[:60]} ({len(source.content)} chars)")
+            except Exception as exc:
+                print(f"   ❌ {url}: {exc}")
 
-    print(f"\n📦 Total sources: {len(sources)}")
+    if new_count == 0 and not dry_run:
+        print("\n⚠ No new sources to ingest.")
+        print("   Tip: Use --url to add URLs or add .md files to 02-Clippings/")
 
     if skip_synthesis:
-        print("   ⏭ Skipping synthesis (--skip-synthesis)")
+        print("\n   ⏭ Skipping synthesis (--skip-synthesis)")
         return
 
     if dry_run:
-        print("   🔍 Dry run — would synthesise these sources:")
-        for key, source in sorted(sources.items()):
-            print(f"      {source.title[:60]} ← {key}")
+        print("\n   🔍 Dry run — no files written.")
         return
 
-    # ── Run synthesis + render pipeline ────────────────────────────────
+    # ── Load the FULL corpus from sources/ ────────────────────────────
+    # This is critical: run_pipeline treats any source not in the dict
+    # as deleted.  We must pass the complete set of sources, not just
+    # the newly extracted ones.
+    full_corpus = load_sources_from_dir(config.sources_dir)
+
+    if not full_corpus:
+        print("\n⚠ No source files found in sources/.")
+        return
+
+    print(f"\n📦 Total corpus: {len(full_corpus)} source(s)")
+    if new_count:
+        print(f"   ({new_count} new/changed this run)")
+
+    # ── Run synthesis + render pipeline on the full corpus ─────────────
     print("\n🤖 Running LLM synthesis pipeline...")
     from obsidian_llm_wiki.core.pipeline import run_pipeline
 
-    result = asyncio.run(run_pipeline(vault_path, sources, config, force=True))
+    result = asyncio.run(run_pipeline(vault_path, full_corpus, config))
 
     print_result_summary(result)
 
 
-def load_config_with_concurrency(vault_path: Path, parallel: int):
+def _reload_config_with_concurrency(vault_path: Path, parallel: int):
     """Reload config with concurrency override."""
     from obsidian_llm_wiki.config import load_config
 

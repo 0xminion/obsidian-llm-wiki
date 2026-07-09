@@ -4,19 +4,14 @@ from __future__ import annotations
 
 from obsidian_llm_wiki.core.models import (
     BodySection,
-    Claim,
     ConceptLink,
     ConceptNote,
     ConceptType,
-    MapOfContent,
     ProvenanceState,
     RelationType,
     SourceDoc,
-    SourceSynthesis,
-    SynthesisBundle,
     source_synthesis_from_dict,
 )
-
 
 # ── SourceDoc ────────────────────────────────────────────────────────────
 

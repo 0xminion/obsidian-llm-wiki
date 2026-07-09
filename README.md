@@ -1,56 +1,103 @@
 # obsidian-llm-wiki
 
-LLM-powered knowledge compiler for Obsidian vaults — sources in, interlinked wiki out.
+LLM-powered knowledge compiler for Obsidian vaults — give it any link, get a
+structured, interlinked wiki with typed relationships, tagged concepts, and
+deterministic markdown rendering.
 
-`obsidian-llm-wiki` takes raw web sources (URLs, clippings) and compiles them
-into an Obsidian vault with LLM-synthesised concepts, tags, summaries, and
-cross-links. The core innovation is a **single LLM synthesis call** that
-produces a structured JSON bundle (summaries, tags, concepts, relationships,
-citations, MOCs) — all markdown rendering is deterministic.
+`obsidian-llm-wiki` ingests web articles, YouTube videos, PDFs, Word
+documents, and plain text — synthesises them via LLM into structured
+concepts with typed cross-references — and renders an Obsidian vault with
+YAML frontmatter, wikilinks, machine-readable `relations[]`, and MOC
+groupings. All markdown generation is deterministic; the LLM only produces
+the intermediate synthesis JSON.
 
 ---
 
 ## Architecture
 
 ```
-Sources / URLs / Clippings  →  Ingest  →  Synthesise  →  Merge  →  Render
-                                (httpx)    (1 LLM call    (corpus    (deterministic
-                                           per source)     dedup)     markdown)
-         ↓                       ↓           ↓              ↓           ↓
-    SourceDoc               web.py     SynthesisBundle   dedupe    Obsidian vault
-                            clippings  (typed JSON)     .py       (wikilinks,
-                                                                   frontmatter)
+Sources / URLs / Files  →  Extract  →  Synthesise  →  Merge  →  Render
+   (web, YouTube,          (registry)  (LLM calls)   (corpus   (deterministic
+    PDF, DOCX, text,                    + cache)      dedup)    markdown)
+         ↓                     ↓            ↓             ↓          ↓
+    SourceDoc            extractors    SynthesisBundle  dedupe   Obsidian vault
+                         web.py        (typed JSON)    .py      (wikilinks,
+                         youtube.py                             frontmatter,
+                         pdf.py                                 relations[])
+                         docx.py
 ```
+
+### Key design decisions
+
+- **Synthesis cache** (`.llmwiki/cache/<filename>.json`) — incremental builds
+  reuse cached syntheses for unchanged sources, so the rendered corpus is
+  always complete — not just the subset that changed in this run.
+- **Orphan detection** — when a source is deleted, its exclusively-owned
+  concepts get `orphaned: true` in frontmatter. Shared concepts are preserved.
+- **Full-corpus rendering** — `render_vault()` always receives the complete
+  set of sources, not just changed ones. This prevents silent data loss.
+- **Typed relationships** — concepts carry `related: [{slug, relation, display}]`
+  with normalised relation types (`variant_of`, `depends_on`, `component_of`,
+  etc.). These render as both human-readable `[[slug|display]] — \`relation\``
+  in the body and machine-readable `relations[]` in frontmatter.
 
 ### The Synthesis Contract
 
-The LLM produces **one structured JSON object per source** containing
-everything the renderers need:
+The LLM produces one structured JSON object per source containing everything
+the renderers need:
 
 ```json
 {
-  "source_title": "...",
-  "source_summary": "2-3 sentence overview",
-  "source_tags": ["machine-learning", "optimization"],
-  "key_points": ["...", "..."],
+  "source_title": "Attention Is All You Need",
+  "source_summary": "Introduces the Transformer architecture...",
+  "source_tags": ["deep-learning", "attention"],
+  "key_points": ["Self-attention eliminates recurrence", ...],
   "concepts": [
     {
-      "title": "Gradient Descent",
-      "slug": "gradient-descent",
-      "summary": "Optimization algorithm for minimizing loss",
-      "tags": ["optimization", "machine-learning"],
+      "title": "Self-Attention",
+      "slug": "self-attention",
+      "summary": "Attention mechanism relating positions in a sequence.",
+      "tags": ["attention", "neural-network"],
       "sections": [{"heading": "Core", "points": ["..."]}],
-      "related": [{"slug": "sgd", "relation": "variant_of"}],
-      "claims": [{"text": "Learning rate controls step size"}]
+      "related": [{"slug": "multi-head-attention", "relation": "component_of"}],
+      "claims": [{"text": "Complexity is O(n^2)", "source_ref": "section 3.2"}],
+      "confidence": 0.95
     }
   ],
   "maps": [
-    {"title": "Optimization", "slug": "optimization", "concept_slugs": ["gradient-descent"]}
+    {"title": "Attention Mechanisms", "slug": "attention-mechanisms",
+     "concept_slugs": ["self-attention", "multi-head-attention"]}
   ]
 }
 ```
 
-All markdown generation is **pure functions** — no LLM calls during render.
+### Synthesis modes
+
+| Mode | `SYNTHESIS_MODE` | LLM calls | When to use |
+|------|-------------------|-----------|-------------|
+| **Single-pass** (default) | `single` | 1 per source | Fast, good for short articles |
+| **Two-pass quality** | `two_pass` | 1 + N (per concept) | Deep, evidence-backed sections |
+
+In two-pass mode, Pass 1 extracts a concept skeleton (title, slug, rationale),
+then Pass 2 expands each concept with a focused prompt producing 300+ word
+sections. A quality gate flags thin concepts (`confidence: 0.3`).
+
+---
+
+## Supported Sources
+
+| Source | Extractor | Optional dep | Install |
+|--------|-----------|--------------|---------|
+| Web articles / blogs / news | `trafilatura` | included | — |
+| YouTube videos | `yt-dlp` + `youtube-transcript-api` | `pip install okf-pipeline[youtube]` | transcript + metadata |
+| PDF files | `pymupdf` (fitz) | `pip install okf-pipeline[pdf]` | full text with page markers |
+| Word `.docx` | `python-docx` | `pip install okf-pipeline[docx]` | text with heading structure |
+| Plain text / markdown | built-in | — | direct file read |
+
+Install all optional extractors: `pip install okf-pipeline[all]`
+
+The extractor registry auto-detects source type from URL domain or file
+extension. Unknown URLs fall back to web extraction (trafilatura).
 
 ---
 
@@ -62,20 +109,27 @@ git clone https://github.com/0xminion/obsidian-llm-wiki.git
 cd obsidian-llm-wiki
 pip install -e .
 
+# Optional: install YouTube/PDF/DOCX extractors
+pip install -e ".[all]"
+
 # Interactive setup
 olw setup
 
-# Ingest URLs and build the vault
-olw ingest ~/MyVault --url https://example.com/article
+# Ingest any link — YouTube, PDF, web article, etc.
+olw ingest ~/MyVault --url https://youtube.com/watch?v=...
+olw ingest ~/MyVault --url https://arxiv.org/abs/1706.03762
+olw ingest ~/MyVault -u URL1 -u URL2 --parallel 5
 
-# Re-build after manual edits to sources
+# Re-build after manual edits to sources (incremental, uses cache)
 olw build ~/MyVault
+olw build ~/MyVault --force    # force re-synthesis of all
 
-# Query the vault
+# Query the vault (RAG-style)
 olw query ~/MyVault --ask "What is a transformer model?"
 
 # Validate the vault
 olw validate ~/MyVault
+olw validate ~/MyVault --strict   # broken wikilinks = errors
 ```
 
 ---
@@ -85,10 +139,10 @@ olw validate ~/MyVault
 | Command | Description |
 |---------|-------------|
 | `olw setup` | Interactive setup wizard — configures LLM provider, vault path |
-| `olw ingest` | Ingest URLs + clippings → synthesise → render in one pass |
-| `olw build` | Re-synthesise changed sources and re-render the vault |
+| `olw ingest` | Ingest URLs + clippings → extract → synthesise → render |
+| `olw build` | Re-synthesise changed sources (incremental, cache-backed) and re-render |
 | `olw query` | RAG-style question answering against the vault |
-| `olw validate` | Check vault for conformance issues |
+| `olw validate` | Check vault for conformance (frontmatter, wikilinks, strict mode) |
 
 ---
 
@@ -100,16 +154,19 @@ olw validate ~/MyVault
 ├── 04-Wiki/               ← Wiki root
 │   ├── sources/           ← Original source content
 │   ├── entries/           ← LLM-synthesised analysis pages
-│   ├── concepts/          ← Evergreen atomic notes (with wikilinks)
+│   ├── concepts/          ← Evergreen atomic notes (with wikilinks + relations)
 │   ├── mocs/              ← Maps of Content (topic groupings)
 │   ├── index.md           ← Bundle-root index
-│   └── .llmwiki/          ← Internal state (excluded from export)
+│   └── .llmwiki/          ← Internal state
 │       ├── state.json     ← Source hash database for incremental builds
-│       └── lock           ← Compile-time PID lock
+│       ├── lock           ← Compile-time PID lock
+│       └── cache/         ← Synthesis cache (one JSON per source)
 └── .env                   ← Configuration
 ```
 
-Every `.md` file carries YAML frontmatter with a `type` field:
+### Concept frontmatter
+
+Every concept page carries YAML frontmatter with typed relations:
 
 ```yaml
 ---
@@ -117,11 +174,23 @@ type: Concept
 title: Gradient Descent
 tags: [machine-learning, optimization]
 aliases: [GD, batch gradient descent]
-timestamp: 2026-07-03T10:00:00Z
+confidence: 0.95
+timestamp: 2026-07-09T10:00:00Z
+relations:
+  - target: sgd
+    type: variant_of
+    display: SGD
+  - target: learning-rate
+    type: depends_on
+    display: Learning Rate
 ---
 ```
 
-Cross-links use Obsidian wikilinks: `[[gradient-descent]]` or `[[gradient-descent|GD]]`.
+Cross-links use Obsidian wikilinks with typed edge annotations:
+`[[sgd|SGD]] — \`variant_of\``
+
+The `relations[]` frontmatter array is machine-readable for Obsidian Dataview
+queries and graph visualisation plugins.
 
 ---
 
@@ -135,6 +204,7 @@ LLM_PROVIDER=ollama          # ollama | openai
 LLM_HOST=http://localhost:11434
 LLM_MODEL=gemma3:27b
 LLM_API_KEY=                  # for openai providers
+LLM_TIMEOUT_MS=1800000        # 30 minutes
 
 # Vault
 VAULT_PATH=$HOME/MyVault
@@ -148,6 +218,14 @@ COMPILE_CONCURRENCY=3
 
 # Language (en, zh, or empty for auto-detect)
 OUTPUT_LANGUAGE=
+
+# Synthesis mode
+SYNTHESIS_MODE=single        # single | two_pass
+
+# Retry
+RETRY_COUNT=3
+RETRY_BASE_MS=1000
+RETRY_MULTIPLIER=4
 
 # Quality gates
 CONCEPT_MIN_BODY_CHARS=800
@@ -171,26 +249,34 @@ For OpenAI, OpenRouter, LM Studio, vLLM, etc., set `LLM_PROVIDER=openai`,
 
 ```
 obsidian_llm_wiki/
-  cli/                  # Typer CLI (ingest, build, query, setup, validate)
+  cli/                   # Typer CLI (ingest, build, query, setup, validate)
   core/
-    models.py           # SynthesisBundle schema (the synthesis contract)
-    pipeline.py         # Single orchestrator (~200 LOC)
-    state.py            # Incremental compilation state
-    lock.py             # PID-based compile lock
+    models.py            # SynthesisBundle schema + serializers + RelationType
+    pipeline.py          # Full-corpus orchestrator with cache + orphan logic
+    cache.py             # Synthesis cache (per-source JSON persistence)
+    orphan.py            # Orphan detection (exclusive vs shared concepts)
+    state.py             # Incremental compilation state
+    lock.py              # PID-based compile lock
   ingest/
-    web.py              # httpx + trafilatura web extraction
-    clippings.py        # Clippings quality gate
+    web.py               # httpx + trafilatura web extraction
+    clippings.py         # Clippings quality gate
+    sources.py           # Source loading from sources/ directory
+    extractors/
+      __init__.py        # Registry with @register_extractor pattern
+      youtube.py         # yt-dlp + youtube-transcript-api
+      pdf.py             # pymupdf (fitz)
+      docx.py            # python-docx
   synth/
-    prompts.py          # Single-call synthesis prompt builder
-    parser.py           # JSON → SynthesisBundle validation
-    dedupe.py           # Corpus-level concept/tag reconciliation
+    prompts.py           # Single-pass synthesis prompt builder
+    quality.py           # Two-pass quality synthesis (extract → expand)
+    parser.py            # JSON → SynthesisBundle validation + empty section filter
+    dedupe.py            # Corpus-level concept/tag reconciliation
   render/
-    obsidian.py         # Deterministic Obsidian markdown renderer
+    obsidian.py          # Deterministic Obsidian markdown renderer
   providers/
-    llm.py              # Ollama + OpenAI-compatible clients
-  adapters/             # Optional tools (migrate, visualizer, export, enrich)
-  config.py             # Configuration management
-pipeline/               # Legacy package (backward compat, 320 tests)
+    llm.py               # Ollama + OpenAI-compatible clients
+  config.py              # Configuration management
+pipeline/                 # Legacy package (backward compat tests)
 ```
 
 ---
@@ -199,16 +285,24 @@ pipeline/               # Legacy package (backward compat, 320 tests)
 
 ```bash
 pip install -e ".[dev]"
-pytest                     # 374 tests (320 legacy + 54 new)
-ruff check .               # lint
+pytest                     # 434 tests (320 legacy + 114 new)
+ruff check obsidian_llm_wiki pipeline tests tests/new
 ```
 
 ### Tests
 
-The test suite includes a **golden end-to-end test** (`test_golden_pipeline.py`)
-that feeds a fake source through the complete pipeline with a mocked LLM and
-asserts the exact vault structure, frontmatter, wikilinks, and state
-persistence. This is the test that proves the product works as intended.
+The test suite includes:
+
+- **Golden end-to-end test** (`test_golden_pipeline.py`) — full pipeline with
+  mocked LLM, asserts vault structure, frontmatter, wikilinks, and state.
+- **Incremental cache test** (`test_incremental_cache.py`) — multi-source cache
+  reuse + orphan detection on source deletion.
+- **Extractor tests** (`test_extractors.py`) — registry dispatch, fallback,
+  video ID extraction.
+- **Two-pass quality tests** (`test_quality.py`) — mocked two-pass flow,
+  quality gate enforcement, pipeline dispatch.
+- **Model tests** (`test_models_phase4.py`) — relation normalization, empty
+  section rejection, RelationType enum.
 
 ---
 
@@ -217,4 +311,7 @@ persistence. This is the test that proves the product works as intended.
 - **Python 3.11+**
 - **[Ollama](https://ollama.com)** running locally (default), or any
   **OpenAI-compatible API** endpoint
-- Python dependencies: `typer`, `httpx`, `pyyaml`, `python-dotenv`, `trafilatura`
+- Python dependencies: `typer`, `httpx[socks]`, `pyyaml`, `python-dotenv`,
+  `trafilatura`
+- Optional: `yt-dlp`, `youtube-transcript-api` (YouTube),
+  `pymupdf` (PDF), `python-docx` (DOCX)
