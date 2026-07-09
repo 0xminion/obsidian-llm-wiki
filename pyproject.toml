@@ -32,6 +32,7 @@ pdf = [
 docx = [
     "python-docx>=1.1,<2",
 ]
+podcast = []
 all = [
     "yt-dlp>=2025.3,<2026",
     "youtube-transcript-api>=0.6,<1",

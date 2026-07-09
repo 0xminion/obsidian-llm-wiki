@@ -203,3 +203,6 @@ with suppress(ImportError):
 
 with suppress(ImportError):
     from obsidian_llm_wiki.ingest.extractors import docx as _docx  # noqa: F401
+
+with suppress(ImportError):
+    from obsidian_llm_wiki.ingest.extractors import podcast as _podcast  # noqa: F401
