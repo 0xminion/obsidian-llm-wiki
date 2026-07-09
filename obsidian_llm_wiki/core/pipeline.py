@@ -259,7 +259,16 @@ async def _synthesize_source(
     source: SourceDoc,
     existing_concepts: list[str],
 ) -> SourceSynthesis | None:
-    """Call the LLM to synthesise one source into a SourceSynthesis."""
+    """Call the LLM to synthesise one source into a SourceSynthesis.
+
+    Dispatches to the two-pass quality synthesis when
+    ``config.synthesis_mode == "two_pass"``; otherwise uses the default
+    single-pass synthesis.
+    """
+    if config.synthesis_mode == "two_pass":
+        from obsidian_llm_wiki.synth.quality import quality_synthesize_source
+        return await quality_synthesize_source(config, filename, source, existing_concepts)
+
     from obsidian_llm_wiki.providers.llm import acall_llm
 
     prompt = build_synthesis_prompt(
