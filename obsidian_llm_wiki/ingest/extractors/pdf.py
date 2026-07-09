@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from urllib.parse import urlparse
 
 from obsidian_llm_wiki.core.models import SourceDoc
 from obsidian_llm_wiki.ingest.extractors import register_extractor

@@ -87,16 +87,22 @@ def build_frontmatter(fm_dict: dict[str, Any]) -> str:
     return f"---\n{dumped}\n---\n"
 
 
+_FM_RE = re.compile(r"^---\n(.*?)\n---\n?(.*)$", re.DOTALL)
+
+
 def parse_frontmatter(raw: str) -> tuple[dict, str]:
-    """Parse YAML frontmatter from ``raw``.  Returns (meta, body)."""
+    """Parse YAML frontmatter from ``raw``.  Returns (meta, body).
+
+    Handles edge cases the old ``partition``-based approach missed:
+      * Body starting immediately after closing ``---`` (no leading newline)
+      * No trailing newline after the closing ``---``
+    """
     if not raw.startswith("---\n"):
         return {}, raw
-    _prefix, sep, rest = raw.partition("---\n")
-    if not sep:
+    match = _FM_RE.match(raw)
+    if not match:
         return {}, raw
-    yaml_block, sep2, body = rest.partition("\n---")
-    if not sep2:
-        return {}, raw
+    yaml_block, body = match.group(1), match.group(2)
     try:
         meta = yaml.safe_load(yaml_block)
     except yaml.YAMLError:

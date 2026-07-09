@@ -76,7 +76,10 @@ def validate(
             # Bare wikilink — check if a matching file exists.
             target = url.replace(".md", "")
             if target not in all_paths and url not in all_paths:
-                warnings.append(f"{rel}: broken link → {url}")
+                if strict:
+                    errors.append(f"{rel}: broken link → {url}")
+                else:
+                    warnings.append(f"{rel}: broken link → {url}")
 
     # Check for index.md files.
     for subdir in ["sources", "entries", "concepts", "mocs"]:

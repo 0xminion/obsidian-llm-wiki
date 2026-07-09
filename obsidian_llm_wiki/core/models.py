@@ -275,6 +275,11 @@ def _concept_from_dict(data: dict[str, Any]) -> ConceptNote:
         for s in data.get("sections", [])
         if isinstance(s, dict)
     ]
+    # Drop empty sections (both points and prose empty/missing).
+    sections = [
+        section for section in sections
+        if section.points or section.prose.strip()
+    ]
     claims = [
         Claim(
             text=c.get("text", ""),

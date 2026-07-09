@@ -15,6 +15,7 @@ from __future__ import annotations
 import logging
 import os
 from collections.abc import Callable
+from contextlib import suppress
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -128,17 +129,11 @@ def _extract_file(file_path: str) -> SourceDoc:
 # decorator. Import errors are silently swallowed — the extractor just
 # won't be available. Each module handles its own dependency checking.
 
-try:
+with suppress(ImportError):
     from obsidian_llm_wiki.ingest.extractors import youtube as _youtube  # noqa: F401
-except ImportError:
-    pass
 
-try:
+with suppress(ImportError):
     from obsidian_llm_wiki.ingest.extractors import pdf as _pdf  # noqa: F401
-except ImportError:
-    pass
 
-try:
+with suppress(ImportError):
     from obsidian_llm_wiki.ingest.extractors import docx as _docx  # noqa: F401
-except ImportError:
-    pass
