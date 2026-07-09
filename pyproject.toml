@@ -59,6 +59,13 @@ select = ["E", "F", "W", "I", "N", "UP", "B", "C4", "SIM"]
 "obsidian_llm_wiki/cli/*.py" = ["B008"]
 # Schema string literals are intentionally long one-liners.
 "obsidian_llm_wiki/synth/prompts.py" = ["E501"]
+# Test files: long JSON/HTML fixtures and minor style deviations are acceptable.
+"tests/new/test_golden_pipeline.py" = ["E501"]
+"tests/new/test_parser.py" = ["E501"]
+"tests/test_web_extractor.py" = ["E501"]
+"tests/test_enrich.py" = ["E501", "E741"]
+"tests/test_llm_providers.py" = ["SIM117"]
+"tests/new/test_render.py" = ["F841"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests", "tests/new"]
