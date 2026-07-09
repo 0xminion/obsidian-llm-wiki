@@ -93,18 +93,32 @@ def test_extract_unknown_url_falls_back_to_web():
 def test_extract_youtube_url_routes_to_youtube_extractor():
     """YouTube URLs route to the YouTube extractor when deps are available."""
     from obsidian_llm_wiki.ingest.extractors import youtube as yt_mod
+    from obsidian_llm_wiki.ingest import extractors as reg
 
     if not yt_mod._DEPS_AVAILABLE:
         pytest.skip("YouTube deps (yt-dlp, youtube-transcript-api) not installed")
 
     fake_source = SourceDoc(
         title="Test Video",
-        content="Transcript content here.",
+        content="Transcript content here that is long enough for quality gates.",
         url="https://www.youtube.com/watch?v=dQw4w9WgXcQ",
     )
-    with patch.object(yt_mod, "extract_youtube", return_value=fake_source):
-        # Re-register the patched function
+
+    def fake_extract(url: str) -> SourceDoc:
+        return fake_source
+
+    # Patch the registry entry directly — @register_extractor stores the
+    # function object at import time, so patch.object(yt_mod, ...) only
+    # rebinds the module attribute and dispatch still calls the real fn.
+    original = list(reg._EXTRACTORS)
+    try:
+        reg._EXTRACTORS[:] = [
+            (m, fake_extract if m is yt_mod._is_youtube else fn)
+            for m, fn in original
+        ]
         result = extract("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+    finally:
+        reg._EXTRACTORS[:] = original
     assert result.title == "Test Video"
 
 

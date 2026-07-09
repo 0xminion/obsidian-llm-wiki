@@ -65,6 +65,22 @@ def register_extractor(
 # ── Dispatch ────────────────────────────────────────────────────────────
 
 
+_ARXIV_HOSTS = frozenset(("arxiv.org", "www.arxiv.org", "export.arxiv.org"))
+
+
+def _normalize_arxiv_url(url: str) -> str:
+    """Rewrite arxiv /abs/ URLs to /pdf/ for direct PDF extraction."""
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    if host not in _ARXIV_HOSTS:
+        return url
+    path = parsed.path or ""
+    if "/abs/" in path:
+        new_path = path.replace("/abs/", "/pdf/", 1)
+        return parsed._replace(path=new_path, query="", fragment="").geturl()
+    return url
+
+
 def extract(raw_url: str) -> SourceDoc:
     """Extract content from a URL or file path using the registered extractors.
 
@@ -82,6 +98,9 @@ def extract(raw_url: str) -> SourceDoc:
     Raises:
         RuntimeError: If all extraction strategies fail.
     """
+    # Normalize arxiv /abs/ → /pdf/ before any dispatch.
+    raw_url = _normalize_arxiv_url(raw_url)
+
     # Check if it's a local file path.
     if _looks_like_file_path(raw_url):
         return _extract_file(raw_url)
@@ -89,15 +108,34 @@ def extract(raw_url: str) -> SourceDoc:
     # Parse as URL.
     parsed = urlparse(raw_url)
 
-    # Remote binary file (PDF/DOCX in URL path) → download to temp, then extract.
-    if _is_remote_file(raw_url):
-        return _extract_remote_file(raw_url)
-
-    # Try registered extractors (YouTube, etc.).
+    # Try registered extractors first (YouTube, PDF, JATS, etc.).
+    # If a specialized extractor MATCHES the URL but fails, we fail closed —
+    # do NOT fall through to extract_web, which would produce garbage from
+    # cookie-walled pages (YouTube footer chrome, CF challenge HTML, etc.).
+    # JATS does its own XML→HTML fallback internally; PDF downloads directly.
+    matched_errors: list[tuple[str, Exception]] = []
     for match_fn, extractor_fn in _EXTRACTORS:
         if match_fn(parsed, raw_url):
             logger.debug("Routing '%s' to %s", raw_url, extractor_fn.__name__)
-            return extractor_fn(raw_url)
+            try:
+                return extractor_fn(raw_url)
+            except Exception as exc:
+                logger.warning(
+                    "Extractor %s failed for %s: %s; trying fallback",
+                    extractor_fn.__name__, raw_url, exc,
+                )
+                matched_errors.append((extractor_fn.__name__, exc))
+                continue
+
+    if matched_errors:
+        raise RuntimeError(
+            f"All specialized extractors failed for {raw_url}: "
+            + "; ".join(f"{n}: {e}" for n, e in matched_errors)
+        )
+
+    # Remote binary file (PDF/DOCX in URL path) → download to temp, then extract.
+    if _is_remote_file(raw_url):
+        return _extract_remote_file(raw_url)
 
     # Fallback: web extraction.
     return extract_web(raw_url)
@@ -203,6 +241,9 @@ with suppress(ImportError):
 
 with suppress(ImportError):
     from obsidian_llm_wiki.ingest.extractors import docx as _docx  # noqa: F401
+
+with suppress(ImportError):
+    from obsidian_llm_wiki.ingest.extractors import jats as _jats  # noqa: F401
 
 with suppress(ImportError):
     from obsidian_llm_wiki.ingest.extractors import podcast as _podcast  # noqa: F401
