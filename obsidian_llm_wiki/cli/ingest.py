@@ -73,7 +73,7 @@ def ingest(
     # ── Extract URLs and write to sources/ ──────────────────────────────
     if urls:
         print(f"\n🌐 Extracting {len(urls)} URL(s)...")
-        from obsidian_llm_wiki.ingest.web import extract_web
+        from obsidian_llm_wiki.ingest.extractors import extract
         from obsidian_llm_wiki.render.obsidian import render_source_page
 
         for url in urls:
@@ -81,7 +81,7 @@ def ingest(
                 print(f"   🔍 Would extract: {url}")
                 continue
             try:
-                source = extract_web(url)
+                source = extract(url)
                 filename = f"{slugify(source.title)}.md"
                 filepath = config.sources_dir / filename
                 config.sources_dir.mkdir(parents=True, exist_ok=True)
