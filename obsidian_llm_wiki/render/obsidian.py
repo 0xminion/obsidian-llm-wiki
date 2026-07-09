@@ -234,6 +234,11 @@ def render_concept_page(
         fm["aliases"] = concept.aliases
     if concept.confidence < 1.0:
         fm["confidence"] = concept.confidence
+    if concept.related:
+        fm["relations"] = [
+            {"target": r.slug, "type": r.relation, "display": r.display or r.slug}
+            for r in concept.related
+        ]
 
     parts: list[str] = [f"# {concept.title}", ""]
 
@@ -259,7 +264,7 @@ def render_concept_page(
         parts.extend(["## Related Concepts", ""])
         for link in concept.related:
             display = link.display or link.slug
-            parts.append(f"- {make_wikilink(link.slug, display)}")
+            parts.append(f"- {make_wikilink(link.slug, display)} — `{link.relation}`")
         parts.append("")
 
     body = "\n".join(parts)
