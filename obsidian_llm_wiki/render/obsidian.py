@@ -476,21 +476,33 @@ def render_moc_page(
                 parts.append("")
 
     # ── Cross-lingual links from embedding ──────────────────────────
+    # Instead of a separate section, merge cross-lingual concepts into the
+    # Concepts list so they appear as part of the same MoC umbrella.
     if cross_lingual_links and moc.concept_slugs:
-        xling_lines: list[str] = []
+        existing_slugs = set(moc.concept_slugs)
+        added_slugs: list[str] = []
         for slug in moc.concept_slugs:
             if slug in cross_lingual_links:
-                for target_slug, score, display in cross_lingual_links[slug]:
-                    if target_slug in moc.concept_slugs:
-                        continue  # Already shown in Concepts section
-                    xling_lines.append(
-                        f"  - {make_wikilink(slug)} ↔ {make_wikilink(target_slug, display)} "
-                        f"(similarity: {score:.2f})"
+                for target_slug, _score, display in cross_lingual_links[slug]:
+                    if target_slug in existing_slugs:
+                        continue  # Already in this MoC
+                    existing_slugs.add(target_slug)
+                    added_slugs.append(target_slug)
+                    target_concept = all_concepts.get(target_slug) if all_concepts else None
+                    badge = ""
+                    if target_concept and target_concept.confidence < 0.5:
+                        badge = " *(low confidence)*"
+                    definition = ""
+                    if target_concept:
+                        definition = (
+                            f" — {target_concept.summary}"
+                            if target_concept.summary else ""
+                        )
+                    parts.append(
+                        f"- {make_wikilink(target_slug, display)}"
+                        f"{badge}{definition} *(cross-lingual link)*"
                     )
-        if xling_lines:
-            parts.extend(["## Cross-Lingual Links / 跨语言关联", ""])
-            parts.extend(xling_lines)
-            parts.append("")
+        # Don't add a separate section heading
 
     body = "\n".join(parts)
     return f"{build_frontmatter(fm)}\n{body}"

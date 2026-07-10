@@ -275,22 +275,106 @@ def _find_episode_audio_in_rss(rss_text: str, episode_id: str) -> str:
 # ── Spotify audio URL ────────────────────────────────────────────────────
 
 def _find_spotify_audio_url(url: str) -> str:
-    """Find the audio URL for a Spotify episode.
+    """Find the audio URL for a Spotify episode via cross-platform search.
 
-    Spotify doesn't expose direct audio URLs without auth.
-    We try to find the RSS feed via iTunes Lookup if the show is also
-    on Apple Podcasts, otherwise return empty.
+    Most podcasts are cross-published. If the Spotify episode is also on
+    Apple Podcasts, we can find the audio URL via iTunes Lookup → RSS.
+    We use the podcast title from defuddle.md metadata to search iTunes.
     """
-    # Extract episode ID from URL
-    episode_match = re.search(r"/episode/([a-zA-Z0-9]+)", url)
-    if not episode_match:
+    # Get episode metadata from defuddle.md
+    metadata = _fetch_defuddle_md_metadata(url)
+    title = metadata.get("title", "")
+    author = metadata.get("author", "")
+
+    if not title:
         return ""
 
-    # Spotify episodes don't have a public audio URL.
-    # We can try to find the same podcast on Apple Podcasts via
-    # the show name from defuddle.md metadata, but that's unreliable.
-    # For now, return empty — transcript will need to come from
-    # the Spotify API (requires auth) or Whisper.
+    # Search iTunes for the same podcast
+    search_term = title.strip()
+    if author:
+        # Use author (podcast show name) for better matching
+        search_term = author.strip()
+
+    try:
+        with httpx.Client(
+            **make_client_kwargs(timeout=DEFAULT_TIMEOUT, follow_redirects=True),
+            headers={"User-Agent": BROWSER_HEADERS["User-Agent"]},
+        ) as client:
+            # Search iTunes podcast directory
+            resp = client.get(
+                "https://itunes.apple.com/search",
+                params={
+                    "term": search_term,
+                    "media": "podcast",
+                    "limit": 5,
+                },
+            )
+            if resp.status_code != 200:
+                return ""
+
+            data = resp.json()
+            results = data.get("results", [])
+            if not results:
+                return ""
+
+            # Try each result's feed URL
+            for result in results:
+                feed_url = result.get("feedUrl", "")
+                if not feed_url:
+                    continue
+
+                # Fetch RSS feed
+                rss_resp = client.get(feed_url)
+                if rss_resp.status_code != 200:
+                    continue
+
+                # Search for episode matching the title
+                audio = _find_episode_audio_by_title(
+                    rss_resp.text, title,
+                )
+                if audio:
+                    logger.info(
+                        "Found cross-platform audio for Spotify episode '%s' "
+                        "via iTunes podcast '%s'",
+                        title, result.get("collectionName", ""),
+                    )
+                    return audio
+
+    except Exception as exc:
+        logger.debug("Spotify cross-platform search failed: %s", exc)
+
+    return ""
+
+
+def _find_episode_audio_by_title(rss_text: str, target_title: str) -> str:
+    """Find an episode's audio URL in RSS XML by matching title (fuzzy)."""
+    items = re.findall(r"<item>(.*?)</item>", rss_text, re.DOTALL)
+
+    # Normalize: remove special characters for comparison
+    def normalize(s: str) -> str:
+        return re.sub(r"[^\w\s]", "", s.lower()).strip()
+
+    target_norm = normalize(target_title)
+
+    for item in items:
+        title_m = re.search(r"<title>(.*?)</title>", item, re.DOTALL)
+        if not title_m:
+            continue
+        item_title = title_m.group(1).strip()
+        item_norm = normalize(item_title)
+
+        # Check for substring match (either direction)
+        if (
+            target_norm and item_norm
+            and (
+                target_norm in item_norm
+                or item_norm in target_norm
+            )
+        ):
+            enclosure = re.search(r'<enclosure[^>]+url="([^"]+)"', item)
+            if enclosure:
+                return enclosure.group(1).replace("&amp;", "&")
+
     return ""
 
 

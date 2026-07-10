@@ -94,7 +94,7 @@ def test_moc_cross_ref_diagram_unidirectional():
 
 
 def test_render_moc_page_with_cross_lingual_links():
-    """MoC with cross_lingual_links shows Cross-Lingual Links section."""
+    """MoC with cross_lingual_links merges them into Concepts section."""
     from obsidian_llm_wiki.core.models import MapOfContent
     from obsidian_llm_wiki.render.obsidian import render_moc_page
     moc = MapOfContent(
@@ -104,12 +104,14 @@ def test_render_moc_page_with_cross_lingual_links():
     a = _make_concept("concept-a", "Concept A")
     xling = {"concept-a": [("concept-b", 0.92, "概念B")]}
     page = render_moc_page(
-        moc, all_concepts={"concept-a": a},
+        moc, all_concepts={"concept-a": a, "concept-b": _make_concept("concept-b", "概念B")},
         cross_lingual_links=xling,
     )
-    assert "Cross-Lingual Links / 跨语言关联" in page
-    assert "概念B" in page
-    assert "0.92" in page
+    # Cross-lingual links should NOT be a separate section
+    assert "Cross-Lingual Links" not in page
+    # But the cross-lingual concept should appear in the Concepts section
+    assert "concept-b" in page
+    assert "cross-lingual link" in page
 
 
 # ── render/obsidian.py: render_source_page deduplication ───────────────────
