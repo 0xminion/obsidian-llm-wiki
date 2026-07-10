@@ -31,6 +31,7 @@ from obsidian_llm_wiki.core.models import (
     Claim,
     ConceptLink,
     ConceptNote,
+    MapOfContent,
     SourceDoc,
     SourceSynthesis,
     normalize_relation,
@@ -43,6 +44,8 @@ __all__ = [
     "quality_synthesize_source",
     "build_extract_prompt",
     "build_expand_prompt",
+    "concept_body_chars",
+    "filter_thin_concepts",
 ]
 
 
@@ -277,6 +280,7 @@ async def quality_synthesize_source(
                 "Pass 2 (expand) failed for '%s' concept '%s': %s",
                 filename, original.slug, result,
             )
+            original.confidence = 0.3
             continue
 
         if result is None:
@@ -284,6 +288,7 @@ async def quality_synthesize_source(
                 "Pass 2 produced no output for '%s' concept '%s'",
                 filename, original.slug,
             )
+            original.confidence = 0.3
             continue
 
         # Replace skeleton concept with expanded version.
@@ -293,16 +298,19 @@ async def quality_synthesize_source(
         expanded.provenance = original.provenance
         expanded.is_new = original.is_new
 
-        # ── Quality gate: check body length ────────────────────────────
-        body_chars = _concept_body_chars(expanded)
-        if body_chars < config.concept_min_body_chars:
-            expanded.confidence = 0.3
+        skeleton.concepts[i] = expanded
+
+    # ── Post-loop quality sweep ────────────────────────────────────────
+    # Catch both failed expansions (empty skeleton) and thin successful
+    # expansions in one pass. Don't clobber already-lowered confidence.
+    for concept in skeleton.concepts:
+        body = _concept_body_chars(concept)
+        if body < config.concept_min_body_chars and concept.confidence >= 1.0:
+            concept.confidence = 0.3
             logger.warning(
                 "Concept '%s' body is %d chars (threshold %d) — confidence set to 0.3",
-                expanded.slug, body_chars, config.concept_min_body_chars,
+                concept.slug, body, config.concept_min_body_chars,
             )
-
-        skeleton.concepts[i] = expanded
 
     logger.info(
         "Pass 2 done for '%s': %d concepts expanded",
@@ -356,6 +364,93 @@ def _concept_body_chars(concept: ConceptNote) -> int:
         for point in section.points:
             total += len(point)
     return total
+
+
+# Public alias for pipeline / tests
+concept_body_chars = _concept_body_chars
+
+
+def filter_thin_concepts(
+    synthesis: SourceSynthesis,
+    min_body_chars: int,
+) -> SourceSynthesis:
+    """Hard quality gate: drop concepts below threshold from a SourceSynthesis.
+
+    This is a strict-mode gate, NOT applied by default in the pipeline.
+    The default single-pass and two-pass paths retain all concepts — thin
+    concepts get ``confidence: 0.3`` via the two-pass quality gate, not
+    silent deletion.
+
+    This function is available for future ``QUALITY_GATE_MODE=strict`` or
+    CI validation use. It prunes:
+    - ``related`` links on surviving concepts whose target slug was dropped.
+    - Dropped slugs from each MOC's ``concept_slugs``.
+    - MOCs with fewer than 2 surviving concept members.
+
+    Returns a new SourceSynthesis (does not mutate the input).
+    """
+    import dataclasses
+
+    kept: list[ConceptNote] = []
+    dropped_slugs: set[str] = set()
+
+    for concept in synthesis.concepts:
+        bc = _concept_body_chars(concept)
+        if bc >= min_body_chars:
+            kept.append(concept)
+        else:
+            dropped_slugs.add(concept.slug)
+            logger.warning(
+                "Quality gate: dropping concept '%s' — body is %d chars (threshold %d)",
+                concept.slug, bc, min_body_chars,
+            )
+
+    if not dropped_slugs:
+        return synthesis  # nothing to prune
+
+    # Prune related links to dropped slugs on surviving concepts (non-mutating)
+    kept_final: list[ConceptNote] = []
+    for concept in kept:
+        if concept.related:
+            pruned_related = [
+                link for link in concept.related
+                if link.slug not in dropped_slugs
+            ]
+            concept = dataclasses.replace(concept, related=pruned_related)
+        kept_final.append(concept)
+
+    # Prune MOC concept_slugs and drop MOCs with < 2 surviving members (non-mutating)
+    kept_mocs: list[MapOfContent] = []
+    for moc in synthesis.maps:
+        pruned_slugs = [
+            s for s in moc.concept_slugs if s not in dropped_slugs
+        ]
+        if len(pruned_slugs) >= 2:
+            kept_mocs.append(dataclasses.replace(moc, concept_slugs=pruned_slugs))
+        else:
+            logger.warning(
+                "Quality gate: dropping MOC '%s' — only %d concept(s) left after pruning",
+                moc.slug, len(pruned_slugs),
+            )
+
+    logger.info(
+        "Quality gate: dropped %d/%d concepts, %d/%d MOCs",
+        len(dropped_slugs), len(synthesis.concepts),
+        len(synthesis.maps) - len(kept_mocs), len(synthesis.maps),
+    )
+
+    # Return a new SourceSynthesis with pruned data
+    return SourceSynthesis(
+        source_title=synthesis.source_title,
+        source_summary=synthesis.source_summary,
+        source_tags=synthesis.source_tags,
+        key_points=synthesis.key_points,
+        open_questions=synthesis.open_questions,
+        language=synthesis.language,
+        concepts=kept_final,
+        maps=kept_mocs,
+        source_file=synthesis.source_file,
+    )
 
 
 def _parse_concept_json(response: str) -> dict[str, Any] | None:

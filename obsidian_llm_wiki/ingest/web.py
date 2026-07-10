@@ -14,13 +14,14 @@ import re
 import httpx
 
 from obsidian_llm_wiki.core.models import SourceDoc
+from obsidian_llm_wiki.ingest.http_headers import BROWSER_HEADERS, DEFAULT_TIMEOUT
+from obsidian_llm_wiki.ingest.proxy import make_client_kwargs
 
 logger = logging.getLogger("obswiki.ingest.web")
 
 __all__ = ["extract_web"]
 
-_TIMEOUT = 45
-_UA = "Mozilla/5.0 (compatible; obsidian-llm-wiki/3.0)"
+_TIMEOUT = DEFAULT_TIMEOUT
 
 
 def extract_web(url: str, timeout: int = _TIMEOUT) -> SourceDoc:
@@ -60,12 +61,12 @@ def _extract_trafilatura(url: str, timeout: int) -> SourceDoc:
     """Extract via httpx fetch + trafilatura."""
     import trafilatura
 
-    with httpx.Client(timeout=timeout, follow_redirects=True,
-                      headers={"User-Agent": _UA}) as client:
+    with httpx.Client(**make_client_kwargs(timeout=timeout, follow_redirects=True)) as client:
         resp = client.get(url)
-        resp.raise_for_status()
         html = resp.text
 
+    _check_cloudflare(resp, html)
+    resp.raise_for_status()
     extracted = trafilatura.extract(
         html,
         include_comments=False,
@@ -87,12 +88,12 @@ def _extract_trafilatura(url: str, timeout: int) -> SourceDoc:
 
 def _extract_regex(url: str, timeout: int) -> SourceDoc:
     """Extract via httpx + regex HTML-to-text."""
-    with httpx.Client(timeout=timeout, follow_redirects=True,
-                      headers={"User-Agent": _UA}) as client:
+    with httpx.Client(**make_client_kwargs(timeout=timeout, follow_redirects=True)) as client:
         resp = client.get(url)
-        resp.raise_for_status()
         html = resp.text
 
+    _check_cloudflare(resp, html)
+    resp.raise_for_status()
     if not html.strip():
         raise RuntimeError("empty response")
 
@@ -108,8 +109,7 @@ def _extract_wayback(url: str, timeout: int) -> SourceDoc:
     """Extract via archive.org Wayback Machine."""
     wayback_url = f"https://web.archive.org/web/2/{url}"
 
-    with httpx.Client(timeout=timeout + 20, follow_redirects=True,
-                      headers={"User-Agent": _UA}) as client:
+    with httpx.Client(**make_client_kwargs(timeout=timeout + 20, follow_redirects=True)) as client:
         resp = client.get(wayback_url)
         resp.raise_for_status()
         html = resp.text
@@ -130,6 +130,27 @@ def _extract_wayback(url: str, timeout: int) -> SourceDoc:
         raise RuntimeError("wayback produced empty content")
 
     return SourceDoc(title=title or url, content=content, url=url)
+
+
+def _check_cloudflare(resp: httpx.Response, html: str) -> None:
+    """Detect Cloudflare JS challenge pages and fail cleanly.
+
+    CF challenges return 403 with specific headers/body markers. Feeding
+    these into the LLM as source content would produce garbage notes.
+    """
+    # Header-based detection (most reliable)
+    if resp.headers.get("cf-mitigated") == "challenge":
+        raise RuntimeError(
+            "Cloudflare JS challenge — cannot extract without a real browser. "
+            "This site requires JavaScript execution or cookies."
+        )
+    # Body-based detection (fallback for 403 without cf-mitigated header)
+    if resp.status_code == 403:
+        title = _extract_title_from_html(html)
+        if "just a moment" in title.lower() or "attention required" in title.lower():
+            raise RuntimeError(
+                "Cloudflare challenge page detected — cannot extract without a real browser."
+            )
 
 
 # ── HTML helpers ────────────────────────────────────────────────────────

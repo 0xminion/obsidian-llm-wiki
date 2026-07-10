@@ -229,11 +229,11 @@ def render_concept_page(
         "title": concept.title,
         "tags": concept.tags,
         "timestamp": ts,
+        "confidence": concept.confidence,
+        "provenance": concept.provenance,
     }
     if concept.aliases:
         fm["aliases"] = concept.aliases
-    if concept.confidence < 1.0:
-        fm["confidence"] = concept.confidence
     if concept.related:
         fm["relations"] = [
             {"target": r.slug, "type": r.relation, "display": r.display or r.slug}
