@@ -232,7 +232,7 @@ def render_entry_page(
     parts.extend([
         "## Source",
         "",
-        f"- {make_wikilink(source_slug, 'Source document')}",
+        f"- {make_wikilink(source_slug, synthesis.source_title)}",
     ])
 
     body = "\n".join(parts)
@@ -823,10 +823,46 @@ def render_vault(
         written.append(str(path))
 
     # ── Render entry pages ───────────────────────────────────────────
+    # Build a lookup from slugified source_title → actual source filename
+    # so the Source wikilink in each entry resolves to the real source note.
+    source_filename_lookup: dict[str, str] = {}
+    for filename in sources:
+        stem = filename[:-3] if filename.endswith(".md") else filename
+        source_filename_lookup[slugify(stem)] = stem
+
+    # Also map each synthesis's source_file to the actual source stem.
+    for synthesis in bundle.sources:
+        if synthesis.source_file:
+            sf = synthesis.source_file
+            sf_stem = sf[:-3] if sf.endswith(".md") else sf
+            title_slug = slugify(synthesis.source_title)
+            source_filename_lookup[title_slug] = sf_stem
+
+    # For remaining unmatched, try prefix/substring matching.
+    for synthesis in bundle.sources:
+        title_slug = slugify(synthesis.source_title)
+        if title_slug not in source_filename_lookup:
+            for s in source_filename_lookup:
+                if s.startswith(title_slug) or title_slug.startswith(s):
+                    source_filename_lookup[title_slug] = source_filename_lookup[s]
+                    break
+            else:
+                # Try substring match on the Chinese part of the title
+                import re as _re
+                zh_match = _re.search(r"[\u4e00-\u9fff]", synthesis.source_title)
+                if zh_match:
+                    zh_part = synthesis.source_title[zh_match.start():]
+                    zh_slug = slugify(zh_part)
+                    for s in source_filename_lookup:
+                        if zh_slug and (zh_slug in s or s in zh_slug):
+                            source_filename_lookup[title_slug] = source_filename_lookup[s]
+                            break
+
     for synthesis in bundle.sources:
         entry_slug = slugify(synthesis.source_title)
+        actual_source_stem = source_filename_lookup.get(entry_slug, entry_slug)
         concept_slugs = [c.slug for c in synthesis.concepts]
-        page = render_entry_page(synthesis, entry_slug, concept_slugs, ts)
+        page = render_entry_page(synthesis, actual_source_stem, concept_slugs, ts)
         path = dirs["entries"] / f"{entry_slug}.md"
         atomic_write(path, page)
         written.append(str(path))

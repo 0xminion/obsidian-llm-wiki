@@ -32,7 +32,7 @@ __all__ = [
 
 _EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "nomic-embed-text:v1.5")
 _OLLAMA_HOST = os.environ.get("LLM_HOST", "http://localhost:11435")
-_SIMILARITY_THRESHOLD = 0.85
+_SIMILARITY_THRESHOLD = 0.50
 _EMBEDDINGS_ENABLED = (
     os.environ.get("EMBEDDINGS_ENABLED", "false").strip().lower()
     in ("true", "1", "yes")

@@ -1,34 +1,40 @@
-"""Spotify + generic podcast extractor — HTML scrape episode descriptions + metadata.
+"""Podcast extractor — Spotify, Apple Podcasts, and generic RSS.
 
-Spotify podcast episodes expose a JSON-LD page via their web player URL.
-Generic podcasts use an RSS feed.  This extractor tries Spotify first, then RSS.
+Extracts podcast episode transcripts and metadata via:
+1. defuddle.md for episode metadata (title, description, date)
+2. iTunes Lookup API → RSS feed → episode audio URL
+3. Supadata API for audio transcription (async job polling)
+4. Fallback to defuddle.md metadata only if no transcript available
 
-Dependencies (optional): ``httpx``.
-Install with: ``pip install okf-pipeline[podcast]``
+Supported platforms:
+  - open.spotify.com/episode/*
+  - podcasts.apple.com/*/podcast/*/id*?i=*
+  - Generic RSS feeds (*.xml, /feed, /rss)
+  - anchor.fm, overcast.fm, podbean.com, buzzsprout.com, etc.
+
+Dependencies: httpx (required), defuddle.md (web service), Supadata API (optional)
 """
 
 from __future__ import annotations
 
 import logging
 import re
+import time
+from urllib.parse import parse_qs, urlparse
 
 from obsidian_llm_wiki.core.models import SourceDoc
 from obsidian_llm_wiki.ingest.extractors import register_extractor
+from obsidian_llm_wiki.ingest.http_headers import BROWSER_HEADERS, DEFAULT_TIMEOUT
+from obsidian_llm_wiki.ingest.proxy import make_client_kwargs
 
 logger = logging.getLogger("obswiki.ingest.extractors.podcast")
 
-# ── Dependency check ────────────────────────────────────────────────────
-
-try:
-    import httpx
-
-    _DEPS_AVAILABLE = True
-except ImportError:
-    _DEPS_AVAILABLE = False
+__all__ = ["extract_spotify", "extract_apple_podcast", "extract_generic_podcast"]
 
 # ── Domain matching ─────────────────────────────────────────────────────
 
-_SPOTIFY_HOSTS = frozenset(("open.spotify.com", "Spotify.com"))
+_SPOTIFY_HOSTS = frozenset(("open.spotify.com", "spotify.com"))
+_APPLE_HOSTS = frozenset(("podcasts.apple.com", "podcasters.apple.com"))
 _PODCAST_HOSTS = frozenset((
     "anchor.fm", "overcast.fm", "podbean.com", "buzzsprout.com",
     "transistor.fm", "captivate.fm", "ausha.co",
@@ -39,8 +45,15 @@ def _is_spotify(parsed, raw: str) -> bool:
     return bool(parsed.hostname and parsed.hostname.lower() in _SPOTIFY_HOSTS)
 
 
+def _is_apple_podcast(parsed, raw: str) -> bool:
+    return bool(parsed.hostname and parsed.hostname.lower() in _APPLE_HOSTS)
+
+
 def _is_generic_podcast(parsed, raw: str) -> bool:
-    return bool(parsed.hostname and any(h in parsed.hostname.lower() for h in _PODCAST_HOSTS))
+    return bool(
+        parsed.hostname and
+        any(h in parsed.hostname.lower() for h in _PODCAST_HOSTS)
+    )
 
 
 def _is_rss_feed(url: str) -> bool:
@@ -49,176 +62,332 @@ def _is_rss_feed(url: str) -> bool:
 
 # ── Registration ───────────────────────────────────────────────────────
 
-if _DEPS_AVAILABLE:
+@register_extractor(_is_spotify)
+def extract_spotify(raw_url: str) -> SourceDoc:
+    """Extract a Spotify podcast episode with transcript if available."""
+    return _extract_podcast(raw_url, platform="spotify")
 
-    @register_extractor(_is_spotify)
-    def extract_spotify(raw_url: str) -> SourceDoc:  # type: ignore[valid-type]
-        """Extract a Spotify podcast episode via HTML + JSON-LD metadata.
 
-        Falls back to description-only if full metadata is unavailable.
-        """
-        try:
-            response = httpx.get(raw_url, headers=_HEADERS, timeout=30, follow_redirects=True)  # type: ignore[union-attr]
-            response.raise_for_status()
-        except Exception as exc:
-            raise RuntimeError(f"Failed to fetch Spotify URL '{raw_url}': {exc}") from exc
+@register_extractor(_is_apple_podcast)
+def extract_apple_podcast(raw_url: str) -> SourceDoc:
+    """Extract an Apple Podcasts episode with transcript if available."""
+    return _extract_podcast(raw_url, platform="apple")
 
-        html = response.text
 
-        # Extract JSON-LD structured data.
-        json_ld = _extract_json_ld(html)
-        if json_ld:
-            title = json_ld.get("name") or json_ld.get("headline", raw_url)
-            description = json_ld.get("description", "")
-            author_raw = json_ld.get("author", "")
-            author = (
-                author_raw.get("name", "") if isinstance(author_raw, dict)
-                else str(author_raw)
-            )
-            date = json_ld.get("datePublished", "")
+@register_extractor(_is_generic_podcast)
+def extract_generic_podcast(raw_url: str) -> SourceDoc:
+    """Extract a generic podcast episode via RSS."""
+    return _extract_podcast(raw_url, platform="generic")
+
+
+# ── Core extraction ─────────────────────────────────────────────────────
+
+def _extract_podcast(raw_url: str, platform: str = "generic") -> SourceDoc:
+    """Extract podcast episode with transcript.
+
+    Strategy:
+      1. defuddle.md for metadata (title, description, date, host)
+      2. Find audio URL via iTunes Lookup API + RSS feed
+      3. Supadata API for transcript from audio URL
+      4. Fallback to metadata only
+    """
+    errors: list[str] = []
+
+    # Step 1: Get metadata via defuddle.md
+    metadata = _fetch_defuddle_md_metadata(raw_url)
+    title = metadata.get("title", "")
+    description = metadata.get("description", "")
+    author = metadata.get("author", "")
+    date = metadata.get("published", "")
+
+    # Step 2: Find audio URL
+    audio_url = ""
+    if platform == "apple":
+        audio_url = _find_apple_audio_url(raw_url)
+    elif platform == "spotify":
+        audio_url = _find_spotify_audio_url(raw_url)
+
+    # Step 3: Try Supadata transcript from audio URL
+    transcript = ""
+    if audio_url:
+        supadata_key = _get_supadata_key()
+        if supadata_key:
+            transcript = _supadata_transcribe_audio(audio_url, supadata_key)
+            if not transcript:
+                errors.append("supadata: no transcript returned")
         else:
-            title = _extract_og_title(html) or raw_url
-            description = _extract_meta_description(html) or ""
-            author = _extract_og_site_name(html) or ""
-            date = ""
+            logger.debug("No SUPADATA_API_KEY — skipping transcript")
 
-        # Spotify episodes embed audio duration in the page.
-        duration = _extract_duration(html)
+    # Step 4: Build content
+    parts: list[str] = []
+    if author:
+        parts.append(f"Host: {author}")
+    if date:
+        parts.append(f"Published: {date}")
+    if audio_url:
+        parts.append(f"Audio: {audio_url}")
+    if transcript:
+        parts.append("")
+        parts.append("## Transcript")
+        parts.append("")
+        parts.append(transcript)
+    elif description:
+        parts.append("")
+        parts.append("## Episode Description")
+        parts.append("")
+        parts.append(description)
+    elif description:
+        parts.append(f"Description:\n{description}")
 
-        parts: list[str] = []
-        if author:
-            parts.append(f"Host: {author}")
-        if date:
-            parts.append(f"Published: {date}")
-        if duration:
-            parts.append(f"Duration: {duration}")
-        if description:
-            parts.append(f"Description:\n{description}")
+    content = "\n".join(parts)
+    if not content.strip():
+        raise RuntimeError(
+            f"Could not extract podcast content from {raw_url}: "
+            + "; ".join(errors)
+        )
 
-        content = "\n\n".join(parts)
-        if not content.strip():
-            raise RuntimeError(f"Could not extract content from Spotify URL: {raw_url}")
+    if not title:
+        title = raw_url
 
-        return SourceDoc(title=title, content=content, url=raw_url)
-
-    @register_extractor(_is_generic_podcast)
-    def extract_podcast_rss(raw_url: str) -> SourceDoc:  # type: ignore[valid-type]
-        """Extract a podcast episode via RSS feed.
-
-        Fetches the RSS XML and extracts title, description, publication date,
-        and enclosure (audio file) URL.
-        """
-        try:
-            response = httpx.get(raw_url, headers=_HEADERS, timeout=30, follow_redirects=True)  # type: ignore[union-attr]
-            response.raise_for_status()
-        except Exception as exc:
-            raise RuntimeError(f"Failed to fetch podcast RSS '{raw_url}': {exc}") from exc
-
-        xml_text = response.text
-
-        title = _extract_rss_title(xml_text) or raw_url
-        description = _extract_rss_description(xml_text) or ""
-        pub_date = _extract_rss_date(xml_text) or ""
-        audio_url = _extract_rss_enclosure(xml_text) or ""
-
-        parts: list[str] = []
-        if pub_date:
-            parts.append(f"Published: {pub_date}")
-        if audio_url:
-            parts.append(f"Audio: {audio_url}")
-        if description:
-            parts.append(f"Description:\n{description}")
-
-        content = "\n\n".join(parts)
-        if not content.strip():
-            raise RuntimeError(f"Could not extract content from podcast RSS: {raw_url}")
-
-        return SourceDoc(title=title, content=content, url=raw_url)
+    return SourceDoc(title=title, content=content.strip(), url=raw_url)
 
 
-# ── Helpers ─────────────────────────────────────────────────────────────
+# ── defuddle.md metadata ────────────────────────────────────────────────
 
-_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)"
-    ),
-}
+def _fetch_defuddle_md_metadata(url: str) -> dict[str, str]:
+    """Fetch episode metadata via defuddle.md web service."""
+    stripped = url.replace("https://", "").replace("http://", "")
+    defuddle_url = f"https://defuddle.md/{stripped}"
 
-_OG_TITLE_RE = re.compile(r'<meta property="og:title" content="([^"]+)"')
-_META_DESC_RE = re.compile(r'<meta name="description" content="([^"]+)"')
-_JSON_LD_RE = re.compile(r'<script type="application/ld\+json">(.*?)</script>', re.DOTALL)
-_DURATION_RE = re.compile(r'"duration":"PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)"')
-
-
-def _extract_og_title(html: str) -> str:
-    m = _OG_TITLE_RE.search(html)
-    return m.group(1) if m else ""
-
-
-def _extract_meta_description(html: str) -> str:
-    m = _META_DESC_RE.search(html)
-    return m.group(1) if m else ""
-
-
-def _extract_og_site_name(html: str) -> str:
-    m = re.search(r'<meta property="og:site_name" content="([^"]+)"', html)
-    return m.group(1) if m else ""
-
-
-def _extract_duration(html: str) -> str:
-    m = _DURATION_RE.search(html)
-    if not m:
-        return ""
-    h, m_i, s = (int(x) if x else 0 for x in m.groups())
-    if h:
-        return f"{h}h {m_i}m"
-    if m_i:
-        return f"{m_i}m {s}s"
-    return f"{s}s"
-
-
-def _extract_json_ld(html: str) -> dict | None:
-    """Extract and parse JSON-LD structured data from HTML."""
-    m = _JSON_LD_RE.search(html)
-    if not m:
-        return None
     try:
-        import json
-        return json.loads(m.group(1))
-    except Exception:
-        return None
+        with httpx.Client(
+            **make_client_kwargs(timeout=DEFAULT_TIMEOUT, follow_redirects=True),
+            headers={
+                "User-Agent": BROWSER_HEADERS["User-Agent"],
+                "Accept": "text/html",
+            },
+        ) as client:
+            resp = client.get(defuddle_url)
+        if resp.status_code != 200:
+            return {}
+
+        text = resp.text.strip()
+        if not text or len(text) < 50:
+            return {}
+
+        metadata: dict[str, str] = {}
+        if text.startswith("---"):
+            fm_end = text.find("---", 3)
+            if fm_end > 0:
+                fm_text = text[3:fm_end].strip()
+                for line in fm_text.split("\n"):
+                    if line.startswith("title:"):
+                        metadata["title"] = line[6:].strip().strip('"').strip("'")
+                    elif line.startswith("author:"):
+                        metadata["author"] = line[7:].strip().strip('"').strip("'")
+                    elif line.startswith("published:"):
+                        metadata["published"] = line[11:].strip().strip('"').strip("'")
+                    elif line.startswith("description:"):
+                        metadata["description"] = line[12:].strip().strip('"').strip("'")
+        return metadata
+    except Exception as exc:
+        logger.debug("defuddle.md failed for %s: %s", url, exc)
+        return {}
 
 
-# RSS extraction helpers (regex-based, no feedparser dep).
+# ── Apple Podcasts audio URL via iTunes Lookup + RSS ────────────────────
 
-_RSS_TITLE_RE = re.compile(r"<title>(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?</title>", re.IGNORECASE)
-_RSS_DESC_RE = re.compile(
-    r"<description>(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?</description>",
-    re.IGNORECASE | re.DOTALL,
-)
-_RSS_DATE_RE = re.compile(r"<pubDate>(.*?)</pubDate>", re.IGNORECASE)
-_RSS_ENC_RE = re.compile(r"<enclosure[^>]+url=\"([^\"]+)\"", re.IGNORECASE)
+def _find_apple_audio_url(url: str) -> str:
+    """Find the audio enclosure URL for an Apple Podcasts episode.
+
+    Uses iTunes Lookup API to get the RSS feed URL, then fetches the RSS
+    feed and finds the episode by matching the episode GUID or title.
+    """
+    # Extract podcast ID and episode ID from URL
+    # URL format: https://podcasts.apple.com/us/podcast/{slug}/id{podcast_id}?i={episode_id}
+    parsed = urlparse(url)
+    podcast_id_match = re.search(r"/id(\d+)", parsed.path)
+    qs = parse_qs(parsed.query)
+    episode_id = qs.get("i", [""])[0]
+
+    if not podcast_id_match:
+        return ""
+
+    podcast_id = podcast_id_match.group(1)
+
+    # Use iTunes Lookup API to get RSS feed URL
+    try:
+        with httpx.Client(
+            **make_client_kwargs(timeout=DEFAULT_TIMEOUT, follow_redirects=True),
+            headers={"User-Agent": BROWSER_HEADERS["User-Agent"]},
+        ) as client:
+            resp = client.get(
+                f"https://itunes.apple.com/lookup?id={podcast_id}",
+            )
+        if resp.status_code != 200:
+            return ""
+
+        data = resp.json()
+        results = data.get("results", [])
+        if not results:
+            return ""
+
+        feed_url = results[0].get("feedUrl", "")
+        if not feed_url:
+            return ""
+
+        # Fetch RSS feed and find episode
+        with httpx.Client(
+            **make_client_kwargs(timeout=DEFAULT_TIMEOUT, follow_redirects=True),
+            headers={"User-Agent": BROWSER_HEADERS["User-Agent"]},
+        ) as client:
+            resp = client.get(feed_url)
+        if resp.status_code != 200:
+            return ""
+
+        return _find_episode_audio_in_rss(resp.text, episode_id)
+    except Exception as exc:
+        logger.debug("Apple audio URL lookup failed: %s", exc)
+        return ""
 
 
-def _extract_rss_title(xml: str) -> str:
-    # Skip the channel-level <title> (first one), get item-level.
-    titles = _RSS_TITLE_RE.findall(xml)
-    return titles[1].strip() if len(titles) > 1 else ""
+def _find_episode_audio_in_rss(rss_text: str, episode_id: str) -> str:
+    """Find the audio enclosure URL for a specific episode in RSS XML."""
+    items = re.findall(r"<item>(.*?)</item>", rss_text, re.DOTALL)
+    for item in items:
+        # Match by episode ID in GUID or link
+        if episode_id and episode_id in item:
+            enclosure = re.search(r'<enclosure[^>]+url="([^"]+)"', item)
+            if enclosure:
+                return enclosure.group(1).replace("&amp;", "&")
+        # Fallback: match by title (if episode_id not in item)
+        title_m = re.search(r"<title>(.*?)</title>", item, re.DOTALL)
+        if title_m and episode_id:
+            # Sometimes the episode ID appears in the GUID
+            guid_m = re.search(r"<guid[^>]*>(.*?)</guid>", item, re.DOTALL)
+            if guid_m and episode_id in guid_m.group(1):
+                enclosure = re.search(r'<enclosure[^>]+url="([^"]+)"', item)
+                if enclosure:
+                    return enclosure.group(1).replace("&amp;", "&")
+    return ""
 
 
-def _extract_rss_description(xml: str) -> str:
-    descs = _RSS_DESC_RE.findall(xml)
-    desc = descs[1].strip() if len(descs) > 1 else ""
-    # Strip HTML tags.
-    desc = re.sub(r"<[^>]+>", "", desc)
-    return desc.strip()
+# ── Spotify audio URL ────────────────────────────────────────────────────
+
+def _find_spotify_audio_url(url: str) -> str:
+    """Find the audio URL for a Spotify episode.
+
+    Spotify doesn't expose direct audio URLs without auth.
+    We try to find the RSS feed via iTunes Lookup if the show is also
+    on Apple Podcasts, otherwise return empty.
+    """
+    # Extract episode ID from URL
+    episode_match = re.search(r"/episode/([a-zA-Z0-9]+)", url)
+    if not episode_match:
+        return ""
+
+    # Spotify episodes don't have a public audio URL.
+    # We can try to find the same podcast on Apple Podcasts via
+    # the show name from defuddle.md metadata, but that's unreliable.
+    # For now, return empty — transcript will need to come from
+    # the Spotify API (requires auth) or Whisper.
+    return ""
 
 
-def _extract_rss_date(xml: str) -> str:
-    dates = _RSS_DATE_RE.findall(xml)
-    return dates[0].strip() if dates else ""
+# ── Supadata transcription ───────────────────────────────────────────────
+
+def _get_supadata_key() -> str:
+    """Get the Supadata API key from environment."""
+    import os
+    return os.environ.get("SUPADATA_API_KEY", "")
 
 
-def _extract_rss_enclosure(xml: str) -> str:
-    m = _RSS_ENC_RE.search(xml)
-    return m.group(1).strip() if m else ""
+def _supadata_transcribe_audio(audio_url: str, api_key: str) -> str:
+    """Transcribe audio URL via Supadata API with async job polling.
+
+    Returns the transcript text, or empty string if transcription fails
+    or times out.
+    """
+    try:
+        with httpx.Client(timeout=30) as client:
+            # Submit transcription job
+            resp = client.get(
+                "https://api.supadata.ai/v1/transcript",
+                params={"url": audio_url, "text": "true", "mode": "auto"},
+                headers={"x-api-key": api_key},
+            )
+
+            if resp.status_code == 200:
+                # Synchronous response
+                data = resp.json()
+                return _extract_supadata_content(data)
+            elif resp.status_code == 202:
+                # Async job — poll for completion
+                job_data = resp.json()
+                job_id = job_data.get("jobId", "")
+                if not job_id:
+                    return ""
+                return _poll_supadata_job(job_id, api_key)
+            else:
+                logger.debug(
+                    "Supadata returned %d for audio URL: %s",
+                    resp.status_code, resp.text[:200],
+                )
+                return ""
+    except Exception as exc:
+        logger.debug("Supadata transcription failed: %s", exc)
+        return ""
+
+
+def _poll_supadata_job(job_id: str, api_key: str, max_polls: int = 60) -> str:
+    """Poll Supadata async job until completion."""
+    for _i in range(max_polls):
+        try:
+            with httpx.Client(timeout=30) as client:
+                resp = client.get(
+                    f"https://api.supadata.ai/v1/transcript/{job_id}",
+                    headers={"x-api-key": api_key},
+                )
+            if resp.status_code == 200:
+                data = resp.json()
+                content = _extract_supadata_content(data)
+                if content and len(content) > 100:
+                    return content
+                # Still processing
+                status = data.get("status", "")
+                if status in ("failed", "error"):
+                    logger.debug("Supadata job %s failed: %s", job_id, status)
+                    return ""
+            elif resp.status_code == 202:
+                pass  # Still processing
+            else:
+                logger.debug("Supadata poll returned %d", resp.status_code)
+                return ""
+        except Exception as exc:
+            logger.debug("Supadata poll error: %s", exc)
+        time.sleep(5)
+    logger.debug("Supadata job %s timed out after %d polls", job_id, max_polls)
+    return ""
+
+
+def _extract_supadata_content(data: dict) -> str:
+    """Extract transcript text from Supadata response."""
+    content = data.get("content", "")
+    if isinstance(content, list):
+        # Chunked content: join segments
+        parts = []
+        for segment in content:
+            text = segment.get("text", "") if isinstance(segment, dict) else str(segment)
+            parts.append(text)
+        return " ".join(parts)
+    return str(content) if content else ""
+
+
+# ── Import httpx ─────────────────────────────────────────────────────────
+
+try:
+    import httpx
+    _DEPS_AVAILABLE = True
+except ImportError:
+    _DEPS_AVAILABLE = False
+    logger.warning("httpx not available — podcast extractor disabled")
