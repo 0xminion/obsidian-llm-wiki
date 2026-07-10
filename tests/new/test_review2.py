@@ -301,3 +301,73 @@ def test_extract_web_all_layers_fail():
             assert "trafilatura" in str(e)
             assert "defuddle" in str(e)
             assert "wayback" in str(e)
+
+
+# ── render/obsidian.py: deterministic bilingual title normalization ──────────
+
+
+def test_render_vault_normalizes_chinese_titles_and_slugs(tmp_path):
+    """Chinese-derived titles become English-first bilingual with bilingual filenames."""
+    from obsidian_llm_wiki.core.models import (
+        ConceptNote,
+        MapOfContent,
+        SourceSynthesis,
+        SynthesisBundle,
+    )
+    from obsidian_llm_wiki.render.obsidian import render_vault
+
+    concept = ConceptNote(
+        title="侨批与家族量证明",
+        slug="qiaopi-proof-of-family",
+        summary="一种宗族信用机制。",
+        aliases=["Proof of Family"],
+    )
+    moc = MapOfContent(
+        title="信用与结算的演化图谱",
+        slug="evolution-of-trust-and-settlement",
+        summary="中文摘要。",
+        concept_slugs=["qiaopi-proof-of-family"],
+    )
+    synthesis = SourceSynthesis(
+        source_title="被套过的人，还可以买谁？",
+        source_summary="中文摘要。",
+        language="zh",
+        concepts=[concept],
+        maps=[moc],
+    )
+    bundle = SynthesisBundle(sources=[synthesis], concepts=[concept], maps=[moc])
+
+    render_vault(tmp_path, bundle, {})
+
+    concept_path = tmp_path / "concepts" / "proof-of-family-侨批与家族量证明.md"
+    assert concept_path.exists()
+    concept_text = concept_path.read_text()
+    assert "title: Proof of Family (侨批与家族量证明)" in concept_text
+    assert "# Proof of Family (侨批与家族量证明)" in concept_text
+
+    moc_path = tmp_path / "mocs" / "evolution-of-trust-and-settlement-信用与结算的演化图谱.md"
+    assert moc_path.exists()
+    moc_text = moc_path.read_text()
+    assert "title: Evolution of Trust and Settlement (信用与结算的演化图谱)" in moc_text
+    assert "## Concepts / 概念" in moc_text
+    assert "[[proof-of-family-侨批与家族量证明" in moc_text
+
+    entry_files = list((tmp_path / "entries").glob("*.md"))
+    assert any(
+        "proof-of-family" in f.name and "被套过的人还可以买谁" in f.name
+        for f in entry_files
+    )
+
+
+def test_bilingual_title_split_keeps_english_first_order():
+    """Already-correct bilingual titles must not get reversed on second pass."""
+    from obsidian_llm_wiki.render.obsidian import _ensure_english_first_bilingual
+
+    assert _ensure_english_first_bilingual(
+        "USDT as Settlement Layer (USDT 作为结算货币)",
+        slug="usdt-as-settlement-layer",
+    ) == "USDT as Settlement Layer (USDT 作为结算货币)"
+    assert _ensure_english_first_bilingual(
+        "USDT 作为结算货币 (USDT as Settlement Layer)",
+        slug="usdt-as-settlement-layer",
+    ) == "USDT as Settlement Layer (USDT 作为结算货币)"

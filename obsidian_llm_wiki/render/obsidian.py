@@ -305,7 +305,7 @@ def render_concept_page(
     if all_concepts and concept.related:
         cross_ref_lines = _build_cross_ref_diagram(concept, all_concepts)
         if cross_ref_lines:
-            parts.extend(["## 关联图谱 / Cross-References", ""])
+            parts.extend(["## Cross-References / 关联图谱", ""])
             parts.append("```text")
             parts.extend(cross_ref_lines)
             parts.append("```")
@@ -434,7 +434,13 @@ def render_moc_page(
         parts.extend([moc.summary, ""])
 
     if moc.concept_slugs:
-        parts.extend(["## Concepts", ""])
+        concept_entries = [
+            all_concepts.get(slug) if all_concepts else None
+            for slug in moc.concept_slugs
+        ]
+        bilingual_headings = _moc_needs_bilingual_headings(moc, concept_entries)
+        concepts_heading = "## Concepts / 概念" if bilingual_headings else "## Concepts"
+        parts.extend([concepts_heading, ""])
         for slug in moc.concept_slugs:
             entry = all_concepts.get(slug) if all_concepts else None
             badge = ""
@@ -463,7 +469,7 @@ def render_moc_page(
         if len(moc_concepts) >= 2:
             diagram_lines = _build_moc_cross_ref_diagram(moc_concepts, all_concepts)
             if diagram_lines:
-                parts.extend(["## 关联图谱 / Cross-References", ""])
+                parts.extend(["## Cross-References / 关联图谱", ""])
                 parts.append("```text")
                 parts.extend(diagram_lines)
                 parts.append("```")
@@ -535,6 +541,187 @@ def _is_chinese(text: str) -> bool:
     has_cjk = bool(re.search(r"[\u4e00-\u9fff]", text))
     has_kana = bool(re.search(r"[\u3040-\u309f\u30a0-\u30ff]", text))
     return has_cjk and not has_kana
+
+
+def _has_latin(text: str) -> bool:
+    """Return True if text contains Latin alphabet characters."""
+    return bool(re.search(r"[A-Za-z]", text or ""))
+
+
+def _title_from_slug(slug: str) -> str:
+    """Convert a slug to a readable English title fallback."""
+    words = [w for w in re.split(r"[-_]+", slug or "") if w]
+    if not words:
+        return "Untitled"
+    small = {
+        "a", "an", "and", "as", "at", "by", "for", "in",
+        "of", "on", "or", "the", "to", "vs", "via",
+    }
+    titled: list[str] = []
+    for idx, word in enumerate(words):
+        lower = word.lower()
+        if lower in {"usdt", "swift", "tbml", "llm", "ai"}:
+            titled.append(lower.upper())
+        elif idx > 0 and lower in small:
+            titled.append(lower)
+        else:
+            titled.append(lower.capitalize())
+    return " ".join(titled)
+
+
+def _split_bilingual_title(title: str) -> tuple[str, str] | None:
+    """Return (english, chinese) if title already has both languages."""
+    title = (title or "").strip()
+    if not (_is_chinese(title) and _has_latin(title)):
+        return None
+
+    # Desired format: English first, Chinese in parentheses.
+    m = re.fullmatch(r"(?P<en>[A-Za-z][^)）]+?)\s*[（(](?P<zh>.*[\u4e00-\u9fff].*)[)）]", title)
+    if m:
+        return m.group("en").strip(), m.group("zh").strip()
+
+    # Common model failure: Chinese first, English in parentheses.
+    m = re.fullmatch(r"(?P<zh>.*[\u4e00-\u9fff].*?)\s*[（(](?P<en>[A-Za-z][^)）]+)[)）]", title)
+    if m:
+        return m.group("en").strip(), m.group("zh").strip()
+
+    return None
+
+
+def _english_alias(aliases: list[str]) -> str:
+    """Pick the first English alias if one exists."""
+    for alias in aliases or []:
+        alias = (alias or "").strip()
+        if alias and _has_latin(alias) and not _is_chinese(alias):
+            return alias
+    return ""
+
+
+def _ensure_english_first_bilingual(
+    title: str,
+    *,
+    slug: str = "",
+    aliases: list[str] | None = None,
+) -> str:
+    """Return English-first bilingual title when title contains Chinese.
+
+    If the model produced a Chinese-only title, derive the English side from an
+    English alias first, then from the canonical slug. This is intentionally
+    deterministic: filenames and wikilinks must not depend on another LLM call.
+    """
+    title = (title or "").strip()
+    if not _is_chinese(title):
+        return title
+
+    existing = _split_bilingual_title(title)
+    if existing:
+        english, chinese = existing
+        return f"{english} ({chinese})"
+
+    english = _english_alias(aliases or []) or _title_from_slug(slug)
+    return f"{english} ({title})"
+
+
+def _bilingual_slug(english_first_title: str) -> str:
+    """Filename-safe slug that keeps both English and Chinese title parts."""
+    return slugify(english_first_title)
+
+
+def _english_side(title: str) -> str:
+    """Return the English side of an English-first bilingual title."""
+    if not title:
+        return ""
+    existing = _split_bilingual_title(title)
+    if existing:
+        return existing[0]
+    if _has_latin(title):
+        return re.split(r"[（(]", title, maxsplit=1)[0].strip()
+    return ""
+
+
+def _normalize_bilingual_titles_and_slugs(bundle: SynthesisBundle) -> None:
+    """Normalize Chinese-derived titles/slugs across a bundle in-place."""
+    slug_map: dict[str, str] = {}
+
+    # Concepts: normalize title and slug, then remap all relationship targets.
+    for concept in bundle.concepts:
+        if _is_chinese(concept.title):
+            old_slug = concept.slug
+            concept.title = _ensure_english_first_bilingual(
+                concept.title,
+                slug=concept.slug,
+                aliases=concept.aliases,
+            )
+            concept.slug = _bilingual_slug(concept.title)
+            if old_slug and old_slug != concept.slug:
+                slug_map[old_slug] = concept.slug
+
+    # Source-local concept objects may not be the same instances as bundle.concepts.
+    for synthesis in bundle.sources:
+        for concept in synthesis.concepts:
+            if concept.slug in slug_map:
+                concept.slug = slug_map[concept.slug]
+            if _is_chinese(concept.title):
+                concept.title = _ensure_english_first_bilingual(
+                    concept.title,
+                    slug=concept.slug,
+                    aliases=concept.aliases,
+                )
+                concept.slug = _bilingual_slug(concept.title)
+
+    def remap_links(concepts: list[ConceptNote]) -> None:
+        for concept in concepts:
+            for link in concept.related:
+                if link.slug in slug_map:
+                    link.slug = slug_map[link.slug]
+
+    remap_links(bundle.concepts)
+    for synthesis in bundle.sources:
+        remap_links(synthesis.concepts)
+
+    # MoCs: normalize titles/slugs and remap concept references.
+    for moc in bundle.maps:
+        moc.concept_slugs = [slug_map.get(slug, slug) for slug in moc.concept_slugs]
+        if _is_chinese(moc.title):
+            moc.title = _ensure_english_first_bilingual(moc.title, slug=moc.slug)
+            moc.slug = _bilingual_slug(moc.title)
+
+    for synthesis in bundle.sources:
+        for moc in synthesis.maps:
+            moc.concept_slugs = [slug_map.get(slug, slug) for slug in moc.concept_slugs]
+            if _is_chinese(moc.title):
+                moc.title = _ensure_english_first_bilingual(moc.title, slug=moc.slug)
+                moc.slug = _bilingual_slug(moc.title)
+
+    # Entries from Chinese sources: source titles do not have a canonical English
+    # slug, so derive the English side from the first two linked concepts.
+    for synthesis in bundle.sources:
+        if not _is_chinese(synthesis.source_title):
+            continue
+        if _has_latin(synthesis.source_title):
+            synthesis.source_title = _ensure_english_first_bilingual(
+                synthesis.source_title,
+                slug=slugify(synthesis.source_title),
+            )
+            continue
+        concept_titles = [
+            _english_side(concept.title) or _title_from_slug(concept.slug)
+            for concept in synthesis.concepts[:2]
+            if concept.slug
+        ]
+        english = " and ".join(concept_titles) if concept_titles else "Chinese Source"
+        synthesis.source_title = f"{english} ({synthesis.source_title})"
+
+
+def _moc_needs_bilingual_headings(
+    moc: MapOfContent,
+    concepts: list[ConceptNote | None],
+) -> bool:
+    """Return True for Chinese or multilingual MoCs."""
+    titles = [moc.title, *(c.title for c in concepts if c)]
+    has_chinese = any(_is_chinese(t) for t in titles)
+    has_english = any(_has_latin(t) for t in titles)
+    return has_chinese and has_english
 
 
 # ── Index renderers ─────────────────────────────────────────────────────
@@ -611,6 +798,12 @@ def render_vault(
     """
     written: list[str] = []
     ts = _timestamp()
+
+    # Make the language policy deterministic. The synthesis prompt asks Chinese
+    # sources to use English-first bilingual titles, but smaller/local models do
+    # not always comply. Rendering is the last safe choke point before filenames
+    # and wikilinks are written, so normalize here and remap slugs consistently.
+    _normalize_bilingual_titles_and_slugs(bundle)
 
     # Ensure directories exist.
     dirs = {
