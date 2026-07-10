@@ -280,6 +280,7 @@ async def quality_synthesize_source(
                 "Pass 2 (expand) failed for '%s' concept '%s': %s",
                 filename, original.slug, result,
             )
+            original.confidence = 0.3
             continue
 
         if result is None:
@@ -287,6 +288,7 @@ async def quality_synthesize_source(
                 "Pass 2 produced no output for '%s' concept '%s'",
                 filename, original.slug,
             )
+            original.confidence = 0.3
             continue
 
         # Replace skeleton concept with expanded version.
@@ -296,16 +298,19 @@ async def quality_synthesize_source(
         expanded.provenance = original.provenance
         expanded.is_new = original.is_new
 
-        # ── Quality gate: check body length ────────────────────────────
-        body_chars = _concept_body_chars(expanded)
-        if body_chars < config.concept_min_body_chars:
-            expanded.confidence = 0.3
+        skeleton.concepts[i] = expanded
+
+    # ── Post-loop quality sweep ────────────────────────────────────────
+    # Catch both failed expansions (empty skeleton) and thin successful
+    # expansions in one pass. Don't clobber already-lowered confidence.
+    for concept in skeleton.concepts:
+        body = _concept_body_chars(concept)
+        if body < config.concept_min_body_chars and concept.confidence >= 1.0:
+            concept.confidence = 0.3
             logger.warning(
                 "Concept '%s' body is %d chars (threshold %d) — confidence set to 0.3",
-                expanded.slug, body_chars, config.concept_min_body_chars,
+                concept.slug, body, config.concept_min_body_chars,
             )
-
-        skeleton.concepts[i] = expanded
 
     logger.info(
         "Pass 2 done for '%s': %d concepts expanded",

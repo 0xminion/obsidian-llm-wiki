@@ -16,7 +16,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from obsidian_llm_wiki.core.models import SourceDoc
+from obsidian_llm_wiki.core.models import ConceptNote, SourceDoc
 from obsidian_llm_wiki.synth.quality import (
     _concept_body_chars,
     _parse_concept_json,
@@ -263,6 +263,88 @@ async def test_quality_synthesize_source_empty_concepts():
     assert result is not None
     assert len(result.concepts) == 0
     assert result.source_summary == "Nothing here."
+
+
+@pytest.mark.asyncio
+async def test_quality_synthesize_source_pass2_failure_sets_low_confidence():
+    """Pass-2 failure (None or exception) sets confidence=0.3 on skeleton concept.
+
+    Regression test for the trade-size-scale-effect bug: a skeleton concept
+    whose Pass-2 expansion returned None was shipped at confidence=1.0
+    with zero body content.
+    """
+    source = SourceDoc(
+        title="Test Source",
+        content="Some content here for the source. " * 10,
+    )
+
+    skeleton_response = json.dumps({
+        "source_title": "Test Source",
+        "source_summary": "A test source.",
+        "concepts": [
+            {"title": "Good Concept", "slug": "good-concept", "summary": "Will expand fine."},
+            {"title": "Null Concept", "slug": "null-concept", "summary": "Pass 2 returns None."},
+            {"title": "Error Concept", "slug": "error-concept", "summary": "Pass 2 raises."},
+        ],
+        "maps": [],
+    })
+
+    async def _mock_acall(prompt, *args, **kwargs):
+        # Pass 1 only — return skeleton
+        return skeleton_response
+
+    async def _mock_expand(config, concept, source, all_concepts):
+        # Pass 2 routed by slug — concurrency-safe under asyncio.gather
+        if concept.slug == "good-concept":
+            from obsidian_llm_wiki.core.models import BodySection
+            return ConceptNote(
+                title="Good Concept",
+                slug="good-concept",
+                summary="Expanded well.",
+                sections=[BodySection(heading="Core", points=["x" * 900])],
+                confidence=1.0,
+            )
+        if concept.slug == "null-concept":
+            return None
+        if concept.slug == "error-concept":
+            raise RuntimeError("LLM timeout")
+        return None
+
+    with patch(
+        "obsidian_llm_wiki.providers.llm.acall_llm",
+        new_callable=AsyncMock,
+        side_effect=_mock_acall,
+    ):
+        with patch(
+            "obsidian_llm_wiki.synth.quality._expand_one_concept",
+            new_callable=AsyncMock,
+            side_effect=_mock_expand,
+        ):
+            result = await quality_synthesize_source(
+                _MockConfig(),
+                "test.md",
+                source,
+                existing_concepts=[],
+            )
+
+    assert result is not None
+    assert len(result.concepts) == 3
+
+    good = next(c for c in result.concepts if c.slug == "good-concept")
+    null_c = next(c for c in result.concepts if c.slug == "null-concept")
+    error_c = next(c for c in result.concepts if c.slug == "error-concept")
+
+    # Good expansion stays at confidence 1.0
+    assert good.confidence == 1.0
+    assert _concept_body_chars(good) >= 800
+
+    # Failed expansions get confidence 0.3 (the fix)
+    assert null_c.confidence == 0.3, f"Expected 0.3 for None expansion, got {null_c.confidence}"
+    assert error_c.confidence == 0.3, f"Expected 0.3 for exception expansion, got {error_c.confidence}"
+
+    # Failed expansions have no body (skeleton only)
+    assert _concept_body_chars(null_c) == 0
+    assert _concept_body_chars(error_c) == 0
 
 
 @pytest.mark.asyncio
