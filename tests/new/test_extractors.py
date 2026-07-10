@@ -7,6 +7,7 @@ The registry must gracefully handle missing deps and fall back to web.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from unittest.mock import patch
 
@@ -115,21 +116,22 @@ def test_extract_youtube_url_routes_to_youtube_extractor():
 def test_extract_youtube_url_raises_when_no_api_key():
     """YouTube extractor raises RuntimeError when TRANSCRIPT_API_KEY is not set.
 
-    Tests the extractor function in isolation with a mocked API key state,
+    Tests the extractor function in isolation with a mocked env var,
     bypassing the test subprocess environment inheritance issue.
     """
     from obsidian_llm_wiki.ingest.extractors import youtube as yt_mod
 
-    # Save and nullify the module-level key
-    original_key = yt_mod._TRANSCRIPT_API_KEY
-    yt_mod._TRANSCRIPT_API_KEY = None
+    # Save and nullify the env var
+    original_key = os.environ.get("TRANSCRIPT_API_KEY")
+    os.environ.pop("TRANSCRIPT_API_KEY", None)
     try:
         yt_mod.extract_youtube_video("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
         pytest.fail("Expected RuntimeError but extract_youtube_video succeeded")
     except RuntimeError as exc:
         assert "TRANSCRIPT_API_KEY" in str(exc)
     finally:
-        yt_mod._TRANSCRIPT_API_KEY = original_key
+        if original_key is not None:
+            os.environ["TRANSCRIPT_API_KEY"] = original_key
 
 
 # ── Video ID extraction ─────────────────────────────────────────────────────

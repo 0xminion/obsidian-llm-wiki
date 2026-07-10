@@ -22,9 +22,17 @@ logger = logging.getLogger("obswiki.ingest.youtube")
 
 __all__ = ["extract_youtube_video"]
 
-_TRANSCRIPT_API_KEY = os.environ.get("TRANSCRIPT_API_KEY", "").strip() or None
 _TRANSCRIPT_API_BASE = "https://transcriptapi.com"
 _TRANSCRIPT_API_VERSION = "v2"
+
+
+def _get_api_key() -> str | None:
+    """Read the TranscriptAPI key from env at call time, not import time.
+
+    The .env file is loaded by the CLI after module import, so a module-level
+    read would miss it. This function reads the env var on each call.
+    """
+    return os.environ.get("TRANSCRIPT_API_KEY", "").strip() or None
 
 
 def _video_id(url: str) -> str | None:
@@ -59,7 +67,8 @@ def extract_youtube_video(raw_url: str) -> SourceDoc:
     Raises:
         RuntimeError: If TRANSCRIPT_API_KEY is not set or API call fails.
     """
-    if not _TRANSCRIPT_API_KEY:
+    api_key = _get_api_key()
+    if not api_key:
         raise RuntimeError(
             "TRANSCRIPT_API_KEY not set — set it in your .env or environment. "
             "Get your key at https://transcriptapi.com"
@@ -84,13 +93,31 @@ def extract_youtube_video(raw_url: str) -> SourceDoc:
             resp = client.get(
                 api_url,
                 headers={
-                    "x-api-key": _TRANSCRIPT_API_KEY,
+                    "Authorization": f"Bearer {api_key}",
                     "Accept": "application/json",
                     "User-Agent": "obsidian-llm-wiki/3.0",
                 },
             )
 
         if resp.status_code == 401 or resp.status_code == 403:
+            # Distinguish auth failure from billing/plan issues
+            try:
+                body = resp.json()
+                detail = body.get("detail", {})
+                if isinstance(detail, dict):
+                    reason = detail.get("reason", "")
+                    message = detail.get("message", "")
+                    if reason == "no_active_paid_plan":
+                        raise RuntimeError(
+                            f"TranscriptAPI: no active paid plan ({message}). "
+                            "Upgrade at https://transcriptapi.com/billing"
+                        )
+                    if message:
+                        raise RuntimeError(
+                            f"TranscriptAPI auth failed ({resp.status_code}): {message}"
+                        )
+            except (ValueError, KeyError):
+                pass
             raise RuntimeError(
                 f"TranscriptAPI authentication failed ({resp.status_code}) — "
                 "check your TRANSCRIPT_API_KEY at https://transcriptapi.com"
@@ -134,7 +161,64 @@ def extract_youtube_video(raw_url: str) -> SourceDoc:
     except Exception as exc:
         errors.append(f"transcript_api: {exc}")
 
+    # Fallback 1: Invidious API (metadata + description, no transcript)
+    try:
+        from obsidian_llm_wiki.ingest.alt_source import extract_via_invidious
+        source = extract_via_invidious(raw_url)
+        logger.info("Invidious fallback: extracted %d chars for %s", len(source.content), raw_url)
+        return source
+    except Exception as exc:
+        errors.append(f"invidious: {exc}")
+
+    # Fallback 2: oEmbed metadata (title + author only, minimal)
+    try:
+        source = _extract_oembed(raw_url)
+        if source:
+            logger.info("oEmbed fallback: extracted metadata for %s", raw_url)
+            return source
+    except Exception as exc:
+        errors.append(f"oembed: {exc}")
+
     raise RuntimeError(
         f"YouTube transcript extraction failed for {raw_url}: " +
         "; ".join(errors)
     )
+
+
+def _extract_oembed(youtube_url: str) -> SourceDoc | None:
+    """Fetch video metadata via YouTube oEmbed API (no auth required).
+
+    Returns title + author + thumbnail description. Minimal content,
+    but better than nothing when all other methods fail.
+    """
+    from urllib.parse import quote
+    import httpx
+
+    oembed_url = f"https://www.youtube.com/oembed?url={quote(youtube_url, safe='')}&format=json"
+    with httpx.Client(timeout=15, follow_redirects=True) as client:
+        resp = client.get(oembed_url)
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+
+    title = data.get("title", "") or youtube_url
+    author = data.get("author_name", "") or ""
+    thumbnail = data.get("thumbnail_url", "") or ""
+
+    content_parts = [
+        f"Title: {title}",
+        f"Channel: {author}",
+    ]
+    if thumbnail:
+        content_parts.append(f"Thumbnail: {thumbnail}")
+    content_parts.extend([
+        "",
+        "Note: Full transcript unavailable (no active TranscriptAPI plan).",
+        "Only video metadata was extracted. Upgrade at https://transcriptapi.com/billing",
+    ])
+
+    content = "\n".join(content_parts)
+    if len(content) < 100:
+        return None
+
+    return SourceDoc(title=title, content=content, url=youtube_url)

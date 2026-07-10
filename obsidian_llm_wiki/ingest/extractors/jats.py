@@ -70,7 +70,10 @@ def extract_jats(raw_url: str) -> SourceDoc:
     suffix and falls back to extract_web on the HTML article page.
     """
     try:
-        with httpx.Client(**make_client_kwargs(follow_redirects=True, timeout=45)) as client:
+        with httpx.Client(
+            **make_client_kwargs(follow_redirects=True, timeout=45),
+            headers=BROWSER_HEADERS,
+        ) as client:
             resp = client.get(raw_url)
             resp.raise_for_status()
             xml_text = resp.text

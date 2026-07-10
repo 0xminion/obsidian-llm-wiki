@@ -184,7 +184,10 @@ def _extract_trafilatura(url: str, timeout: int) -> SourceDoc:
     """Extract via httpx fetch + trafilatura."""
     import trafilatura
 
-    with httpx.Client(**make_client_kwargs(timeout=timeout, follow_redirects=True)) as client:
+    with httpx.Client(
+        **make_client_kwargs(timeout=timeout, follow_redirects=True),
+        headers=BROWSER_HEADERS,
+    ) as client:
         resp = client.get(url)
         html = resp.text
 
