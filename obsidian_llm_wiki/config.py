@@ -81,6 +81,11 @@ class Config:
     # Set as env TRANSCRIPT_API_KEY=sk_...
     transcript_api_key: str = ""
 
+    # Supadata API key for YouTube/media transcripts (replaces TranscriptAPI).
+    # Get your key at https://dash.supadata.ai/organizations/api-key
+    # Set as env SUPADATA_API_KEY=sd_...
+    supadata_api_key: str = ""
+
     # ── Derived paths (lazy) ──────────────────────
     _vault: Path | None = field(default=None, repr=False)
 
@@ -182,6 +187,7 @@ def load_config(env_file: str | None = None, **overrides: str) -> Config:
         residential_proxy_url=os.getenv("RESIDENTIAL_PROXY_URL", ""),
         youtube_cookies_file=os.getenv("YOUTUBE_COOKIES_FILE", ""),
         transcript_api_key=os.getenv("TRANSCRIPT_API_KEY", ""),
+        supadata_api_key=os.getenv("SUPADATA_API_KEY", ""),
     )
 
 

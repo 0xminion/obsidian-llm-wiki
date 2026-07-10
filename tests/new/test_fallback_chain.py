@@ -159,7 +159,7 @@ def _make_concept(slug, title, related=None, aliases=None):
 def test_build_cross_ref_section_bidirectional():
     """Both concepts link to each other → bidirectional edge shown."""
     from obsidian_llm_wiki.core.models import ConceptLink
-    from obsidian_llm_wiki.render.obsidian import _build_cross_ref_section
+    from obsidian_llm_wiki.render.obsidian import _build_cross_ref_diagram
 
     a = _make_concept("a", "Concept A", related=[
         ConceptLink(slug="b", relation="depends_on", display="Concept B"),
@@ -167,35 +167,36 @@ def test_build_cross_ref_section_bidirectional():
     b = _make_concept("b", "Concept B", related=[
         ConceptLink(slug="a", relation="related_to", display="Concept A"),
     ])
-    lines = _build_cross_ref_section(a, {"a": a, "b": b})
+    lines = _build_cross_ref_diagram(a, {"a": a, "b": b})
     assert len(lines) >= 2
-    assert any("→" in line for line in lines)
-    # Reverse edge line contains the target's wikilink and relation
-    assert any("←" in line for line in lines)
+    assert any("↓" in line for line in lines)
+    assert any("↔" in line for line in lines)
 
 
 def test_build_cross_ref_section_unidirectional():
-    """Target doesn't link back → unidirectional note."""
+    """Target doesn't link back → no bidirectional arrow."""
     from obsidian_llm_wiki.core.models import ConceptLink
-    from obsidian_llm_wiki.render.obsidian import _build_cross_ref_section
+    from obsidian_llm_wiki.render.obsidian import _build_cross_ref_diagram
 
     a = _make_concept("a", "Concept A", related=[
         ConceptLink(slug="b", relation="related_to"),
     ])
     b = _make_concept("b", "Concept B", related=[])
-    lines = _build_cross_ref_section(a, {"a": a, "b": b})
-    assert any("unidirectional" in line for line in lines)
+    lines = _build_cross_ref_diagram(a, {"a": a, "b": b})
+    assert len(lines) >= 2
+    # Should not have bidirectional arrow
+    assert not any("↔" in line for line in lines)
 
 
 def test_build_cross_ref_section_missing_target():
     """Target not in all_concepts → skipped (empty or no line for it)."""
     from obsidian_llm_wiki.core.models import ConceptLink
-    from obsidian_llm_wiki.render.obsidian import _build_cross_ref_section
+    from obsidian_llm_wiki.render.obsidian import _build_cross_ref_diagram
 
     a = _make_concept("a", "Concept A", related=[
         ConceptLink(slug="nonexistent", relation="related_to"),
     ])
-    lines = _build_cross_ref_section(a, {"a": a})
+    lines = _build_cross_ref_diagram(a, {"a": a})
     assert len(lines) == 0
 
 

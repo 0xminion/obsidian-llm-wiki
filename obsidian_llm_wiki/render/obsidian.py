@@ -12,6 +12,7 @@ single input; the output is a complete vault directory tree.
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 import tempfile
@@ -21,6 +22,8 @@ from pathlib import Path
 from typing import Any
 
 import yaml
+
+logger = logging.getLogger("obswiki.render.obsidian")
 
 from obsidian_llm_wiki.core.models import (
     ConceptNote,
@@ -158,7 +161,11 @@ def _timestamp() -> str:
 
 
 def render_source_page(source: SourceDoc, timestamp: str | None = None) -> str:
-    """Render a Source-type page (raw content for provenance)."""
+    """Render a Source-type page (raw content for provenance).
+
+    Avoids duplicate headings: if the content already starts with the title
+    (as a # heading or plain text), the body heading is skipped.
+    """
     ts = timestamp or _timestamp()
     fm = {
         "type": ConceptType.SOURCE.value,
@@ -166,7 +173,21 @@ def render_source_page(source: SourceDoc, timestamp: str | None = None) -> str:
         "url": source.url or "",
         "timestamp": ts,
     }
-    body = f"# {source.title}\n\n{source.content}"
+    content = source.content.strip()
+    title_clean = source.title.strip()
+
+    # Check if content already starts with the title as a heading or plain text
+    starts_with_heading = content.startswith(f"# {title_clean}")
+    starts_with_plain = content.startswith(title_clean)
+
+    if starts_with_heading:
+        # Content already has the heading — don't duplicate
+        body = content
+    elif starts_with_plain:
+        # Content starts with title text (not as heading) — add heading, strip duplicate
+        body = f"# {source.title}\n\n{content[len(title_clean):].lstrip()}"
+    else:
+        body = f"# {source.title}\n\n{content}"
     return f"{build_frontmatter(fm)}\n{body}"
 
 
@@ -279,8 +300,9 @@ def render_concept_page(
 
     # ── 关联图谱 / Cross-References ──────────────────────────────────
     # Typed-edge relationship graph. Shown when all_concepts is provided.
+    # Renders as ASCII flow diagram matching the user's screenshot format.
     if all_concepts and concept.related:
-        cross_ref_lines = _build_cross_ref_section(concept, all_concepts)
+        cross_ref_lines = _build_cross_ref_diagram(concept, all_concepts)
         if cross_ref_lines:
             parts.extend(["## 关联图谱 / Cross-References", ""])
             parts.extend(cross_ref_lines)
@@ -290,20 +312,25 @@ def render_concept_page(
     return f"{build_frontmatter(fm)}\n{body}"
 
 
-def _build_cross_ref_section(
+def _build_cross_ref_diagram(
     concept: ConceptNote,
     all_concepts: dict[str, ConceptNote],
 ) -> list[str]:
-    """Build the typed-edge cross-reference section for a concept.
+    """Build the typed-edge cross-reference section as an ASCII flow diagram.
 
-    Shows all typed relationships as a structured flow diagram matching the
-    screenshot the user shared: node → edge-type → node.
+    Renders in the format from the user's screenshot:
+      [Concept A]
+          ↓ [relation_type]
+      [Concept B] → [sub-concept]
+          ↓ [relation_type]
+      [Concept C] ↔ [paired-concept]
 
-    Example output:
-      - 庞氏经济学 (Ponzi Economics) → 三盘理论 (Three-disc Theory)
-        type: 衍生自 (derives_from)
+    Cross-links: [[slug-a]] (descriptor)
+                 [[slug-b]] (descriptor)
     """
     lines: list[str] = []
+
+    # Build the flow diagram from this concept's related edges
     for link in concept.related:
         target = all_concepts.get(link.slug)
         if not target:
@@ -313,23 +340,58 @@ def _build_cross_ref_section(
         relation_type = link.relation or "related_to"
 
         # Primary edge: this concept → target
-        lines.append(
-            f"- {make_wikilink(concept.slug, concept.title)} "
-            f"→ {make_wikilink(link.slug, display)}"
-        )
-        lines.append(f"  type: `{relation_type}`")
+        lines.append(f"**{make_wikilink(concept.slug, concept.title)}**")
+        lines.append(f"    ↓ {relation_type}")
 
-        # Reverse edge: did target also link back to this concept?
-        # If not, note the unidirectional relationship
+        # Target line with any sub-relationships
+        target_sub = ""
+        if target.related:
+            sub_links = [
+                r for r in target.related
+                if r.slug != concept.slug
+            ][:2]  # Show up to 2 sub-relationships
+            if sub_links:
+                sub_parts = []
+                for sl in sub_links:
+                    sub_target = all_concepts.get(sl.slug)
+                    if sub_target:
+                        sub_parts.append(make_wikilink(sl.slug, sub_target.title))
+                if sub_parts:
+                    target_sub = " → " + " → ".join(sub_parts)
+
+        # Check for bidirectional edge
         reverse_links = [
             r for r in (target.related or [])
             if r.slug == concept.slug
         ]
-        if reverse_links:
+        if reverse_links and not target_sub:
             rev_rel = reverse_links[0].relation or "related_to"
-            lines.append(f"  ← {make_wikilink(target.slug, target.title)} (`{rev_rel}`)")
+            lines.append(
+                f"**{make_wikilink(target.slug, target.title)}** ↔ "
+                f"{make_wikilink(concept.slug, concept.title)} (`{rev_rel}`)"
+            )
+        elif target_sub:
+            lines.append(
+                f"**{make_wikilink(target.slug, display)}**{target_sub}"
+            )
         else:
-            lines.append(f"  ← (unidirectional — target does not link back)")
+            lines.append(f"**{make_wikilink(target.slug, display)}**")
+
+        lines.append("")
+
+    # Cross-links section (wikilinks with descriptors)
+    if lines and concept.related:
+        cross_links: list[str] = []
+        for link in concept.related:
+            target = all_concepts.get(link.slug)
+            if target:
+                descriptor = link.relation or "related"
+                cross_links.append(
+                    f"  - {make_wikilink(link.slug, target.title)} ({descriptor})"
+                )
+        if cross_links:
+            lines.append("Cross-links:")
+            lines.extend(cross_links)
 
     return lines
 
@@ -338,6 +400,7 @@ def render_moc_page(
     moc: MapOfContent,
     timestamp: str | None = None,
     all_concepts: dict[str, ConceptNote] | None = None,
+    cross_lingual_links: dict[str, list[tuple[str, float, str]]] | None = None,
 ) -> str:
     """Render a Map of Content page.
 
@@ -347,7 +410,10 @@ def render_moc_page(
         all_concepts: Optional slug→ConceptNote dict. When provided, the MOC
             displays concept language badges and cross-lingual aliases, grouping
             concepts that share the same semantic meaning across languages under
-            a unified entry.
+            a unified entry. Also enables 关联图谱 cross-references.
+        cross_lingual_links: Optional dict from embedding.find_cross_lingual_links.
+            Maps slug → list of (target_slug, score, display). Used to show
+            cross-lingual concept pairs in the MoC.
     """
     ts = timestamp or _timestamp()
     fm = {
@@ -375,8 +441,78 @@ def render_moc_page(
             parts.append(f"- {make_wikilink(slug)}{badge}")
         parts.append("")
 
+    # ── 关联图谱 / Cross-References in MoC ──────────────────────────
+    # Show relationship diagram between concepts in this MoC
+    if all_concepts and moc.concept_slugs:
+        moc_concepts = [
+            all_concepts[s] for s in moc.concept_slugs
+            if s in all_concepts
+        ]
+        if len(moc_concepts) >= 2:
+            diagram_lines = _build_moc_cross_ref_diagram(moc_concepts, all_concepts)
+            if diagram_lines:
+                parts.extend(["## 关联图谱 / Cross-References", ""])
+                parts.extend(diagram_lines)
+                parts.append("")
+
+    # ── Cross-lingual links from embedding ──────────────────────────
+    if cross_lingual_links and moc.concept_slugs:
+        xling_lines: list[str] = []
+        for slug in moc.concept_slugs:
+            if slug in cross_lingual_links:
+                for target_slug, score, display in cross_lingual_links[slug]:
+                    if target_slug in moc.concept_slugs:
+                        continue  # Already shown in Concepts section
+                    xling_lines.append(
+                        f"  - {make_wikilink(slug)} ↔ {make_wikilink(target_slug, display)} "
+                        f"(similarity: {score:.2f})"
+                    )
+        if xling_lines:
+            parts.extend(["## Cross-Lingual Links / 跨语言关联", ""])
+            parts.extend(xling_lines)
+            parts.append("")
+
     body = "\n".join(parts)
     return f"{build_frontmatter(fm)}\n{body}"
+
+
+def _build_moc_cross_ref_diagram(
+    moc_concepts: list[ConceptNote],
+    all_concepts: dict[str, ConceptNote],
+) -> list[str]:
+    """Build ASCII flow diagram showing relationships between MoC concepts."""
+    lines: list[str] = []
+    seen_pairs: set[tuple[str, str]] = set()
+
+    for concept in moc_concepts:
+        for link in concept.related or []:
+            if link.slug not in all_concepts:
+                continue
+            if link.slug not in {c.slug for c in moc_concepts}:
+                continue  # Only show links between MoC concepts
+
+            pair_key = tuple(sorted([concept.slug, link.slug]))
+            if pair_key in seen_pairs:
+                continue
+            seen_pairs.add(pair_key)
+
+            target = all_concepts[link.slug]
+            relation = link.relation or "related_to"
+
+            # Check if bidirectional
+            reverse = any(
+                r.slug == concept.slug
+                for r in (target.related or [])
+            )
+            arrow = "↔" if reverse else "→"
+
+            lines.append(
+                f"- {make_wikilink(concept.slug, concept.title)} "
+                f"{arrow} {make_wikilink(target.slug, target.title)} "
+                f"(`{relation}`)"
+            )
+
+    return lines
 
 
 def _is_chinese(text: str) -> bool:
@@ -489,11 +625,23 @@ def render_vault(
         written.append(str(path))
 
     # Build concept map for cross-reference linking.
-    # Used by render_concept_page (typed edge cross-refs) and
-    # render_moc_page (cross-lingual language badges).
     concept_map: dict[str, ConceptNote] = {
         c.slug: c for c in bundle.concepts
     }
+
+    # ── Cross-lingual embedding links ────────────────────────────────
+    # Find semantically similar concepts across languages using embeddings.
+    cross_lingual_links: dict[str, list[tuple[str, float, str]]] = {}
+    try:
+        from obsidian_llm_wiki.synth.embedding import find_cross_lingual_links
+        cross_lingual_links = find_cross_lingual_links(bundle.concepts)
+        if cross_lingual_links:
+            logger.info(
+                "Embedding: found %d cross-lingual concept links",
+                len(cross_lingual_links),
+            )
+    except Exception as exc:
+        logger.debug("Embedding-based linking skipped: %s", exc)
 
     # ── Render concept pages ─────────────────────────────────────────
     for concept in bundle.concepts:
@@ -504,7 +652,11 @@ def render_vault(
 
     # ── Render MOC pages ─────────────────────────────────────────────
     for moc in bundle.maps:
-        page = render_moc_page(moc, ts, all_concepts=concept_map)
+        page = render_moc_page(
+            moc, ts,
+            all_concepts=concept_map,
+            cross_lingual_links=cross_lingual_links or None,
+        )
         path = dirs["mocs"] / f"{moc.slug}.md"
         atomic_write(path, page)
         written.append(str(path))
