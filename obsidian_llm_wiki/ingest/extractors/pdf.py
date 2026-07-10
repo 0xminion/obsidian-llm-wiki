@@ -22,6 +22,7 @@ import httpx
 from obsidian_llm_wiki.core.models import SourceDoc
 from obsidian_llm_wiki.ingest.extractors import register_extractor
 from obsidian_llm_wiki.ingest.http_headers import BROWSER_HEADERS
+from obsidian_llm_wiki.ingest.proxy import make_client_kwargs
 
 logger = logging.getLogger("obswiki.ingest.extractors.pdf")
 
@@ -91,9 +92,7 @@ if _DEPS_AVAILABLE:
 
     def _extract_remote_pdf(url: str) -> SourceDoc:
         """Download a remote PDF and extract text from bytes."""
-        with httpx.Client(
-            follow_redirects=True, timeout=60, headers=BROWSER_HEADERS
-        ) as client:
+        with httpx.Client(**make_client_kwargs(follow_redirects=True, timeout=60)) as client:
             resp = client.get(url)
             resp.raise_for_status()
             pdf_bytes = resp.content

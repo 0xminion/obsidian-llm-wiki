@@ -173,8 +173,9 @@ def _extract_remote_file(url: str) -> SourceDoc:
     # Download to temp file.
     tmp_path: str | None = None
     try:
+        from obsidian_llm_wiki.ingest.proxy import make_client_kwargs
         with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-            with httpx.Client(follow_redirects=True, timeout=60) as client:
+            with httpx.Client(**make_client_kwargs(follow_redirects=True, timeout=60)) as client:
                 resp = client.get(url)
                 resp.raise_for_status()
                 tmp.write(resp.content)

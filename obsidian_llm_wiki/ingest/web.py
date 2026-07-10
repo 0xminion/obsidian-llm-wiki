@@ -15,6 +15,7 @@ import httpx
 
 from obsidian_llm_wiki.core.models import SourceDoc
 from obsidian_llm_wiki.ingest.http_headers import BROWSER_HEADERS, DEFAULT_TIMEOUT
+from obsidian_llm_wiki.ingest.proxy import make_client_kwargs
 
 logger = logging.getLogger("obswiki.ingest.web")
 
@@ -60,8 +61,7 @@ def _extract_trafilatura(url: str, timeout: int) -> SourceDoc:
     """Extract via httpx fetch + trafilatura."""
     import trafilatura
 
-    with httpx.Client(timeout=timeout, follow_redirects=True,
-                      headers=BROWSER_HEADERS) as client:
+    with httpx.Client(**make_client_kwargs(timeout=timeout, follow_redirects=True)) as client:
         resp = client.get(url)
         html = resp.text
 
@@ -88,8 +88,7 @@ def _extract_trafilatura(url: str, timeout: int) -> SourceDoc:
 
 def _extract_regex(url: str, timeout: int) -> SourceDoc:
     """Extract via httpx + regex HTML-to-text."""
-    with httpx.Client(timeout=timeout, follow_redirects=True,
-                      headers=BROWSER_HEADERS) as client:
+    with httpx.Client(**make_client_kwargs(timeout=timeout, follow_redirects=True)) as client:
         resp = client.get(url)
         html = resp.text
 
@@ -110,8 +109,7 @@ def _extract_wayback(url: str, timeout: int) -> SourceDoc:
     """Extract via archive.org Wayback Machine."""
     wayback_url = f"https://web.archive.org/web/2/{url}"
 
-    with httpx.Client(timeout=timeout + 20, follow_redirects=True,
-                      headers=BROWSER_HEADERS) as client:
+    with httpx.Client(**make_client_kwargs(timeout=timeout + 20, follow_redirects=True)) as client:
         resp = client.get(wayback_url)
         resp.raise_for_status()
         html = resp.text

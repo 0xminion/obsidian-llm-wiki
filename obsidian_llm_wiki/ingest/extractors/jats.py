@@ -17,6 +17,7 @@ from defusedxml import ElementTree as DET
 from obsidian_llm_wiki.core.models import SourceDoc
 from obsidian_llm_wiki.ingest.extractors import register_extractor
 from obsidian_llm_wiki.ingest.http_headers import BROWSER_HEADERS
+from obsidian_llm_wiki.ingest.proxy import make_client_kwargs
 
 logger = logging.getLogger("obswiki.ingest.extractors.jats")
 
@@ -69,9 +70,7 @@ def extract_jats(raw_url: str) -> SourceDoc:
     suffix and falls back to extract_web on the HTML article page.
     """
     try:
-        with httpx.Client(
-            follow_redirects=True, timeout=45, headers=BROWSER_HEADERS
-        ) as client:
+        with httpx.Client(**make_client_kwargs(follow_redirects=True, timeout=45)) as client:
             resp = client.get(raw_url)
             resp.raise_for_status()
             xml_text = resp.text
@@ -91,8 +90,29 @@ def extract_jats(raw_url: str) -> SourceDoc:
     if not xml_text.strip():
         raise RuntimeError(f"Empty XML response from {raw_url}")
 
-    # Parse with defusedxml (XXE-safe)
-    root = DET.fromstring(xml_text)
+    # Detect HTML masquerading as XML before parsing.
+    content_type = (resp.headers.get("content-type") or "").lower()
+    looks_like_html = (
+        "html" in content_type
+        or xml_text.lstrip()[:20].lower().startswith(("<!doctype", "<html"))
+    )
+    if looks_like_html:
+        # Salvage the already-downloaded HTML body — do NOT re-fetch
+        # (the stripped .xml URL may 404 while the .xml response itself
+        # contains the full HTML article page).
+        return _salvage_html_body(raw_url, xml_text)
+
+    # Parse with defusedxml (XXE-safe).
+    # If the XML is malformed (e.g. HTML served as .xml), salvage the
+    # body as HTML instead of crashing.
+    try:
+        root = DET.fromstring(xml_text)
+    except Exception as parse_exc:
+        logger.warning(
+            "XML parse failed for %s: %s; salvaging as HTML",
+            raw_url, parse_exc,
+        )
+        return _salvage_html_body(raw_url, xml_text)
 
     # ── Extract title ─────────────────────────────────────────────
     title = _find_jats_title(root)
@@ -129,6 +149,63 @@ def extract_jats(raw_url: str) -> SourceDoc:
         content=content.strip(),
         url=raw_url,
     )
+
+
+# ── HTML salvage (when .xml returns HTML body) ──────────────────────────
+
+
+def _salvage_html_body(raw_url: str, html: str) -> SourceDoc:
+    """Extract text from an HTML body already downloaded (e.g. .xml that was HTML).
+
+    Never re-fetches: stripped .xml URLs may 404 while the original response
+    body already contains the full article page.
+    """
+    import re as _re
+
+    # Prefer trafilatura on the in-memory HTML
+    try:
+        import trafilatura
+
+        extracted = trafilatura.extract(
+            html,
+            include_comments=False,
+            include_tables=True,
+            favor_precision=True,
+        )
+    except Exception:
+        extracted = None
+
+    if extracted and extracted.strip():
+        # Title from <title> or og:title
+        title = ""
+        m = _re.search(r"<title[^>]*>([^<]+)</title>", html, _re.IGNORECASE)
+        if m:
+            title = m.group(1).strip()
+        if not title:
+            m = _re.search(
+                r'property=["\']og:title["\'][^>]*content=["\']([^"\']+)',
+                html,
+                _re.IGNORECASE,
+            )
+            if m:
+                title = m.group(1).strip()
+        if not title:
+            title = raw_url
+
+        if len(extracted.strip()) < 50:
+            raise RuntimeError(
+                f"HTML salvage too short ({len(extracted)} chars): {raw_url}"
+            )
+        return SourceDoc(title=title, content=extracted.strip(), url=raw_url)
+
+    # Regex fallback: strip tags manually
+    from obsidian_llm_wiki.ingest.web import _extract_title_from_html, _strip_tags
+
+    title = _extract_title_from_html(html) or raw_url
+    text = _strip_tags(html)
+    if not text or len(text.strip()) < 50:
+        raise RuntimeError(f"HTML salvage produced no usable text: {raw_url}")
+    return SourceDoc(title=title, content=text.strip(), url=raw_url)
 
 
 # ── JATS element extraction helpers ─────────────────────────────────────
