@@ -65,7 +65,19 @@ def extract_twitter(raw_url: str) -> SourceDoc:
     tweet_id = _extract_tweet_id(raw_url)
     handle = _extract_handle(raw_url)
 
-    # ── Primary: VxTwitter API ────────────────────────────────────────
+    # ── Primary: Defuddle.md web service ──────────────────────────────
+    try:
+        source = _extract_via_defuddle_md(raw_url)
+        if source:
+            logger.info(
+                "Defuddle.md: extracted %d chars for %s",
+                len(source.content), raw_url,
+            )
+            return source
+    except Exception as exc:
+        errors.append(f"defuddle_md: {exc}")
+
+    # ── Fallback: VxTwitter API ────────────────────────────────────────
     try:
         source = _extract_via_vxtwitter(raw_url, tweet_id, handle)
         if source:
@@ -81,7 +93,7 @@ def extract_twitter(raw_url: str) -> SourceDoc:
     try:
         source = _extract_via_defuddle(raw_url)
         if source:
-            logger.info("Defuddle fallback: %d chars for %s", len(source.content), raw_url)
+            logger.info("Defuddle CLI fallback: %d chars for %s", len(source.content), raw_url)
             return source
     except Exception as exc:
         errors.append(f"defuddle: {exc}")
@@ -96,6 +108,73 @@ def extract_twitter(raw_url: str) -> SourceDoc:
     raise RuntimeError(
         f"Twitter extraction failed for {raw_url}: " + "; ".join(errors)
     )
+
+
+def _extract_via_defuddle_md(url: str) -> SourceDoc | None:
+    """Extract full content via defuddle.md web service.
+
+    defuddle.md is a hosted version of defuddle that renders JS-heavy pages
+    (including X Articles) and returns clean markdown with YAML frontmatter.
+    URL format: https://defuddle.md/<original-url>
+    """
+    # Build defuddle.md URL
+    # Strip https:// from the original URL
+    stripped = url.replace("https://", "").replace("http://", "")
+    defuddle_url = f"https://defuddle.md/{stripped}"
+
+    with httpx.Client(
+        **make_client_kwargs(timeout=DEFAULT_TIMEOUT, follow_redirects=True),
+        headers={
+            "User-Agent": BROWSER_HEADERS["User-Agent"],
+            "Accept": "text/html",
+        },
+    ) as client:
+        resp = client.get(defuddle_url)
+
+    if resp.status_code != 200:
+        logger.debug("defuddle.md returned %d for %s", resp.status_code, url)
+        return None
+
+    text = resp.text.strip()
+    if not text or len(text) < 100:
+        return None
+
+    # Parse frontmatter (defuddle.md returns YAML frontmatter + markdown body)
+    title = ""
+    content = text
+
+    if text.startswith("---"):
+        fm_end = text.find("---", 3)
+        if fm_end > 0:
+            fm_text = text[3:fm_end].strip()
+            content = text[fm_end + 3:].strip()
+
+            # Parse YAML frontmatter manually (avoid yaml dependency)
+            for line in fm_text.split("\n"):
+                if line.startswith("title:"):
+                    title = line[6:].strip().strip('"').strip("'")
+                elif line.startswith("author:"):
+                    pass  # Author available but not needed in SourceDoc
+                elif line.startswith("word_count:"):
+                    pass  # Available but not needed
+
+    if not title:
+        # Try first # heading
+        for line in content.split("\n", 5):
+            if line.startswith("# "):
+                title = line[2:].strip()
+                break
+    if not title:
+        title = url
+
+    # Strip cover image markdown from content start
+    if content.startswith("!["):
+        content = content.split("\n", 1)[-1].lstrip() if "\n" in content else content
+
+    if not content or len(content.strip()) < 50:
+        return None
+
+    return SourceDoc(title=title, content=content.strip(), url=url)
 
 
 def _extract_via_vxtwitter(
