@@ -62,7 +62,7 @@ SYNTHESIS_SCHEMA: dict[str, Any] = {
         {
             "title": "string — MOC topic title",
             "slug": "string — filename-safe slug",
-            "summary": "string — what this MOC covers and why the topic matters",
+            "summary": "string — 3-5 sentences explaining what this MOC covers, the key tension or question it addresses, and how the concepts within it relate to each other. Do NOT write a generic one-liner like 'Concepts relating to X'. Write an insightful synthesis that demonstrates deep understanding of the source material.",
             "tags": ["string — lowercase tags"],
             "concept_slugs": ["string — slugs of concepts grouped under this MOC"]
         }
@@ -131,7 +131,9 @@ Rules:
 * Use the "related" field to link concepts to each other by slug.  Be \
 generous with cross-references — a good knowledge graph has many edges.
 * Create 1-3 MOCs (Maps of Content) that group related concepts by topic. \
-Only create a MOC if 2+ concepts share a theme.
+Only create a MOC if 2+ concepts share a theme. Each MOC summary must be \
+3-5 sentences of insightful synthesis — NOT a generic one-liner. Explain \
+the key tension, how the concepts interact, and why this grouping matters.
 * Review the existing concept index below to avoid duplicates.  Set \
 "is_new" to false for concepts that already exist.
 * Surface ALL available insights — do not produce stubs or shallow summaries.

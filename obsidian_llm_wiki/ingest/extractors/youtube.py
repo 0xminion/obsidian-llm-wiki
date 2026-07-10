@@ -244,8 +244,11 @@ def _parse_supadata_response(data: dict, url: str) -> SourceDoc | None:
             "video may have no speech"
         )
 
-    # Title from response or derive from URL
+    # Title from response or fetch via oEmbed
     title = data.get("title", "") or ""
+    if not title:
+        # Supadata doesn't always return a title — fetch via oEmbed
+        title = _fetch_youtube_title(url)
     if not title:
         vid = _video_id(url)
         title = f"YouTube video {vid}" if vid else url
@@ -255,6 +258,27 @@ def _parse_supadata_response(data: dict, url: str) -> SourceDoc | None:
         text = f"[Transcript language: {lang}]\n\n{text}"
 
     return SourceDoc(title=title, content=text, url=url)
+
+
+def _fetch_youtube_title(url: str) -> str:
+    """Fetch video title via YouTube oEmbed API (no auth required).
+
+    Returns empty string if the fetch fails.
+    """
+    from urllib.parse import quote
+    oembed_url = (
+        f"https://www.youtube.com/oembed"
+        f"?url={quote(url, safe='')}&format=json"
+    )
+    try:
+        with httpx.Client(timeout=10, follow_redirects=True) as client:
+            resp = client.get(oembed_url)
+            if resp.status_code == 200:
+                data = resp.json()
+                return data.get("title", "") or ""
+    except Exception:
+        pass
+    return ""
 
 
 def _extract_oembed(youtube_url: str) -> SourceDoc | None:
