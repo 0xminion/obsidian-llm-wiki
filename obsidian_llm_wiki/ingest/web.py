@@ -63,10 +63,10 @@ def _extract_trafilatura(url: str, timeout: int) -> SourceDoc:
     with httpx.Client(timeout=timeout, follow_redirects=True,
                       headers=BROWSER_HEADERS) as client:
         resp = client.get(url)
-        resp.raise_for_status()
         html = resp.text
 
     _check_cloudflare(resp, html)
+    resp.raise_for_status()
     extracted = trafilatura.extract(
         html,
         include_comments=False,
@@ -91,10 +91,10 @@ def _extract_regex(url: str, timeout: int) -> SourceDoc:
     with httpx.Client(timeout=timeout, follow_redirects=True,
                       headers=BROWSER_HEADERS) as client:
         resp = client.get(url)
-        resp.raise_for_status()
         html = resp.text
 
     _check_cloudflare(resp, html)
+    resp.raise_for_status()
     if not html.strip():
         raise RuntimeError("empty response")
 
