@@ -300,12 +300,15 @@ def render_concept_page(
 
     # ── 关联图谱 / Cross-References ──────────────────────────────────
     # Typed-edge relationship graph. Shown when all_concepts is provided.
-    # Renders as ASCII flow diagram matching the user's screenshot format.
+    # Renders inside a markdown code block (```text) for monospace display
+    # with copy icon in Obsidian, matching the user's screenshot format.
     if all_concepts and concept.related:
         cross_ref_lines = _build_cross_ref_diagram(concept, all_concepts)
         if cross_ref_lines:
             parts.extend(["## 关联图谱 / Cross-References", ""])
+            parts.append("```text")
             parts.extend(cross_ref_lines)
+            parts.append("```")
             parts.append("")
 
     body = "\n".join(parts)
@@ -318,15 +321,21 @@ def _build_cross_ref_diagram(
 ) -> list[str]:
     """Build the typed-edge cross-reference section as an ASCII flow diagram.
 
-    Renders in the format from the user's screenshot:
-      [Concept A]
-          ↓ [relation_type]
-      [Concept B] → [sub-concept]
-          ↓ [relation_type]
-      [Concept C] ↔ [paired-concept]
+    Renders inside a code block (```text) so Obsidian shows it as monospace
+    with a copy icon. Wikilinks inside code blocks render as literal [[slug]]
+    text — the user's screenshot shows them this way intentionally.
 
-    Cross-links: [[slug-a]] (descriptor)
-                 [[slug-b]] (descriptor)
+    Format matches the user's screenshot:
+      注意力价值 (Attention Value)
+          ↓ tokenized by
+      Pump.fun → 人人可发币 → Meme币爆发
+          ↓ amplified by
+      KOL/交易所注意力捕获
+          ↓ creates
+      流动性收割 ↔ 上市即出货
+
+      Cross-links: [[slug]] (descriptor)
+                   [[slug]] (descriptor)
     """
     lines: list[str] = []
 
@@ -336,11 +345,11 @@ def _build_cross_ref_diagram(
         if not target:
             continue
 
-        display = link.display or link.slug
+        target_display = link.display or target.slug
         relation_type = link.relation or "related_to"
 
-        # Primary edge: this concept → target
-        lines.append(f"**{make_wikilink(concept.slug, concept.title)}**")
+        # Primary edge: this concept → relation → target
+        lines.append(f"{concept.title}")
         lines.append(f"    ↓ {relation_type}")
 
         # Target line with any sub-relationships
@@ -349,13 +358,13 @@ def _build_cross_ref_diagram(
             sub_links = [
                 r for r in target.related
                 if r.slug != concept.slug
-            ][:2]  # Show up to 2 sub-relationships
+            ][:2]
             if sub_links:
                 sub_parts = []
                 for sl in sub_links:
                     sub_target = all_concepts.get(sl.slug)
                     if sub_target:
-                        sub_parts.append(make_wikilink(sl.slug, sub_target.title))
+                        sub_parts.append(sub_target.title)
                 if sub_parts:
                     target_sub = " → " + " → ".join(sub_parts)
 
@@ -367,31 +376,27 @@ def _build_cross_ref_diagram(
         if reverse_links and not target_sub:
             rev_rel = reverse_links[0].relation or "related_to"
             lines.append(
-                f"**{make_wikilink(target.slug, target.title)}** ↔ "
-                f"{make_wikilink(concept.slug, concept.title)} (`{rev_rel}`)"
+                f"{target.title} ↔ {concept.title} ({rev_rel})"
             )
         elif target_sub:
-            lines.append(
-                f"**{make_wikilink(target.slug, display)}**{target_sub}"
-            )
+            lines.append(f"{target_display}{target_sub}")
         else:
-            lines.append(f"**{make_wikilink(target.slug, display)}**")
+            lines.append(f"{target_display}")
 
-        lines.append("")
-
-    # Cross-links section (wikilinks with descriptors)
+    # Cross-links section (wikilinks as literal text inside code block)
     if lines and concept.related:
-        cross_links: list[str] = []
+        cross_link_lines: list[str] = []
         for link in concept.related:
             target = all_concepts.get(link.slug)
             if target:
                 descriptor = link.relation or "related"
-                cross_links.append(
-                    f"  - {make_wikilink(link.slug, target.title)} ({descriptor})"
+                cross_link_lines.append(
+                    f"  [[{link.slug}]] ({descriptor})"
                 )
-        if cross_links:
+        if cross_link_lines:
+            lines.append("")
             lines.append("Cross-links:")
-            lines.extend(cross_links)
+            lines.extend(cross_link_lines)
 
     return lines
 
@@ -452,7 +457,9 @@ def render_moc_page(
             diagram_lines = _build_moc_cross_ref_diagram(moc_concepts, all_concepts)
             if diagram_lines:
                 parts.extend(["## 关联图谱 / Cross-References", ""])
+                parts.append("```text")
                 parts.extend(diagram_lines)
+                parts.append("```")
                 parts.append("")
 
     # ── Cross-lingual links from embedding ──────────────────────────
@@ -507,9 +514,9 @@ def _build_moc_cross_ref_diagram(
             arrow = "↔" if reverse else "→"
 
             lines.append(
-                f"- {make_wikilink(concept.slug, concept.title)} "
-                f"{arrow} {make_wikilink(target.slug, target.title)} "
-                f"(`{relation}`)"
+                f"{concept.title} "
+                f"{arrow} {target.title} "
+                f"({relation})"
             )
 
     return lines

@@ -201,7 +201,7 @@ def test_build_cross_ref_section_missing_target():
 
 
 def test_render_concept_page_with_cross_refs():
-    """render_concept_page with all_concepts renders 关联图谱 section."""
+    """render_concept_page with all_concepts renders 关联图谱 section inside code block."""
     from obsidian_llm_wiki.core.models import ConceptLink
     from obsidian_llm_wiki.render.obsidian import render_concept_page
 
@@ -211,6 +211,8 @@ def test_render_concept_page_with_cross_refs():
     b = _make_concept("b", "Concept B")
     page = render_concept_page(a, all_concepts={"a": a, "b": b})
     assert "关联图谱 / Cross-References" in page
+    assert "```text" in page
+    assert "```" in page
 
 
 def test_render_concept_page_no_cross_refs_without_all_concepts():
