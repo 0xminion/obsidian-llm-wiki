@@ -75,12 +75,34 @@ def make_wikilink(slug: str, alias: str | None = None) -> str:
     return f"[[{slug}]]"
 
 
+def _sanitize_tag(tag: str) -> str:
+    """Sanitize a single tag for Obsidian compatibility.
+
+    Obsidian tags cannot contain spaces. Replace spaces with hyphens.
+    Also strips leading/trailing whitespace and removes special chars
+    that break YAML parsing.
+    """
+    tag = (tag or "").strip()
+    # Replace spaces with hyphens
+    tag = re.sub(r"\s+", "-", tag)
+    # Remove characters that break Obsidian tags
+    tag = re.sub(r"[#\"'`,;()\[\]{}]", "", tag)
+    return tag
+
+
 def build_frontmatter(fm_dict: dict[str, Any]) -> str:
     """Serialize a dict to a ``---``-delimited YAML frontmatter block.
 
-    The block ends with a trailing newline so it composes cleanly with a
-    body: ``build_frontmatter(fm) + "\\n\\n" + body``.
+    Tags are sanitized: spaces → hyphens, special chars removed.
     """
+    # Sanitize tags if present
+    if "tags" in fm_dict and isinstance(fm_dict["tags"], list):
+        fm_dict = dict(fm_dict)  # shallow copy to avoid mutating caller's dict
+        fm_dict["tags"] = [
+            _sanitize_tag(t) for t in fm_dict["tags"]
+            if t and str(t).strip()
+        ]
+
     dumped = yaml.dump(
         fm_dict,
         sort_keys=False,
@@ -512,16 +534,27 @@ def _build_moc_cross_ref_diagram(
     moc_concepts: list[ConceptNote],
     all_concepts: dict[str, ConceptNote],
 ) -> list[str]:
-    """Build ASCII flow diagram showing relationships between MoC concepts."""
+    """Build ASCII flow diagram matching concept cross-ref format.
+
+    Format (consistent with _build_cross_ref_diagram):
+      Concept A
+          ↓ relation
+      Concept B → Concept C
+
+      Cross-links:
+        [[slug-a]] (relation)
+        [[slug-b]] (relation)
+    """
     lines: list[str] = []
     seen_pairs: set[tuple[str, str]] = set()
+    moc_slugs = {c.slug for c in moc_concepts}
 
     for concept in moc_concepts:
         for link in concept.related or []:
             if link.slug not in all_concepts:
                 continue
-            if link.slug not in {c.slug for c in moc_concepts}:
-                continue  # Only show links between MoC concepts
+            if link.slug not in moc_slugs:
+                continue
 
             pair_key = tuple(sorted([concept.slug, link.slug]))
             if pair_key in seen_pairs:
@@ -536,13 +569,38 @@ def _build_moc_cross_ref_diagram(
                 r.slug == concept.slug
                 for r in (target.related or [])
             )
-            arrow = "↔" if reverse else "→"
 
-            lines.append(
-                f"{concept.title} "
-                f"{arrow} {target.title} "
-                f"({relation})"
-            )
+            # Flow format: concept on one line, relation on next, target on third
+            lines.append(concept.title)
+            lines.append(f"    ↓ {relation}")
+            if reverse:
+                lines.append(f"{target.title} ↔ {concept.title}")
+            else:
+                lines.append(f"{target.title}")
+            lines.append("")
+
+    # Cross-links section with [[slug]] (relation) — same as concepts
+    if lines:
+        cross_links: list[str] = []
+        seen_link_slugs: set[str] = set()
+        for concept in moc_concepts:
+            for link in concept.related or []:
+                if link.slug not in moc_slugs:
+                    continue
+                pair = tuple(sorted([concept.slug, link.slug]))
+                if pair in seen_link_slugs:
+                    continue
+                seen_link_slugs.add(pair)
+                descriptor = link.relation or "related"
+                cross_links.append(
+                    f"  [[{link.slug}]] ({descriptor})"
+                )
+        if cross_links:
+            if lines and lines[-1] == "":
+                lines.pop()
+            lines.append("")
+            lines.append("Cross-links:")
+            lines.extend(cross_links)
 
     return lines
 

@@ -66,28 +66,32 @@ def test_moc_cross_ref_diagram_dedup():
     a = _make_concept("a", "A", related=[ConceptLink(slug="b", relation="r")])
     b = _make_concept("b", "B", related=[ConceptLink(slug="a", relation="r")])
     lines = _build_moc_cross_ref_diagram([a, b], {"a": a, "b": b})
-    # Should only have ONE line for the a↔b pair, not two
-    assert len(lines) == 1
+    # Should only have ONE pair — check by counting "↓" entries
+    down_count = sum(1 for line in lines if "↓" in line)
+    assert down_count == 1
 
 
 def test_moc_cross_ref_diagram_bidirectional():
-    """Bidirectional pair uses ↔ arrow."""
+    """Bidirectional pair uses ↔ arrow in target line."""
     from obsidian_llm_wiki.core.models import ConceptLink
     from obsidian_llm_wiki.render.obsidian import _build_moc_cross_ref_diagram
     a = _make_concept("a", "A", related=[ConceptLink(slug="b", relation="r")])
     b = _make_concept("b", "B", related=[ConceptLink(slug="a", relation="r")])
     lines = _build_moc_cross_ref_diagram([a, b], {"a": a, "b": b})
-    assert "↔" in lines[0]
+    joined = "\n".join(lines)
+    assert "↔" in joined
 
 
 def test_moc_cross_ref_diagram_unidirectional():
-    """Unidirectional pair uses → arrow."""
+    """Unidirectional pair does not use ↔ arrow."""
     from obsidian_llm_wiki.core.models import ConceptLink
     from obsidian_llm_wiki.render.obsidian import _build_moc_cross_ref_diagram
     a = _make_concept("a", "A", related=[ConceptLink(slug="b", relation="r")])
     b = _make_concept("b", "B", related=[])
     lines = _build_moc_cross_ref_diagram([a, b], {"a": a, "b": b})
-    assert "→" in lines[0]
+    joined = "\n".join(lines)
+    assert "↓" in joined
+    assert "↔" not in joined
 
 
 # ── render/obsidian.py: render_moc_page cross-lingual links ─────────────────
