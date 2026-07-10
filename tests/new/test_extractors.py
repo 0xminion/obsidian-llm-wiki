@@ -115,7 +115,6 @@ def test_extract_youtube_url_routes_to_youtube_extractor():
 
 def test_extract_youtube_url_raises_when_no_api_key():
     """YouTube extractor raises RuntimeError when SUPADATA_API_KEY is not set."""
-    import os
     from obsidian_llm_wiki.ingest.extractors import youtube as yt_mod
 
     # Save and nullify the env var

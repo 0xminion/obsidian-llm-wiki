@@ -314,18 +314,17 @@ async def test_quality_synthesize_source_pass2_failure_sets_low_confidence():
         "obsidian_llm_wiki.providers.llm.acall_llm",
         new_callable=AsyncMock,
         side_effect=_mock_acall,
+    ), patch(
+        "obsidian_llm_wiki.synth.quality._expand_one_concept",
+        new_callable=AsyncMock,
+        side_effect=_mock_expand,
     ):
-        with patch(
-            "obsidian_llm_wiki.synth.quality._expand_one_concept",
-            new_callable=AsyncMock,
-            side_effect=_mock_expand,
-        ):
-            result = await quality_synthesize_source(
-                _MockConfig(),
-                "test.md",
-                source,
-                existing_concepts=[],
-            )
+        result = await quality_synthesize_source(
+            _MockConfig(),
+            "test.md",
+            source,
+            existing_concepts=[],
+        )
 
     assert result is not None
     assert len(result.concepts) == 3

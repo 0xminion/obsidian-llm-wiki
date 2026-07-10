@@ -134,7 +134,6 @@ def _supadata_transcript(url: str, api_key: str) -> SourceDoc | None:
     Returns None if no transcript available (not an error — caller falls through).
     Raises RuntimeError on auth/billing errors.
     """
-    from urllib.parse import quote
 
     params = {
         "url": url,
@@ -276,7 +275,8 @@ def _extract_oembed(youtube_url: str) -> SourceDoc | None:
         f"Title: {title}",
         f"Channel: {author}",
         "",
-        "Note: Full transcript unavailable (Supadata API key not configured or insufficient credits).",
+        "Note: Full transcript unavailable "
+        "(Supadata API key not configured or insufficient credits).",
         "Only video metadata was extracted.",
     ]
 

@@ -6,9 +6,9 @@ have high cosine similarity (>0.85), they are automatically linked as
 cross-lingual aliases in the MoC and concept pages.
 
 Architecture:
-  - _embed(text) → list[float] — call Ollama /api/embeddings
-  - _cosine_sim(a, b) → float — cosine similarity
-  - find_cross_lingual_links(concepts) → dict[slug, list[(target_slug, score)]]
+  - embed_text(text) → list[float] | None — call Ollama /api/embeddings
+  - cosine_similarity(a, b) → float — cosine similarity
+  - find_cross_lingual_links(concepts) → dict[slug, list[(target_slug, score, display)]]
   - The results are injected into concept.related and MoC concept_slugs
     during rendering.
 """
@@ -16,6 +16,7 @@ Architecture:
 from __future__ import annotations
 
 import logging
+import math
 import os
 from typing import Any
 
@@ -32,18 +33,26 @@ __all__ = [
 _EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "nomic-embed-text:v1.5")
 _OLLAMA_HOST = os.environ.get("LLM_HOST", "http://localhost:11435")
 _SIMILARITY_THRESHOLD = 0.85
+_EMBEDDINGS_ENABLED = (
+    os.environ.get("EMBEDDINGS_ENABLED", "false").strip().lower()
+    in ("true", "1", "yes")
+)
+_EMBED_TIMEOUT = 10  # seconds — short to avoid hanging renders
 
 
 def embed_text(text: str) -> list[float] | None:
     """Generate embedding for a text string via Ollama.
 
-    Returns None if the embedding service is unavailable.
+    Returns None if embeddings are disabled or the service is unavailable.
     """
+    if not _EMBEDDINGS_ENABLED:
+        return None
+
     if not text.strip():
         return None
 
     try:
-        with httpx.Client(timeout=30) as client:
+        with httpx.Client(timeout=_EMBED_TIMEOUT) as client:
             resp = client.post(
                 f"{_OLLAMA_HOST}/api/embeddings",
                 json={
@@ -65,14 +74,17 @@ def embed_text(text: str) -> list[float] | None:
 
 
 def cosine_similarity(a: list[float], b: list[float]) -> float:
-    """Compute cosine similarity between two embedding vectors."""
-    if not a or not b or len(a) != len(b):
+    """Compute cosine similarity between two embedding vectors.
+
+    Returns 0.0 if vectors have mismatched lengths or zero magnitude.
+    """
+    if len(a) != len(b):
         return 0.0
-    dot = sum(x * y for x, y in zip(a, b, strict=False))
-    norm_a = sum(x * x for x in a) ** 0.5
-    norm_b = sum(y * y for y in b) ** 0.5
+    norm_a = math.sqrt(sum(x * x for x in a))
+    norm_b = math.sqrt(sum(y * y for y in b))
     if norm_a == 0 or norm_b == 0:
         return 0.0
+    dot = sum(x * y for x, y in zip(a, b, strict=False))
     return dot / (norm_a * norm_b)
 
 
@@ -82,21 +94,9 @@ def find_cross_lingual_links(
 ) -> dict[str, list[tuple[str, float, str]]]:
     """Find cross-lingual concept pairs with high semantic similarity.
 
-    For each concept, embed its title + summary. Compare all pairs where
-    the concepts have different detected languages (or one has Chinese
-    aliases). If similarity > threshold, record the link.
-
-    Args:
-        concepts: List of ConceptNote objects.
-        threshold: Minimum cosine similarity to consider a match.
-
-    Returns:
-        Dict mapping slug → list of (target_slug, similarity_score, display_text).
-        Only includes cross-lingual matches (same-language matches are skipped
-        — those should be handled by the LLM's related field).
+    Returns empty dict if embeddings are disabled or unavailable.
     """
     from obsidian_llm_wiki.synth.language import detect_language
-    from obsidian_llm_wiki.render.obsidian import _is_chinese
 
     # Build embeddings for all concepts
     embeddings: dict[str, list[float]] = {}
@@ -136,7 +136,6 @@ def find_cross_lingual_links(
                     (c for c in concepts if c.slug == slug_b), None
                 )
                 display = target_concept.title if target_concept else slug_b
-
                 links.setdefault(slug_a, []).append((slug_b, sim, display))
                 links.setdefault(slug_b, []).append((slug_a, sim, ""))
 

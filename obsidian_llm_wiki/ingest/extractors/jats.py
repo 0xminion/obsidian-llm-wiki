@@ -9,10 +9,9 @@ Dependency: ``defusedxml`` (installed by default).
 from __future__ import annotations
 
 import logging
-from urllib.parse import urlparse
 
 import httpx
-from defusedxml import ElementTree as DET
+from defusedxml import ElementTree as DET  # noqa: N814
 
 from obsidian_llm_wiki.core.models import SourceDoc
 from obsidian_llm_wiki.ingest.extractors import register_extractor
@@ -52,9 +51,7 @@ def _is_xml_jats(parsed, raw: str) -> bool:
     if path.endswith(".xml"):
         return True
     host = (parsed.hostname or "").lower()
-    if host in _JATS_HOSTS:
-        return True
-    return False
+    return host in _JATS_HOSTS
 
 
 # ── Registration ────────────────────────────────────────────────────────

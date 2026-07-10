@@ -13,7 +13,6 @@ from obsidian_llm_wiki.cli._helpers import print_result_summary, resolve_vault
 from obsidian_llm_wiki.ingest.sources import load_sources_from_dir
 from obsidian_llm_wiki.render.obsidian import atomic_write, slugify
 
-
 LEDGER_TEMPLATE = """\
 ---
 type: ledger
