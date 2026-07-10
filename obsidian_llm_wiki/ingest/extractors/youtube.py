@@ -1,328 +1,224 @@
-"""YouTube extractor — tiered metadata + transcript extraction.
+"""YouTube transcript extraction via TranscriptAPI.com.
 
-Tier 1: yt-dlp + proxy (multi-client extractor_args)
-Tier 2: YouTube Innertube API (no-auth, works from any IP)
-Tier 3: youtube-transcript-api for captions
-Tier 4: oEmbed (title + author only)
-
-Accepts description-only content when the video has no transcript
-but has a substantive description (≥ 200 chars total content).
-
-Dependencies (optional): ``yt-dlp`` and ``youtube-transcript-api``.
+TranscriptAPI provides reliable, credit-based YouTube transcript extraction.
+API docs: https://transcriptapi.com/docs/api
+Endpoint: GET https://transcriptapi.com/api/v2/youtube/transcript
+Auth: x-api-key header with the user's API key.
 """
 
 from __future__ import annotations
 
-import json
 import logging
-import re
-from urllib.parse import quote
+import os
 
 import httpx
 
 from obsidian_llm_wiki.core.models import SourceDoc
 from obsidian_llm_wiki.ingest.extractors import register_extractor
-from obsidian_llm_wiki.ingest.http_headers import BROWSER_HEADERS
-from obsidian_llm_wiki.ingest.proxy import get_proxy_url, ytdlp_proxy_arg, make_client_kwargs
+from obsidian_llm_wiki.ingest.http_headers import DEFAULT_TIMEOUT
+from obsidian_llm_wiki.ingest.proxy import make_client_kwargs
 
-logger = logging.getLogger("obswiki.ingest.extractors.youtube")
+logger = logging.getLogger("obswiki.ingest.youtube")
 
-# ── Dependency check ────────────────────────────────────────────────────
+__all__ = ["extract_youtube_video"]
 
-try:
-    import yt_dlp  # noqa: F401
-    from youtube_transcript_api import YouTubeTranscriptApi  # noqa: F401
-
-    _DEPS_AVAILABLE = True
-except ImportError:
-    _DEPS_AVAILABLE = False
-
-# ── Innertube (always available — pure httpx, no deps) ──────────────────
-
-_INNERTUBE_KEY = "AIzaSyAO_FJ2UqR_toL8vFg1h9NJm7b0G1hJC6w"
-
-# ── Domain matching ─────────────────────────────────────────────────────
-
-_YOUTUBE_HOSTS = frozenset((
-    "youtube.com",
-    "www.youtube.com",
-    "m.youtube.com",
-    "youtu.be",
-    "www.youtu.be",
-))
+_TRANSCRIPT_API_BASE = "https://transcriptapi.com"
+_TRANSCRIPT_API_VERSION = "v2"
 
 
-def _is_youtube(parsed, raw: str) -> bool:
-    """Match YouTube URLs."""
-    return bool(parsed.hostname and parsed.hostname.lower() in _YOUTUBE_HOSTS)
+def _get_api_key() -> str | None:
+    """Read the TranscriptAPI key from env at call time, not import time.
 
-
-# ── Registration ─────────────────────────────────────────────────────────
-# Always register — innertube + oEmbed work without yt-dlp/transcript deps.
-
-@register_extractor(_is_youtube)
-def extract_youtube(raw_url: str) -> SourceDoc:
-    """Extract metadata + transcript from a YouTube video.
-
-    Tries tiers in order, accumulating whatever content is available.
-    Accepts description-only if total content ≥ 200 chars.
-    Fail-closed if nothing usable — never falls through to extract_web.
+    The .env file is loaded by the CLI after module import, so a module-level
+    read would miss it. This function reads the env var on each call.
     """
-    video_id = _extract_video_id(raw_url)
-    if not video_id:
-        raise RuntimeError(f"Could not extract video ID from: {raw_url}")
-
-    title = ""
-    description = ""
-    channel = ""
-    transcript_text = ""
-
-    # ── Tier 1: yt-dlp + proxy (if available) ────────────────────────
-    if _DEPS_AVAILABLE:
-        title, description, channel = _try_ytdlp(raw_url)
-        if not title:
-            logger.warning("yt-dlp metadata failed for '%s' (all clients)", raw_url)
-
-    # ── Tier 2: Innertube API (no deps, always available) ────────────
-    if not title or not description:
-        innertube = _fetch_innertube(video_id)
-        if innertube:
-            if not title:
-                title = innertube.get("title", "")
-            if not channel:
-                channel = innertube.get("author", "")
-            if not description:
-                description = innertube.get("shortDescription", "")
-            # Try captions from innertube
-            caption_tracks = innertube.get("_caption_tracks", [])
-            if caption_tracks and not transcript_text:
-                transcript_text = _fetch_innertube_captions(caption_tracks)
-
-    # ── Tier 3: youtube-transcript-api (if available, no proxy needed) ─
-    if _DEPS_AVAILABLE and not transcript_text:
-        transcript_text = _try_transcript_api(video_id, raw_url)
-
-    # ── Tier 4: oEmbed (title + author only) ─────────────────────────
-    if not title:
-        oembed = _fetch_oembed(raw_url)
-        if oembed:
-            title = oembed.get("title", "")
-            author = oembed.get("author_name", "")
-            if author:
-                channel = channel or author
-            if not description and title:
-                description = f"Video by {author}. Title: {title}"
-
-    # ── Assemble content ─────────────────────────────────────────────
-    parts: list[str] = []
-    if channel:
-        parts.append(f"Channel: {channel}")
-    if description:
-        parts.append(f"Description:\n{description}")
-    if transcript_text:
-        parts.append(f"Transcript:\n{transcript_text}")
-    else:
-        parts.append("Transcript: (not available)")
-
-    content = "\n\n".join(parts)
-    stripped = content.strip()
-
-    # ── Quality gate ────────────────────────────────────────────────
-    if not title and not transcript_text and not description:
-        raise RuntimeError(
-            f"YouTube extraction completely failed for '{raw_url}': "
-            f"no metadata from any tier. Falling through to web extraction."
-        )
-
-    # Accept description-only if total content is substantive (≥ 200 chars).
-    # Videos without transcripts still have useful descriptions.
-    if len(stripped) < 200:
-        raise RuntimeError(
-            f"YouTube extraction too thin for '{raw_url}': "
-            f"{len(stripped)} chars. Falling through to web extraction."
-        )
-
-    if not title:
-        title = raw_url
-
-    return SourceDoc(title=title, content=content, url=raw_url)
+    return os.environ.get("TRANSCRIPT_API_KEY", "").strip() or None
 
 
-# ── Tier 1: yt-dlp + proxy ────────────────────────────────────────────────
-
-def _try_ytdlp(url: str) -> tuple[str, str, str]:
-    """Try yt-dlp with multiple player clients + proxy. Returns (title, description, channel)."""
-    proxy = ytdlp_proxy_arg()
-    player_clients = ("android", "ios", "tv_embedded", "web")
-
-    for client in player_clients:
-        ydl_opts: dict = {
-            "quiet": True,
-            "no_warnings": True,
-            "skip_download": True,
-            "extract_flat": False,
-            "extractor_args": {"youtube": {"player_client": [client]}},
-        }
-        if proxy:
-            ydl_opts["proxy"] = proxy
-        try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:  # type: ignore[possibly-unbound]
-                info = ydl.extract_info(url, download=False)
-                t = info.get("title", "") or ""
-                d = info.get("description", "") or ""
-                c = info.get("channel", info.get("uploader", "")) or ""
-                if t:
-                    return t, d, c
-        except Exception as exc:
-            logger.debug("yt-dlp client=%s failed for '%s': %s", client, url, exc)
-            continue
-    return "", "", ""
-
-
-# ── Tier 2: Innertube API ────────────────────────────────────────────────
-
-def _fetch_innertube(video_id: str) -> dict | None:
-    """Fetch video metadata via YouTube Innertube player API.
-
-    No authentication required. Works from any IP (including datacenter).
-    Returns dict with title, author, shortDescription, and _caption_tracks.
-    """
-    payload = {
-        "videoId": video_id,
-        "context": {
-            "client": {
-                "clientName": "WEB",
-                "clientVersion": "2.20240101.00.00",
-            }
-        },
-    }
-    url = f"https://www.youtube.com/youtubei/v1/player?key={_INNERTUBE_KEY}"
-    try:
-        with httpx.Client(**make_client_kwargs(timeout=15)) as client:
-            resp = client.post(
-                url,
-                json=payload,
-                headers={"Content-Type": "application/json"},
-            )
-            if resp.status_code != 200:
-                logger.debug("innertube %d for '%s'", resp.status_code, video_id)
-                return None
-            data = resp.json()
-    except Exception as exc:
-        logger.debug("innertube failed for '%s': %s", video_id, exc)
-        return None
-
-    vd = data.get("videoDetails", {})
-    if not vd:
-        return None
-
-    # Extract caption tracks if available
-    caption_tracks = []
-    caps = data.get("captions", {})
-    if caps:
-        renderer = caps.get("playerCaptionsTracklistRenderer", {})
-        caption_tracks = renderer.get("captionTracks", [])
-
-    result = {
-        "title": vd.get("title", ""),
-        "author": vd.get("author", ""),
-        "shortDescription": vd.get("shortDescription", ""),
-        "lengthSeconds": vd.get("lengthSeconds", ""),
-        "keywords": vd.get("keywords", []),
-        "_caption_tracks": caption_tracks,
-    }
-    return result
-
-
-def _fetch_innertube_captions(caption_tracks: list) -> str:
-    """Fetch caption text from innertube caption track URLs.
-
-    Returns formatted transcript text, or empty string on failure.
-    """
-    if not caption_tracks:
-        return ""
-
-    # Prefer English, fall back to first track
-    track = None
-    for t in caption_tracks:
-        if t.get("languageCode", "").startswith("en"):
-            track = t
-            break
-    if not track:
-        track = caption_tracks[0]
-
-    base_url = track.get("baseUrl", "")
-    if not base_url:
-        return ""
-
-    try:
-        with httpx.Client(**make_client_kwargs(timeout=15)) as client:
-            resp = client.get(base_url)
-            if resp.status_code != 200:
-                return ""
-            raw = resp.text
-
-        # Parse XML caption format
-        entries = re.findall(
-            r'<text start="([\d.]+)"[^>]*>(.*?)</text>', raw, re.DOTALL
-        )
-        if not entries:
-            return ""
-
-        lines = []
-        for start, text in entries:
-            # Decode HTML entities
-            text = text.replace("&amp;", "&").replace("&#39;", "'").replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", '"')
-            t = float(start)
-            lines.append(f"[{t:.0f}s] {text.strip()}")
-        return "\n\n".join(lines)
-    except Exception as exc:
-        logger.debug("innertube caption fetch failed: %s", exc)
-        return ""
-
-
-# ── Tier 3: youtube-transcript-api ───────────────────────────────────────
-
-def _try_transcript_api(video_id: str, raw_url: str) -> str:
-    """Try youtube-transcript-api for captions. Returns transcript text or empty."""
-    try:
-        transcript_list = YouTubeTranscriptApi.get_transcript(video_id)  # type: ignore[possibly-unbound]
-        return "\n\n".join(
-            f"[{entry.get('start', 0):.0f}s] {entry.get('text', '')}"
-            for entry in transcript_list
-        )
-    except Exception as exc:
-        logger.warning("No transcript available for '%s': %s", raw_url, exc)
-        return ""
-
-
-# ── Tier 4: oEmbed ────────────────────────────────────────────────────────
-
-def _fetch_oembed(url: str) -> dict | None:
-    """Fetch YouTube oEmbed metadata (no-auth public API)."""
-    oembed_url = f"https://www.youtube.com/oembed?url={quote(url, safe='')}&format=json"
-    try:
-        with httpx.Client(**make_client_kwargs(timeout=10)) as client:
-            resp = client.get(oembed_url)
-            if resp.status_code == 200:
-                return resp.json()
-    except Exception as exc:
-        logger.debug("oEmbed fetch failed for '%s': %s", url, exc)
+def _video_id(url: str) -> str | None:
+    """Extract 11-char video ID from any YouTube URL."""
+    import re
+    from urllib.parse import urlparse
+    parsed = urlparse(url)
+    if parsed.hostname in ("youtu.be",):
+        return parsed.path.strip("/")[:11]
+    if parsed.hostname in ("www.youtube.com", "youtube.com", "m.youtube.com"):
+        for param in (parsed.query or "").split("&"):
+            k, _, v = param.partition("=")
+            if k == "v":
+                return v[:11]
+        for seg in parsed.path.split("/"):
+            if len(seg) == 11 and re.match(r"^[a-zA-Z0-9_-]{11}$", seg):
+                return seg
     return None
 
 
-# ── Helpers ─────────────────────────────────────────────────────────────
+@register_extractor(lambda parsed, raw: raw.startswith("http") and bool(_video_id(raw)))
+def extract_youtube_video(raw_url: str) -> SourceDoc:
+    """Extract transcript from a YouTube video via TranscriptAPI.com.
 
-_VIDEO_ID_RE = re.compile(
-    r"(?:youtube\.com/(?:watch\?v=|embed/|v/)|youtu\.be/)([a-zA-Z0-9_-]{11})"
-)
+    Strategy:
+      1. TranscriptAPI.com v2 API (requires API key in TRANSCRIPT_API_KEY env var)
+      2. Fail with clear message if no API key is set
+
+    This replaces the previous yt-dlp-based extractor as the primary path.
+    yt-dlp remains available as a fallback if TranscriptAPI fails.
+
+    Raises:
+        RuntimeError: If TRANSCRIPT_API_KEY is not set or API call fails.
+    """
+    api_key = _get_api_key()
+    if not api_key:
+        raise RuntimeError(
+            "TRANSCRIPT_API_KEY not set — set it in your .env or environment. "
+            "Get your key at https://transcriptapi.com"
+        )
+
+    video_id = _video_id(raw_url)
+    if not video_id:
+        raise RuntimeError(f"Could not extract YouTube video ID from: {raw_url}")
+
+    api_url = (
+        f"{_TRANSCRIPT_API_BASE}/api/{_TRANSCRIPT_API_VERSION}/youtube/transcript"
+        f"?videoId={video_id}&languages=en"
+    )
+
+    errors: list[str] = []
+
+    # Try transcript API
+    try:
+        with httpx.Client(
+            **make_client_kwargs(timeout=DEFAULT_TIMEOUT, follow_redirects=True),
+        ) as client:
+            resp = client.get(
+                api_url,
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Accept": "application/json",
+                    "User-Agent": "obsidian-llm-wiki/3.0",
+                },
+            )
+
+        if resp.status_code == 401 or resp.status_code == 403:
+            # Distinguish auth failure from billing/plan issues
+            try:
+                body = resp.json()
+                detail = body.get("detail", {})
+                if isinstance(detail, dict):
+                    reason = detail.get("reason", "")
+                    message = detail.get("message", "")
+                    if reason == "no_active_paid_plan":
+                        raise RuntimeError(
+                            f"TranscriptAPI: no active paid plan ({message}). "
+                            "Upgrade at https://transcriptapi.com/billing"
+                        )
+                    if message:
+                        raise RuntimeError(
+                            f"TranscriptAPI auth failed ({resp.status_code}): {message}"
+                        )
+            except (ValueError, KeyError):
+                pass
+            raise RuntimeError(
+                f"TranscriptAPI authentication failed ({resp.status_code}) — "
+                "check your TRANSCRIPT_API_KEY at https://transcriptapi.com"
+            )
+        if resp.status_code == 404:
+            raise RuntimeError(
+                f"No transcript available for video {video_id} on TranscriptAPI"
+            )
+        resp.raise_for_status()
+        data = resp.json()
+
+        # Parse TranscriptAPI response shape
+        # Returns: {"transcript": [{"text": "...", "start": 0.0, "duration": 5.12}, ...]}
+        transcript_segments = data.get("transcript", [])
+        if isinstance(transcript_segments, dict):
+            transcript_segments = transcript_segments.get("transcript", [])
+        if not transcript_segments:
+            raise RuntimeError(f"Empty transcript returned for {video_id}")
+
+        # Build plain text: concatenate all segment text
+        lines: list[str] = []
+        for seg in transcript_segments:
+            text = seg.get("text", "").strip()
+            if text:
+                lines.append(text)
+
+        content = " ".join(lines)
+        title = data.get("videoTitle", "") or data.get("title", "") or raw_url
+
+        if not content or len(content) < 200:
+            raise RuntimeError(
+                f"Transcript too short ({len(content)} chars) for {video_id}"
+            )
+
+        logger.info(
+            "TranscriptAPI: extracted %d chars for %s (%s)",
+            len(content), video_id, raw_url,
+        )
+        return SourceDoc(title=title, content=content, url=raw_url)
+
+    except Exception as exc:
+        errors.append(f"transcript_api: {exc}")
+
+    # Fallback 1: Invidious API (metadata + description, no transcript)
+    try:
+        from obsidian_llm_wiki.ingest.alt_source import extract_via_invidious
+        source = extract_via_invidious(raw_url)
+        logger.info("Invidious fallback: extracted %d chars for %s", len(source.content), raw_url)
+        return source
+    except Exception as exc:
+        errors.append(f"invidious: {exc}")
+
+    # Fallback 2: oEmbed metadata (title + author only, minimal)
+    try:
+        source = _extract_oembed(raw_url)
+        if source:
+            logger.info("oEmbed fallback: extracted metadata for %s", raw_url)
+            return source
+    except Exception as exc:
+        errors.append(f"oembed: {exc}")
+
+    raise RuntimeError(
+        f"YouTube transcript extraction failed for {raw_url}: " +
+        "; ".join(errors)
+    )
 
 
-def _extract_video_id(url: str) -> str:
-    """Extract the 11-character video ID from a YouTube URL."""
-    match = _VIDEO_ID_RE.search(url)
-    if match:
-        return match.group(1)
-    if re.fullmatch(r"[a-zA-Z0-9_-]{11}", url):
-        return url
-    return ""
+def _extract_oembed(youtube_url: str) -> SourceDoc | None:
+    """Fetch video metadata via YouTube oEmbed API (no auth required).
+
+    Returns title + author + thumbnail description. Minimal content,
+    but better than nothing when all other methods fail.
+    """
+    from urllib.parse import quote
+    import httpx
+
+    oembed_url = f"https://www.youtube.com/oembed?url={quote(youtube_url, safe='')}&format=json"
+    with httpx.Client(timeout=15, follow_redirects=True) as client:
+        resp = client.get(oembed_url)
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+
+    title = data.get("title", "") or youtube_url
+    author = data.get("author_name", "") or ""
+    thumbnail = data.get("thumbnail_url", "") or ""
+
+    content_parts = [
+        f"Title: {title}",
+        f"Channel: {author}",
+    ]
+    if thumbnail:
+        content_parts.append(f"Thumbnail: {thumbnail}")
+    content_parts.extend([
+        "",
+        "Note: Full transcript unavailable (no active TranscriptAPI plan).",
+        "Only video metadata was extracted. Upgrade at https://transcriptapi.com/billing",
+    ])
+
+    content = "\n".join(content_parts)
+    if len(content) < 100:
+        return None
+
+    return SourceDoc(title=title, content=content, url=youtube_url)

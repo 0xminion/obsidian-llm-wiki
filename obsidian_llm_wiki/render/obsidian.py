@@ -221,8 +221,18 @@ def render_entry_page(
 def render_concept_page(
     concept: ConceptNote,
     timestamp: str | None = None,
+    all_concepts: dict[str, ConceptNote] | None = None,
 ) -> str:
-    """Render a Concept-type page (evergreen atomic note)."""
+    """Render a Concept-type page (evergreen atomic note).
+
+    Args:
+        concept: The concept to render.
+        timestamp: Optional ISO timestamp (defaults to now).
+        all_concepts: Optional dict of slug→ConceptNote for cross-reference discovery.
+            When provided, the page includes a '关联图谱 / Cross-References' section
+            with typed edges discovered by comparing this concept's related slugs
+            against the other direction (bidirectional edges inferred).
+    """
     ts = timestamp or _timestamp()
     fm: dict[str, Any] = {
         "type": ConceptType.CONCEPT.value,
@@ -267,15 +277,78 @@ def render_concept_page(
             parts.append(f"- {make_wikilink(link.slug, display)} — `{link.relation}`")
         parts.append("")
 
+    # ── 关联图谱 / Cross-References ──────────────────────────────────
+    # Typed-edge relationship graph. Shown when all_concepts is provided.
+    if all_concepts and concept.related:
+        cross_ref_lines = _build_cross_ref_section(concept, all_concepts)
+        if cross_ref_lines:
+            parts.extend(["## 关联图谱 / Cross-References", ""])
+            parts.extend(cross_ref_lines)
+            parts.append("")
+
     body = "\n".join(parts)
     return f"{build_frontmatter(fm)}\n{body}"
+
+
+def _build_cross_ref_section(
+    concept: ConceptNote,
+    all_concepts: dict[str, ConceptNote],
+) -> list[str]:
+    """Build the typed-edge cross-reference section for a concept.
+
+    Shows all typed relationships as a structured flow diagram matching the
+    screenshot the user shared: node → edge-type → node.
+
+    Example output:
+      - 庞氏经济学 (Ponzi Economics) → 三盘理论 (Three-disc Theory)
+        type: 衍生自 (derives_from)
+    """
+    lines: list[str] = []
+    for link in concept.related:
+        target = all_concepts.get(link.slug)
+        if not target:
+            continue
+
+        display = link.display or link.slug
+        relation_type = link.relation or "related_to"
+
+        # Primary edge: this concept → target
+        lines.append(
+            f"- {make_wikilink(concept.slug, concept.title)} "
+            f"→ {make_wikilink(link.slug, display)}"
+        )
+        lines.append(f"  type: `{relation_type}`")
+
+        # Reverse edge: did target also link back to this concept?
+        # If not, note the unidirectional relationship
+        reverse_links = [
+            r for r in (target.related or [])
+            if r.slug == concept.slug
+        ]
+        if reverse_links:
+            rev_rel = reverse_links[0].relation or "related_to"
+            lines.append(f"  ← {make_wikilink(target.slug, target.title)} (`{rev_rel}`)")
+        else:
+            lines.append(f"  ← (unidirectional — target does not link back)")
+
+    return lines
 
 
 def render_moc_page(
     moc: MapOfContent,
     timestamp: str | None = None,
+    all_concepts: dict[str, ConceptNote] | None = None,
 ) -> str:
-    """Render a Map of Content page."""
+    """Render a Map of Content page.
+
+    Args:
+        moc: The MOC to render.
+        timestamp: Optional ISO timestamp.
+        all_concepts: Optional slug→ConceptNote dict. When provided, the MOC
+            displays concept language badges and cross-lingual aliases, grouping
+            concepts that share the same semantic meaning across languages under
+            a unified entry.
+    """
     ts = timestamp or _timestamp()
     fm = {
         "type": ConceptType.MOC.value,
@@ -292,11 +365,26 @@ def render_moc_page(
     if moc.concept_slugs:
         parts.extend(["## Concepts", ""])
         for slug in moc.concept_slugs:
-            parts.append(f"- {make_wikilink(slug)}")
+            entry = all_concepts.get(slug) if all_concepts else None
+            badge = ""
+            if entry and entry.aliases:
+                # Show cross-lingual aliases as language badge
+                zh_alias = next((a for a in entry.aliases if _is_chinese(a)), None)
+                if zh_alias:
+                    badge = f" · {zh_alias}"
+            parts.append(f"- {make_wikilink(slug)}{badge}")
         parts.append("")
 
     body = "\n".join(parts)
     return f"{build_frontmatter(fm)}\n{body}"
+
+
+def _is_chinese(text: str) -> bool:
+    """Return True if text contains Chinese characters (but not Japanese)."""
+    import re
+    has_cjk = bool(re.search(r"[\u4e00-\u9fff]", text))
+    has_kana = bool(re.search(r"[\u3040-\u309f\u30a0-\u30ff]", text))
+    return has_cjk and not has_kana
 
 
 # ── Index renderers ─────────────────────────────────────────────────────
@@ -400,16 +488,23 @@ def render_vault(
         atomic_write(path, page)
         written.append(str(path))
 
+    # Build concept map for cross-reference linking.
+    # Used by render_concept_page (typed edge cross-refs) and
+    # render_moc_page (cross-lingual language badges).
+    concept_map: dict[str, ConceptNote] = {
+        c.slug: c for c in bundle.concepts
+    }
+
     # ── Render concept pages ─────────────────────────────────────────
     for concept in bundle.concepts:
-        page = render_concept_page(concept, ts)
+        page = render_concept_page(concept, ts, all_concepts=concept_map)
         path = dirs["concepts"] / f"{concept.slug}.md"
         atomic_write(path, page)
         written.append(str(path))
 
     # ── Render MOC pages ─────────────────────────────────────────────
     for moc in bundle.maps:
-        page = render_moc_page(moc, ts)
+        page = render_moc_page(moc, ts, all_concepts=concept_map)
         path = dirs["mocs"] / f"{moc.slug}.md"
         atomic_write(path, page)
         written.append(str(path))

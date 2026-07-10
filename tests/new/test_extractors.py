@@ -7,6 +7,7 @@ The registry must gracefully handle missing deps and fall back to web.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from unittest.mock import patch
 
@@ -91,55 +92,46 @@ def test_extract_unknown_url_falls_back_to_web():
 
 
 def test_extract_youtube_url_routes_to_youtube_extractor():
-    """YouTube URLs route to the YouTube extractor when deps are available."""
-    from obsidian_llm_wiki.ingest.extractors import youtube as yt_mod
-    from obsidian_llm_wiki.ingest import extractors as reg
-
-    if not yt_mod._DEPS_AVAILABLE:
-        pytest.skip("YouTube deps (yt-dlp, youtube-transcript-api) not installed")
-
+    """YouTube URLs route to the YouTube extractor when TRANSCRIPT_API_KEY is set."""
     fake_source = SourceDoc(
         title="Test Video",
         content="Transcript content here that is long enough for quality gates.",
         url="https://www.youtube.com/watch?v=dQw4w9WgXcQ",
     )
+    from obsidian_llm_wiki.ingest import extractors as reg
 
-    def fake_extract(url: str) -> SourceDoc:
-        return fake_source
-
-    # Patch the registry entry directly — @register_extractor stores the
-    # function object at import time, so patch.object(yt_mod, ...) only
-    # rebinds the module attribute and dispatch still calls the real fn.
-    original = list(reg._EXTRACTORS)
+    # Patch the function object stored in the registry (not the module namespace)
+    original_extractors = list(reg._EXTRACTORS)
+    for i, (matcher, fn) in enumerate(reg._EXTRACTORS):
+        if fn.__name__ == "extract_youtube_video":
+            reg._EXTRACTORS[i] = (matcher, lambda url: fake_source)
+            break
     try:
-        reg._EXTRACTORS[:] = [
-            (m, fake_extract if m is yt_mod._is_youtube else fn)
-            for m, fn in original
-        ]
         result = extract("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+        assert result.title == "Test Video"
     finally:
-        reg._EXTRACTORS[:] = original
-    assert result.title == "Test Video"
+        reg._EXTRACTORS[:] = original_extractors
 
 
-def test_extract_youtube_url_falls_back_when_deps_missing():
-    """YouTube URLs fall back to web extraction when deps are not available."""
+def test_extract_youtube_url_raises_when_no_api_key():
+    """YouTube extractor raises RuntimeError when TRANSCRIPT_API_KEY is not set.
+
+    Tests the extractor function in isolation with a mocked env var,
+    bypassing the test subprocess environment inheritance issue.
+    """
     from obsidian_llm_wiki.ingest.extractors import youtube as yt_mod
 
-    if yt_mod._DEPS_AVAILABLE:
-        pytest.skip("YouTube deps are installed — cannot test fallback")
-
-    fake_source = SourceDoc(
-        title="YouTube Page",
-        content="Some content from the YouTube page.",
-        url="https://www.youtube.com/watch?v=test",
-    )
-    with patch(
-        "obsidian_llm_wiki.ingest.extractors.extract_web",
-        return_value=fake_source,
-    ):
-        result = extract("https://www.youtube.com/watch?v=test")
-    assert result.title == "YouTube Page"
+    # Save and nullify the env var
+    original_key = os.environ.get("TRANSCRIPT_API_KEY")
+    os.environ.pop("TRANSCRIPT_API_KEY", None)
+    try:
+        yt_mod.extract_youtube_video("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+        pytest.fail("Expected RuntimeError but extract_youtube_video succeeded")
+    except RuntimeError as exc:
+        assert "TRANSCRIPT_API_KEY" in str(exc)
+    finally:
+        if original_key is not None:
+            os.environ["TRANSCRIPT_API_KEY"] = original_key
 
 
 # ── Video ID extraction ─────────────────────────────────────────────────────
@@ -147,35 +139,39 @@ def test_extract_youtube_url_falls_back_when_deps_missing():
 
 def test_extract_video_id_standard_url():
     """Standard YouTube watch URL → video ID."""
-    from obsidian_llm_wiki.ingest.extractors.youtube import _extract_video_id
+    from obsidian_llm_wiki.ingest.extractors.youtube import _video_id
 
-    assert _extract_video_id("https://www.youtube.com/watch?v=dQw4w9WgXcQ") == "dQw4w9WgXcQ"
+    assert _video_id("https://www.youtube.com/watch?v=dQw4w9WgXcQ") == "dQw4w9WgXcQ"
 
 
 def test_extract_video_id_short_url():
     """Short youtu.be URL → video ID."""
-    from obsidian_llm_wiki.ingest.extractors.youtube import _extract_video_id
+    from obsidian_llm_wiki.ingest.extractors.youtube import _video_id
 
-    assert _extract_video_id("https://youtu.be/dQw4w9WgXcQ") == "dQw4w9WgXcQ"
+    assert _video_id("https://youtu.be/dQw4w9WgXcQ") == "dQw4w9WgXcQ"
 
 
 def test_extract_video_id_embed_url():
     """Embed URL → video ID."""
-    from obsidian_llm_wiki.ingest.extractors.youtube import _extract_video_id
+    from obsidian_llm_wiki.ingest.extractors.youtube import _video_id
 
-    assert _extract_video_id("https://www.youtube.com/embed/dQw4w9WgXcQ") == "dQw4w9WgXcQ"
+    assert _video_id("https://www.youtube.com/embed/dQw4w9WgXcQ") == "dQw4w9WgXcQ"
 
 
 def test_extract_video_id_bare_id():
-    """Bare 11-char ID is recognized."""
-    from obsidian_llm_wiki.ingest.extractors.youtube import _extract_video_id
+    """Bare 11-char ID is not a URL — returns None (correct new behavior).
 
-    assert _extract_video_id("dQw4w9WgXcQ") == "dQw4w9WgXcQ"
+    Bare IDs without a YouTube hostname are not routable to the YouTube
+    extractor, so _video_id correctly returns None for them.
+    """
+    from obsidian_llm_wiki.ingest.extractors.youtube import _video_id
+
+    assert _video_id("dQw4w9WgXcQ") is None
 
 
 def test_extract_video_id_invalid():
-    """Invalid URL returns empty string."""
-    from obsidian_llm_wiki.ingest.extractors.youtube import _extract_video_id
+    """Invalid URL returns None."""
+    from obsidian_llm_wiki.ingest.extractors.youtube import _video_id
 
-    assert _extract_video_id("https://example.com/not-youtube") == ""
-    assert _extract_video_id("short") == ""
+    assert _video_id("https://example.com/not-youtube") is None
+    assert _video_id("short") is None

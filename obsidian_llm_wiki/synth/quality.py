@@ -219,12 +219,20 @@ async def quality_synthesize_source(
     """
     from obsidian_llm_wiki.providers.llm import acall_llm
 
+    # Detect source language for correct prompt instructions
+    source_lang = ""
+    try:
+        from obsidian_llm_wiki.synth.language import detect_language
+        source_lang = detect_language(source.content)
+    except Exception:
+        pass
+
     # ── Pass 1: Extract skeleton ──────────────────────────────────────
     extract_prompt = build_extract_prompt(
         source.title,
         source.content,
         existing_concepts=existing_concepts,
-        language=config.output_language,
+        language=source_lang or config.output_language,
     )
     messages = [{"role": "user", "content": "Extract concepts from the source document above."}]
 
@@ -265,7 +273,7 @@ async def quality_synthesize_source(
 
     expand_results = await asyncio.gather(
         *[
-            _run_with_sem(_expand_one_concept(config, concept, source, all_concept_dicts))
+            _run_with_sem(_expand_one_concept(config, concept, source, all_concept_dicts, source_lang))
             for concept in skeleton.concepts
         ],
         return_exceptions=True,
@@ -324,6 +332,7 @@ async def _expand_one_concept(
     concept: ConceptNote,
     source: SourceDoc,
     all_concepts: list[dict[str, str]],
+    source_lang: str = "",
 ) -> ConceptNote | None:
     """Expand a single concept via a focused LLM call."""
     from obsidian_llm_wiki.providers.llm import acall_llm
@@ -335,7 +344,7 @@ async def _expand_one_concept(
         source_title=source.title,
         source_content=source.content,
         all_concepts=all_concepts,
-        language=config.output_language,
+        language=source_lang or config.output_language,
     )
     messages = [{"role": "user", "content": f'Expand the concept "{concept.title}".'}]
 

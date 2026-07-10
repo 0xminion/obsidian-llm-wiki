@@ -293,7 +293,7 @@ async def test_quality_synthesize_source_pass2_failure_sets_low_confidence():
         # Pass 1 only — return skeleton
         return skeleton_response
 
-    async def _mock_expand(config, concept, source, all_concepts):
+    async def _mock_expand(config, concept, source, all_concepts, source_lang=""):
         # Pass 2 routed by slug — concurrency-safe under asyncio.gather
         if concept.slug == "good-concept":
             from obsidian_llm_wiki.core.models import BodySection

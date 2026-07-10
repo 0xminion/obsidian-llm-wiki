@@ -67,6 +67,20 @@ class Config:
     retry_base_ms: int = 1_000
     retry_multiplier: int = 4
 
+    # ── Extraction fallbacks ─────────────────────────────
+    # Residential proxy URL (socks5h:// or http://) for blocked sites.
+    # Tailscale exit node: socks5h://<tailscale-ip>:1080
+    residential_proxy_url: str = ""
+
+    # Path to Netscape cookies file for YouTube transcript extraction.
+    # Export from browser: https://addons.mozilla.org/en-US/firefox/addon/cookies-txt/
+    youtube_cookies_file: str = ""
+
+    # Path to TranscriptAPI.com API key file or direct string.
+    # Get your key at https://transcriptapi.com
+    # Set as env TRANSCRIPT_API_KEY=sk_...
+    transcript_api_key: str = ""
+
     # ── Derived paths (lazy) ──────────────────────
     _vault: Path | None = field(default=None, repr=False)
 
@@ -165,6 +179,9 @@ def load_config(env_file: str | None = None, **overrides: str) -> Config:
         retry_count=_int_env("RETRY_COUNT", 3),
         retry_base_ms=_int_env("RETRY_BASE_MS", 1_000),
         retry_multiplier=_int_env("RETRY_MULTIPLIER", 4),
+        residential_proxy_url=os.getenv("RESIDENTIAL_PROXY_URL", ""),
+        youtube_cookies_file=os.getenv("YOUTUBE_COOKIES_FILE", ""),
+        transcript_api_key=os.getenv("TRANSCRIPT_API_KEY", ""),
     )
 
 

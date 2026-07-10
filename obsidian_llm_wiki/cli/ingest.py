@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime
 from pathlib import Path
 
 import typer
@@ -11,6 +12,26 @@ from obsidian_llm_wiki.cli import app
 from obsidian_llm_wiki.cli._helpers import print_result_summary, resolve_vault
 from obsidian_llm_wiki.ingest.sources import load_sources_from_dir
 from obsidian_llm_wiki.render.obsidian import atomic_write, slugify
+
+
+LEDGER_TEMPLATE = """\
+---
+type: ledger
+title: Failed URL Ingestion Ledger
+timestamp: {timestamp}
+---
+
+# Failed URL Ingestion Ledger
+
+This file records URLs that permanently failed extraction after all fallback
+strategies were exhausted. Each entry shows the URL, the error, and the date.
+
+To retry: manually remove the entry and re-run ``olw ingest``.
+
+| Date | URL | Error |
+|------|-----|-------|
+{rows}
+"""
 
 
 @app.command()
@@ -38,6 +59,8 @@ def ingest(
     FULL corpus (existing + new).  Unchanged sources reuse their cached
     synthesis; only new/changed sources trigger LLM calls.
 
+    Failed URLs are recorded in ``sources/failed_urls.md`` for manual retry.
+
     Examples:
         olw ingest ~/MyVault --url https://example.com/article
         olw ingest ~/MyVault -u URL1 -u URL2 --parallel 5
@@ -57,6 +80,7 @@ def ingest(
     from obsidian_llm_wiki.ingest.clippings import collect_clippings
 
     new_count = 0
+    failed_urls: list[tuple[str, str]] = []  # (url, error)
 
     passed_clippings = collect_clippings(config)
     if passed_clippings:
@@ -90,11 +114,16 @@ def ingest(
                 new_count += 1
                 print(f"   ✅ {source.title[:60]} ({len(source.content)} chars)")
             except Exception as exc:
+                failed_urls.append((url, str(exc)))
                 print(f"   ❌ {url}: {exc}")
 
-    if new_count == 0 and not dry_run:
+    if new_count == 0 and not dry_run and not failed_urls:
         print("\n⚠ No new sources to ingest.")
         print("   Tip: Use --url to add URLs or add .md files to 02-Clippings/")
+
+    # ── Update failed URLs ledger ─────────────────────────────────────
+    if failed_urls and not dry_run:
+        _update_failed_ledger(config.sources_dir, failed_urls)
 
     if skip_synthesis:
         print("\n   ⏭ Skipping synthesis (--skip-synthesis)")
@@ -117,6 +146,8 @@ def ingest(
     print(f"\n📦 Total corpus: {len(full_corpus)} source(s)")
     if new_count:
         print(f"   ({new_count} new/changed this run)")
+    if failed_urls:
+        print(f"   ({len(failed_urls)} failed — see sources/failed_urls.md)")
 
     # ── Run synthesis + render pipeline on the full corpus ─────────────
     print("\n🤖 Running LLM synthesis pipeline...")
@@ -125,6 +156,42 @@ def ingest(
     result = asyncio.run(run_pipeline(vault_path, full_corpus, config))
 
     print_result_summary(result)
+
+
+def _update_failed_ledger(sources_dir: Path, new_failures: list[tuple[str, str]]) -> None:
+    """Append failed URLs to the failed_urls.md ledger."""
+    ledger_path = sources_dir / "failed_urls.md"
+    ts = datetime.now(UTC).strftime("%Y-%m-%d")
+
+    # Load existing entries from ledger
+    existing: dict[str, str] = {}
+    if ledger_path.exists():
+        text = ledger_path.read_text(encoding="utf-8")
+        for line in text.splitlines():
+            # Match table data rows (start with |) but skip header/separator
+            if line.startswith("|") and "---" not in line and "Date" not in line:
+                parts = line.split("|")
+                if len(parts) >= 4:  # | date | url | error |
+                    existing[parts[2].strip()] = parts[3].strip()
+
+    # Update with new failures
+    for url, error in new_failures:
+        existing[url] = error
+
+    # Build rows
+    rows = []
+    for url, error in existing.items():
+        # Truncate error to avoid massive cells
+        err_short = error[:120].replace("\n", " ")
+        rows.append(f"| {ts} | {url} | {err_short} |")
+
+    content = LEDGER_TEMPLATE.format(
+        timestamp=datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        rows="\n".join(rows),
+    )
+
+    atomic_write(ledger_path, content)
+    print(f"\n   📋 Updated {ledger_path} ({len(existing)} failed URLs total)")
 
 
 def _reload_config_with_concurrency(vault_path: Path, parallel: int):
