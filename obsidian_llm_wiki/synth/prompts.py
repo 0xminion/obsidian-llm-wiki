@@ -49,7 +49,7 @@ SYNTHESIS_SCHEMA: dict[str, Any] = {
             "related": [
                 {
                     "slug": "string — slug of a related concept",
-                    "relation": "variant_of | depends_on | contrasts_with | related_to | prerequisite_of | example_of",
+                    "relation": "depends_on | prerequisite_of | example_of | variant_of | contrasts_with | complements | supersedes | part_of | evolves_into | measures | enables | competes_with | related_to",
                     "display": "string — display text for the link (optional)"
                 }
             ],

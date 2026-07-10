@@ -30,9 +30,11 @@ __all__ = [
     "cosine_similarity",
 ]
 
-_EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "nomic-embed-text:v1.5")
+_EMBEDDING_MODEL = os.environ.get(
+    "EMBEDDING_MODEL", "embeddinggemma:300m"
+)
 _OLLAMA_HOST = os.environ.get("LLM_HOST", "http://localhost:11435")
-_SIMILARITY_THRESHOLD = 0.85
+_SIMILARITY_THRESHOLD = 0.60
 _EMBEDDINGS_ENABLED = (
     os.environ.get("EMBEDDINGS_ENABLED", "false").strip().lower()
     in ("true", "1", "yes")

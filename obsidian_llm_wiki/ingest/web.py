@@ -35,23 +35,30 @@ def extract_web(url: str, timeout: int = _TIMEOUT) -> SourceDoc:
     """Extract full article content from a web URL.
 
     Strategy (in order):
-      1. trafilatura extract — primary HTML→text
-      2. defuddle CLI — npm package, better JS removal, custom UA support
-      3. Invidious API — YouTube-only metadata fallback
-      4. archive.org Wayback Machine — last resort
+      1. defuddle.md web service — best structured markdown for articles/blogs
+      2. trafilatura extract — fallback for non-JS pages
+      3. defuddle CLI — local defuddle fallback
+      4. Invidious API — YouTube-only metadata fallback
+      5. archive.org Wayback Machine — last resort
 
     Raises:
         RuntimeError: When all strategies fail.
     """
     errors: list[str] = []
 
-    # Layer 1: trafilatura
+    # Layer 1: defuddle.md web service (best markdown quality for articles/blogs)
+    try:
+        return _extract_defuddle_md(url, timeout)
+    except Exception as exc:
+        errors.append(f"defuddle.md: {exc}")
+
+    # Layer 2: trafilatura
     try:
         return _extract_trafilatura(url, timeout)
     except Exception as exc:
         errors.append(f"trafilatura: {exc}")
 
-    # Layer 2: defuddle CLI (no proxy — it has its own UA handling)
+    # Layer 3: defuddle CLI (no proxy — it has its own UA handling)
     try:
         return _extract_defuddle(url, timeout)
     except Exception as exc:
@@ -244,6 +251,61 @@ def _is_bad_title(title: str) -> bool:
         return True
     # HTML tag fragment
     return bool(title.startswith("<") and ">" in title)
+
+
+def _extract_defuddle_md(url: str, timeout: int) -> SourceDoc:
+    """Extract via defuddle.md web service — best markdown for articles/blogs.
+
+    defuddle.md renders JS-heavy pages and returns clean markdown with
+    YAML frontmatter (title, author, published, word_count).
+    """
+    stripped = url.replace("https://", "").replace("http://", "")
+    defuddle_url = f"https://defuddle.md/{stripped}"
+
+    with httpx.Client(
+        **make_client_kwargs(timeout=timeout, follow_redirects=True),
+        headers={
+            "User-Agent": BROWSER_HEADERS["User-Agent"],
+            "Accept": "text/html",
+        },
+    ) as client:
+        resp = client.get(defuddle_url)
+
+    if resp.status_code != 200:
+        raise RuntimeError(f"defuddle.md returned HTTP {resp.status_code}")
+
+    text = resp.text.strip()
+    if not text or len(text) < 100:
+        raise RuntimeError("defuddle.md returned empty content")
+
+    # Parse frontmatter
+    title = ""
+    content = text
+    if text.startswith("---"):
+        fm_end = text.find("---", 3)
+        if fm_end > 0:
+            fm_text = text[3:fm_end].strip()
+            content = text[fm_end + 3:].strip()
+            for line in fm_text.split("\n"):
+                if line.startswith("title:"):
+                    title = line[6:].strip().strip('"').strip("'")
+
+    if not title:
+        for line in content.split("\n", 5):
+            if line.startswith("# "):
+                title = line[2:].strip()
+                break
+    if not title:
+        title = url
+
+    # Strip cover image markdown from content start
+    if content.startswith("!["):
+        content = content.split("\n", 1)[-1].lstrip() if "\n" in content else content
+
+    if not content or len(content.strip()) < 50:
+        raise RuntimeError("defuddle.md content too short")
+
+    return SourceDoc(title=title, content=content.strip(), url=url)
 
 
 def _extract_trafilatura(url: str, timeout: int) -> SourceDoc:

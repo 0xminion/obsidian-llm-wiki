@@ -150,7 +150,12 @@ _EXPAND_SCHEMA: dict[str, Any] = {
     "related": [
         {
             "slug": "string — related concept slug",
-            "relation": "variant_of | depends_on | contrasts_with | related_to",
+            "relation": (
+                "depends_on | prerequisite_of | example_of | variant_of | "
+                "contrasts_with | complements | supersedes | part_of | "
+                "evolves_into | measures | enables | competes_with | "
+                "related_to"
+            ),
             "display": "string — display text (optional)",
         }
     ],
