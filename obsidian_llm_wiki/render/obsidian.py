@@ -380,9 +380,11 @@ def render_moc_page(
 
 
 def _is_chinese(text: str) -> bool:
-    """Return True if text contains Chinese characters."""
+    """Return True if text contains Chinese characters (but not Japanese)."""
     import re
-    return bool(re.search(r"[\u4e00-\u9fff]", text))
+    has_cjk = bool(re.search(r"[\u4e00-\u9fff]", text))
+    has_kana = bool(re.search(r"[\u3040-\u309f\u30a0-\u30ff]", text))
+    return has_cjk and not has_kana
 
 
 # ── Index renderers ─────────────────────────────────────────────────────

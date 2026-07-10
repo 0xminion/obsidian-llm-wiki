@@ -57,7 +57,7 @@ def detect_language(text: str) -> str:
     cy_ratio = cyrillic / max(len(text), 1)
 
     # Common Chinese words (high signal)
-    zh_markers = ["的", "是", "在", "不", "了", "和", "有", "我", "他", "这", "个", "们", "为", "到", "说", "们"]
+    zh_markers = ["的", "是", "在", "不", "了", "和", "有", "我", "他", "这", "个", "为", "到", "说"]
     zh_word_count = sum(text.count(w) for w in zh_markers)
 
     # English word heuristics

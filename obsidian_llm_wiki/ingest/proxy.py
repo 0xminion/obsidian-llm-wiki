@@ -44,6 +44,6 @@ def make_client_kwargs(**kwargs: Any) -> dict[str, Any]:
             from httpx import URL, Proxy
             opts["proxy"] = Proxy(url=URL(proxy_url))
         except Exception:
-            opts["proxies"] = proxy_url
+            opts["proxy"] = proxy_url  # httpx 0.28 accepts string URL directly
 
     return opts

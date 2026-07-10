@@ -53,7 +53,7 @@ def _video_id(url: str) -> str | None:
     return None
 
 
-@register_extractor(lambda parsed, raw: bool(_video_id(raw) if raw.startswith("http") else _video_id(raw)))
+@register_extractor(lambda parsed, raw: raw.startswith("http") and bool(_video_id(raw)))
 def extract_youtube_video(raw_url: str) -> SourceDoc:
     """Extract transcript from a YouTube video via TranscriptAPI.com.
 

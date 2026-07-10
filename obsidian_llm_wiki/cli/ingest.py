@@ -168,10 +168,11 @@ def _update_failed_ledger(sources_dir: Path, new_failures: list[tuple[str, str]]
     if ledger_path.exists():
         text = ledger_path.read_text(encoding="utf-8")
         for line in text.splitlines():
-            if "|" in line and not line.startswith("|") and not line.startswith("-"):
+            # Match table data rows (start with |) but skip header/separator
+            if line.startswith("|") and "---" not in line and "Date" not in line:
                 parts = line.split("|")
-                if len(parts) >= 3:
-                    existing[parts[1].strip()] = parts[2].strip()
+                if len(parts) >= 4:  # | date | url | error |
+                    existing[parts[2].strip()] = parts[3].strip()
 
     # Update with new failures
     for url, error in new_failures:

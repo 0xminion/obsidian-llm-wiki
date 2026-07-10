@@ -52,7 +52,6 @@ def extract_via_invidious(youtube_url: str, timeout: int = DEFAULT_TIMEOUT) -> S
 
     # Try multiple Invidious instances
     instances = [
-        "https://invidious.snopyta.org",
         "https://yewtu.be",
         "https://invidious.privacyredirect.com",
     ]
