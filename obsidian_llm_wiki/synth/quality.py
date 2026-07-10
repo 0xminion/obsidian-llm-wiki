@@ -255,6 +255,23 @@ async def quality_synthesize_source(
         logger.warning("Pass 1 extracted no concepts for '%s'", filename)
         return skeleton
 
+    # Extract rationale from Pass 1 JSON (separate from summary).
+    # The Pass 1 schema has both 'rationale' (why this concept matters)
+    # and 'summary' (1-2 sentence summary). We store rationales by slug
+    # so Pass 2 can use the richer rationale instead of the short summary.
+    rationales: dict[str, str] = {}
+    try:
+        from obsidian_llm_wiki.synth.parser import _extract_json
+        raw_data = _extract_json(response)
+        if isinstance(raw_data, dict):
+            for c in raw_data.get("concepts", []):
+                if isinstance(c, dict) and c.get("slug"):
+                    rat = c.get("rationale", "")
+                    if rat:
+                        rationales[c["slug"]] = rat
+    except Exception:
+        pass
+
     logger.info(
         "Pass 1 done for '%s': %d concepts extracted",
         filename, len(skeleton.concepts),
@@ -276,6 +293,7 @@ async def quality_synthesize_source(
             _run_with_sem(
                 _expand_one_concept(
                     config, concept, source, all_concept_dicts, source_lang,
+                    rationale=rationales.get(concept.slug, ""),
                 )
             )
             for concept in skeleton.concepts
@@ -337,6 +355,7 @@ async def _expand_one_concept(
     source: SourceDoc,
     all_concepts: list[dict[str, str]],
     source_lang: str = "",
+    rationale: str = "",
 ) -> ConceptNote | None:
     """Expand a single concept via a focused LLM call."""
     from obsidian_llm_wiki.providers.llm import acall_llm
@@ -344,7 +363,7 @@ async def _expand_one_concept(
     prompt = build_expand_prompt(
         concept_title=concept.title,
         concept_slug=concept.slug,
-        concept_rationale=concept.summary,
+        concept_rationale=rationale or concept.summary,
         source_title=source.title,
         source_content=source.content,
         all_concepts=all_concepts,
@@ -547,3 +566,13 @@ def _build_concept_from_expand(data: dict[str, Any], fallback_slug: str) -> Conc
         related=related,
         confidence=1.0,
     )
+
+
+def _extract_rationale(data: dict) -> str:
+    """Extract rationale from Pass 1 JSON (separate from summary).
+
+    The Pass 1 schema has both 'rationale' (why this concept matters)
+    and 'summary' (1-2 sentence summary). We use rationale for the
+    Pass 2 expand prompt and summary for the concept page.
+    """
+    return data.get("rationale", "") or data.get("summary", "")
