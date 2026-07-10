@@ -67,10 +67,16 @@ def detect_language(text: str) -> str:
     # Arabic word heuristics
     ar_words = re.findall(r"[\u0600-\u06ff]{4,}", text)
 
-    if cjk_ratio > 0.03 or zh_word_count >= 5:
-        return "zh"
+    # Japanese must be checked BEFORE Chinese because Japanese uses
+    # CJK ideographs alongside hiragana/katakana. If we check CJK first,
+    # Japanese text (which has kanji) would be misidentified as Chinese.
+    # The key differentiator: Japanese has hiragana/katakana, Chinese doesn't.
     if jp_ratio > 0.01:
         return "ja"
+
+    # Chinese: high density of CJK Unified Ideographs (no hiragana/katakana)
+    if cjk_ratio > 0.03 or zh_word_count >= 5:
+        return "zh"
     if ko_ratio > 0.02:
         return "ko"
     if ar_ratio > 0.03 or len(ar_words) >= 3:
