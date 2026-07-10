@@ -134,22 +134,71 @@ def _extract_defuddle(url: str, timeout: int) -> SourceDoc:
     if not output.strip():
         raise RuntimeError("defuddle returned empty output")
 
-    # defuddle --md returns markdown. Parse title from first # heading or URL.
+    # defuddle --md returns markdown. Parse title from first # heading.
+    # If the first line is not a heading, try defuddle --json for metadata.
     lines = output.strip().split("\n", 3)
     title = ""
     if lines and lines[0].startswith("# "):
         title = lines[0][2:].strip()
-    elif lines:
-        title = lines[0].strip()
+
+    # If no heading title, try defuddle --json for structured metadata
+    if not title or _is_bad_title(title):
+        title = _defuddle_metadata_title(url, timeout)
+
+    # If still no title and first line isn't a heading, use the URL
+    if not title or _is_bad_title(title):
+        title = url
 
     content = output.strip()
-    if title and content.startswith("# " + title):
+    # Strip the title heading from content if present
+    if title and content.startswith(f"# {title}"):
         content = content[len(title) + 2:].strip()
+    # Also strip markdown image prefix from content if it's the first line
+    if content.startswith("!["):
+        # Remove the image line and any following blank line
+        content = content.split("\n", 1)[-1].lstrip() if "\n" in content else content
 
     if not content or len(content) < 50:
         raise RuntimeError(f"defuddle produced short content ({len(content)} chars)")
 
-    return SourceDoc(title=title or url, content=content, url=url)
+    return SourceDoc(title=title, content=content, url=url)
+
+
+def _defuddle_metadata_title(url: str, timeout: int) -> str:
+    """Fetch page title via defuddle --json (includes metadata).
+
+    defuddle --json returns a JSON object with title, author, etc.
+    This is used as a fallback when --md output has no # heading.
+    """
+    import json
+
+    defuddle_path = shutil.which("defuddle") or shutil.which("npx")
+    if not defuddle_path:
+        return ""
+
+    cmd: list[str]
+    if "defuddle" in defuddle_path:
+        cmd = [defuddle_path, "parse", url, "--json"]
+    else:
+        cmd = [defuddle_path, "defuddle", "parse", url, "--json"]
+
+    env = os.environ.copy()
+    env["NODE_EXTRA_CA_CERTS"] = ""
+
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=min(timeout, 60),
+            env=env,
+        )
+        if proc.returncode != 0:
+            return ""
+        data = json.loads(proc.stdout)
+        return (data.get("title") or "").strip()
+    except Exception:
+        return ""
 
 
 def _is_youtube_url(url: str) -> bool:
@@ -179,6 +228,24 @@ def _is_journal_xml_url(url: str) -> bool:
     return url.endswith(".xml") or "/article-" in url
 
 
+def _is_bad_title(title: str) -> bool:
+    """Check if a title is garbage (markdown image, URL, or too short).
+
+    trafilatura sometimes picks up markdown image alt text or raw URLs
+    as the title instead of the actual page title.
+    """
+    if not title or len(title.strip()) < 3:
+        return True
+    # Markdown image: ![alt](url)
+    if title.startswith("![") and "](" in title:
+        return True
+    # Raw URL
+    if title.startswith("http") and "://" in title:
+        return True
+    # HTML tag fragment
+    return bool(title.startswith("<") and ">" in title)
+
+
 def _extract_trafilatura(url: str, timeout: int) -> SourceDoc:
     """Extract via httpx fetch + trafilatura."""
     import trafilatura
@@ -205,8 +272,10 @@ def _extract_trafilatura(url: str, timeout: int) -> SourceDoc:
     title = ""
     if metadata:
         title = (metadata.title or "").strip()
-    if not title:
+    if not title or _is_bad_title(title):
         title = _extract_title_from_html(html)
+    if not title or _is_bad_title(title):
+        title = ""
 
     return SourceDoc(title=title or url, content=extracted.strip(), url=url)
 
