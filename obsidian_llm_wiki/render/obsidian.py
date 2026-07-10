@@ -869,6 +869,12 @@ def render_vault(
     written: list[str] = []
     ts = _timestamp()
 
+    # ── Backlink propagation: ensure bidirectional edges ──────────────
+    # This runs inside render_vault so it works even when re-rendering
+    # from cache without going through the full pipeline.
+    from obsidian_llm_wiki.synth.dedupe import propagate_backlinks
+    propagate_backlinks(bundle)
+
     # Make the language policy deterministic. The synthesis prompt asks Chinese
     # sources to use English-first bilingual titles, but smaller/local models do
     # not always comply. Rendering is the last safe choke point before filenames

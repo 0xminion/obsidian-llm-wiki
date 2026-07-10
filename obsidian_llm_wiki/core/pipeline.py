@@ -213,6 +213,14 @@ async def run_pipeline(
         bundle = merge_bundle(all_syntheses)
         result.errors.extend(bundle.errors)
 
+        # ── Backlink propagation: ensure bidirectional edges ──────────
+        # After merging cached + fresh syntheses, old concepts may not
+        # have reverse links to new concepts that reference them. This
+        # pass walks all edges and adds missing reverse links so MoC
+        # cross-reference diagrams show bidirectional arrows correctly.
+        from obsidian_llm_wiki.synth.dedupe import propagate_backlinks
+        propagate_backlinks(bundle)
+
         # ── Render: full corpus deterministic markdown ─────────────────
         logger.info(
             "Rendering %d concepts, %d MOCs from %d sources...",

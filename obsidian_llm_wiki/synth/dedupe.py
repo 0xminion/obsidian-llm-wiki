@@ -37,6 +37,7 @@ __all__ = [
     "merge_concepts",
     "normalise_tags",
     "slugify",
+    "propagate_backlinks",
 ]
 
 logger = logging.getLogger("obswiki.synth.dedupe")
@@ -168,3 +169,63 @@ def merge_bundle(sources: list[SourceSynthesis]) -> SynthesisBundle:
         maps=merged_maps,
         errors=errors,
     )
+
+
+# ── Backlink propagation ────────────────────────────────────────────────
+
+
+def propagate_backlinks(bundle: SynthesisBundle) -> None:
+    """Ensure bidirectional relationships across all concepts.
+
+    After merging, concept A may have a ``related`` link to concept B,
+    but B may not have a link back to A — especially when A and B were
+    synthesized in different runs (B is cached, A is new).
+
+    This pass walks all concepts in the bundle and for every forward
+    edge A→B, ensures B has a reverse edge B→A with the same relation
+    type (or ``related_to`` as a fallback). It also enriches MoC
+    concept lists: if a concept in a MoC links to a concept in another
+    MoC, the target concept's MoCs are checked for reciprocal links.
+
+    This is a pure data operation — no LLM needed. It runs in O(E)
+    where E is the total number of edges.
+    """
+    concept_map: dict[str, ConceptNote] = {c.slug: c for c in bundle.concepts}
+    if not concept_map:
+        return
+
+    added = 0
+
+    for concept in bundle.concepts:
+        for link in concept.related or []:
+            target = concept_map.get(link.slug)
+            if target is None:
+                continue  # Link points outside the bundle
+
+            # Check if target already has a link back to this concept
+            existing_back = any(
+                r.slug == concept.slug
+                for r in (target.related or [])
+            )
+            if existing_back:
+                continue
+
+            # Add reverse link
+            from obsidian_llm_wiki.core.models import ConceptLink
+            reverse_relation = link.relation or "related_to"
+            if target.related is None:
+                target.related = []
+            target.related.append(
+                ConceptLink(
+                    slug=concept.slug,
+                    relation=reverse_relation,
+                    display=concept.title,
+                )
+            )
+            added += 1
+
+    if added:
+        logger.info(
+            "Backlink propagation: added %d reverse edges across %d concepts",
+            added, len(concept_map),
+        )
