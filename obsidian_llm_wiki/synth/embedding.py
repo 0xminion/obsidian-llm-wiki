@@ -32,18 +32,26 @@ __all__ = [
 _EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "nomic-embed-text:v1.5")
 _OLLAMA_HOST = os.environ.get("LLM_HOST", "http://localhost:11435")
 _SIMILARITY_THRESHOLD = 0.85
+_EMBEDDINGS_ENABLED = (
+    os.environ.get("EMBEDDINGS_ENABLED", "false").strip().lower()
+    in ("true", "1", "yes")
+)
+_EMBED_TIMEOUT = 10  # seconds — short to avoid hanging renders
 
 
 def embed_text(text: str) -> list[float] | None:
     """Generate embedding for a text string via Ollama.
 
-    Returns None if the embedding service is unavailable.
+    Returns None if embeddings are disabled or the service is unavailable.
     """
+    if not _EMBEDDINGS_ENABLED:
+        return None
+
     if not text.strip():
         return None
 
     try:
-        with httpx.Client(timeout=30) as client:
+        with httpx.Client(timeout=_EMBED_TIMEOUT) as client:
             resp = client.post(
                 f"{_OLLAMA_HOST}/api/embeddings",
                 json={
@@ -82,21 +90,9 @@ def find_cross_lingual_links(
 ) -> dict[str, list[tuple[str, float, str]]]:
     """Find cross-lingual concept pairs with high semantic similarity.
 
-    For each concept, embed its title + summary. Compare all pairs where
-    the concepts have different detected languages (or one has Chinese
-    aliases). If similarity > threshold, record the link.
-
-    Args:
-        concepts: List of ConceptNote objects.
-        threshold: Minimum cosine similarity to consider a match.
-
-    Returns:
-        Dict mapping slug → list of (target_slug, similarity_score, display_text).
-        Only includes cross-lingual matches (same-language matches are skipped
-        — those should be handled by the LLM's related field).
+    Returns empty dict if embeddings are disabled or unavailable.
     """
     from obsidian_llm_wiki.synth.language import detect_language
-    from obsidian_llm_wiki.render.obsidian import _is_chinese
 
     # Build embeddings for all concepts
     embeddings: dict[str, list[float]] = {}

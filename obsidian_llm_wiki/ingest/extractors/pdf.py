@@ -12,8 +12,6 @@ normalization in ``extractors/__init__.py::extract()`` which rewrites
 from __future__ import annotations
 
 import logging
-import os
-import tempfile
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -21,7 +19,6 @@ import httpx
 
 from obsidian_llm_wiki.core.models import SourceDoc
 from obsidian_llm_wiki.ingest.extractors import register_extractor
-from obsidian_llm_wiki.ingest.http_headers import BROWSER_HEADERS
 from obsidian_llm_wiki.ingest.proxy import make_client_kwargs
 
 logger = logging.getLogger("obswiki.ingest.extractors.pdf")
@@ -52,9 +49,7 @@ def _is_pdf(parsed, raw: str) -> bool:
         return True
     # arxiv PDF URLs: /pdf/XXXX.YYYYY (no .pdf suffix in URL path)
     host = (parsed.hostname or "").lower()
-    if host in _ARXIV_HOSTS and "/pdf/" in (parsed.path or ""):
-        return True
-    return False
+    return bool(host in _ARXIV_HOSTS and "/pdf/" in (parsed.path or ""))
 
 
 # ── Registration (only if deps available) ────────────────────────────────

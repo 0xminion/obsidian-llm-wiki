@@ -23,8 +23,6 @@ from typing import Any
 
 import yaml
 
-logger = logging.getLogger("obswiki.render.obsidian")
-
 from obsidian_llm_wiki.core.models import (
     ConceptNote,
     ConceptType,
@@ -33,6 +31,8 @@ from obsidian_llm_wiki.core.models import (
     SourceSynthesis,
     SynthesisBundle,
 )
+
+logger = logging.getLogger("obswiki.render.obsidian")
 
 __all__ = [
     "render_vault",

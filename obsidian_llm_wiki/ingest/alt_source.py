@@ -107,12 +107,11 @@ def _extract_youtube_video_id(url: str) -> str | None:
     """Extract the 11-char video ID from various YouTube URL formats."""
     parsed = urlparse(url)
     # youtube.com/watch?v=...
-    if parsed.hostname in ("www.youtube.com", "youtube.com", "m.youtube.com"):
-        if parsed.query:
-            for param in parsed.query.split("&"):
-                k, _, v = param.partition("=")
-                if k == "v":
-                    return v[:11]
+    if parsed.hostname in ("www.youtube.com", "youtube.com", "m.youtube.com") and parsed.query:
+        for param in parsed.query.split("&"):
+            k, _, v = param.partition("=")
+            if k == "v":
+                return v[:11]
     # youtu.be/...
     if parsed.hostname == "youtu.be":
         return parsed.path.strip("/")[:11]
@@ -192,7 +191,7 @@ def extract_via_semantic_scholar(ssrn_url: str, timeout: int = DEFAULT_TIMEOUT) 
     except Exception as exc:
         raise RuntimeError(
             f"Semantic Scholar lookup failed for SSRN:{paper_id}: {exc}"
-        )
+        ) from exc
 
 
 def _extract_ssrn_paper_id(url: str) -> str | None:
@@ -278,7 +277,7 @@ def extract_via_journal_page(url: str, timeout: int = DEFAULT_TIMEOUT) -> Source
     except Exception as exc:
         raise RuntimeError(
             f"Journal direct page failed for {direct_url}: {exc}"
-        )
+        ) from exc
 
 
 def _strip_journal_html(html: str) -> str:

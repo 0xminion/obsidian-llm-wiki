@@ -9,19 +9,17 @@ Tests:
 
 from __future__ import annotations
 
+import yaml
+
 from obsidian_llm_wiki.core.models import (
     BodySection,
-    Claim,
-    ConceptNote,
     ConceptLink,
-    ConceptType,
+    ConceptNote,
     MapOfContent,
     SourceSynthesis,
 )
 from obsidian_llm_wiki.render.obsidian import render_concept_page
 from obsidian_llm_wiki.synth.quality import concept_body_chars, filter_thin_concepts
-import yaml
-
 
 # ── concept_body_chars ────────────────────────────────────────────────────
 
@@ -55,14 +53,19 @@ def test_body_chars_fat_concept():
         summary="A comprehensive summary about the concept.",
         sections=[
             BodySection(heading="Core", prose=long_prose),
-            BodySection(heading="Context", points=["Point one with evidence.", "Point two with more evidence."]),
+            BodySection(heading="Context", points=[
+                "Point one with evidence.", "Point two with more evidence.",
+            ]),
         ],
     )
     assert concept_body_chars(c) > 800
 
 
 def test_body_chars_excludes_summary():
-    """Body char count does NOT include the summary field (matches _concept_body_chars semantics)."""
+    """Body char count does NOT include the summary field.
+
+    (matches _concept_body_chars semantics)
+    """
     c1 = ConceptNote(title="T", slug="t", summary="", sections=[])
     c2 = ConceptNote(title="T", slug="t", summary="Extra summary text here.", sections=[])
     # Both have zero sections → both 0, summary not counted
@@ -96,7 +99,10 @@ def test_filter_thin_concepts_drops_short():
         source_title="Test",
         source_summary="A test synthesis.",
         concepts=[thin, fat1, fat2],
-        maps=[MapOfContent(title="MOC", slug="moc", summary="", concept_slugs=["thin", "fat1", "fat2"])],
+        maps=[MapOfContent(
+            title="MOC", slug="moc", summary="",
+            concept_slugs=["thin", "fat1", "fat2"],
+        )],
     )
 
     result = filter_thin_concepts(synth, min_body_chars=800)

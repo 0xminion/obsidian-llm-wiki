@@ -273,7 +273,11 @@ async def quality_synthesize_source(
 
     expand_results = await asyncio.gather(
         *[
-            _run_with_sem(_expand_one_concept(config, concept, source, all_concept_dicts, source_lang))
+            _run_with_sem(
+                _expand_one_concept(
+                    config, concept, source, all_concept_dicts, source_lang,
+                )
+            )
             for concept in skeleton.concepts
         ],
         return_exceptions=True,

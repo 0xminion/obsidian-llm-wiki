@@ -10,12 +10,6 @@ Covers:
 
 from __future__ import annotations
 
-import os
-import tempfile
-from pathlib import Path
-from unittest.mock import patch
-
-
 # ── proxy.py ────────────────────────────────────────────────────────────────
 
 
@@ -103,8 +97,8 @@ def test_detect_language_short_text():
 
 def test_get_language_instruction_known_codes():
     from obsidian_llm_wiki.synth.language import (
-        get_language_instruction,
         LANGUAGE_INSTRUCTIONS,
+        get_language_instruction,
     )
     for code in ("en", "zh", "ja", "ko", "ar", "ru"):
         assert get_language_instruction(code) == LANGUAGE_INSTRUCTIONS[code]
@@ -144,7 +138,8 @@ def test_language_name_unknown_code():
 
 def _make_concept(slug, title, related=None, aliases=None):
     from obsidian_llm_wiki.core.models import (
-        BodySection, ConceptLink, ConceptNote,
+        BodySection,
+        ConceptNote,
     )
     return ConceptNote(
         title=title,
@@ -374,7 +369,8 @@ def test_is_ssrn_url_false():
 
 def test_is_journal_xml_url_xml_suffix():
     from obsidian_llm_wiki.ingest.web import _is_journal_xml_url
-    assert _is_journal_xml_url("https://akjournals.com/view/journals/2054/9/3/article-p294.xml") is True
+    url = "https://akjournals.com/view/journals/2054/9/3/article-p294.xml"
+    assert _is_journal_xml_url(url) is True
 
 
 def test_is_journal_xml_url_article_segment():
