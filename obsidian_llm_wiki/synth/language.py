@@ -100,10 +100,18 @@ LANGUAGE_INSTRUCTIONS: dict[str, str] = {
     "en": (
         "Write all summaries, content, and titles in English."
     ),
-    # Chinese: everything in Chinese (no translation)
+    # Chinese: everything in Chinese (no translation), but titles include
+    # English first then Chinese for cross-lingual discoverability
     "zh": (
-        "Write all summaries, content, and titles in Chinese (中文). "
-        "Do NOT translate Chinese terms to English — keep them in their original Chinese form."
+        "Write all summaries, content, and section body text in Chinese (中文). "
+        "Do NOT translate Chinese terms to English — keep them in their original Chinese form. "
+        "However, for all concept titles, entry titles, and MoC titles, "
+        "use a bilingual format: English title first, then Chinese title in parentheses, "
+        "e.g. 'Redefinition of Liquidity (流动性的重新定义)'. "
+        "For MoC section headings (## Concepts, ## 关联图谱), use bilingual headings: "
+        "'## Concepts / 概念', '## Key Findings / 关键发现'. "
+        "The slug should be English (lowercase, hyphens). "
+        "The body content stays in Chinese."
     ),
     # Japanese
     "ja": (
