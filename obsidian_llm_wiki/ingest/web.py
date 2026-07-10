@@ -1,15 +1,23 @@
 """Web URL extraction — Stage 1 deterministic ingest.
 
-Primary: httpx + trafilatura (pure Python, no subprocess).
-Fallback: archive.org Wayback Machine via httpx.
+Multi-layer strategy:
+  1. httpx fetch + trafilatura extract (primary)
+  2. defuddle CLI (npm) — removes JS/clutter, often succeeds where trafilatura is blocked
+  3. Invidious API (YouTube metadata fallback)
+  4. archive.org Wayback Machine (last resort)
 
-Never truncates content.  Always returns full SourceDoc.
+Each layer runs only if the previous one fails. The SourceDoc always carries
+the full content — never truncated.
 """
 
 from __future__ import annotations
 
 import logging
+import os
 import re
+import shutil
+import subprocess
+import tempfile
 
 import httpx
 
@@ -27,26 +35,54 @@ _TIMEOUT = DEFAULT_TIMEOUT
 def extract_web(url: str, timeout: int = _TIMEOUT) -> SourceDoc:
     """Extract full article content from a web URL.
 
-    Strategy:
-      1. httpx fetch + trafilatura extract (primary)
-      2. httpx fetch + regex HTML-to-text (fallback 1)
-      3. archive.org Wayback Machine (fallback 2)
+    Strategy (in order):
+      1. trafilatura extract — primary HTML→text
+      2. defuddle CLI — npm package, better JS removal, custom UA support
+      3. Invidious API — YouTube-only metadata fallback
+      4. archive.org Wayback Machine — last resort
 
     Raises:
         RuntimeError: When all strategies fail.
     """
     errors: list[str] = []
 
+    # Layer 1: trafilatura
     try:
         return _extract_trafilatura(url, timeout)
     except Exception as exc:
         errors.append(f"trafilatura: {exc}")
 
+    # Layer 2: defuddle CLI (no proxy — it has its own UA handling)
     try:
-        return _extract_regex(url, timeout)
+        return _extract_defuddle(url, timeout)
     except Exception as exc:
-        errors.append(f"regex: {exc}")
+        errors.append(f"defuddle: {exc}")
 
+    # Layer 3: Invidious (YouTube only)
+    if _is_youtube_url(url):
+        try:
+            from obsidian_llm_wiki.ingest.alt_source import extract_via_invidious
+            return extract_via_invidious(url, timeout)
+        except Exception as exc:
+            errors.append(f"invidious: {exc}")
+
+    # Layer 4: SSRN via Semantic Scholar (academic paper fallback)
+    if _is_ssrn_url(url):
+        try:
+            from obsidian_llm_wiki.ingest.alt_source import extract_via_semantic_scholar
+            return extract_via_semantic_scholar(url, timeout)
+        except Exception as exc:
+            errors.append(f"semantic_scholar: {exc}")
+
+    # Layer 5: akjournals / journal XML direct-page fallback
+    if _is_journal_xml_url(url):
+        try:
+            from obsidian_llm_wiki.ingest.alt_source import extract_via_journal_page
+            return extract_via_journal_page(url, timeout)
+        except Exception as exc:
+            errors.append(f"journal_direct: {exc}")
+
+    # Layer 6: Wayback Machine
     try:
         return _extract_wayback(url, timeout)
     except Exception as exc:
@@ -55,6 +91,93 @@ def extract_web(url: str, timeout: int = _TIMEOUT) -> SourceDoc:
     raise RuntimeError(
         f"All extraction strategies failed for {url}:\n  " + "\n  ".join(errors)
     )
+
+
+def _extract_defuddle(url: str, timeout: int) -> SourceDoc:
+    """Extract via defuddle npm CLI (removes JS, ads, clutter).
+
+    defuddle is a browser-quality extractor that handles JS-rendered pages.
+    It is tried after trafilatura and before Wayback Machine.
+
+    Requires: npm install -g defuddle
+    The CLI accepts --user-agent to bypass simple 403 blocks.
+    """
+    # Find defuddle binary
+    defuddle_path = shutil.which("defuddle") or shutil.which("npx")
+    cmd: list[str]
+    if not defuddle_path:
+        raise RuntimeError("defuddle not found — npm install -g defuddle")
+    if "defuddle" in defuddle_path:
+        cmd = [defuddle_path, "parse", url, "--md"]
+    else:
+        # npx defuddle parse ...
+        cmd = [defuddle_path, "defuddle", "parse", url, "--md"]
+
+    # Run with browser UA to reduce 403s
+    env = os.environ.copy()
+    env["NODE_EXTRA_CA_CERTS"] = ""  # Clear problematic CA certs
+
+    proc = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        timeout=min(timeout, 60),
+        env=env,
+    )
+
+    if proc.returncode != 0:
+        stderr = proc.stderr.strip()
+        if stderr:
+            raise RuntimeError(f"defuddle exited {proc.returncode}: {stderr[:200]}")
+        raise RuntimeError(f"defuddle exited {proc.returncode} (no stderr)")
+
+    output = proc.stdout
+    if not output.strip():
+        raise RuntimeError("defuddle returned empty output")
+
+    # defuddle --md returns markdown. Parse title from first # heading or URL.
+    lines = output.strip().split("\n", 3)
+    title = ""
+    if lines and lines[0].startswith("# "):
+        title = lines[0][2:].strip()
+    elif lines:
+        title = lines[0].strip()
+
+    content = output.strip()
+    if title and content.startswith("# " + title):
+        content = content[len(title) + 2:].strip()
+
+    if not content or len(content) < 50:
+        raise RuntimeError(f"defuddle produced short content ({len(content)} chars)")
+
+    return SourceDoc(title=title or url, content=content, url=url)
+
+
+def _is_youtube_url(url: str) -> bool:
+    """Check if URL is a YouTube video page."""
+    try:
+        from urllib.parse import urlparse
+        host = urlparse(url).hostname or ""
+        return host in (
+            "youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be"
+        )
+    except Exception:
+        return False
+
+
+def _is_ssrn_url(url: str) -> bool:
+    """Check if URL is a SSRN paper page."""
+    try:
+        from urllib.parse import urlparse
+        host = urlparse(url).hostname or ""
+        return "ssrn.com" in host
+    except Exception:
+        return False
+
+
+def _is_journal_xml_url(url: str) -> bool:
+    """Check if URL is a journal XML article URL."""
+    return url.endswith(".xml") or "/article-" in url
 
 
 def _extract_trafilatura(url: str, timeout: int) -> SourceDoc:

@@ -1,70 +1,49 @@
-"""Shared proxy transport — routes all HTTP fetchers through the configured proxy.
+"""Proxy / SOCKS support for httpx clients.
 
-Reads from environment variables in this priority order:
-  1. ``OLW_PROXY`` (explicit pipeline override)
-  2. ``HTTPS_PROXY`` / ``https_proxy`` (ambient SOCKS/HTTP proxy)
-  3. ``HTTP_PROXY`` / ``http_proxy``
+Routes HTTP requests through a residential proxy when RESIDENTIAL_PROXY_URL is set.
+Supports:
+  - SOCKS5 (socks5h://) — DNS resolved on the proxy side (ideal for bypassing geo-blocks)
+  - HTTP proxy (http://)
+  - HTTPS proxy (https://)
 
-Returns a proxy URL string (e.g. ``socks5h://172.24.0.2:1080``) or ``None``
-if no proxy is configured.
+Tailscale exit node: use socks5h://<tailscale-ip>:1080
+Residential proxy: use the proxy URL provided by your proxy service.
 
-All httpx clients in the pipeline should use ``make_client()`` to get a
-proxy-aware client with browser headers. yt-dlp uses ``ytdlp_proxy_arg()``.
+Usage in httpx.Client kwargs:
+    from obsidian_llm_wiki.ingest.proxy import make_client_kwargs
+    with httpx.Client(**make_client_kwargs()) as client:
+        resp = client.get(url)
 """
 
 from __future__ import annotations
 
 import os
+from typing import Any
 
-from obsidian_llm_wiki.ingest.http_headers import BROWSER_HEADERS
-
-__all__ = [
-    "get_proxy_url",
-    "make_client_kwargs",
-    "ytdlp_proxy_arg",
-]
-
-# Cache the resolved proxy so we don't re-read env on every call.
-_cached_proxy: str | None | bool = False  # False = not yet resolved
+__all__ = ["make_client_kwargs"]
 
 
-def get_proxy_url() -> str | None:
-    """Return the proxy URL from environment, or None if no proxy is set.
+def make_client_kwargs(**kwargs: Any) -> dict[str, Any]:
+    """Return httpx.Client kwargs including proxy configuration.
 
-    Priority: OLW_PROXY > HTTPS_PROXY > https_proxy > HTTP_PROXY > http_proxy.
-    """
-    global _cached_proxy
-    if _cached_proxy is not False:
-        return _cached_proxy if isinstance(_cached_proxy, str) else None
-
-    proxy = (
-        os.getenv("OLW_PROXY")
-        or os.getenv("HTTPS_PROXY")
-        or os.getenv("https_proxy")
-        or os.getenv("HTTP_PROXY")
-        or os.getenv("http_proxy")
-    )
-    _cached_proxy = proxy or None
-    return _cached_proxy if isinstance(_cached_proxy, str) else None
-
-
-def make_client_kwargs(**overrides) -> dict:
-    """Build httpx.Client kwargs with proxy + browser headers.
+    Reads RESIDENTIAL_PROXY_URL from the environment.
+    Returns a dict suitable for unpacking into httpx.Client(**make_client_kwargs()).
 
     Usage::
 
-        kwargs = make_client_kwargs(timeout=45, follow_redirects=True)
-        with httpx.Client(**kwargs) as client:
+        from obsidian_llm_wiki.ingest.proxy import make_client_kwargs
+        with httpx.Client(**make_client_kwargs(timeout=30)) as client:
             resp = client.get(url)
     """
-    kwargs: dict = {"headers": dict(BROWSER_HEADERS)}
-    proxy = get_proxy_url()
-    if proxy:
-        kwargs["proxy"] = proxy
-    kwargs.update(overrides)
-    return kwargs
+    proxy_url = os.environ.get("RESIDENTIAL_PROXY_URL", "").strip() or None
 
+    opts: dict[str, Any] = dict(kwargs)
 
-def ytdlp_proxy_arg() -> str | None:
-    """Return the proxy URL for yt-dlp's --proxy option, or None."""
-    return get_proxy_url()
+    if proxy_url:
+        try:
+            from httpx import URL, Proxy
+            opts["proxy"] = Proxy(url=URL(proxy_url))
+        except Exception:
+            opts["proxies"] = proxy_url
+
+    return opts

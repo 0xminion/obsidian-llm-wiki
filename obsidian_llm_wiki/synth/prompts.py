@@ -85,11 +85,11 @@ def build_synthesis_prompt(
         source_title: Title of the source document.
         source_content: Full text content of the source.
         existing_concepts: Slugs of already-known concepts (for dedup).
-        language: Preferred output language (empty = auto-detect).
+        language: ISO 639-1 language code — controls the language instruction
+            injected into the prompt. If empty, auto-detected by detect_language().
 
     Returns:
-        The complete system prompt string.  The user message should be a
-        simple instruction like "Synthesise the source document above."
+        The complete system prompt string.
     """
     existing_str = (
         "\n".join(f"  - {s}" for s in existing_concepts)
@@ -99,9 +99,20 @@ def build_synthesis_prompt(
 
     schema_json = json.dumps(SYNTHESIS_SCHEMA, indent=2, ensure_ascii=False)
 
+    # Language instruction
     lang_instruction = ""
     if language:
-        lang_instruction = f"\nWrite all summaries and content in **{language}**."
+        from obsidian_llm_wiki.synth.language import get_language_instruction
+        li = get_language_instruction(language)
+        if li:
+            lang_instruction = f"\n{li}"
+
+    # Key findings instruction — surface ALL, no cap
+    findings_instruction = (
+        "\n* Surface ALL key findings — do not limit to 5. Include every "
+        "substantive claim, data point, and insight in the source. "
+        "It is better to surface more than fewer."
+    )
 
     return f"""You are a knowledge synthesis engine.  Analyse the source document \
 and produce a structured JSON synthesis.
@@ -124,7 +135,8 @@ Only create a MOC if 2+ concepts share a theme.
 * Review the existing concept index below to avoid duplicates.  Set \
 "is_new" to false for concepts that already exist.
 * Surface ALL available insights — do not produce stubs or shallow summaries.
-* Claims should be specific, evidence-backed statements from the source.{lang_instruction}
+* Claims should be specific, evidence-backed statements from the source.
+{findings_instruction}{lang_instruction}
 
 --- EXISTING CONCEPT INDEX ---
 {existing_str}

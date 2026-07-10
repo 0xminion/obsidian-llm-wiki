@@ -264,10 +264,21 @@ async def _synthesize_source(
     Dispatches to the two-pass quality synthesis when
     ``config.synthesis_mode == "two_pass"``; otherwise uses the default
     single-pass synthesis.
+
+    Language is always detected from source content (not config.output_language)
+    so that Chinese sources stay Chinese, English stays English, etc.
     """
+    # Detect language once — used by both single and two-pass paths
+    source_lang = _detect_source_language(source.content, filename)
+
     if config.synthesis_mode == "two_pass":
         from obsidian_llm_wiki.synth.quality import quality_synthesize_source
-        return await quality_synthesize_source(config, filename, source, existing_concepts)
+        synth = await quality_synthesize_source(
+            config, filename, source, existing_concepts,
+        )
+        if synth is not None and source_lang and not synth.language:
+            synth.language = source_lang
+        return synth
 
     from obsidian_llm_wiki.providers.llm import acall_llm
 
@@ -275,7 +286,7 @@ async def _synthesize_source(
         source.title,
         source.content,
         existing_concepts=existing_concepts,
-        language=config.output_language,
+        language=source_lang,
     )
 
     messages = [{"role": "user", "content": "Synthesise the source document above."}]
@@ -296,7 +307,21 @@ async def _synthesize_source(
         synthesis.source_title = source.title
     synthesis.source_file = filename
 
+    if source_lang and not synthesis.language:
+        synthesis.language = source_lang
+
     return synthesis
+
+
+def _detect_source_language(content: str, filename: str) -> str:
+    """Detect the primary language of source content."""
+    try:
+        from obsidian_llm_wiki.synth.language import detect_language
+        lang = detect_language(content)
+        logger.debug("Detected language '%s' for '%s'", lang, filename)
+        return lang
+    except Exception:
+        return ""
 
 
 def _existing_concept_slugs(
