@@ -114,24 +114,21 @@ def test_extract_youtube_url_routes_to_youtube_extractor():
 
 
 def test_extract_youtube_url_raises_when_no_api_key():
-    """YouTube extractor raises RuntimeError when TRANSCRIPT_API_KEY is not set.
-
-    Tests the extractor function in isolation with a mocked env var,
-    bypassing the test subprocess environment inheritance issue.
-    """
+    """YouTube extractor raises RuntimeError when SUPADATA_API_KEY is not set."""
+    import os
     from obsidian_llm_wiki.ingest.extractors import youtube as yt_mod
 
     # Save and nullify the env var
-    original_key = os.environ.get("TRANSCRIPT_API_KEY")
-    os.environ.pop("TRANSCRIPT_API_KEY", None)
+    original_key = os.environ.get("SUPADATA_API_KEY")
+    os.environ.pop("SUPADATA_API_KEY", None)
     try:
         yt_mod.extract_youtube_video("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
         pytest.fail("Expected RuntimeError but extract_youtube_video succeeded")
     except RuntimeError as exc:
-        assert "TRANSCRIPT_API_KEY" in str(exc)
+        assert "SUPADATA_API_KEY" in str(exc)
     finally:
         if original_key is not None:
-            os.environ["TRANSCRIPT_API_KEY"] = original_key
+            os.environ["SUPADATA_API_KEY"] = original_key
 
 
 # ── Video ID extraction ─────────────────────────────────────────────────────

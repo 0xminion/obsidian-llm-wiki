@@ -1,15 +1,22 @@
-"""YouTube transcript extraction via TranscriptAPI.com.
+"""YouTube/media transcript extraction via Supadata API.
 
-TranscriptAPI provides reliable, credit-based YouTube transcript extraction.
-API docs: https://transcriptapi.com/docs/api
-Endpoint: GET https://transcriptapi.com/api/v2/youtube/transcript
-Auth: x-api-key header with the user's API key.
+Supadata provides transcript extraction for YouTube, TikTok, Instagram,
+X (Twitter), Facebook, and public video files. It can fetch existing
+transcripts (mode=native) or generate them with AI (mode=auto/generate).
+
+API docs: https://docs.supadata.ai/get-transcript
+Endpoint: GET https://api.supadata.ai/v1/transcript
+Auth: x-api-key header
+Pricing: 1 native transcript = 1 credit, 1 generated minute = 2 credits
+
+The API supports async job processing for long videos (HTTP 202 + job ID polling).
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import time
 
 import httpx
 
@@ -22,17 +29,14 @@ logger = logging.getLogger("obswiki.ingest.youtube")
 
 __all__ = ["extract_youtube_video"]
 
-_TRANSCRIPT_API_BASE = "https://transcriptapi.com"
-_TRANSCRIPT_API_VERSION = "v2"
+_SUPADATA_API_BASE = "https://api.supadata.ai/v1"
+_POLL_INTERVAL = 3  # seconds between job status checks
+_POLL_MAX_ATTEMPTS = 40  # ~2 minutes max polling
 
 
 def _get_api_key() -> str | None:
-    """Read the TranscriptAPI key from env at call time, not import time.
-
-    The .env file is loaded by the CLI after module import, so a module-level
-    read would miss it. This function reads the env var on each call.
-    """
-    return os.environ.get("TRANSCRIPT_API_KEY", "").strip() or None
+    """Read the Supadata API key from env at call time (not import time)."""
+    return os.environ.get("SUPADATA_API_KEY", "").strip() or None
 
 
 def _video_id(url: str) -> str | None:
@@ -53,115 +57,54 @@ def _video_id(url: str) -> str | None:
     return None
 
 
+def _is_supported_media_url(url: str) -> bool:
+    """Check if URL is a supported media platform for Supadata."""
+    try:
+        from urllib.parse import urlparse
+        host = urlparse(url).hostname or ""
+        return any(h in host for h in (
+            "youtube.com", "youtu.be", "tiktok.com",
+            "instagram.com", "x.com", "twitter.com",
+            "facebook.com", "fb.watch",
+        ))
+    except Exception:
+        return False
+
+
 @register_extractor(lambda parsed, raw: raw.startswith("http") and bool(_video_id(raw)))
 def extract_youtube_video(raw_url: str) -> SourceDoc:
-    """Extract transcript from a YouTube video via TranscriptAPI.com.
+    """Extract transcript from a YouTube video via Supadata API.
 
     Strategy:
-      1. TranscriptAPI.com v2 API (requires API key in TRANSCRIPT_API_KEY env var)
-      2. Fail with clear message if no API key is set
-
-    This replaces the previous yt-dlp-based extractor as the primary path.
-    yt-dlp remains available as a fallback if TranscriptAPI fails.
+      1. Supadata API (mode=auto — try native transcript, fallback to AI generation)
+      2. Invidious API (metadata + description fallback)
+      3. oEmbed metadata (title + channel only, last resort)
 
     Raises:
-        RuntimeError: If TRANSCRIPT_API_KEY is not set or API call fails.
+        RuntimeError: If SUPADATA_API_KEY is not set or all methods fail.
     """
     api_key = _get_api_key()
     if not api_key:
         raise RuntimeError(
-            "TRANSCRIPT_API_KEY not set — set it in your .env or environment. "
-            "Get your key at https://transcriptapi.com"
+            "SUPADATA_API_KEY not set — set it in your .env or environment. "
+            "Get your key at https://dash.supadata.ai/organizations/api-key"
         )
-
-    video_id = _video_id(raw_url)
-    if not video_id:
-        raise RuntimeError(f"Could not extract YouTube video ID from: {raw_url}")
-
-    api_url = (
-        f"{_TRANSCRIPT_API_BASE}/api/{_TRANSCRIPT_API_VERSION}/youtube/transcript"
-        f"?videoId={video_id}&languages=en"
-    )
 
     errors: list[str] = []
 
-    # Try transcript API
+    # ── Primary: Supadata API ────────────────────────────────────────
     try:
-        with httpx.Client(
-            **make_client_kwargs(timeout=DEFAULT_TIMEOUT, follow_redirects=True),
-        ) as client:
-            resp = client.get(
-                api_url,
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Accept": "application/json",
-                    "User-Agent": "obsidian-llm-wiki/3.0",
-                },
+        source = _supadata_transcript(raw_url, api_key)
+        if source:
+            logger.info(
+                "Supadata: extracted %d chars for %s",
+                len(source.content), raw_url,
             )
-
-        if resp.status_code == 401 or resp.status_code == 403:
-            # Distinguish auth failure from billing/plan issues
-            try:
-                body = resp.json()
-                detail = body.get("detail", {})
-                if isinstance(detail, dict):
-                    reason = detail.get("reason", "")
-                    message = detail.get("message", "")
-                    if reason == "no_active_paid_plan":
-                        raise RuntimeError(
-                            f"TranscriptAPI: no active paid plan ({message}). "
-                            "Upgrade at https://transcriptapi.com/billing"
-                        )
-                    if message:
-                        raise RuntimeError(
-                            f"TranscriptAPI auth failed ({resp.status_code}): {message}"
-                        )
-            except (ValueError, KeyError):
-                pass
-            raise RuntimeError(
-                f"TranscriptAPI authentication failed ({resp.status_code}) — "
-                "check your TRANSCRIPT_API_KEY at https://transcriptapi.com"
-            )
-        if resp.status_code == 404:
-            raise RuntimeError(
-                f"No transcript available for video {video_id} on TranscriptAPI"
-            )
-        resp.raise_for_status()
-        data = resp.json()
-
-        # Parse TranscriptAPI response shape
-        # Returns: {"transcript": [{"text": "...", "start": 0.0, "duration": 5.12}, ...]}
-        transcript_segments = data.get("transcript", [])
-        if isinstance(transcript_segments, dict):
-            transcript_segments = transcript_segments.get("transcript", [])
-        if not transcript_segments:
-            raise RuntimeError(f"Empty transcript returned for {video_id}")
-
-        # Build plain text: concatenate all segment text
-        lines: list[str] = []
-        for seg in transcript_segments:
-            text = seg.get("text", "").strip()
-            if text:
-                lines.append(text)
-
-        content = " ".join(lines)
-        title = data.get("videoTitle", "") or data.get("title", "") or raw_url
-
-        if not content or len(content) < 200:
-            raise RuntimeError(
-                f"Transcript too short ({len(content)} chars) for {video_id}"
-            )
-
-        logger.info(
-            "TranscriptAPI: extracted %d chars for %s (%s)",
-            len(content), video_id, raw_url,
-        )
-        return SourceDoc(title=title, content=content, url=raw_url)
-
+            return source
     except Exception as exc:
-        errors.append(f"transcript_api: {exc}")
+        errors.append(f"supadata: {exc}")
 
-    # Fallback 1: Invidious API (metadata + description, no transcript)
+    # ── Fallback 1: Invidious API (metadata + description, no transcript) ──
     try:
         from obsidian_llm_wiki.ingest.alt_source import extract_via_invidious
         source = extract_via_invidious(raw_url)
@@ -170,7 +113,7 @@ def extract_youtube_video(raw_url: str) -> SourceDoc:
     except Exception as exc:
         errors.append(f"invidious: {exc}")
 
-    # Fallback 2: oEmbed metadata (title + author only, minimal)
+    # ── Fallback 2: oEmbed metadata (title + author only, minimal) ──
     try:
         source = _extract_oembed(raw_url)
         if source:
@@ -185,14 +128,139 @@ def extract_youtube_video(raw_url: str) -> SourceDoc:
     )
 
 
-def _extract_oembed(youtube_url: str) -> SourceDoc | None:
-    """Fetch video metadata via YouTube oEmbed API (no auth required).
+def _supadata_transcript(url: str, api_key: str) -> SourceDoc | None:
+    """Fetch transcript via Supadata API with async job support.
 
-    Returns title + author + thumbnail description. Minimal content,
-    but better than nothing when all other methods fail.
+    Returns None if no transcript available (not an error — caller falls through).
+    Raises RuntimeError on auth/billing errors.
     """
     from urllib.parse import quote
-    import httpx
+
+    params = {
+        "url": url,
+        "text": "true",  # plain text transcript
+        "mode": "auto",  # try native, fallback to AI generation
+    }
+
+    with httpx.Client(
+        **make_client_kwargs(timeout=DEFAULT_TIMEOUT, follow_redirects=True),
+    ) as client:
+        resp = client.get(
+            f"{_SUPADATA_API_BASE}/transcript",
+            params=params,
+            headers={
+                "x-api-key": api_key,
+                "Accept": "application/json",
+            },
+        )
+
+    # Auth errors
+    if resp.status_code == 401:
+        raise RuntimeError(
+            "Supadata API key invalid — check SUPADATA_API_KEY at "
+            "https://dash.supadata.ai/organizations/api-key"
+        )
+    if resp.status_code == 402:
+        raise RuntimeError(
+            "Supadata: insufficient credits — check your billing at "
+            "https://dash.supadata.ai"
+        )
+    if resp.status_code == 403:
+        raise RuntimeError(
+            "Supadata: video is private/restricted/age-gated"
+        )
+
+    # Async job — poll for results
+    if resp.status_code == 202:
+        job_data = resp.json()
+        job_id = job_data.get("jobId")
+        if not job_id:
+            raise RuntimeError("Supadata returned 202 but no jobId")
+        return _poll_supadata_job(job_id, api_key)
+
+    resp.raise_for_status()
+    data = resp.json()
+
+    # Check for transcript unavailable (206)
+    if resp.status_code == 206:
+        raise RuntimeError(
+            "Supadata: no transcript available for this video"
+        )
+
+    return _parse_supadata_response(data, url)
+
+
+def _poll_supadata_job(job_id: str, api_key: str) -> SourceDoc | None:
+    """Poll Supadata job status until completed or failed."""
+    with httpx.Client(
+        **make_client_kwargs(timeout=30, follow_redirects=True),
+    ) as client:
+        for attempt in range(_POLL_MAX_ATTEMPTS):
+            time.sleep(_POLL_INTERVAL)
+            resp = client.get(
+                f"{_SUPADATA_API_BASE}/transcript/{job_id}",
+                headers={"x-api-key": api_key, "Accept": "application/json"},
+            )
+            if resp.status_code == 404:
+                raise RuntimeError(f"Supadata job {job_id} expired")
+            resp.raise_for_status()
+            data = resp.json()
+            status = data.get("status", "")
+            if status == "completed":
+                result = data.get("result", data)
+                return _parse_supadata_response(result, data.get("url", ""))
+            if status == "failed":
+                error = data.get("error", "unknown error")
+                raise RuntimeError(f"Supadata job {job_id} failed: {error}")
+            # queued or active — keep polling
+            logger.debug("Supadata job %s: %s (attempt %d)", job_id, status, attempt + 1)
+
+    raise RuntimeError(
+        f"Supadata job {job_id} timed out after {_POLL_MAX_ATTEMPTS * _POLL_INTERVAL}s"
+    )
+
+
+def _parse_supadata_response(data: dict, url: str) -> SourceDoc | None:
+    """Parse Supadata transcript response into SourceDoc."""
+    # Response format: {"content": "transcript text...", "lang": "en", ...}
+    # Or for chunked: {"content": [{"text": "...", "start": 0, "duration": 5}, ...]}
+    content_raw = data.get("content", "")
+    lang = data.get("lang", "")
+
+    if isinstance(content_raw, list):
+        # Chunked format — join text segments
+        text = " ".join(
+            seg.get("text", "").strip()
+            for seg in content_raw
+            if seg.get("text")
+        )
+    elif isinstance(content_raw, str):
+        text = content_raw.strip()
+    else:
+        text = ""
+
+    if not text or len(text) < 200:
+        raise RuntimeError(
+            f"Supadata transcript too short ({len(text)} chars) — "
+            "video may have no speech"
+        )
+
+    # Title from response or derive from URL
+    title = data.get("title", "") or ""
+    if not title:
+        vid = _video_id(url)
+        title = f"YouTube video {vid}" if vid else url
+
+    # Add language note if non-English
+    if lang and lang != "en":
+        text = f"[Transcript language: {lang}]\n\n{text}"
+
+    return SourceDoc(title=title, content=text, url=url)
+
+
+def _extract_oembed(youtube_url: str) -> SourceDoc | None:
+    """Fetch video metadata via YouTube oEmbed API (no auth required)."""
+    from urllib.parse import quote
 
     oembed_url = f"https://www.youtube.com/oembed?url={quote(youtube_url, safe='')}&format=json"
     with httpx.Client(timeout=15, follow_redirects=True) as client:
@@ -203,19 +271,14 @@ def _extract_oembed(youtube_url: str) -> SourceDoc | None:
 
     title = data.get("title", "") or youtube_url
     author = data.get("author_name", "") or ""
-    thumbnail = data.get("thumbnail_url", "") or ""
 
     content_parts = [
         f"Title: {title}",
         f"Channel: {author}",
-    ]
-    if thumbnail:
-        content_parts.append(f"Thumbnail: {thumbnail}")
-    content_parts.extend([
         "",
-        "Note: Full transcript unavailable (no active TranscriptAPI plan).",
-        "Only video metadata was extracted. Upgrade at https://transcriptapi.com/billing",
-    ])
+        "Note: Full transcript unavailable (Supadata API key not configured or insufficient credits).",
+        "Only video metadata was extracted.",
+    ]
 
     content = "\n".join(content_parts)
     if len(content) < 100:
