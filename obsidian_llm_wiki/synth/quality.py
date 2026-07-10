@@ -72,7 +72,12 @@ _EXTRACT_SCHEMA: dict[str, Any] = {
         {
             "title": "string — MOC title",
             "slug": "string — slug",
-            "summary": "string — what this MOC covers",
+            "summary": (
+                "string — 3-5 sentences of insightful synthesis. "
+                "Explain the key tension or question, how the concepts "
+                "interact, and why this grouping matters. "
+                "Do NOT write a generic one-liner."
+            ),
             "tags": ["string"],
             "concept_slugs": ["string — slugs grouped under this MOC"],
         }
@@ -106,7 +111,9 @@ Rules:
 * Each concept needs a slug (lowercase, hyphens, no spaces).
 * Each concept needs a rationale explaining why it matters in THIS source.
 * Do NOT write concept body content — just identify and summarise.
-* Create 1-3 MOCs grouping related concepts.
+* Create 1-3 MOCs grouping related concepts. Each MOC summary must be \
+3-5 sentences of insightful synthesis — NOT a generic one-liner. Explain \
+the key tension, how the concepts interact, and why this grouping matters.
 * Tags must be lowercase, 2-4 per concept.{lang_instruction}
 
 --- EXISTING CONCEPT INDEX ---

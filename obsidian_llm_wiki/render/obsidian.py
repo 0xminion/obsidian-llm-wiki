@@ -438,12 +438,19 @@ def render_moc_page(
         for slug in moc.concept_slugs:
             entry = all_concepts.get(slug) if all_concepts else None
             badge = ""
-            if entry and entry.aliases:
-                # Show cross-lingual aliases as language badge
-                zh_alias = next((a for a in entry.aliases if _is_chinese(a)), None)
-                if zh_alias:
-                    badge = f" · {zh_alias}"
-            parts.append(f"- {make_wikilink(slug)}{badge}")
+            definition = ""
+            if entry:
+                if entry.aliases:
+                    # Show cross-lingual aliases as language badge
+                    zh_alias = next(
+                        (a for a in entry.aliases if _is_chinese(a)), None,
+                    )
+                    if zh_alias:
+                        badge = f" · {zh_alias}"
+                # Include brief definition from concept summary
+                if entry.summary:
+                    definition = f" — {entry.summary}"
+            parts.append(f"- {make_wikilink(slug)}{badge}{definition}")
         parts.append("")
 
     # ── 关联图谱 / Cross-References in MoC ──────────────────────────
