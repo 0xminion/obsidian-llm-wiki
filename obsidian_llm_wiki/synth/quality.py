@@ -11,8 +11,13 @@ instead of the default single-shot synthesis:
   (300-500 words minimum) with specific evidence from the source.
 
   **Quality gate:** After expansion, any concept whose total body chars
-  fall below ``config.concept_min_body_chars`` gets ``confidence: 0.3`` and
-  a warning is logged.
+  fall below ``config.concept_min_body_chars`` gets a gradient confidence
+  score (see ``gradient_confidence``) and a warning is logged.
+
+  **Content chunking:** Sources above ``config.chunk_size`` (default 30K chars)
+  are split into chunks. Pass 1 runs on each chunk independently, and the
+  resulting skeletons are merged (union concepts by slug, union MoCs by slug,
+  union key_points) before Pass 2 expansion proceeds on the merged skeleton.
 
 The two-pass mode is opt-in.  The default single-pass mode is unchanged and
 the golden test exercises it.  Two-pass trades latency/cost for depth.
@@ -46,7 +51,166 @@ __all__ = [
     "build_expand_prompt",
     "concept_body_chars",
     "filter_thin_concepts",
+    "gradient_confidence",
+    "chunk_content",
+    "merge_skeletons",
 ]
+
+
+# ── Content chunking ────────────────────────────────────────────────────
+
+
+def chunk_content(content: str, chunk_size: int = 30_000) -> list[str]:
+    """Split content into chunks of approximately ``chunk_size`` chars.
+
+    Splits at paragraph boundaries (double newlines) when possible to avoid
+    cutting mid-sentence. If a single paragraph exceeds chunk_size, it is
+    hard-split at chunk_size boundaries.
+
+    Returns a list of content chunks. If content <= chunk_size, returns a
+    single-element list containing the original content.
+    """
+    if len(content) <= chunk_size:
+        return [content]
+
+    chunks: list[str] = []
+    paragraphs = content.split("\n\n")
+    current: list[str] = []
+    current_len = 0
+
+    for para in paragraphs:
+        para_len = len(para)
+        if current_len + para_len + 2 > chunk_size and current:
+            chunks.append("\n\n".join(current))
+            current = [para]
+            current_len = para_len
+        else:
+            current.append(para)
+            current_len += para_len + 2
+
+    if current:
+        chunks.append("\n\n".join(current))
+
+    # Hard-split any chunk that still exceeds chunk_size (very long paragraphs)
+    final: list[str] = []
+    for chunk in chunks:
+        while len(chunk) > chunk_size:
+            final.append(chunk[:chunk_size])
+            chunk = chunk[chunk_size:]
+        if chunk:
+            final.append(chunk)
+
+    return final
+
+
+def merge_skeletons(skeletons: list[SourceSynthesis]) -> SourceSynthesis:
+    """Merge multiple Pass 1 skeletons into one.
+
+    Unions:
+    - concepts (by slug — first occurrence wins for body fields, tags merged)
+    - maps/MoCs (by slug — concept_slugs unioned)
+    - key_points (concatenated, de-duplicated by string equality)
+    - open_questions (concatenated, de-duplicated)
+    - source_tags (union)
+    """
+    if not skeletons:
+        return SourceSynthesis(source_title="", source_summary="")
+
+    if len(skeletons) == 1:
+        return skeletons[0]
+
+    merged = SourceSynthesis(
+        source_title=skeletons[0].source_title,
+        source_summary=skeletons[0].source_summary,
+        source_file=skeletons[0].source_file,
+        language=skeletons[0].language,
+    )
+
+    # Union source_tags
+    all_tags: set[str] = set()
+    for s in skeletons:
+        all_tags.update(s.source_tags)
+    merged.source_tags = sorted(all_tags)
+
+    # Union key_points (dedup by string equality)
+    seen_points: set[str] = set()
+    for s in skeletons:
+        for kp in s.key_points:
+            if kp not in seen_points:
+                seen_points.add(kp)
+                merged.key_points.append(kp)
+
+    # Union open_questions (dedup)
+    seen_q: set[str] = set()
+    for s in skeletons:
+        for q in s.open_questions:
+            if q not in seen_q:
+                seen_q.add(q)
+                merged.open_questions.append(q)
+
+    # Union concepts by slug — first occurrence wins for body/summary,
+    # but tags are unioned across chunks.
+    concept_by_slug: dict[str, ConceptNote] = {}
+    for s in skeletons:
+        for concept in s.concepts:
+            if concept.slug in concept_by_slug:
+                # Merge tags into existing
+                existing = concept_by_slug[concept.slug]
+                for tag in concept.tags:
+                    if tag not in existing.tags:
+                        existing.tags.append(tag)
+            else:
+                concept_by_slug[concept.slug] = concept
+    merged.concepts = list(concept_by_slug.values())
+
+    # Union MoCs by slug — concept_slugs unioned
+    moc_by_slug: dict[str, MapOfContent] = {}
+    for s in skeletons:
+        for moc in s.maps:
+            if moc.slug in moc_by_slug:
+                existing = moc_by_slug[moc.slug]
+                for slug in moc.concept_slugs:
+                    if slug not in existing.concept_slugs:
+                        existing.concept_slugs.append(slug)
+                for tag in moc.tags:
+                    if tag not in existing.tags:
+                        existing.tags.append(tag)
+            else:
+                moc_by_slug[moc.slug] = moc
+    merged.maps = list(moc_by_slug.values())
+
+    return merged
+
+
+# ── Gradient confidence scoring ─────────────────────────────────────────
+
+
+def gradient_confidence(body_chars: int, concept_min_body_chars: int) -> float:
+    """Compute a gradient confidence score based on body length.
+
+    - If body_chars >= concept_min_body_chars: confidence = 1.0
+    - If body_chars >= concept_min_body_chars * 0.5:
+        confidence = 0.5 + 0.5 * (body_chars / concept_min_body_chars)
+    - If body_chars < concept_min_body_chars * 0.5:
+        confidence = 0.1 + 0.4 * (body_chars / (concept_min_body_chars * 0.5))
+    - Clamped to [0.1, 1.0]
+
+    This replaces the old binary 0.3/1.0 threshold.
+    """
+    if concept_min_body_chars <= 0:
+        return 1.0
+
+    if body_chars >= concept_min_body_chars:
+        return 1.0
+
+    half_threshold = concept_min_body_chars * 0.5
+    if body_chars >= half_threshold:
+        return 0.5 + 0.5 * (body_chars / concept_min_body_chars)
+
+    # body_chars < half_threshold
+    if half_threshold <= 0:
+        return 0.1
+    return 0.1 + 0.4 * (body_chars / half_threshold)
 
 
 # ── Pass 1: Extract concept skeleton ─────────────────────────────────────
@@ -173,6 +337,8 @@ def build_expand_prompt(
     language: str = "",
 ) -> str:
     """Build the Pass 2 expansion prompt for one concept."""
+    from obsidian_llm_wiki.synth.prompts import RELATIONSHIP_FEWSHOT
+
     schema_json = json.dumps(_EXPAND_SCHEMA, indent=2, ensure_ascii=False)
     concepts_list = "\n".join(
         f"  - {c['slug']}: {c['title']}"
@@ -197,6 +363,8 @@ Rules:
 * Sections must have substantive points OR prose — never both empty.\
 {lang_instruction}
 
+{RELATIONSHIP_FEWSHOT}
+
 --- CONCEPT TO EXPAND ---
 Title: {concept_title}
 Slug: {concept_slug}
@@ -216,6 +384,87 @@ Now produce the JSON expansion for "{concept_title}"."""
 # ── Two-pass orchestrator ──────────────────────────────────────────────────
 
 
+def _diagnose_pass2_failure(
+    exc: BaseException,
+    concept_slug: str,
+    source: SourceDoc,
+    config: Any,
+    *,
+    prompt: str | None = None,
+    response: str | None = None,
+) -> dict[str, Any]:
+    """Capture structured diagnostic info for a Pass 2 synthesis failure.
+
+    Determines the failure type:
+    - timeout: exception is a timeout-related error
+    - empty_response: response was empty or whitespace-only
+    - json_parse_error: response was non-empty but unparseable as JSON
+    - context_window_overflow: prompt length exceeds context_window
+    - exception: other exception with its type and message
+
+    Returns a structured dict suitable for logging and error messages.
+    """
+    diag: dict[str, Any] = {
+        "concept_slug": concept_slug,
+        "source_file": source.source_file or "",
+        "source_title": source.title,
+        "source_content_len": len(source.content),
+    }
+
+    # Check for timeout errors
+    exc_type_name = type(exc).__name__
+    exc_msg = str(exc)
+    is_timeout = (
+        "timeout" in exc_type_name.lower()
+        or "timeout" in exc_msg.lower()
+        or "timed out" in exc_msg.lower()
+    )
+
+    if is_timeout:
+        diag["failure_type"] = "timeout"
+        diag["exception_type"] = exc_type_name
+        diag["reason"] = f"LLM call timed out: {exc_msg}"
+        return diag
+
+    # Check for context window overflow
+    context_window = getattr(getattr(config, "llm", None), "context_window", None)
+    if context_window and prompt:
+        # Rough token estimate: ~4 chars per token
+        est_tokens = len(prompt) // 4
+        if est_tokens > context_window:
+            diag["failure_type"] = "context_window_overflow"
+            diag["estimated_prompt_tokens"] = est_tokens
+            diag["context_window"] = context_window
+            diag["reason"] = (
+                f"Prompt estimated at {est_tokens} tokens exceeds "
+                f"context window of {context_window} tokens"
+            )
+            return diag
+
+    # Check response-based failures (when we have the response)
+    if response is not None:
+        if not response.strip():
+            diag["failure_type"] = "empty_response"
+            diag["reason"] = "LLM returned an empty or whitespace-only response"
+            return diag
+
+        # Try JSON parse to see if that was the issue
+        try:
+            json.loads(response.strip())
+        except (json.JSONDecodeError, ValueError):
+            diag["failure_type"] = "json_parse_error"
+            diag["response_len"] = len(response)
+            diag["response_preview"] = response[:200]
+            diag["reason"] = "Response could not be parsed as JSON"
+            return diag
+
+    # Generic exception fallback
+    diag["failure_type"] = "exception"
+    diag["exception_type"] = exc_type_name
+    diag["reason"] = f"{exc_type_name}: {exc_msg}"
+    return diag
+
+
 async def quality_synthesize_source(
     config: Any,
     filename: str,
@@ -225,7 +474,12 @@ async def quality_synthesize_source(
     """Run the two-pass quality synthesis for one source.
 
     Pass 1: Extract concept skeleton (title, slug, rationale, summary, tags, MOCs).
+        If source content exceeds the chunking threshold (~40K chars), it is
+        split into chunks of ~chunk_size chars each. Each chunk is independently
+        synthesised, and the resulting skeletons are merged.
     Pass 2: For each concept, expand with a focused prompt producing deep sections.
+        Failures are captured with diagnostic info (timeout, empty response,
+        JSON parse error, context window overflow).
 
     Returns a complete SourceSynthesis with expanded concept bodies.
     """
@@ -239,25 +493,106 @@ async def quality_synthesize_source(
     except Exception:
         pass
 
-    # ── Pass 1: Extract skeleton ──────────────────────────────────────
-    extract_prompt = build_extract_prompt(
-        source.title,
-        source.content,
-        existing_concepts=existing_concepts,
-        language=source_lang or config.output_language,
-    )
-    messages = [{"role": "user", "content": "Extract concepts from the source document above."}]
+    # ── Pass 1: Extract skeleton (with chunking) ──────────────────────
+    chunk_size = getattr(config, "chunk_size", 30_000)
+    # Threshold: chunk if content > ~40K chars (~10K tokens)
+    chunk_threshold = 40_000
+    content_len = len(source.content)
 
-    try:
-        response = await acall_llm(extract_prompt, messages, config)
-    except Exception as exc:
-        logger.error("Pass 1 (extract) failed for '%s': %s", filename, exc)
-        raise
+    if content_len > chunk_threshold:
+        chunks = chunk_content(source.content, chunk_size)
+        logger.info(
+            "Source '%s' is %d chars — chunking into %d chunk(s) of ~%d chars",
+            filename, content_len, len(chunks), chunk_size,
+        )
 
-    skeleton = parse_single_source_synthesis(response)
-    if skeleton is None:
-        logger.warning("Pass 1 produced no parseable JSON for '%s'", filename)
-        return None
+        # Run Pass 1 on each chunk concurrently
+        sem = asyncio.Semaphore(config.compile_concurrency)
+
+        async def _extract_chunk(chunk_content: str) -> str | None:
+            async with sem:
+                prompt = build_extract_prompt(
+                    source.title,
+                    chunk_content,
+                    existing_concepts=existing_concepts,
+                    language=source_lang or config.output_language,
+                )
+                msgs = [
+                    {"role": "user", "content": "Extract concepts from the source document above."}
+                ]
+                try:
+                    return await acall_llm(prompt, msgs, config)
+                except Exception as exc:
+                    logger.error("Pass 1 chunk failed for '%s': %s", filename, exc)
+                    return None
+
+        chunk_responses = await asyncio.gather(
+            *[_extract_chunk(c) for c in chunks],
+            return_exceptions=False,
+        )
+
+        # Parse each chunk's response into a skeleton
+        skeletons: list[SourceSynthesis] = []
+        all_rationales: dict[str, str] = {}
+        for chunk_resp in chunk_responses:
+            if chunk_resp is None:
+                continue
+            chunk_skeleton = parse_single_source_synthesis(chunk_resp)
+            if chunk_skeleton is not None:
+                skeletons.append(chunk_skeleton)
+                # Extract rationales from each chunk's JSON
+                try:
+                    from obsidian_llm_wiki.synth.parser import _extract_json
+                    raw_data = _extract_json(chunk_resp)
+                    if isinstance(raw_data, dict):
+                        for c in raw_data.get("concepts", []):
+                            if isinstance(c, dict) and c.get("slug"):
+                                rat = c.get("rationale", "")
+                                if rat:
+                                    all_rationales[c["slug"]] = rat
+                except Exception:
+                    pass
+
+        if not skeletons:
+            logger.warning("Pass 1 produced no parseable skeletons for '%s'", filename)
+            return None
+
+        skeleton = merge_skeletons(skeletons)
+        rationales = all_rationales
+    else:
+        # Single-chunk path (original logic)
+        extract_prompt = build_extract_prompt(
+            source.title,
+            source.content,
+            existing_concepts=existing_concepts,
+            language=source_lang or config.output_language,
+        )
+        messages = [{"role": "user", "content": "Extract concepts from the source document above."}]
+
+        try:
+            response = await acall_llm(extract_prompt, messages, config)
+        except Exception as exc:
+            logger.error("Pass 1 (extract) failed for '%s': %s", filename, exc)
+            raise
+
+        skeleton = parse_single_source_synthesis(response)
+        if skeleton is None:
+            logger.warning("Pass 1 produced no parseable JSON for '%s'", filename)
+            return None
+
+        # Extract rationales from Pass 1 JSON
+        rationales: dict[str, str] = {}
+        try:
+            from obsidian_llm_wiki.synth.parser import _extract_json
+            raw_data = _extract_json(response)
+            if isinstance(raw_data, dict):
+                for c in raw_data.get("concepts", []):
+                    if isinstance(c, dict) and c.get("slug"):
+                        rat = c.get("rationale", "")
+                        if rat:
+                            rationales[c["slug"]] = rat
+        except Exception:
+            pass
 
     if not skeleton.source_title:
         skeleton.source_title = source.title
@@ -266,23 +601,6 @@ async def quality_synthesize_source(
     if not skeleton.concepts:
         logger.warning("Pass 1 extracted no concepts for '%s'", filename)
         return skeleton
-
-    # Extract rationale from Pass 1 JSON (separate from summary).
-    # The Pass 1 schema has both 'rationale' (why this concept matters)
-    # and 'summary' (1-2 sentence summary). We store rationales by slug
-    # so Pass 2 can use the richer rationale instead of the short summary.
-    rationales: dict[str, str] = {}
-    try:
-        from obsidian_llm_wiki.synth.parser import _extract_json
-        raw_data = _extract_json(response)
-        if isinstance(raw_data, dict):
-            for c in raw_data.get("concepts", []):
-                if isinstance(c, dict) and c.get("slug"):
-                    rat = c.get("rationale", "")
-                    if rat:
-                        rationales[c["slug"]] = rat
-    except Exception:
-        pass
 
     logger.info(
         "Pass 1 done for '%s': %d concepts extracted",
@@ -314,23 +632,41 @@ async def quality_synthesize_source(
     )
 
     # ── Merge expanded concepts back into skeleton ─────────────────────
+    # Track diagnostic info for failures
+    diagnostics: list[dict[str, Any]] = []
+
     for i, result in enumerate(expand_results):
         original = skeleton.concepts[i]
 
         if isinstance(result, BaseException):
-            logger.warning(
-                "Pass 2 (expand) failed for '%s' concept '%s': %s",
-                filename, original.slug, result,
+            diag = _diagnose_pass2_failure(
+                result, original.slug, source, config,
+                prompt=None, response=None,
             )
-            original.confidence = 0.3
+            diagnostics.append(diag)
+            logger.warning(
+                "Pass 2 (expand) failed for '%s' concept '%s': %s — diagnostic: %s",
+                filename, original.slug, result, diag,
+            )
+            original.confidence = gradient_confidence(
+                _concept_body_chars(original), config.concept_min_body_chars,
+            )
             continue
 
         if result is None:
+            diag: dict[str, Any] = {
+                "concept_slug": original.slug,
+                "failure_type": "empty_response",
+                "reason": "Pass 2 LLM call returned None (no parseable JSON in response)",
+            }
+            diagnostics.append(diag)
             logger.warning(
-                "Pass 2 produced no output for '%s' concept '%s'",
-                filename, original.slug,
+                "Pass 2 produced no output for '%s' concept '%s' — diagnostic: %s",
+                filename, original.slug, diag,
             )
-            original.confidence = 0.3
+            original.confidence = gradient_confidence(
+                _concept_body_chars(original), config.concept_min_body_chars,
+            )
             continue
 
         # Replace skeleton concept with expanded version.
@@ -342,22 +678,32 @@ async def quality_synthesize_source(
 
         skeleton.concepts[i] = expanded
 
-    # ── Post-loop quality sweep ────────────────────────────────────────
+    # ── Post-loop quality sweep with gradient confidence ───────────────
     # Catch both failed expansions (empty skeleton) and thin successful
-    # expansions in one pass. Don't clobber already-lowered confidence.
+    # expansions. Use gradient confidence instead of binary 0.3.
     for concept in skeleton.concepts:
         body = _concept_body_chars(concept)
         if body < config.concept_min_body_chars and concept.confidence >= 1.0:
-            concept.confidence = 0.3
+            concept.confidence = gradient_confidence(
+                body, config.concept_min_body_chars,
+            )
             logger.warning(
-                "Concept '%s' body is %d chars (threshold %d) — confidence set to 0.3",
+                "Concept '%s' body is %d chars (threshold %d) — "
+                "gradient confidence set to %.3f",
                 concept.slug, body, config.concept_min_body_chars,
+                concept.confidence,
             )
 
-    logger.info(
-        "Pass 2 done for '%s': %d concepts expanded",
-        filename, len(skeleton.concepts),
-    )
+    if diagnostics:
+        logger.info(
+            "Pass 2 done for '%s': %d concepts expanded, %d failure(s) with diagnostics: %s",
+            filename, len(skeleton.concepts), len(diagnostics), diagnostics,
+        )
+    else:
+        logger.info(
+            "Pass 2 done for '%s': %d concepts expanded",
+            filename, len(skeleton.concepts),
+        )
     return skeleton
 
 

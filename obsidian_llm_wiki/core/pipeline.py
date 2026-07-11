@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -35,6 +36,7 @@ from obsidian_llm_wiki.core.cache import (
     save_synthesis,
 )
 from obsidian_llm_wiki.core.lock import acquire_lock, release_lock
+from obsidian_llm_wiki.core.metrics import MetricsCollector
 from obsidian_llm_wiki.core.models import (
     CompileResult,
     SourceDoc,
@@ -55,6 +57,10 @@ from obsidian_llm_wiki.synth.parser import parse_single_source_synthesis
 from obsidian_llm_wiki.synth.prompts import build_synthesis_prompt
 
 logger = logging.getLogger("obswiki.core.pipeline")
+
+# ── Retry truncation levels ────────────────────────────────────────────────
+# When a source fails synthesis, progressively truncate content and retry.
+_TRUNCATION_LEVELS = [None, 50_000, 20_000]  # full → 50K → 20K
 
 
 async def run_pipeline(
@@ -90,6 +96,10 @@ async def run_pipeline(
     if not acquire_lock(config.lock_file):
         result.errors.append("lock: another compilation is running")
         return result
+
+    # ── Initialise metrics collector ──────────────────────────────────
+    metrics = MetricsCollector(vault)
+    metrics.start_run()
 
     try:
         # ── Read state ─────────────────────────────────────────────────
@@ -131,8 +141,11 @@ async def run_pipeline(
                 continue
             if content_len > config.max_source_chars:
                 logger.warning(
-                    "Source '%s' is %d chars — truncating to %d",
+                    "Source '%s' is %d chars — exceeds max_source_chars (%d), "
+                    "truncating to safety cap. Sources above chunk_size (%d) "
+                    "will be chunked during two-pass synthesis.",
                     filename, content_len, config.max_source_chars,
+                    config.chunk_size,
                 )
                 source = SourceDoc(
                     title=source.title,
@@ -168,13 +181,15 @@ async def run_pipeline(
             # ── Build existing concept index for dedup context ─────────
             existing_concepts = _existing_concept_slugs(state, all_syntheses_by_file)
 
-            # ── Synthesise: one LLM call per changed source ─────────────
+            # ── Synthesise with truncation-based retry ──────────────────
+            # Each source is tried at full content, then 50K, then 20K.
             sem = asyncio.Semaphore(config.compile_concurrency)
 
             async def _synth_one(filename: str, source: SourceDoc):
                 async with sem:
-                    return await _synthesize_source(
-                        config, filename, source, existing_concepts
+                    return await _synthesize_with_retry(
+                        config, filename, source, existing_concepts,
+                        metrics,
                     )
 
             synth_results = await asyncio.gather(
@@ -189,10 +204,25 @@ async def run_pipeline(
                 if isinstance(res, BaseException):
                     logger.error("Synthesis failed for '%s': %s", filename, res)
                     result.errors.append(f"synth:{filename}:{res}")
+                    if metrics:
+                        metrics.record_synthesis(
+                            source_file=filename,
+                            success=False,
+                            error_type=type(res).__name__,
+                        )
                     continue
                 if res is None:
-                    logger.warning("Synthesis produced no output for '%s'", filename)
-                    result.errors.append(f"synth:{filename}: no output")
+                    logger.warning(
+                        "Synthesis produced no output for '%s' "
+                        "(tried all truncation levels)", filename,
+                    )
+                    result.errors.append(f"synth:{filename}: no output (permanent failure)")
+                    if metrics:
+                        metrics.record_synthesis(
+                            source_file=filename,
+                            success=False,
+                            error_type="no_output_all_truncation_levels",
+                        )
                     continue
                 all_syntheses_by_file[filename] = res
                 save_synthesis(res, config.llmwiki_dir, filename)
@@ -231,9 +261,20 @@ async def run_pipeline(
             f: sources.get(f) or _source_from_synthesis(all_syntheses_by_file[f])
             for f in all_syntheses_by_file
         }
+        render_start = time.monotonic()
         written = render_vault(bundle_dir, bundle, all_sources_for_render)
         result.pages.extend(written)
         result.concepts = bundle.concepts
+
+        # ── Record rendering metrics ───────────────────────────────────
+        render_time = time.monotonic() - render_start
+        metrics.record_rendering(
+            concepts_rendered=len(bundle.concepts),
+            mocs_rendered=len(bundle.maps),
+            cross_lingual_links=0,  # populated by embedding pass if enabled
+            backlinks_added=0,  # approximate: not separately tracked yet
+            time_seconds=render_time,
+        )
 
         # ── Update state for compiled sources ─────────────────────────
         compiled_at = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -258,6 +299,9 @@ async def run_pipeline(
         return result
 
     finally:
+        # ── Persist metrics ─────────────────────────────────────────────
+        metrics.finish_run()
+        metrics.save()
         release_lock(config.lock_file)
 
 
@@ -319,6 +363,189 @@ async def _synthesize_source(
         synthesis.language = source_lang
 
     return synthesis
+
+
+async def _synthesize_with_retry(
+    config: Config,
+    filename: str,
+    source: SourceDoc,
+    existing_concepts: list[str],
+    metrics: MetricsCollector | None = None,
+) -> SourceSynthesis | None:
+    """Synthesize a source with progressive content truncation on failure.
+
+    Tries (in order):
+      1. Full content
+      2. Content truncated to 50K chars
+      3. Content truncated to 20K chars
+
+    If all attempts fail, logs as permanently failed and returns None.
+    Records each attempt via the metrics collector if provided.
+    """
+    for level_idx, truncation_chars in enumerate(_TRUNCATION_LEVELS):
+        if truncation_chars is not None and len(source.content) > truncation_chars:
+            truncated_source = SourceDoc(
+                title=source.title,
+                content=source.content[:truncation_chars],
+                url=source.url,
+                source_file=filename,
+            )
+            level_label = f"{truncation_chars // 1000}K"
+        else:
+            truncated_source = source
+            level_label = "full"
+
+        if level_idx > 0:
+            logger.info(
+                "Retrying '%s' with truncated content (%s chars, level %d)",
+                filename, level_label, level_idx,
+            )
+
+        synth_start = time.monotonic()
+        try:
+            synth = await _synthesize_source(
+                config, filename, truncated_source, existing_concepts,
+            )
+        except Exception as exc:
+            synth_time = time.monotonic() - synth_start
+            logger.error(
+                "Synthesis attempt %d failed for '%s' (%s): %s",
+                level_idx + 1, filename, level_label, exc,
+            )
+            if metrics:
+                metrics.record_synthesis(
+                    source_file=filename,
+                    pass1_time=synth_time,
+                    success=False,
+                    error_type=type(exc).__name__,
+                )
+            if level_idx < len(_TRUNCATION_LEVELS) - 1:
+                continue
+            # Last level — re-raise so the caller handles it as a failure
+            raise
+
+        synth_time = time.monotonic() - synth_start
+
+        if synth is not None:
+            if metrics:
+                metrics.record_synthesis(
+                    source_file=filename,
+                    pass1_time=synth_time,
+                    concepts_extracted=len(synth.concepts),
+                    success=True,
+                )
+            return synth
+
+        # synth is None — no output, try next truncation level
+        if metrics:
+            metrics.record_synthesis(
+                source_file=filename,
+                pass1_time=synth_time,
+                success=False,
+                error_type="no_output",
+            )
+        logger.warning(
+            "Synthesis produced no output for '%s' at level %d (%s)",
+            filename, level_idx + 1, level_label,
+        )
+
+    # All truncation levels exhausted — permanent failure
+    logger.error(
+        "Permanent synthesis failure for '%s': all %d truncation levels exhausted. "
+        "Content length: %d chars.",
+        filename, len(_TRUNCATION_LEVELS), len(source.content),
+    )
+    return None
+
+
+async def recompile_single_source(
+    vault_path: str | Path,
+    source_file: str,
+    config: Config | None = None,
+) -> CompileResult:
+    """Manually retry a single failed source file.
+
+    Loads the source from the vault's sources/ directory, runs synthesis
+    with truncation-based retry, and caches the result.
+
+    Args:
+        vault_path: Path to the Obsidian vault root.
+        source_file: The source filename (e.g. "my-article.md").
+        config: Pipeline config (loaded from vault_path/.env if None).
+
+    Returns:
+        CompileResult with the compilation outcome.
+    """
+    vault = Path(vault_path).resolve()
+    result = CompileResult()
+
+    if config is None:
+        env_file = str(vault / ".env") if (vault / ".env").exists() else None
+        config = load_config(env_file=env_file, VAULT_PATH=str(vault))
+
+    bundle_dir = config.wiki_dir
+    bundle_dir.mkdir(parents=True, exist_ok=True)
+
+    # Load the single source file
+    source_path = config.sources_dir / source_file
+    if not source_path.exists():
+        result.errors.append(f"Source file not found: {source_path}")
+        return result
+
+    content = source_path.read_text(encoding="utf-8")
+    title = source_path.stem
+    source = SourceDoc(title=title, content=content, url=str(source_path), source_file=source_file)
+
+    if len(content) < config.min_source_chars:
+        result.errors.append(
+            f"source:{source_file}: too short ({len(content)} < "
+            f"{config.min_source_chars} chars)"
+        )
+        return result
+
+    # Acquire lock
+    if not acquire_lock(config.lock_file):
+        result.errors.append("lock: another compilation is running")
+        return result
+
+    metrics = MetricsCollector(vault)
+    metrics.start_run()
+
+    try:
+        state = read_state(config.state_file)
+        existing_concepts = _existing_concept_slugs(state)
+
+        synth = await _synthesize_with_retry(
+            config, source_file, source, existing_concepts, metrics,
+        )
+
+        if synth is None:
+            result.errors.append(f"synth:{source_file}: permanent failure (all truncation levels)")
+            return result
+
+        save_synthesis(synth, config.llmwiki_dir, source_file)
+        result.compiled += 1
+        result.concepts = synth.concepts
+
+        compiled_at = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+        update_source_state(
+            state, source_file,
+            hash_content(source.content),
+            [c.slug for c in synth.concepts],
+            compiled_at,
+        )
+        write_state(config.state_file, state)
+
+        logger.info(
+            "Recompiled '%s': %d concepts extracted",
+            source_file, len(synth.concepts),
+        )
+        return result
+
+    finally:
+        metrics.finish_run()
+        metrics.save()
+        release_lock(config.lock_file)
 
 
 def _detect_source_language(content: str, filename: str) -> str:

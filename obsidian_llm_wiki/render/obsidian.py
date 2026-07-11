@@ -875,6 +875,22 @@ def render_vault(
     from obsidian_llm_wiki.synth.dedupe import propagate_backlinks
     propagate_backlinks(bundle)
 
+    # ── Semantic concept dedup ───────────────────────────────────────
+    # Merge same-language concepts with high embedding similarity.
+    try:
+        from obsidian_llm_wiki.synth.dedupe import semantic_dedupe_concepts
+        semantic_dedupe_concepts(bundle)
+    except Exception as exc:
+        logger.debug("Semantic dedup skipped: %s", exc)
+
+    # ── Embedding-based MoC assignment for orphans ───────────────────
+    # Assign concepts not in any MoC to the most semantically similar MoC.
+    try:
+        from obsidian_llm_wiki.synth.dedupe import assign_orphans_to_mocs
+        assign_orphans_to_mocs(bundle)
+    except Exception as exc:
+        logger.debug("MoC orphan assignment skipped: %s", exc)
+
     # Make the language policy deterministic. The synthesis prompt asks Chinese
     # sources to use English-first bilingual titles, but smaller/local models do
     # not always comply. Rendering is the last safe choke point before filenames
@@ -1001,5 +1017,17 @@ def render_vault(
     bundle_idx_path = bundle_dir / "index.md"
     atomic_write(bundle_idx_path, bundle_idx)
     written.append(str(bundle_idx_path))
+
+    # ── Graph visualization export ───────────────────────────────────
+    # Export the knowledge graph as JSON (for D3.js / Obsidian graph view)
+    # and Mermaid (for Obsidian embedding).
+    try:
+        from obsidian_llm_wiki.render.graph_export import export_graph
+        graph_dir = bundle_dir / ".llmwiki"
+        export_graph(bundle, graph_dir)
+        written.append(str(graph_dir / "graph.json"))
+        written.append(str(graph_dir / "graph.mmd"))
+    except Exception as exc:
+        logger.debug("Graph export skipped: %s", exc)
 
     return written

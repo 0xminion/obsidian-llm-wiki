@@ -18,18 +18,31 @@ Dependencies: httpx (required), defuddle.md (web service), Supadata API (optiona
 from __future__ import annotations
 
 import logging
+import os
 import re
+import tempfile
 import time
+from contextlib import suppress
 from urllib.parse import parse_qs, urlparse
 
 from obsidian_llm_wiki.core.models import SourceDoc
 from obsidian_llm_wiki.ingest.extractors import register_extractor
 from obsidian_llm_wiki.ingest.http_headers import BROWSER_HEADERS, DEFAULT_TIMEOUT
 from obsidian_llm_wiki.ingest.proxy import make_client_kwargs
+from obsidian_llm_wiki.ingest.supadata_utils import (
+    supadata_rate_limit,
+    track_supadata_call,
+    validate_supadata_key,
+)
 
 logger = logging.getLogger("obswiki.ingest.extractors.podcast")
 
-__all__ = ["extract_spotify", "extract_apple_podcast", "extract_generic_podcast"]
+__all__ = [
+    "extract_spotify",
+    "extract_apple_podcast",
+    "extract_generic_podcast",
+    "validate_supadata_key",
+]
 
 # ── Domain matching ─────────────────────────────────────────────────────
 
@@ -109,14 +122,25 @@ def _extract_podcast(raw_url: str, platform: str = "generic") -> SourceDoc:
 
     # Step 3: Try Supadata transcript from audio URL
     transcript = ""
+    supadata_failed = False
     if audio_url:
         supadata_key = _get_supadata_key()
         if supadata_key:
             transcript = _supadata_transcribe_audio(audio_url, supadata_key)
             if not transcript:
                 errors.append("supadata: no transcript returned")
+                supadata_failed = True
         else:
             logger.debug("No SUPADATA_API_KEY — skipping transcript")
+
+    # Step 3b: Whisper fallback when Supadata fails or is rate-limited
+    if not transcript and audio_url and supadata_failed:
+        whisper_transcript = _whisper_fallback_transcribe(audio_url)
+        if whisper_transcript:
+            logger.info("Whisper fallback succeeded for %s", raw_url)
+            transcript = whisper_transcript
+        else:
+            errors.append("whisper: fallback unavailable or failed")
 
     # Step 4: Build content
     parts: list[str] = []
@@ -393,6 +417,7 @@ def _supadata_transcribe_audio(audio_url: str, api_key: str) -> str:
     or times out.
     """
     try:
+        supadata_rate_limit()
         with httpx.Client(timeout=30) as client:
             # Submit transcription job
             resp = client.get(
@@ -400,6 +425,8 @@ def _supadata_transcribe_audio(audio_url: str, api_key: str) -> str:
                 params={"url": audio_url, "text": "true", "mode": "auto"},
                 headers={"x-api-key": api_key},
             )
+
+            track_supadata_call(resp)
 
             if resp.status_code == 200:
                 # Synchronous response
@@ -412,6 +439,12 @@ def _supadata_transcribe_audio(audio_url: str, api_key: str) -> str:
                 if not job_id:
                     return ""
                 return _poll_supadata_job(job_id, api_key)
+            elif resp.status_code == 429:
+                logger.warning(
+                    "Supadata rate limited (429) for audio URL — "
+                    "will try Whisper fallback"
+                )
+                return ""
             else:
                 logger.debug(
                     "Supadata returned %d for audio URL: %s",
@@ -427,11 +460,13 @@ def _poll_supadata_job(job_id: str, api_key: str, max_polls: int = 60) -> str:
     """Poll Supadata async job until completion."""
     for _i in range(max_polls):
         try:
+            supadata_rate_limit()
             with httpx.Client(timeout=30) as client:
                 resp = client.get(
                     f"https://api.supadata.ai/v1/transcript/{job_id}",
                     headers={"x-api-key": api_key},
                 )
+            track_supadata_call(resp)
             if resp.status_code == 200:
                 data = resp.json()
                 content = _extract_supadata_content(data)
@@ -465,6 +500,81 @@ def _extract_supadata_content(data: dict) -> str:
             parts.append(text)
         return " ".join(parts)
     return str(content) if content else ""
+
+
+# ── Whisper fallback transcription ─────────────────────────────────────────
+
+def _whisper_fallback_transcribe(audio_url: str) -> str:
+    """Transcribe audio URL using local faster-whisper as a last resort.
+
+    Downloads the audio file to a temp directory, transcribes with
+    faster_whisper.WhisperModel('base', device='cpu', compute_type='int8'),
+    and cleans up the temp file.
+
+    Returns the transcript text, or empty string if:
+      - faster_whisper is not installed (logs a warning, doesn't raise)
+      - audio download fails
+      - transcription fails
+
+    This is the last resort after Supadata and defuddle.md metadata.
+    """
+    # Check if faster_whisper is installed
+    try:
+        from faster_whisper import WhisperModel
+    except ImportError:
+        logger.warning(
+            "faster_whisper is not installed — Whisper fallback unavailable. "
+            "Install with: pip install faster-whisper"
+        )
+        return ""
+
+    # Download audio to temp file
+    tmp_path: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            suffix=".mp3", delete=False,
+        ) as tmp:
+            with httpx.Client(
+                timeout=120, follow_redirects=True,
+                headers={"User-Agent": BROWSER_HEADERS["User-Agent"]},
+            ) as client:
+                resp = client.get(audio_url)
+                resp.raise_for_status()
+                tmp.write(resp.content)
+            tmp_path = tmp.name
+
+        logger.info(
+            "Whisper fallback: transcribing audio from %s (%d bytes)",
+            audio_url,
+            os.path.getsize(tmp_path) if tmp_path else 0,
+        )
+
+        # Transcribe with faster-whisper
+        model = WhisperModel("base", device="cpu", compute_type="int8")
+        segments, _info = model.transcribe(tmp_path)
+        transcript_parts = [
+            segment.text.strip() for segment in segments if segment.text.strip()
+        ]
+        transcript = " ".join(transcript_parts)
+
+        if not transcript:
+            logger.warning("Whisper transcription produced no text for %s", audio_url)
+            return ""
+
+        logger.info(
+            "Whisper fallback: transcribed %d chars from %s",
+            len(transcript), audio_url,
+        )
+        return transcript
+
+    except Exception as exc:
+        logger.warning("Whisper fallback failed for %s: %s", audio_url, exc)
+        return ""
+
+    finally:
+        if tmp_path is not None:
+            with suppress(OSError):
+                os.unlink(tmp_path)
 
 
 # ── Import httpx ─────────────────────────────────────────────────────────

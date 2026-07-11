@@ -24,10 +24,15 @@ from obsidian_llm_wiki.core.models import SourceDoc
 from obsidian_llm_wiki.ingest.extractors import register_extractor
 from obsidian_llm_wiki.ingest.http_headers import DEFAULT_TIMEOUT
 from obsidian_llm_wiki.ingest.proxy import make_client_kwargs
+from obsidian_llm_wiki.ingest.supadata_utils import (
+    supadata_rate_limit,
+    track_supadata_call,
+    validate_supadata_key,
+)
 
 logger = logging.getLogger("obswiki.ingest.youtube")
 
-__all__ = ["extract_youtube_video"]
+__all__ = ["extract_youtube_video", "validate_supadata_key"]
 
 _SUPADATA_API_BASE = "https://api.supadata.ai/v1"
 _POLL_INTERVAL = 3  # seconds between job status checks
@@ -141,6 +146,7 @@ def _supadata_transcript(url: str, api_key: str) -> SourceDoc | None:
         "mode": "auto",  # try native, fallback to AI generation
     }
 
+    supadata_rate_limit()
     with httpx.Client(
         **make_client_kwargs(timeout=DEFAULT_TIMEOUT, follow_redirects=True),
     ) as client:
@@ -152,6 +158,8 @@ def _supadata_transcript(url: str, api_key: str) -> SourceDoc | None:
                 "Accept": "application/json",
             },
         )
+
+    track_supadata_call(resp)
 
     # Auth errors
     if resp.status_code == 401:
@@ -196,10 +204,12 @@ def _poll_supadata_job(job_id: str, api_key: str) -> SourceDoc | None:
     ) as client:
         for attempt in range(_POLL_MAX_ATTEMPTS):
             time.sleep(_POLL_INTERVAL)
+            supadata_rate_limit()
             resp = client.get(
                 f"{_SUPADATA_API_BASE}/transcript/{job_id}",
                 headers={"x-api-key": api_key, "Accept": "application/json"},
             )
+            track_supadata_call(resp)
             if resp.status_code == 404:
                 raise RuntimeError(f"Supadata job {job_id} expired")
             resp.raise_for_status()

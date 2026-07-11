@@ -50,6 +50,9 @@ class OllamaClient(LLMClient):
             ],
             "stream": False,
         }
+        # Pass context window to Ollama as num_ctx if not explicitly overridden.
+        if "num_ctx" not in kwargs and self.config.context_window:
+            kwargs["num_ctx"] = self.config.context_window
         body.update(kwargs)
         with httpx.Client(timeout=self._timeout) as client:
             resp = client.post(url, json=body)
