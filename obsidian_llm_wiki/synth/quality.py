@@ -934,3 +934,143 @@ def _extract_rationale(data: dict) -> str:
     Pass 2 expand prompt and summary for the concept page.
     """
     return data.get("rationale", "") or data.get("summary", "")
+
+
+# ── Incremental concept re-synthesis ────────────────────────────────────
+
+
+async def resynthesize_concept(
+    config: Any,
+    concept: ConceptNote,
+    new_source_content: str,
+    new_source_title: str = "",
+) -> ConceptNote | None:
+    """Re-synthesize an existing concept using new source content.
+
+    When a new source references an existing concept, this function produces
+    an updated concept that integrates information from both the original
+    and the new source. Unlike merge_concepts (which only appends sections),
+    this produces a coherent re-written concept body.
+
+    Args:
+        config: Pipeline config with LLM settings.
+        concept: The existing concept to re-synthesize.
+        new_source_content: Content from the new source that references this concept.
+        new_source_title: Title of the new source (for context).
+
+    Returns:
+        Updated ConceptNote with re-synthesized body, or None if LLM fails.
+    """
+    from obsidian_llm_wiki.providers.llm import acall_llm
+
+    # Build the re-synthesis prompt
+    existing_sections = "\n\n".join(
+        f"## {s.heading}\n{s.prose or chr(10).join(f'- {p}' for p in s.points)}"
+        for s in concept.sections
+    )
+
+    prompt = f"""You are updating an existing knowledge wiki concept \
+with new information from a newly ingested source.
+
+## Existing Concept: {concept.title}
+
+### Current Summary
+{concept.summary}
+
+### Current Sections
+{existing_sections}
+
+## New Source: {new_source_title or 'Untitled'}
+
+{new_source_content[:15000]}
+
+## Task
+
+Re-write the concept by integrating the new source's information with the existing content.
+- Keep the same title and slug: "{concept.title}" / "{concept.slug}"
+- Update the summary to reflect the combined understanding
+- Merge sections — don't just append. Rewrite for coherence.
+- Add new claims from the new source
+- Keep existing tags and add new ones if relevant
+- Preserve all existing related links and add new ones if the new source references other concepts
+
+Return JSON:
+```json
+{{
+    "title": "{concept.title}",
+    "slug": "{concept.slug}",
+    "summary": "Updated 1-2 sentence summary",
+    "tags": ["tag1", "tag2"],
+    "sections": [
+        {{"heading": "Section Name", "points": ["point1", "point2"], "prose": ""}}
+    ],
+    "claims": [
+        {{"text": "factual claim", "source_ref": "from new source"}}
+    ]
+}}
+```
+"""
+
+    messages = [
+        {"role": "user",
+         "content": "Update the concept above with the new source information."},
+    ]
+
+    try:
+        response = await acall_llm(prompt, messages, config)
+    except Exception as exc:
+        logger.error("Concept re-synthesis failed for '%s': %s", concept.slug, exc)
+        return None
+
+    if not response or not response.strip():
+        return None
+
+    try:
+        import json
+        # Try to extract JSON from the response
+        text = response.strip()
+        if "```json" in text:
+            start = text.index("```json") + 7
+            end = text.index("```", start)
+            text = text[start:end].strip()
+        elif "```" in text:
+            start = text.index("```") + 3
+            end = text.index("```", start)
+            text = text[start:end].strip()
+
+        data = json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        logger.warning("Could not parse re-synthesis JSON for '%s'", concept.slug)
+        return None
+
+    # Build updated concept
+    from obsidian_llm_wiki.core.models import BodySection, Claim
+
+    sections = []
+    for s in data.get("sections", []):
+        sections.append(BodySection(
+            heading=s.get("heading", ""),
+            points=s.get("points", []),
+            prose=s.get("prose", ""),
+        ))
+
+    claims = []
+    for c in data.get("claims", []):
+        claims.append(Claim(
+            text=c.get("text", ""),
+            source_ref=c.get("source_ref", ""),
+        ))
+
+    return ConceptNote(
+        title=data.get("title", concept.title),
+        slug=data.get("slug", concept.slug),
+        summary=data.get("summary", concept.summary),
+        tags=list(dict.fromkeys(concept.tags + data.get("tags", []))),
+        aliases=concept.aliases,
+        sections=sections,
+        claims=claims,
+        related=concept.related,
+        confidence=concept.confidence,
+        provenance="resynthesized",
+        is_new=False,
+    )

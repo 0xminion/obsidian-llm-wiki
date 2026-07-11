@@ -41,6 +41,7 @@ from obsidian_llm_wiki.core.models import (
     CompileResult,
     SourceDoc,
     SourceSynthesis,
+    SynthesisBundle,
     WikiState,
 )
 from obsidian_llm_wiki.core.orphan import mark_orphaned_concepts
@@ -244,12 +245,21 @@ async def run_pipeline(
         result.errors.extend(bundle.errors)
 
         # ── Backlink propagation: ensure bidirectional edges ──────────
-        # After merging cached + fresh syntheses, old concepts may not
-        # have reverse links to new concepts that reference them. This
-        # pass walks all edges and adds missing reverse links so MoC
-        # cross-reference diagrams show bidirectional arrows correctly.
         from obsidian_llm_wiki.synth.dedupe import propagate_backlinks
         propagate_backlinks(bundle)
+
+        # ── Incremental concept re-synthesis ──────────────────────────
+        # When new sources reference existing concepts (from cached syntheses),
+        # re-synthesize those concepts to integrate new information coherently
+        # rather than just appending sections.
+        if filenames_done and config.synthesis_mode == "two_pass":
+            try:
+                await _resynthesize_referenced_concepts(
+                    config, bundle, filenames_done,
+                    all_syntheses_by_file, sources, metrics,
+                )
+            except Exception as exc:
+                logger.warning("Concept re-synthesis skipped: %s", exc)
 
         # ── Render: full corpus deterministic markdown ─────────────────
         logger.info(
@@ -584,3 +594,92 @@ def _source_from_synthesis(synth: SourceSynthesis) -> SourceDoc:
         content=synth.source_summary or "",
         source_file=synth.source_file,
     )
+
+
+async def _resynthesize_referenced_concepts(
+    config: Config,
+    bundle: SynthesisBundle,
+    new_filenames: list[str],
+    all_syntheses_by_file: dict[str, SourceSynthesis],
+    sources: dict[str, SourceDoc],
+    metrics: MetricsCollector | None = None,
+) -> None:
+    """Re-synthesize existing concepts that are referenced by new sources.
+
+    For each new source, find concepts in the new synthesis whose slug
+    already existed in the corpus (from cached syntheses). For each such
+    concept, call resynthesize_concept() to produce a coherent updated
+    concept body that integrates the new source's information.
+
+    Only runs in two_pass mode. Skipped if no new sources or no overlaps.
+    """
+    if not new_filenames:
+        return
+
+    from obsidian_llm_wiki.synth.quality import resynthesize_concept
+
+    # Build set of concept slugs from cached (unchanged) sources
+    cached_slugs: set[str] = set()
+    for filename, synth in all_syntheses_by_file.items():
+        if filename in new_filenames:
+            continue  # This is a new source
+        cached_slugs.update(c.slug for c in synth.concepts)
+
+    if not cached_slugs:
+        return  # No existing concepts to re-synthesize
+
+    # Find concepts in new sources that reference existing concepts
+    concepts_to_resynth: list[tuple[str, str, str]] = []  # (slug, source_content, source_title)
+    for filename in new_filenames:
+        synth = all_syntheses_by_file.get(filename)
+        if not synth:
+            continue
+        source = sources.get(filename)
+        source_content = source.content if source else ""
+        source_title = source.title if source else synth.source_title
+
+        for concept in synth.concepts:
+            if concept.slug in cached_slugs:
+                concepts_to_resynth.append((concept.slug, source_content, source_title))
+
+    if not concepts_to_resynth:
+        return
+
+    logger.info(
+        "Re-synthesizing %d concepts referenced by new sources...",
+        len(concepts_to_resynth),
+    )
+
+    # Build concept map from bundle
+    concept_map = {c.slug: c for c in bundle.concepts}
+
+    # Re-synthesize each concept
+    sem = asyncio.Semaphore(config.compile_concurrency)
+
+    async def _resynth_one(slug: str, content: str, title: str):
+        async with sem:
+            existing = concept_map.get(slug)
+            if not existing:
+                return None
+            return await resynthesize_concept(config, existing, content, title)
+
+    results = await asyncio.gather(
+        *[_resynth_one(s, c, t) for s, c, t in concepts_to_resynth],
+        return_exceptions=True,
+    )
+
+    # Replace updated concepts in the bundle
+    updated = 0
+    for i, res in enumerate(results):
+        if isinstance(res, BaseException) or res is None:
+            continue
+        slug = concepts_to_resynth[i][0]
+        # Replace in bundle.concepts
+        for j, c in enumerate(bundle.concepts):
+            if c.slug == slug:
+                bundle.concepts[j] = res
+                updated += 1
+                break
+
+    if updated:
+        logger.info("Re-synthesized %d/%d concepts successfully", updated, len(concepts_to_resynth))
