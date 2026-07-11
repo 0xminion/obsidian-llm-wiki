@@ -89,7 +89,8 @@ sections. A quality gate flags thin concepts (`confidence: 0.3`).
 | Source | Extractor | Optional dep | Install |
 |--------|-----------|--------------|---------|
 | Web articles / blogs / news | `trafilatura` | included | — |
-| YouTube videos | `yt-dlp` + `youtube-transcript-api` | `pip install okf-pipeline[youtube]` | transcript + metadata |
+| YouTube videos | Supadata → metadata fallback | API key optional | transcript + metadata |
+| Podcasts / RSS | cache → RSS transcript → AssemblyAI → Supadata → Whisper | API keys optional | publisher or generated transcript |
 | PDF files | `pymupdf` (fitz) | `pip install okf-pipeline[pdf]` | full text with page markers |
 | Word `.docx` | `python-docx` | `pip install okf-pipeline[docx]` | text with heading structure |
 | Plain text / markdown | built-in | — | direct file read |
@@ -98,6 +99,37 @@ Install all optional extractors: `pip install okf-pipeline[all]`
 
 The extractor registry auto-detects source type from URL domain or file
 extension. Unknown URLs fall back to web extraction (trafilatura).
+
+### Podcast transcript resolution
+
+Podcast ingestion is deliberately cache-first and publisher-first:
+
+```text
+local transcript cache
+  → RSS podcast:transcript artifact (VTT/SRT/HTML/plain text/JSON)
+  → publisher page `## Transcript` section via defuddle.md
+  → AssemblyAI remote URL transcription
+  → Supadata remote media transcription
+  → local faster-whisper (only after media acquisition succeeds)
+```
+
+Spotify and Apple episode URLs are resolved through the canonical RSS feed
+when possible. The RSS enclosure gives remote providers a public media URL;
+the pipeline does not scrape first-party player transcript UIs. Publisher
+transcripts are preferred over generated ASR output and every acquired
+transcript is cached under `.llmwiki/transcripts/` with provenance.
+
+Configure transcript providers in the vault-root `.env` (never commit this
+file):
+
+```bash
+ASSEMBLYAI_API_KEY=...    # first remote provider for public RSS enclosures
+SUPADATA_API_KEY=...      # platform-specialized remote fallback
+```
+
+AssemblyAI fetches public media from its own infrastructure, avoiding a local
+audio download. It cannot bypass authentication, DRM, paywalls, or an origin
+that blocks AssemblyAI itself.
 
 ---
 

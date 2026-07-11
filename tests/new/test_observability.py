@@ -375,12 +375,21 @@ class TestWhisperFallback:
                 "published": "2024-01-01",
             },
         ), mock.patch.object(
-            podcast, "_find_spotify_audio_url",
-            return_value="https://example.com/audio.mp3",
+            podcast,
+            "_resolve_episode_asset",
+            return_value=podcast.EpisodeAsset(
+                audio_url="https://example.com/audio.mp3",
+            ),
+        ), mock.patch.object(
+            podcast,
+            "load_transcript_cache",
+            return_value=None,
         ), mock.patch.object(
             podcast, "_get_supadata_key", return_value="fake-key",
         ), mock.patch.object(
             podcast, "_supadata_transcribe_audio", return_value="",
+        ), mock.patch.object(
+            podcast, "get_assemblyai_key", return_value="",
         ), mock.patch.object(
             podcast, "_whisper_fallback_transcribe",
             return_value="whisper transcript text",

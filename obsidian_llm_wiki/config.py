@@ -97,6 +97,11 @@ class Config:
     # Set as env SUPADATA_API_KEY=sd_...
     supadata_api_key: str = ""
 
+    # AssemblyAI is the remote-URL transcript fallback after Supadata. It
+    # fetches public RSS enclosure URLs itself, avoiding local media download.
+    # Set as env ASSEMBLYAI_API_KEY=...
+    assemblyai_api_key: str = ""
+
     # ── Derived paths (lazy) ──────────────────────
     _vault: Path | None = field(default=None, repr=False)
 
@@ -203,6 +208,7 @@ def load_config(env_file: str | None = None, **overrides: str) -> Config:
         youtube_cookies_file=os.getenv("YOUTUBE_COOKIES_FILE", ""),
         transcript_api_key=os.getenv("TRANSCRIPT_API_KEY", ""),
         supadata_api_key=os.getenv("SUPADATA_API_KEY", ""),
+        assemblyai_api_key=os.getenv("ASSEMBLYAI_API_KEY", ""),
     )
 
 
