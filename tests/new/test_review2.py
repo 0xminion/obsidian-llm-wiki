@@ -66,28 +66,32 @@ def test_moc_cross_ref_diagram_dedup():
     a = _make_concept("a", "A", related=[ConceptLink(slug="b", relation="r")])
     b = _make_concept("b", "B", related=[ConceptLink(slug="a", relation="r")])
     lines = _build_moc_cross_ref_diagram([a, b], {"a": a, "b": b})
-    # Should only have ONE line for the a↔b pair, not two
-    assert len(lines) == 1
+    # Should only have ONE pair — check by counting "↓" entries
+    down_count = sum(1 for line in lines if "↓" in line)
+    assert down_count == 1
 
 
 def test_moc_cross_ref_diagram_bidirectional():
-    """Bidirectional pair uses ↔ arrow."""
+    """Bidirectional pair uses ↔ arrow in target line."""
     from obsidian_llm_wiki.core.models import ConceptLink
     from obsidian_llm_wiki.render.obsidian import _build_moc_cross_ref_diagram
     a = _make_concept("a", "A", related=[ConceptLink(slug="b", relation="r")])
     b = _make_concept("b", "B", related=[ConceptLink(slug="a", relation="r")])
     lines = _build_moc_cross_ref_diagram([a, b], {"a": a, "b": b})
-    assert "↔" in lines[0]
+    joined = "\n".join(lines)
+    assert "↔" in joined
 
 
 def test_moc_cross_ref_diagram_unidirectional():
-    """Unidirectional pair uses → arrow."""
+    """Unidirectional pair does not use ↔ arrow."""
     from obsidian_llm_wiki.core.models import ConceptLink
     from obsidian_llm_wiki.render.obsidian import _build_moc_cross_ref_diagram
     a = _make_concept("a", "A", related=[ConceptLink(slug="b", relation="r")])
     b = _make_concept("b", "B", related=[])
     lines = _build_moc_cross_ref_diagram([a, b], {"a": a, "b": b})
-    assert "→" in lines[0]
+    joined = "\n".join(lines)
+    assert "↓" in joined
+    assert "↔" not in joined
 
 
 # ── render/obsidian.py: render_moc_page cross-lingual links ─────────────────
@@ -373,3 +377,106 @@ def test_bilingual_title_split_keeps_english_first_order():
         "USDT 作为结算货币 (USDT as Settlement Layer)",
         slug="usdt-as-settlement-layer",
     ) == "USDT as Settlement Layer (USDT 作为结算货币)"
+
+
+# ── synth/dedupe.py: backlink propagation ──────────────────────────────────
+
+
+def test_propagate_backlinks_adds_reverse_edges():
+    """When A→B exists but B→A doesn't, propagation adds B→A."""
+    from obsidian_llm_wiki.core.models import (
+        ConceptLink,
+        ConceptNote,
+        SynthesisBundle,
+    )
+    from obsidian_llm_wiki.synth.dedupe import propagate_backlinks
+
+    a = ConceptNote(
+        title="A", slug="a", summary="",
+        related=[ConceptLink(slug="b", relation="depends_on")],
+    )
+    b = ConceptNote(
+        title="B", slug="b", summary="",
+        related=[],
+    )
+    bundle = SynthesisBundle(concepts=[a, b])
+    propagate_backlinks(bundle)
+
+    # B should now have a link back to A
+    assert any(r.slug == "a" for r in b.related)
+    assert b.related[0].relation == "depends_on"
+
+
+def test_propagate_backlinks_skips_existing_reverse():
+    """When B→A already exists, propagation doesn't duplicate it."""
+    from obsidian_llm_wiki.core.models import (
+        ConceptLink,
+        ConceptNote,
+        SynthesisBundle,
+    )
+    from obsidian_llm_wiki.synth.dedupe import propagate_backlinks
+
+    a = ConceptNote(
+        title="A", slug="a", summary="",
+        related=[ConceptLink(slug="b", relation="depends_on")],
+    )
+    b = ConceptNote(
+        title="B", slug="b", summary="",
+        related=[ConceptLink(slug="a", relation="related_to")],
+    )
+    bundle = SynthesisBundle(concepts=[a, b])
+    propagate_backlinks(bundle)
+
+    # B should still have exactly one link to A
+    a_links = [r for r in b.related if r.slug == "a"]
+    assert len(a_links) == 1
+
+
+def test_propagate_backlinks_makes_moc_diagrams_bidirectional():
+    """After propagation, MoC cross-ref diagrams show ↔ for one-way edges."""
+    from obsidian_llm_wiki.core.models import (
+        ConceptLink,
+        ConceptNote,
+        MapOfContent,
+        SourceSynthesis,
+        SynthesisBundle,
+    )
+    from obsidian_llm_wiki.render.obsidian import render_vault
+    from obsidian_llm_wiki.synth.dedupe import propagate_backlinks
+
+    # A links to B, but B doesn't link back (simulating cross-run gap)
+    a = ConceptNote(
+        title="Concept A", slug="concept-a", summary="A summary.",
+        related=[ConceptLink(slug="concept-b", relation="enables")],
+    )
+    b = ConceptNote(
+        title="Concept B", slug="concept-b", summary="B summary.",
+        related=[],
+    )
+    moc = MapOfContent(
+        title="Test MoC", slug="test-moc", summary="Test.",
+        concept_slugs=["concept-a", "concept-b"],
+    )
+    synthesis = SourceSynthesis(
+        source_title="Test Source", source_summary="Test.",
+        concepts=[a, b], maps=[moc],
+    )
+    bundle = SynthesisBundle(sources=[synthesis], concepts=[a, b], maps=[moc])
+
+    # Before propagation: B has no link to A
+    assert not any(r.slug == "concept-a" for r in b.related)
+
+    propagate_backlinks(bundle)
+
+    # After propagation: B has a link to A
+    assert any(r.slug == "concept-a" for r in b.related)
+
+    # Render and check the MoC diagram shows ↔ (bidirectional)
+    import tempfile
+    from pathlib import Path
+    with tempfile.TemporaryDirectory() as tmp:
+        render_vault(Path(tmp), bundle, {})
+        moc_file = Path(tmp) / "mocs" / "test-moc.md"
+        text = moc_file.read_text()
+        # The diagram should show ↔ because both directions now exist
+        assert "↔" in text
