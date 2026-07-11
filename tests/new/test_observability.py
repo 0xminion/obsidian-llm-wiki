@@ -72,18 +72,23 @@ class TestMetricsCollector:
 
         # Verify content is valid JSON with expected structure
         data = json.loads(metrics_file.read_text())
-        assert "run_id" in data
-        assert "started_at" in data
-        assert "finished_at" in data
-        assert "extractions" in data
-        assert len(data["extractions"]) == 1
-        assert data["extractions"][0]["chars_extracted"] == 5000
-        assert "syntheses" in data
-        assert len(data["syntheses"]) == 2
-        assert "rendering" in data
-        assert data["rendering"]["concepts_rendered"] == 3
-        assert "embedding" in data
-        assert data["embedding"]["model"] == "nomic-embed-text"
+        # New format: {"runs": [...], "latest": {...}}
+        latest = data.get("latest", data)  # backward compat
+        assert "run_id" in latest
+        assert "started_at" in latest
+        assert "finished_at" in latest
+        assert "extractions" in latest
+        assert len(latest["extractions"]) == 1
+        assert latest["extractions"][0]["chars_extracted"] == 5000
+        assert "syntheses" in latest
+        assert len(latest["syntheses"]) == 2
+        assert "rendering" in latest
+        assert latest["rendering"]["concepts_rendered"] == 3
+        assert "embedding" in latest
+        assert latest["embedding"]["model"] == "nomic-embed-text"
+        # Verify history is preserved
+        assert "runs" in data
+        assert len(data["runs"]) == 1
 
     def test_metrics_summary_computation(self, tmp_path: Path):
         """Summary stats are computed correctly on finish_run."""

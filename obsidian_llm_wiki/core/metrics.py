@@ -29,7 +29,13 @@ from typing import Any
 
 logger = logging.getLogger("obswiki.core.metrics")
 
-__all__ = ["MetricsCollector", "RunMetrics", "load_metrics", "print_metrics_summary"]
+__all__ = [
+    "MetricsCollector",
+    "RunMetrics",
+    "load_metrics",
+    "load_all_metrics",
+    "print_metrics_summary",
+]
 
 
 # ── Metric record dataclasses ──────────────────────────────────────────────
@@ -210,12 +216,36 @@ class MetricsCollector:
         """Persist metrics to ``metrics.json``.
 
         Creates the ``.llmwiki`` directory if it doesn't exist.
-        Overwrites any previous metrics file.
+        Appends the current run to a ``runs`` list, keeping history.
+        Also writes ``latest`` key for backward-compatible single-run access.
         """
         self.llmwiki_dir.mkdir(parents=True, exist_ok=True)
-        data = self._to_dict()
+        current_run = self._to_dict()
+
+        # Load existing metrics to preserve history.
+        existing: dict[str, Any] = {}
+        if self.metrics_file.exists():
+            try:
+                existing = json.loads(
+                    self.metrics_file.read_text(encoding="utf-8")
+                )
+            except (json.JSONDecodeError, OSError):
+                existing = {}
+
+        # Migrate legacy format (flat dict with run_id) to new format.
+        if existing and "runs" not in existing:
+            existing = {"runs": [existing], "latest": existing}
+
+        # Append current run.
+        runs = existing.get("runs", [])
+        runs.append(current_run)
+        # Keep last 50 runs to prevent unbounded growth.
+        if len(runs) > 50:
+            runs = runs[-50:]
+
+        output = {"runs": runs, "latest": current_run}
         self.metrics_file.write_text(
-            json.dumps(data, indent=2, ensure_ascii=False),
+            json.dumps(output, indent=2, ensure_ascii=False),
             encoding="utf-8",
         )
         logger.debug("Metrics saved to %s", self.metrics_file)
@@ -259,7 +289,9 @@ def load_metrics(vault_path: str | Path) -> dict[str, Any] | None:
         vault_path: Path to the Obsidian vault root.
 
     Returns:
-        Parsed metrics dict, or None if no metrics file exists.
+        Parsed metrics dict for the latest run, or None if no metrics file exists.
+        The dict is the latest run's data (backward-compatible with callers
+        that expect a flat run dict). Use ``load_all_metrics`` for full history.
     """
     metrics_file = (
         Path(vault_path).resolve() / "04-Wiki" / ".llmwiki" / "metrics.json"
@@ -267,10 +299,42 @@ def load_metrics(vault_path: str | Path) -> dict[str, Any] | None:
     if not metrics_file.exists():
         return None
     try:
-        return json.loads(metrics_file.read_text(encoding="utf-8"))
+        data = json.loads(metrics_file.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError) as exc:
         logger.warning("Failed to load metrics from %s: %s", metrics_file, exc)
         return None
+    # New format: {"runs": [...], "latest": {...}}
+    if isinstance(data, dict) and "latest" in data:
+        return data["latest"]
+    # Legacy format: flat dict
+    return data
+
+
+def load_all_metrics(vault_path: str | Path) -> list[dict[str, Any]]:
+    """Load all historical metrics from a vault.
+
+    Args:
+        vault_path: Path to the Obsidian vault root.
+
+    Returns:
+        List of run metric dicts, oldest first. Empty list if no metrics.
+    """
+    metrics_file = (
+        Path(vault_path).resolve() / "04-Wiki" / ".llmwiki" / "metrics.json"
+    )
+    if not metrics_file.exists():
+        return []
+    try:
+        data = json.loads(metrics_file.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as exc:
+        logger.warning("Failed to load metrics from %s: %s", metrics_file, exc)
+        return []
+    if isinstance(data, dict) and "runs" in data:
+        return data["runs"]
+    # Legacy format: single flat dict
+    if isinstance(data, dict) and data:
+        return [data]
+    return []
 
 
 def print_metrics_summary(vault_path: str | Path) -> None:

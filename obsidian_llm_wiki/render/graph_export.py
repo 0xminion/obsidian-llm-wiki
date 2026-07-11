@@ -84,6 +84,31 @@ def export_graph(bundle: SynthesisBundle, output_dir: Path) -> None:
 # ── Internal builders ───────────────────────────────────────────────────
 
 
+def _slugify_source_id(raw_id: str) -> str:
+    """Slugify a source file or title for use as a graph node ID."""
+    import re
+    # Strip .md extension if present, then slugify.
+    raw_id = raw_id.replace(".md", "")
+    cleaned = re.sub(r"[^\w\s-]", "", raw_id, flags=re.UNICODE)
+    cleaned = re.sub(r"\s+", "-", cleaned)
+    cleaned = re.sub(r"-+", "-", cleaned)
+    return cleaned.strip("-").lower() or "untitled"
+
+
+def _mermaid_safe_id(slug: str) -> str:
+    """Convert a slug to a Mermaid-safe node identifier."""
+    return slug.replace("-", "_")
+
+
+def _mermaid_safe_label(text: str) -> str:
+    """Escape a label for Mermaid node display."""
+    # Replace characters that break Mermaid syntax.
+    text = text.replace('"', "'")
+    # Brackets break subgraph/node syntax — replace with angle brackets.
+    text = text.replace("[", "‹").replace("]", "›")
+    return text
+
+
 def _build_graph_dict(bundle: SynthesisBundle) -> dict[str, Any]:
     """Build the graph dict from a SynthesisBundle."""
     # Build MoC lookup: concept_slug → moc_slug
@@ -115,9 +140,10 @@ def _build_graph_dict(bundle: SynthesisBundle) -> dict[str, Any]:
             "moc": "",
         })
 
-    # Nodes: sources
+    # Nodes: sources — slugify the ID for consistency with wikilinks.
     for source in bundle.sources:
-        source_slug = source.source_file or source.source_title
+        raw_id = source.source_file or source.source_title
+        source_slug = _slugify_source_id(raw_id)
         nodes.append({
             "id": source_slug,
             "label": source.source_title,
@@ -198,17 +224,19 @@ def _build_mermaid(bundle: SynthesisBundle) -> str:
 
     # MoC nodes with subgraph grouping
     for moc in bundle.maps:
-        lines.append(f"  subgraph {moc.slug.replace('-', '_')}[" + moc.title + "]")
+        moc_id = _mermaid_safe_id(moc.slug)
+        moc_label = _mermaid_safe_label(moc.title)
+        lines.append(f"  subgraph {moc_id}[{moc_label}]")
 
         for slug in moc.concept_slugs:
             concept = next(
                 (c for c in bundle.concepts if c.slug == slug), None
             )
             if concept:
-                label = concept.title.replace('"', "'")
-                lines.append(f"    {slug.replace('-', '_')}[\"{label}\"]")
+                label = _mermaid_safe_label(concept.title)
+                lines.append(f'    {_mermaid_safe_id(slug)}["{label}"]')
             else:
-                lines.append(f"    {slug.replace('-', '_')}[{slug}]")
+                lines.append(f"    {_mermaid_safe_id(slug)}[{_mermaid_safe_label(slug)}]")
 
         lines.append("  end")
 
@@ -219,15 +247,15 @@ def _build_mermaid(bundle: SynthesisBundle) -> str:
 
     for concept in bundle.concepts:
         if concept.slug not in moced_slugs:
-            label = concept.title.replace('"', "'")
-            lines.append(f"  {concept.slug.replace('-', '_')}[\"{label}\"]")
+            label = _mermaid_safe_label(concept.title)
+            lines.append(f'  {_mermaid_safe_id(concept.slug)}["{label}"]')
 
     # Edges
     seen_edges: set[tuple[str, str]] = set()
     for concept in bundle.concepts:
         for link in concept.related:
-            source_id = concept.slug.replace("-", "_")
-            target_id = link.slug.replace("-", "_")
+            source_id = _mermaid_safe_id(concept.slug)
+            target_id = _mermaid_safe_id(link.slug)
             edge_key = (source_id, target_id)
             reverse_key = (target_id, source_id)
 

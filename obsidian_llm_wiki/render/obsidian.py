@@ -855,6 +855,7 @@ def render_vault(
     bundle_dir: Path,
     bundle: SynthesisBundle,
     sources: dict[str, SourceDoc],
+    config: Any = None,
 ) -> list[str]:
     """Render a complete vault from a SynthesisBundle.
 
@@ -862,6 +863,9 @@ def render_vault(
         bundle_dir: The wiki root directory (e.g. vault/04-Wiki).
         bundle: The merged SynthesisBundle from synth.dedupe.
         sources: Dict mapping source filename → SourceDoc.
+        config: Optional pipeline config for threshold settings
+            (similarity_dedup_threshold, moc_assignment_threshold).
+            When None, defaults are used.
 
     Returns:
         List of file paths that were written.
@@ -879,7 +883,10 @@ def render_vault(
     # Merge same-language concepts with high embedding similarity.
     try:
         from obsidian_llm_wiki.synth.dedupe import semantic_dedupe_concepts
-        semantic_dedupe_concepts(bundle)
+        dedup_threshold = (
+            config.similarity_dedup_threshold if config else 0.85
+        )
+        semantic_dedupe_concepts(bundle, threshold=dedup_threshold)
     except Exception as exc:
         logger.debug("Semantic dedup skipped: %s", exc)
 
@@ -887,7 +894,10 @@ def render_vault(
     # Assign concepts not in any MoC to the most semantically similar MoC.
     try:
         from obsidian_llm_wiki.synth.dedupe import assign_orphans_to_mocs
-        assign_orphans_to_mocs(bundle)
+        moc_threshold = (
+            config.moc_assignment_threshold if config else 0.55
+        )
+        assign_orphans_to_mocs(bundle, threshold=moc_threshold)
     except Exception as exc:
         logger.debug("MoC orphan assignment skipped: %s", exc)
 

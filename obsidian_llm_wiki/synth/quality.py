@@ -1058,6 +1058,7 @@ Return JSON:
     for c in data.get("claims", []):
         claims.append(Claim(
             text=c.get("text", ""),
+            concept_slug=concept.slug,
             source_ref=c.get("source_ref", ""),
         ))
 

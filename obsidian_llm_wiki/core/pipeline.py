@@ -272,7 +272,7 @@ async def run_pipeline(
             for f in all_syntheses_by_file
         }
         render_start = time.monotonic()
-        written = render_vault(bundle_dir, bundle, all_sources_for_render)
+        written = render_vault(bundle_dir, bundle, all_sources_for_render, config=config)
         result.pages.extend(written)
         result.concepts = bundle.concepts
 

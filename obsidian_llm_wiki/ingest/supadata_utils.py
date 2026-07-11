@@ -27,6 +27,7 @@ import contextlib
 import json
 import logging
 import os
+import threading
 import time
 from datetime import date
 from pathlib import Path
@@ -50,13 +51,16 @@ __all__ = [
 SUPADATA_RATE_LIMIT_SECONDS = 3.0
 
 # Module-level last call timestamp — shared across all callers.
+# Protected by _rate_lock for thread safety with concurrent extractors.
 _last_call_time: float = 0.0
+_rate_lock = threading.Lock()
 
 
 def reset_rate_limiter() -> None:
     """Reset the rate limiter state (for testing)."""
     global _last_call_time
-    _last_call_time = 0.0
+    with _rate_lock:
+        _last_call_time = 0.0
 
 
 def supadata_rate_limit() -> None:
@@ -64,18 +68,24 @@ def supadata_rate_limit() -> None:
 
     Sleeps if the last call was less than ``SUPADATA_RATE_LIMIT_SECONDS`` ago.
     Updates ``_last_call_time`` after sleeping (or immediately if enough time
-    has elapsed).
+    has elapsed). Thread-safe via ``_rate_lock``.
     """
     global _last_call_time
-    now = time.monotonic()
-    elapsed = now - _last_call_time
-    if elapsed < SUPADATA_RATE_LIMIT_SECONDS:
-        sleep_duration = SUPADATA_RATE_LIMIT_SECONDS - elapsed
-        logger.debug(
-            "Supadata rate limit: sleeping %.1fs", sleep_duration,
-        )
-        time.sleep(sleep_duration)
-    _last_call_time = time.monotonic()
+    with _rate_lock:
+        now = time.monotonic()
+        elapsed = now - _last_call_time
+        if elapsed < SUPADATA_RATE_LIMIT_SECONDS:
+            sleep_duration = SUPADATA_RATE_LIMIT_SECONDS - elapsed
+            logger.debug(
+                "Supadata rate limit: sleeping %.1fs", sleep_duration,
+            )
+            # Release lock during sleep so other threads aren't blocked.
+            _rate_lock.release()
+            try:
+                time.sleep(sleep_duration)
+            finally:
+                _rate_lock.acquire()
+        _last_call_time = time.monotonic()
 
 
 # ── Usage tracking ─────────────────────────────────────────────────────────
