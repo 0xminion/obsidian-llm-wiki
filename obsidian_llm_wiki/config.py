@@ -97,10 +97,16 @@ class Config:
     # Set as env SUPADATA_API_KEY=sd_...
     supadata_api_key: str = ""
 
-    # AssemblyAI is the remote-URL transcript fallback after Supadata. It
+    # AssemblyAI is the primary remote-URL transcript provider. It
     # fetches public RSS enclosure URLs itself, avoiding local media download.
     # Set as env ASSEMBLYAI_API_KEY=...
     assemblyai_api_key: str = ""
+
+    # Optional Podcast Index discovery credentials. The API finds canonical
+    # publisher RSS feeds for cross-platform podcast links; it does not supply
+    # transcript text. Set PODCAST_INDEX_API_KEY and PODCAST_INDEX_API_SECRET.
+    podcast_index_api_key: str = ""
+    podcast_index_api_secret: str = ""
 
     # ── Derived paths (lazy) ──────────────────────
     _vault: Path | None = field(default=None, repr=False)
@@ -209,6 +215,8 @@ def load_config(env_file: str | None = None, **overrides: str) -> Config:
         transcript_api_key=os.getenv("TRANSCRIPT_API_KEY", ""),
         supadata_api_key=os.getenv("SUPADATA_API_KEY", ""),
         assemblyai_api_key=os.getenv("ASSEMBLYAI_API_KEY", ""),
+        podcast_index_api_key=os.getenv("PODCAST_INDEX_API_KEY", ""),
+        podcast_index_api_secret=os.getenv("PODCAST_INDEX_API_SECRET", ""),
     )
 
 

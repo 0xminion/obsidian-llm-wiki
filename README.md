@@ -119,12 +119,20 @@ the pipeline does not scrape first-party player transcript UIs. Publisher
 transcripts are preferred over generated ASR output and every acquired
 transcript is cached under `.llmwiki/transcripts/` with provenance.
 
+When configured, Podcast Index is the first discovery pass for Spotify, Apple,
+and supported generic podcast pages. It searches for publisher RSS feeds, then
+the pipeline verifies the requested episode title inside the candidate feed —
+it never treats a directory search result as proof of a matching episode. A
+miss falls through to the platform-specific iTunes/RSS path.
+
 Configure transcript providers in the vault-root `.env` (never commit this
 file):
 
 ```bash
 ASSEMBLYAI_API_KEY=...    # first remote provider for public RSS enclosures
 SUPADATA_API_KEY=...      # platform-specialized remote fallback
+PODCAST_INDEX_API_KEY=...     # optional free canonical-feed discovery
+PODCAST_INDEX_API_SECRET=...  # paired Podcast Index developer secret
 ```
 
 AssemblyAI fetches public media from its own infrastructure, avoiding a local

@@ -31,6 +31,7 @@ from defusedxml import ElementTree
 from obsidian_llm_wiki.core.models import SourceDoc
 from obsidian_llm_wiki.ingest.extractors import register_extractor
 from obsidian_llm_wiki.ingest.http_headers import BROWSER_HEADERS, DEFAULT_TIMEOUT
+from obsidian_llm_wiki.ingest.podcast_index import discover_feed_urls
 from obsidian_llm_wiki.ingest.proxy import make_client_kwargs
 from obsidian_llm_wiki.ingest.supadata_utils import (
     supadata_rate_limit,
@@ -350,10 +351,21 @@ def _resolve_episode_asset(
     if platform == "rss":
         return _find_episode_asset_in_rss(_fetch_rss_text(raw_url), allow_first=True)
     if platform == "apple":
-        return _find_apple_episode_asset(raw_url, metadata.get("title", ""))
+        return _find_apple_episode_asset(
+            raw_url,
+            metadata.get("title", ""),
+            metadata.get("author", ""),
+        )
     if platform == "spotify":
         return _find_spotify_episode_asset(raw_url, metadata)
-    return EpisodeAsset()
+    by_podcast_index = _find_asset_via_podcast_index(
+        metadata.get("title", ""), metadata.get("author", ""),
+    )
+    if by_podcast_index.audio_url or by_podcast_index.transcript_url:
+        return by_podcast_index
+    return _find_asset_via_itunes(
+        metadata.get("title", ""), metadata.get("author", ""),
+    )
 
 
 def _fetch_rss_text(feed_url: str) -> str:
@@ -430,6 +442,35 @@ def _find_episode_asset_in_rss(
     return EpisodeAsset()
 
 
+def _find_asset_via_podcast_index(title: str, author: str = "") -> EpisodeAsset:
+    """Discover candidate feeds, then verify the requested episode in RSS.
+
+    The optional Podcast Index credentials make this a no-op when absent. A
+    candidate feed is never trusted blindly: an episode-title match is required
+    before returning a public enclosure or transcript artifact.
+    """
+    queries = list(
+        dict.fromkeys(value.strip() for value in (author, title) if value.strip()),
+    )
+    seen_urls: set[str] = set()
+    for query in queries:
+        for feed in discover_feed_urls(query):
+            if feed.feed_url in seen_urls:
+                continue
+            seen_urls.add(feed.feed_url)
+            asset = _find_episode_asset_in_rss(
+                _fetch_rss_text(feed.feed_url), target_title=title,
+            )
+            if asset.audio_url or asset.transcript_url:
+                logger.info(
+                    "Found canonical RSS episode '%s' via Podcast Index feed '%s'",
+                    title,
+                    feed.title,
+                )
+                return asset
+    return EpisodeAsset()
+
+
 def _episode_asset_from_item(item) -> EpisodeAsset:
     """Extract enclosure, GUID, and optional podcast:transcript attributes."""
     audio_url = ""
@@ -457,14 +498,21 @@ def _episode_asset_from_item(item) -> EpisodeAsset:
 
 # ── Apple Podcasts audio URL via iTunes Lookup + RSS ────────────────────
 
-def _find_apple_episode_asset(url: str, target_title: str = "") -> EpisodeAsset:
-    """Resolve Apple episode media and publisher transcript from canonical RSS."""
-    # URL format: https://podcasts.apple.com/us/podcast/{slug}/id{podcast_id}?i={episode_id}
+def _find_apple_episode_asset(
+    url: str,
+    target_title: str = "",
+    author: str = "",
+) -> EpisodeAsset:
+    """Resolve Apple through Podcast Index first, then exact iTunes lookup."""
+    by_podcast_index = _find_asset_via_podcast_index(target_title, author)
+    if by_podcast_index.audio_url or by_podcast_index.transcript_url:
+        return by_podcast_index
+
     parsed = urlparse(url)
     podcast_id_match = re.search(r"/id(\d+)", parsed.path)
     episode_id = parse_qs(parsed.query).get("i", [""])[0]
     if not podcast_id_match:
-        return EpisodeAsset()
+        return _find_asset_via_podcast_index(target_title, author)
 
     try:
         with httpx.Client(
@@ -474,23 +522,23 @@ def _find_apple_episode_asset(url: str, target_title: str = "") -> EpisodeAsset:
             response = client.get(
                 f"https://itunes.apple.com/lookup?id={podcast_id_match.group(1)}",
             )
-        if response.status_code != 200:
-            return EpisodeAsset()
-        results = response.json().get("results", [])
-        feed_url = results[0].get("feedUrl", "") if results else ""
-        by_storefront_id = _find_episode_asset_in_rss(
-            _fetch_rss_text(feed_url), episode_id=episode_id,
-        )
-        if by_storefront_id.audio_url or by_storefront_id.transcript_url:
-            return by_storefront_id
-        # Apple storefront episode IDs are frequently absent from the RSS
-        # GUID/link. Defuddle's episode title is the safe fallback.
-        return _find_episode_asset_in_rss(
-            _fetch_rss_text(feed_url), target_title=target_title,
-        )
+        if response.status_code == 200:
+            results = response.json().get("results", [])
+            feed_url = results[0].get("feedUrl", "") if results else ""
+            rss_text = _fetch_rss_text(feed_url)
+            by_storefront_id = _find_episode_asset_in_rss(
+                rss_text, episode_id=episode_id,
+            )
+            if by_storefront_id.audio_url or by_storefront_id.transcript_url:
+                return by_storefront_id
+            # Apple storefront episode IDs are frequently absent from RSS GUIDs.
+            by_title = _find_episode_asset_in_rss(rss_text, target_title=target_title)
+            if by_title.audio_url or by_title.transcript_url:
+                return by_title
     except (httpx.HTTPError, ValueError) as exc:
-        logger.debug("Apple RSS lookup failed: %s", exc)
-        return EpisodeAsset()
+        logger.debug("Apple iTunes RSS lookup failed: %s", exc)
+
+    return EpisodeAsset()
 
 
 def _find_apple_audio_url(url: str) -> str:
@@ -505,17 +553,10 @@ def _find_episode_audio_in_rss(rss_text: str, episode_id: str) -> str:
 
 # ── Spotify audio URL ────────────────────────────────────────────────────
 
-def _find_spotify_episode_asset(
-    url: str,
-    metadata: dict[str, str] | None = None,
-) -> EpisodeAsset:
-    """Resolve Spotify via cross-platform iTunes discovery and canonical RSS."""
-    metadata = metadata or _fetch_defuddle_md_metadata(url)
-    title = metadata.get("title", "")
-    author = metadata.get("author", "")
+def _find_asset_via_itunes(title: str, author: str = "") -> EpisodeAsset:
+    """Fallback canonical RSS discovery through the iTunes podcast directory."""
     if not title:
         return EpisodeAsset()
-
     search_term = author.strip() or title.strip()
     try:
         with httpx.Client(
@@ -528,7 +569,6 @@ def _find_spotify_episode_asset(
             )
         if response.status_code != 200:
             return EpisodeAsset()
-
         for result in response.json().get("results", []):
             asset = _find_episode_asset_in_rss(
                 _fetch_rss_text(result.get("feedUrl", "")),
@@ -536,14 +576,31 @@ def _find_spotify_episode_asset(
             )
             if asset.audio_url or asset.transcript_url:
                 logger.info(
-                    "Found cross-platform RSS episode for Spotify '%s' via '%s'",
+                    "Found cross-platform RSS episode '%s' via iTunes podcast '%s'",
                     title,
                     result.get("collectionName", ""),
                 )
                 return asset
     except (httpx.HTTPError, ValueError) as exc:
-        logger.debug("Spotify cross-platform search failed: %s", exc)
+        logger.debug("iTunes podcast discovery failed: %s", exc)
     return EpisodeAsset()
+
+
+def _find_spotify_episode_asset(
+    url: str,
+    metadata: dict[str, str] | None = None,
+) -> EpisodeAsset:
+    """Resolve Spotify through Podcast Index, then iTunes, then canonical RSS."""
+    metadata = metadata or _fetch_defuddle_md_metadata(url)
+    title = metadata.get("title", "")
+    author = metadata.get("author", "")
+    if not title:
+        return EpisodeAsset()
+
+    by_podcast_index = _find_asset_via_podcast_index(title, author)
+    if by_podcast_index.audio_url or by_podcast_index.transcript_url:
+        return by_podcast_index
+    return _find_asset_via_itunes(title, author)
 
 
 def _find_spotify_audio_url(url: str) -> str:
