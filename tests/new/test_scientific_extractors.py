@@ -53,6 +53,7 @@ def test_discover_scientific_documents_reads_publication_metadata() -> None:
     </head><body>
       <a href="/downloads/supplement.pdf" type="application/pdf">Download PDF</a>
       <a href="https://unlicensed-mirror.example/paper.pdf">Mirror</a>
+      <a href="https://unlicensed-mirror.journals.example.edu/paper.pdf">Subdomain mirror</a>
     </body></html>
     """
 

@@ -112,18 +112,19 @@ class _ScientificLinkParser(HTMLParser):
 
 
 def _same_official_site(candidate_url: str, landing_url: str) -> bool:
-    """Keep discovery on the publisher's own domain family, never mirrors."""
+    """Keep discovery on the known publisher host, never broad domain families."""
     candidate_host = (urlparse(candidate_url).hostname or "").lower()
     landing_host = (urlparse(landing_url).hostname or "").lower()
     if not candidate_host or not landing_host:
         return False
     if candidate_host == landing_host:
         return True
-    landing_parts = landing_host.split(".")
-    if len(landing_parts) < 2:
-        return False
-    root_domain = ".".join(landing_parts[-2:])
-    return candidate_host.endswith(f".{root_domain}")
+
+    # SSRN's official publicly linked documents use several ssrn.com
+    # subdomains (for example papers.ssrn.com and deliverypdf.ssrn.com).
+    # Keep this narrow exception rather than treating every sibling subdomain
+    # as official, which could silently admit an unlicensed mirror.
+    return candidate_host.endswith(".ssrn.com") and landing_host.endswith(".ssrn.com")
 
 
 def discover_scientific_documents(html: str, landing_url: str) -> list[tuple[str, str]]:

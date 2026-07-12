@@ -105,7 +105,7 @@ def extract_web(url: str, timeout: int = _TIMEOUT) -> SourceDoc:
         except Exception as exc:
             errors.append(f"semantic_scholar: {exc}")
 
-    # Layer 5: akjournals / journal XML direct-page fallback
+    # Layer 8: akjournals / journal XML direct-page fallback
     if _is_journal_xml_url(url):
         try:
             from obsidian_llm_wiki.ingest.alt_source import extract_via_journal_page
@@ -113,7 +113,7 @@ def extract_web(url: str, timeout: int = _TIMEOUT) -> SourceDoc:
         except Exception as exc:
             errors.append(f"journal_direct: {exc}")
 
-    # Layer 6: Wayback Machine
+    # Layer 9: Wayback Machine
     try:
         return _extract_wayback(url, timeout)
     except Exception as exc:
