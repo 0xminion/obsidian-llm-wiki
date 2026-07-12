@@ -125,6 +125,44 @@ def test_registry_imports_scientific_extractor_before_pdf_extractor() -> None:
     assert names.index("extract_arxiv") < names.index("extract_pdf")
 
 
+def test_non_paper_arxiv_url_falls_through_to_extract_web() -> None:
+    """arXiv non-paper pages (/help, /list, /year) must not be claimed by the
+    scientific extractor.  They should fall through to extract_web.
+    """
+    from urllib.parse import urlparse
+
+    from obsidian_llm_wiki.ingest.extractors.scientific import _is_arxiv_url
+
+    for url in (
+        "https://arxiv.org/help",
+        "https://arxiv.org/list/cs.AI/recent",
+        "https://arxiv.org/year/cs/23",
+        "https://arxiv.org/float",
+    ):
+        assert not _is_arxiv_url(urlparse(url), url), url
+
+
+def test_arxiv_paper_id_modern_and_legacy_formats() -> None:
+    """Paper ID parsing handles modern YYMM.NNNNN, versioned, and legacy formats."""
+    from obsidian_llm_wiki.ingest.extractors.scientific import arxiv_paper_id
+
+    # Modern
+    assert arxiv_paper_id("https://arxiv.org/abs/1706.03762") == "1706.03762"
+    # Versioned
+    assert arxiv_paper_id("https://arxiv.org/abs/2301.12345v3") == "2301.12345v3"
+    # HTML route
+    assert arxiv_paper_id("https://arxiv.org/html/2401.00123") == "2401.00123"
+    # PDF route (no .pdf suffix)
+    assert arxiv_paper_id("https://arxiv.org/pdf/2401.00123") == "2401.00123"
+    # PDF route (with .pdf suffix)
+    assert arxiv_paper_id("https://arxiv.org/pdf/2401.00123.pdf") == "2401.00123"
+    # Legacy: category/NNNNNNN
+    assert arxiv_paper_id("https://arxiv.org/abs/cs.LG/0703007") == "cs.LG/0703007"
+    # Non-paper: None
+    assert arxiv_paper_id("https://arxiv.org/help") is None
+    assert arxiv_paper_id("https://arxiv.org/list/cs.AI/recent") is None
+
+
 def test_registry_forwards_original_arxiv_abstract_url_to_specialized_route() -> None:
     """The scientific route sees /abs/ rather than a prematurely rewritten PDF URL."""
     from obsidian_llm_wiki.ingest import extractors as registry

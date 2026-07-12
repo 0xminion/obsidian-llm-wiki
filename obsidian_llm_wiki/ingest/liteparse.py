@@ -175,11 +175,30 @@ def _content_type(headers: httpx.Headers) -> str:
 
 
 def _document_candidates(html: str, page_url: str) -> list[str]:
-    """Find citation metadata and PDF links in an HTML landing page."""
+    """Find citation metadata and PDF links in an HTML landing page.
+
+    Only same-site candidates are returned to avoid routing extraction through
+    external mirrors or third-party access workarounds.
+    """
     parser = _DocumentLinkParser()
     parser.feed(html)
     parser.close()
-    return list(dict.fromkeys(urljoin(page_url, candidate) for candidate in parser.candidates))
+
+    page_host = (urlparse(page_url).hostname or "").lower()
+    seen: set[str] = set()
+    candidates: list[str] = []
+    for raw_candidate in parser.candidates:
+        if not raw_candidate:
+            continue
+        resolved = urljoin(page_url, raw_candidate)
+        if resolved in seen:
+            continue
+        candidate_host = (urlparse(resolved).hostname or "").lower()
+        if candidate_host and candidate_host != page_host:
+            continue
+        seen.add(resolved)
+        candidates.append(resolved)
+    return candidates
 
 
 class _DocumentLinkParser(HTMLParser):
@@ -194,14 +213,15 @@ class _DocumentLinkParser(HTMLParser):
         href = attributes.get("href", "")
         if tag == "meta":
             name = attributes.get("name", attributes.get("property", "")).lower()
-            if name in {"citation_pdf_url", "citation_fulltext_html_url"}:
-                self.candidates.append(attributes.get("content", ""))
-        elif tag in {"a", "link"} and href:
+            content = attributes.get("content", "").strip()
+            if name in {"citation_pdf_url", "citation_fulltext_html_url"} and content:
+                self.candidates.append(content)
+        elif tag in {"a", "link"} and href.strip():
             relation = " ".join(
                 (attributes.get("rel", ""), attributes.get("type", ""), attributes.get("title", ""))
             ).lower()
             if "pdf" in href.lower() or "pdf" in relation:
-                self.candidates.append(href)
+                self.candidates.append(href.strip())
 
 
 def _markdown_title(markdown: str) -> str:

@@ -27,9 +27,14 @@ _MIN_DOCUMENT_CHARS = 100
 
 
 def _is_arxiv_url(parsed, raw: str) -> bool:
-    """Return whether *raw* is an official arXiv abstract, HTML, or PDF URL."""
-    del raw
-    return (parsed.hostname or "").lower() in _ARXIV_HOSTS
+    """Return whether *raw* is an arXiv paper URL (abs/html/pdf with a valid ID).
+
+    Non-paper pages (``/help``, ``/list``, ``/year``) do not match — they fall
+    through to ``extract_web`` as expected.
+    """
+    if (parsed.hostname or "").lower() not in _ARXIV_HOSTS:
+        return False
+    return arxiv_paper_id(raw) is not None
 
 
 def arxiv_paper_id(url: str) -> str | None:

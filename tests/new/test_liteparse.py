@@ -125,6 +125,33 @@ def test_document_candidates_include_citation_html_and_pdf_link_metadata():
     ]
 
 
+def test_document_candidates_reject_offsite_links():
+    """Off-site PDF links must not be followed — prevents routing through mirrors."""
+    from obsidian_llm_wiki.ingest.liteparse import _document_candidates
+
+    candidates = _document_candidates(
+        """
+        <meta name="citation_pdf_url" content="/local/paper.pdf">
+        <a href="https://evil-mirror.example/paper.pdf">Mirror</a>
+        """,
+        "https://journal.example/article",
+    )
+
+    assert candidates == ["https://journal.example/local/paper.pdf"]
+
+
+def test_document_candidates_skip_empty_meta_content():
+    """Empty content attributes do not produce the page URL itself as a candidate."""
+    from obsidian_llm_wiki.ingest.liteparse import _document_candidates
+
+    candidates = _document_candidates(
+        '<meta name="citation_pdf_url" content="">',
+        "https://journal.example/article",
+    )
+
+    assert candidates == []
+
+
 def test_document_fallback_discovers_citation_pdf_from_html_page():
     """Citation PDF metadata is preferred over a generic landing-page HTML parser."""
     from obsidian_llm_wiki.ingest import liteparse
@@ -239,3 +266,46 @@ def test_local_pdf_uses_liteparse_when_pymupdf_returns_empty_text(tmp_path: Path
         assert pdf._extract_local_pdf(str(path)) == expected
 
     fallback.assert_called_once_with(path, str(path))
+
+
+def test_remote_pdf_uses_liteparse_when_pymupdf_fails():
+    """A remote PDF with a corrupt/encrypted text layer falls back to LiteParse."""
+    from obsidian_llm_wiki.ingest.extractors import pdf
+
+    url = "https://example.com/corrupt.pdf"
+    expected = SourceDoc(title="Recovered", content="LiteParse recovered text", url=url)
+
+    class FailingFitz:
+        @staticmethod
+        def open(*_args, **_kwargs):
+            raise RuntimeError("pymupdf cannot open this PDF")
+
+    class FakeClient:
+        def __init__(self, **_kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def get(self, _url):
+            import httpx
+            return httpx.Response(
+                200,
+                content=b"%PDF-corrupt" + b"X" * 200,
+                headers={"content-type": "application/pdf"},
+                request=httpx.Request("GET", url),
+            )
+
+    with (
+        patch.object(pdf, "fitz", FailingFitz),
+        patch.object(pdf.httpx, "Client", FakeClient),
+        patch.object(pdf, "_extract_with_liteparse", return_value=expected) as fallback,
+    ):
+        result = pdf._extract_remote_pdf(url)
+
+    assert result == expected
+    fallback.assert_called_once()
+    assert fallback.call_args.args[1] == url  # source_url is the second positional arg
