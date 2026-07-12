@@ -91,12 +91,12 @@ sections. A quality gate flags thin concepts (`confidence: 0.3`).
 | Web articles / blogs / news | `trafilatura` | included | — |
 | YouTube videos | Supadata → metadata fallback | API key optional | transcript + metadata |
 | Podcasts / RSS | cache → RSS transcript → AssemblyAI → Supadata → Whisper | API keys optional | publisher or generated transcript |
-| PDF files | `pymupdf` (fitz) | `pip install okf-pipeline[pdf]` | full text with page markers |
+| PDF files | `pymupdf` (fitz) | `pip install obsidian-llm-wiki[pdf]` | full text with page markers |
 | Scientific reports (arXiv / publishers) | official accessible HTML → official PDF | `pymupdf` for PDF fallback | structured public full text when available |
-| Word `.docx` | `python-docx` | `pip install okf-pipeline[docx]` | text with heading structure |
+| Word `.docx` | `python-docx` | `pip install obsidian-llm-wiki[docx]` | text with heading structure |
 | Plain text / markdown | built-in | — | direct file read |
 
-Install all optional extractors: `pip install okf-pipeline[all]`
+Install all optional extractors: `pip install obsidian-llm-wiki[all]`
 
 The extractor registry auto-detects source type from URL domain or file
 extension. Unknown URLs fall back to web extraction (trafilatura).
@@ -333,7 +333,6 @@ obsidian_llm_wiki/
   providers/
     llm.py               # Ollama + OpenAI-compatible clients
   config.py              # Configuration management
-pipeline/                 # Legacy package (backward compat tests)
 ```
 
 ---
