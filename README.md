@@ -92,6 +92,7 @@ sections. A quality gate flags thin concepts (`confidence: 0.3`).
 | YouTube videos | Supadata → metadata fallback | API key optional | transcript + metadata |
 | Podcasts / RSS | cache → RSS transcript → AssemblyAI → Supadata → Whisper | API keys optional | publisher or generated transcript |
 | PDF files | `pymupdf` (fitz) | `pip install okf-pipeline[pdf]` | full text with page markers |
+| Scientific reports (arXiv / publishers) | official accessible HTML → official PDF | `pymupdf` for PDF fallback | structured public full text when available |
 | Word `.docx` | `python-docx` | `pip install okf-pipeline[docx]` | text with heading structure |
 | Plain text / markdown | built-in | — | direct file read |
 
@@ -99,6 +100,22 @@ Install all optional extractors: `pip install okf-pipeline[all]`
 
 The extractor registry auto-detects source type from URL domain or file
 extension. Unknown URLs fall back to web extraction (trafilatura).
+
+### Scientific reports and public-access boundaries
+
+For an arXiv URL, ingestion parses the paper identifier and first requests the
+official accessible rendition at `https://arxiv.org/html/<paper-id>`. arXiv
+HTML availability is partial, so an unavailable, short, or unextractable HTML
+conversion falls back to the official `https://arxiv.org/pdf/<paper-id>` through
+the existing PDF document extractor.
+
+When an inaccessible publisher landing page advertises an official direct
+full-text URL through `citation_fulltext_html_url`, `citation_pdf_url`, or a
+same-publisher PDF link, the extractor may follow that public document link.
+It does not use cookies, credentials, paywall bypasses, or unlicensed mirrors.
+For SSRN, no publicly accessible document means the existing Semantic Scholar
+metadata/abstract fallback is used rather than attempting to evade access
+controls.
 
 ### Podcast transcript resolution
 

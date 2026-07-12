@@ -65,22 +65,6 @@ def register_extractor(
 # ── Dispatch ────────────────────────────────────────────────────────────
 
 
-_ARXIV_HOSTS = frozenset(("arxiv.org", "www.arxiv.org", "export.arxiv.org"))
-
-
-def _normalize_arxiv_url(url: str) -> str:
-    """Rewrite arxiv /abs/ URLs to /pdf/ for direct PDF extraction."""
-    parsed = urlparse(url)
-    host = (parsed.hostname or "").lower()
-    if host not in _ARXIV_HOSTS:
-        return url
-    path = parsed.path or ""
-    if "/abs/" in path:
-        new_path = path.replace("/abs/", "/pdf/", 1)
-        return parsed._replace(path=new_path, query="", fragment="").geturl()
-    return url
-
-
 def extract(raw_url: str) -> SourceDoc:
     """Extract content from a URL or file path using the registered extractors.
 
@@ -98,9 +82,6 @@ def extract(raw_url: str) -> SourceDoc:
     Raises:
         RuntimeError: If all extraction strategies fail.
     """
-    # Normalize arxiv /abs/ → /pdf/ before any dispatch.
-    raw_url = _normalize_arxiv_url(raw_url)
-
     # Check if it's a local file path.
     if _looks_like_file_path(raw_url):
         return _extract_file(raw_url)
@@ -236,6 +217,9 @@ def _extract_file(file_path: str) -> SourceDoc:
 
 with suppress(ImportError):
     from obsidian_llm_wiki.ingest.extractors import youtube as _youtube  # noqa: F401
+
+with suppress(ImportError):
+    from obsidian_llm_wiki.ingest.extractors import scientific as _scientific  # noqa: F401
 
 with suppress(ImportError):
     from obsidian_llm_wiki.ingest.extractors import pdf as _pdf  # noqa: F401

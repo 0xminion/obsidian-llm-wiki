@@ -1,10 +1,11 @@
 """Web URL extraction — Stage 1 deterministic ingest.
 
 Multi-layer strategy:
-  1. httpx fetch + trafilatura extract (primary)
-  2. defuddle CLI (npm) — removes JS/clutter, often succeeds where trafilatura is blocked
-  3. Invidious API (YouTube metadata fallback)
-  4. archive.org Wayback Machine (last resort)
+  1. hosted Defuddle markdown extraction
+  2. LiteParse local structured-document fallback
+  3. trafilatura article extraction
+  4. defuddle CLI
+  5. specialist and archive fallbacks
 
 Each layer runs only if the previous one fails. The SourceDoc always carries
 the full content — never truncated.
@@ -36,10 +37,14 @@ def extract_web(url: str, timeout: int = _TIMEOUT) -> SourceDoc:
 
     Strategy (in order):
       1. defuddle.md web service — best structured markdown for articles/blogs
-      2. trafilatura extract — fallback for non-JS pages
-      3. defuddle CLI — local defuddle fallback
-      4. Invidious API — YouTube-only metadata fallback
-      5. archive.org Wayback Machine — last resort
+      2. LiteParse local document parser — direct files and citation-linked papers
+      3. trafilatura extract — fallback for non-JS pages
+      4. defuddle CLI — local defuddle fallback
+      5. public publisher HTML/PDF links — same-site citation metadata only
+      6. Invidious API — YouTube-only metadata fallback
+      7. Semantic Scholar — SSRN metadata/abstract fallback
+      8. journal direct-page fallback
+      9. archive.org Wayback Machine — last resort
 
     Raises:
         RuntimeError: When all strategies fail.
@@ -52,19 +57,39 @@ def extract_web(url: str, timeout: int = _TIMEOUT) -> SourceDoc:
     except Exception as exc:
         errors.append(f"defuddle.md: {exc}")
 
-    # Layer 2: trafilatura
+    # Layer 2: LiteParse local document fallback. This is optional; a missing
+    # CLI is recorded and the ordinary HTML fallbacks continue.
+    try:
+        return _extract_liteparse_document(url, timeout)
+    except Exception as exc:
+        errors.append(f"liteparse: {exc}")
+
+    # Layer 3: trafilatura
     try:
         return _extract_trafilatura(url, timeout)
     except Exception as exc:
         errors.append(f"trafilatura: {exc}")
 
-    # Layer 3: defuddle CLI (no proxy — it has its own UA handling)
+    # Layer 4: defuddle CLI (no proxy — it has its own UA handling)
     try:
         return _extract_defuddle(url, timeout)
     except Exception as exc:
         errors.append(f"defuddle: {exc}")
 
-    # Layer 3: Invidious (YouTube only)
+    # Layer 5: public publisher document links.  This is deliberately limited
+    # to same-publisher citation metadata/direct PDF links and never uses
+    # cookies, credentials, or third-party mirrors to bypass access controls.
+    if not _is_youtube_url(url):
+        try:
+            from obsidian_llm_wiki.ingest.extractors.scientific import (
+                extract_discovered_scientific_document,
+            )
+
+            return extract_discovered_scientific_document(url, timeout)
+        except Exception as exc:
+            errors.append(f"public_scientific_document: {exc}")
+
+    # Layer 6: Invidious (YouTube only)
     if _is_youtube_url(url):
         try:
             from obsidian_llm_wiki.ingest.alt_source import extract_via_invidious
@@ -72,7 +97,7 @@ def extract_web(url: str, timeout: int = _TIMEOUT) -> SourceDoc:
         except Exception as exc:
             errors.append(f"invidious: {exc}")
 
-    # Layer 4: SSRN via Semantic Scholar (academic paper fallback)
+    # Layer 7: SSRN via Semantic Scholar (academic paper fallback)
     if _is_ssrn_url(url):
         try:
             from obsidian_llm_wiki.ingest.alt_source import extract_via_semantic_scholar
@@ -97,6 +122,13 @@ def extract_web(url: str, timeout: int = _TIMEOUT) -> SourceDoc:
     raise RuntimeError(
         f"All extraction strategies failed for {url}:\n  " + "\n  ".join(errors)
     )
+
+
+def _extract_liteparse_document(url: str, timeout: int) -> SourceDoc:
+    """Try LiteParse for direct documents or citation-linked landing pages."""
+    from obsidian_llm_wiki.ingest.liteparse import extract_document_fallback
+
+    return extract_document_fallback(url, timeout)
 
 
 def _extract_defuddle(url: str, timeout: int) -> SourceDoc:
