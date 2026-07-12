@@ -33,6 +33,19 @@ _RESERVED = frozenset({"index.md", "log.md"})
 _WIKILINK_RE = re.compile(r"\[\[([^\]|]+)(?:\|([^\]]+))?\]\]")
 
 
+def _normalize_wikilink_target(target: str) -> str:
+    """Reduce a raw wikilink target to the bare note stem Obsidian resolves.
+
+    Valid links may carry heading anchors ([[slug#Section]]), block refs
+    ([[slug#^id]]), directory prefixes ([[concepts/slug]]), and a .md
+    extension — all of which resolve fine in Obsidian but would fail a naive
+    comparison against bare file stems.
+    """
+    stem = target.split("#", 1)[0].strip()
+    stem = stem.rsplit("/", maxsplit=1)[-1]
+    return stem.removesuffix(".md").strip()
+
+
 @app.command()
 def health(
     vault: str = typer.Argument(..., help="Path to Obsidian vault"),
@@ -97,7 +110,7 @@ def _generate_health_report(bundle_dir: Path) -> str:
             _, body = parse_frontmatter(raw)
             # Count wikilinks in the MoC body as concept references.
             moc_links = _WIKILINK_RE.findall(body)
-            moc_slugs = [link[0].strip() for link in moc_links]
+            moc_slugs = [_normalize_wikilink_target(link[0]) for link in moc_links]
             # Filter to only concept-directory files.
             moc_concept_slugs = [
                 s for s in moc_slugs
@@ -127,9 +140,14 @@ def _generate_health_report(bundle_dir: Path) -> str:
         # Check for broken wikilinks.
         for match in _WIKILINK_RE.finditer(body):
             target_slug = match.group(1).strip()
-            target_slug_no_ext = target_slug.replace(".md", "")
-            if target_slug_no_ext not in all_stems and target_slug not in all_stems:
-                broken_wikilinks.append(f"{rel}: [[{target_slug}]]")
+            stem = _normalize_wikilink_target(target_slug)
+            if not stem or stem in all_stems:
+                continue
+            # Non-markdown embeds ([[img.png]]) can't be verified against
+            # .md stems — skip rather than misreport.
+            if "." in stem:
+                continue
+            broken_wikilinks.append(f"{rel}: [[{target_slug}]]")
 
         # Check tag violations (spaces in tags).
         tags = meta.get("tags", [])

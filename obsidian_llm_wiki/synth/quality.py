@@ -494,12 +494,14 @@ async def quality_synthesize_source(
         pass
 
     # ── Pass 1: Extract skeleton (with chunking) ──────────────────────
+    # Gate chunking on config.chunk_size itself: the CHUNK_SIZE knob controls
+    # *when* chunking happens, not just chunk width. (A separate hardcoded
+    # 40K gate silently left 30-40K sources unchunked, contradicting both this
+    # module's docstring and pipeline.py's user-facing warning.)
     chunk_size = getattr(config, "chunk_size", 30_000)
-    # Threshold: chunk if content > ~40K chars (~10K tokens)
-    chunk_threshold = 40_000
     content_len = len(source.content)
 
-    if content_len > chunk_threshold:
+    if content_len > chunk_size:
         chunks = chunk_content(source.content, chunk_size)
         logger.info(
             "Source '%s' is %d chars — chunking into %d chunk(s) of ~%d chars",
@@ -509,7 +511,7 @@ async def quality_synthesize_source(
         # Run Pass 1 on each chunk concurrently
         sem = asyncio.Semaphore(config.compile_concurrency)
 
-        async def _extract_chunk(chunk_content: str) -> str | None:
+        async def _extract_chunk(chunk_content: str) -> str:
             async with sem:
                 prompt = build_extract_prompt(
                     source.title,
@@ -520,42 +522,54 @@ async def quality_synthesize_source(
                 msgs = [
                     {"role": "user", "content": "Extract concepts from the source document above."}
                 ]
-                try:
-                    return await acall_llm(prompt, msgs, config)
-                except Exception as exc:
-                    logger.error("Pass 1 chunk failed for '%s': %s", filename, exc)
-                    return None
+                return await acall_llm(prompt, msgs, config)
 
+        # Let every chunk finish, then fail loudly if ANY chunk failed. A
+        # partial skeleton must never propagate as success: the pipeline would
+        # cache it and hash-stamp the source, permanently losing the failed
+        # chunks' content with no error recorded and no retry on later runs.
         chunk_responses = await asyncio.gather(
             *[_extract_chunk(c) for c in chunks],
-            return_exceptions=False,
+            return_exceptions=True,
         )
 
         # Parse each chunk's response into a skeleton
         skeletons: list[SourceSynthesis] = []
         all_rationales: dict[str, str] = {}
-        for chunk_resp in chunk_responses:
-            if chunk_resp is None:
+        chunk_errors: list[str] = []
+        for chunk_idx, chunk_resp in enumerate(chunk_responses, start=1):
+            if isinstance(chunk_resp, BaseException):
+                chunk_errors.append(
+                    f"chunk {chunk_idx}/{len(chunks)}: "
+                    f"{type(chunk_resp).__name__}: {chunk_resp}"
+                )
                 continue
             chunk_skeleton = parse_single_source_synthesis(chunk_resp)
-            if chunk_skeleton is not None:
-                skeletons.append(chunk_skeleton)
-                # Extract rationales from each chunk's JSON
-                try:
-                    from obsidian_llm_wiki.synth.parser import _extract_json
-                    raw_data = _extract_json(chunk_resp)
-                    if isinstance(raw_data, dict):
-                        for c in raw_data.get("concepts", []):
-                            if isinstance(c, dict) and c.get("slug"):
-                                rat = c.get("rationale", "")
-                                if rat:
-                                    all_rationales[c["slug"]] = rat
-                except Exception:
-                    pass
+            if chunk_skeleton is None:
+                chunk_errors.append(
+                    f"chunk {chunk_idx}/{len(chunks)}: unparseable response"
+                )
+                continue
+            skeletons.append(chunk_skeleton)
+            # Extract rationales from each chunk's JSON
+            try:
+                from obsidian_llm_wiki.synth.parser import _extract_json
+                raw_data = _extract_json(chunk_resp)
+                if isinstance(raw_data, dict):
+                    for c in raw_data.get("concepts", []):
+                        if isinstance(c, dict) and c.get("slug"):
+                            rat = c.get("rationale", "")
+                            if rat:
+                                all_rationales[c["slug"]] = rat
+            except Exception:
+                pass
 
-        if not skeletons:
-            logger.warning("Pass 1 produced no parseable skeletons for '%s'", filename)
-            return None
+        if chunk_errors:
+            raise RuntimeError(
+                f"Pass 1 chunked extraction incomplete for '{filename}' "
+                f"({len(skeletons)}/{len(chunks)} chunks succeeded): "
+                + "; ".join(chunk_errors)
+            )
 
         skeleton = merge_skeletons(skeletons)
         rationales = all_rationales
@@ -1025,21 +1039,16 @@ Return JSON:
     if not response or not response.strip():
         return None
 
-    try:
-        import json
-        # Try to extract JSON from the response
-        text = response.strip()
-        if "```json" in text:
-            start = text.index("```json") + 7
-            end = text.index("```", start)
-            text = text[start:end].strip()
-        elif "```" in text:
-            start = text.index("```") + 3
-            end = text.index("```", start)
-            text = text[start:end].strip()
+    # Use the shared hardened extractor (fences, prose-wrapped, truncated
+    # output) rather than a bespoke fence parser that fails on responses the
+    # rest of the pipeline handles fine.
+    from obsidian_llm_wiki.synth.parser import _extract_json
 
-        data = json.loads(text)
-    except (json.JSONDecodeError, ValueError):
+    try:
+        data = _extract_json(response)
+    except Exception:
+        data = None
+    if not isinstance(data, dict):
         logger.warning("Could not parse re-synthesis JSON for '%s'", concept.slug)
         return None
 

@@ -33,12 +33,15 @@ from obsidian_llm_wiki.config import Config, load_config
 from obsidian_llm_wiki.core.cache import (
     delete_cached_synthesis,
     load_all_cached_syntheses,
+    load_resynthesis_overlay,
+    save_resynthesis_overlay,
     save_synthesis,
 )
 from obsidian_llm_wiki.core.lock import acquire_lock, release_lock
 from obsidian_llm_wiki.core.metrics import MetricsCollector
 from obsidian_llm_wiki.core.models import (
     CompileResult,
+    ConceptNote,
     SourceDoc,
     SourceSynthesis,
     SynthesisBundle,
@@ -202,15 +205,12 @@ async def run_pipeline(
             filenames_done: list[str] = []
             for i, res in enumerate(synth_results):
                 filename = list(to_compile.keys())[i]
+                # Failure metrics were already recorded per attempt inside
+                # _synthesize_with_retry — recording again here would count
+                # one failed source as 4 failures in metrics.json.
                 if isinstance(res, BaseException):
                     logger.error("Synthesis failed for '%s': %s", filename, res)
                     result.errors.append(f"synth:{filename}:{res}")
-                    if metrics:
-                        metrics.record_synthesis(
-                            source_file=filename,
-                            success=False,
-                            error_type=type(res).__name__,
-                        )
                     continue
                 if res is None:
                     logger.warning(
@@ -218,12 +218,6 @@ async def run_pipeline(
                         "(tried all truncation levels)", filename,
                     )
                     result.errors.append(f"synth:{filename}: no output (permanent failure)")
-                    if metrics:
-                        metrics.record_synthesis(
-                            source_file=filename,
-                            success=False,
-                            error_type="no_output_all_truncation_levels",
-                        )
                     continue
                 all_syntheses_by_file[filename] = res
                 save_synthesis(res, config.llmwiki_dir, filename)
@@ -248,18 +242,48 @@ async def run_pipeline(
         from obsidian_llm_wiki.synth.dedupe import propagate_backlinks
         propagate_backlinks(bundle)
 
+        # ── Re-apply persisted resynthesized concepts ──────────────────
+        # merge_bundle rebuilt every concept from the per-source caches, which
+        # still hold pre-resynthesis bodies. Without re-applying the overlay,
+        # every coherently rewritten concept would revert to its mechanical
+        # merge on the next run. Entries whose slug was freshly extracted this
+        # run are dropped: the fresh synthesis supersedes them (and overlapping
+        # slugs get re-resynthesized below).
+        overlay = load_resynthesis_overlay(config.llmwiki_dir)
+        overlay_dirty = False
+        if overlay:
+            fresh_slugs = {
+                c.slug
+                for f in filenames_done
+                for c in all_syntheses_by_file[f].concepts
+            }
+            for slug in fresh_slugs & overlay.keys():
+                del overlay[slug]
+                overlay_dirty = True
+            concept_index = {c.slug: i for i, c in enumerate(bundle.concepts)}
+            for slug, concept in overlay.items():
+                idx = concept_index.get(slug)
+                if idx is not None:
+                    bundle.concepts[idx] = concept
+
         # ── Incremental concept re-synthesis ──────────────────────────
         # When new sources reference existing concepts (from cached syntheses),
         # re-synthesize those concepts to integrate new information coherently
         # rather than just appending sections.
         if filenames_done and config.synthesis_mode == "two_pass":
             try:
-                await _resynthesize_referenced_concepts(
+                resynthesized = await _resynthesize_referenced_concepts(
                     config, bundle, filenames_done,
                     all_syntheses_by_file, sources, metrics,
                 )
+                if resynthesized:
+                    overlay.update(resynthesized)
+                    overlay_dirty = True
             except Exception as exc:
                 logger.warning("Concept re-synthesis skipped: %s", exc)
+
+        if overlay_dirty:
+            save_resynthesis_overlay(config.llmwiki_dir, overlay)
 
         # ── Render: full corpus deterministic markdown ─────────────────
         logger.info(
@@ -496,19 +520,26 @@ async def recompile_single_source(
     bundle_dir = config.wiki_dir
     bundle_dir.mkdir(parents=True, exist_ok=True)
 
-    # Load the single source file
+    # Load the single source file through the same loader as `olw build`:
+    # it strips YAML frontmatter and takes the title from it. Reading the raw
+    # file here would synthesize frontmatter noise under the stem title AND
+    # store a raw-content hash that never matches the build's body hash, so
+    # the next build would immediately re-synthesize and discard this result.
+    from obsidian_llm_wiki.ingest.sources import load_source_file
+
     source_path = config.sources_dir / source_file
     if not source_path.exists():
         result.errors.append(f"Source file not found: {source_path}")
         return result
 
-    content = source_path.read_text(encoding="utf-8")
-    title = source_path.stem
-    source = SourceDoc(title=title, content=content, url=str(source_path), source_file=source_file)
+    source = load_source_file(source_path)
+    if source is None:
+        result.errors.append(f"source:{source_file}: empty or unreadable")
+        return result
 
-    if len(content) < config.min_source_chars:
+    if len(source.content) < config.min_source_chars:
         result.errors.append(
-            f"source:{source_file}: too short ({len(content)} < "
+            f"source:{source_file}: too short ({len(source.content)} < "
             f"{config.min_source_chars} chars)"
         )
         return result
@@ -603,18 +634,23 @@ async def _resynthesize_referenced_concepts(
     all_syntheses_by_file: dict[str, SourceSynthesis],
     sources: dict[str, SourceDoc],
     metrics: MetricsCollector | None = None,
-) -> None:
+) -> dict[str, ConceptNote]:
     """Re-synthesize existing concepts that are referenced by new sources.
 
-    For each new source, find concepts in the new synthesis whose slug
-    already existed in the corpus (from cached syntheses). For each such
-    concept, call resynthesize_concept() to produce a coherent updated
-    concept body that integrates the new source's information.
+    For each concept whose slug appears in both a new synthesis and the cached
+    corpus, call resynthesize_concept() once with ALL referencing new sources'
+    content combined. One call per slug is essential: concurrent per-source
+    calls would each rewrite the same original concept and the last write
+    would silently discard the other sources' integrations.
+
+    Returns the successfully resynthesized concepts by slug so the caller can
+    persist them — the per-source caches were saved before this ran, so
+    without persistence the rewrites would revert on the next build.
 
     Only runs in two_pass mode. Skipped if no new sources or no overlaps.
     """
     if not new_filenames:
-        return
+        return {}
 
     from obsidian_llm_wiki.synth.quality import resynthesize_concept
 
@@ -626,10 +662,10 @@ async def _resynthesize_referenced_concepts(
         cached_slugs.update(c.slug for c in synth.concepts)
 
     if not cached_slugs:
-        return  # No existing concepts to re-synthesize
+        return {}  # No existing concepts to re-synthesize
 
-    # Find concepts in new sources that reference existing concepts
-    concepts_to_resynth: list[tuple[str, str, str]] = []  # (slug, source_content, source_title)
+    # Group the referencing new sources by concept slug.
+    sources_by_slug: dict[str, list[tuple[str, str]]] = {}  # slug → [(content, title)]
     for filename in new_filenames:
         synth = all_syntheses_by_file.get(filename)
         if not synth:
@@ -640,46 +676,57 @@ async def _resynthesize_referenced_concepts(
 
         for concept in synth.concepts:
             if concept.slug in cached_slugs:
-                concepts_to_resynth.append((concept.slug, source_content, source_title))
+                sources_by_slug.setdefault(concept.slug, []).append(
+                    (source_content, source_title),
+                )
 
-    if not concepts_to_resynth:
-        return
+    if not sources_by_slug:
+        return {}
 
     logger.info(
         "Re-synthesizing %d concepts referenced by new sources...",
-        len(concepts_to_resynth),
+        len(sources_by_slug),
     )
 
     # Build concept map from bundle
     concept_map = {c.slug: c for c in bundle.concepts}
 
-    # Re-synthesize each concept
+    # Re-synthesize each concept once, with all referencing sources combined.
     sem = asyncio.Semaphore(config.compile_concurrency)
 
-    async def _resynth_one(slug: str, content: str, title: str):
+    async def _resynth_one(slug: str, refs: list[tuple[str, str]]):
         async with sem:
             existing = concept_map.get(slug)
             if not existing:
                 return None
-            return await resynthesize_concept(config, existing, content, title)
+            combined_content = "\n\n---\n\n".join(
+                f"### Source: {title}\n\n{content}" for content, title in refs
+            )
+            combined_title = ", ".join(dict.fromkeys(title for _, title in refs))
+            return await resynthesize_concept(
+                config, existing, combined_content, combined_title,
+            )
 
+    slugs = list(sources_by_slug.keys())
     results = await asyncio.gather(
-        *[_resynth_one(s, c, t) for s, c, t in concepts_to_resynth],
+        *[_resynth_one(slug, sources_by_slug[slug]) for slug in slugs],
         return_exceptions=True,
     )
 
-    # Replace updated concepts in the bundle
-    updated = 0
-    for i, res in enumerate(results):
+    # Replace updated concepts in the bundle and collect them for persistence.
+    concept_index = {c.slug: i for i, c in enumerate(bundle.concepts)}
+    resynthesized: dict[str, ConceptNote] = {}
+    for slug, res in zip(slugs, results, strict=True):
         if isinstance(res, BaseException) or res is None:
             continue
-        slug = concepts_to_resynth[i][0]
-        # Replace in bundle.concepts
-        for j, c in enumerate(bundle.concepts):
-            if c.slug == slug:
-                bundle.concepts[j] = res
-                updated += 1
-                break
+        idx = concept_index.get(slug)
+        if idx is not None:
+            bundle.concepts[idx] = res
+            resynthesized[slug] = res
 
-    if updated:
-        logger.info("Re-synthesized %d/%d concepts successfully", updated, len(concepts_to_resynth))
+    if resynthesized:
+        logger.info(
+            "Re-synthesized %d/%d concepts successfully",
+            len(resynthesized), len(sources_by_slug),
+        )
+    return resynthesized

@@ -51,8 +51,16 @@ class OllamaClient(LLMClient):
             "stream": False,
         }
         # Pass context window to Ollama as num_ctx if not explicitly overridden.
-        if "num_ctx" not in kwargs and self.config.context_window:
-            kwargs["num_ctx"] = self.config.context_window
+        # Ollama only reads runtime parameters like num_ctx from the "options"
+        # object — a top-level num_ctx is silently ignored.
+        options: dict[str, Any] = kwargs.pop("options", {})
+        num_ctx = kwargs.pop("num_ctx", None)
+        if num_ctx is None and self.config.context_window:
+            num_ctx = self.config.context_window
+        if num_ctx:
+            options.setdefault("num_ctx", num_ctx)
+        if options:
+            body["options"] = options
         body.update(kwargs)
         with httpx.Client(timeout=self._timeout) as client:
             resp = client.post(url, json=body)

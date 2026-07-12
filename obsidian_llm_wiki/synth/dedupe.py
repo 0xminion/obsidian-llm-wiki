@@ -288,6 +288,11 @@ def semantic_dedupe_concepts(
         if slug_a in merged_slugs:
             continue
         for slug_b in slugs[i + 1:]:
+            # slug_a can become a victim mid-inner-loop; without this check it
+            # would be picked as a *survivor* for a later pair, merging that
+            # pair's content into an already-deleted concept.
+            if slug_a in merged_slugs:
+                break
             if slug_b in merged_slugs:
                 continue
             lang_a = concept_langs.get(slug_a, "en")
@@ -319,6 +324,15 @@ def semantic_dedupe_concepts(
     if not merge_map:
         return
 
+    # Flatten transitive chains (A→B, B→C ⇒ A→C): a survivor of an early merge
+    # can itself be merged away later, and a single-hop lookup would remap
+    # references onto a deleted slug.
+    for victim in merge_map:
+        target = merge_map[victim]
+        while target in merge_map:
+            target = merge_map[target]
+        merge_map[victim] = target
+
     # Remove merged concepts from the bundle.
     bundle.concepts = [
         c for c in bundle.concepts if c.slug not in merged_slugs
@@ -339,6 +353,22 @@ def semantic_dedupe_concepts(
         for link in concept.related:
             if link.slug in merge_map:
                 link.slug = merge_map[link.slug]
+
+    # Remap source-local concept slugs too. Entry pages build their wikilinks
+    # from bundle.sources[*].concepts, and the pipeline persists state.json
+    # from the same per-source objects — leaving victims here would render
+    # [[victim]] links to pages that no longer exist and feed deleted slugs
+    # back into the next run's dedup context.
+    for synthesis in bundle.sources:
+        seen_source_slugs: set[str] = set()
+        remapped_concepts = []
+        for concept in synthesis.concepts:
+            concept.slug = merge_map.get(concept.slug, concept.slug)
+            if concept.slug in seen_source_slugs:
+                continue  # two of this source's concepts merged into one
+            seen_source_slugs.add(concept.slug)
+            remapped_concepts.append(concept)
+        synthesis.concepts = remapped_concepts
 
     logger.info(
         "Semantic dedup: merged %d concept(s), %d remaining",
