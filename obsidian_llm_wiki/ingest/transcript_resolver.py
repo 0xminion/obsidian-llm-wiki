@@ -204,7 +204,7 @@ def validate_assemblyai_key(api_key: str | None = None) -> bool:
     if not key:
         return False
     try:
-        with httpx.Client(timeout=10) as client:
+        with httpx.Client(**make_client_kwargs(timeout=10)) as client:
             response = client.get(
                 _ASSEMBLYAI_BASE_URL,
                 params={"limit": 1},
@@ -244,7 +244,7 @@ def assemblyai_transcribe_url(
     }
 
     try:
-        with httpx.Client(timeout=30) as client:
+        with httpx.Client(**make_client_kwargs(timeout=30)) as client:
             response = client.post(_ASSEMBLYAI_BASE_URL, headers=headers, json=request)
             if response.status_code in (401, 403):
                 logger.warning("AssemblyAI rejected the configured API key.")

@@ -26,10 +26,11 @@ from contextlib import suppress
 from dataclasses import dataclass
 from urllib.parse import parse_qs, urlparse
 
+import httpx
 from defusedxml import ElementTree
 
 from obsidian_llm_wiki.core.models import SourceDoc
-from obsidian_llm_wiki.ingest.extractors import register_extractor
+from obsidian_llm_wiki.ingest.extractors import ExtractorNotApplicableError, register_extractor
 from obsidian_llm_wiki.ingest.http_headers import BROWSER_HEADERS, DEFAULT_TIMEOUT
 from obsidian_llm_wiki.ingest.podcast_index import discover_feed_urls
 from obsidian_llm_wiki.ingest.proxy import make_client_kwargs
@@ -95,8 +96,50 @@ def _is_generic_podcast(parsed, raw: str) -> bool:
     )
 
 
+_RSS_PATH_SEGMENTS = frozenset(("feed", "feeds", "rss", "podcast", "podcasts"))
+
+
 def _is_rss_feed(url: str) -> bool:
-    return url.endswith(".xml") or "/feed" in url or "/rss" in url
+    """Whether a URL *might* be a podcast RSS feed, matched on path structure.
+
+    This is deliberately a coarse pre-filter, not a decision. A substring test
+    over the whole URL (the previous ``"/feed" in url``) also matched
+    ``/feedback`` pages, sitemaps, and any query string mentioning rss. Match on
+    path segments instead, and let ``extract_podcast_rss`` disclaim the URL once
+    it can see whether the body is actually a podcast feed.
+    """
+    path = urlparse(url).path.lower().rstrip("/")
+    if path.endswith((".xml", ".rss")):
+        return True
+    segments = [segment for segment in path.split("/") if segment]
+    return bool(segments) and segments[-1] in _RSS_PATH_SEGMENTS
+
+
+def _looks_like_podcast_feed(rss_text: str) -> bool:
+    """Whether feed XML is a *podcast* feed rather than a plain blog/news feed.
+
+    A podcast feed carries audio/video enclosures, the iTunes namespace, or a
+    Podcasting 2.0 tag. A blog's Atom feed and an XML sitemap carry none of them.
+    """
+    if not rss_text:
+        return False
+    try:
+        root = ElementTree.fromstring(rss_text)
+    except (ElementTree.ParseError, ValueError):
+        return False
+
+    for element in root.iter():
+        local_name = _local_name(element.tag)
+        if local_name == "enclosure":
+            enclosure_type = element.attrib.get("type", "").lower()
+            if enclosure_type.startswith(("audio/", "video/")):
+                return True
+        if local_name == "transcript" and element.attrib.get("url"):
+            return True
+        # itunes:* / podcast:* namespaced tags identify a podcast feed.
+        if "itunes" in element.tag.lower() or "podcast" in element.tag.lower():
+            return True
+    return False
 
 
 # ── Registration ───────────────────────────────────────────────────────
@@ -121,13 +164,28 @@ def extract_generic_podcast(raw_url: str) -> SourceDoc:
 
 @register_extractor(lambda _parsed, raw: _is_rss_feed(raw))
 def extract_podcast_rss(raw_url: str) -> SourceDoc:
-    """Extract the most recent transcript-bearing episode from a public feed."""
-    return _extract_podcast(raw_url, platform="rss")
+    """Extract the most recent transcript-bearing episode from a public feed.
+
+    The URL predicate cannot tell a podcast feed from a blog's Atom feed or an
+    XML sitemap, so confirm from the body before claiming the URL. Disclaiming
+    lets dispatch fall through to ``extract_web`` instead of failing closed.
+    """
+    rss_text = _fetch_rss_text(raw_url)
+    if not _looks_like_podcast_feed(rss_text):
+        raise ExtractorNotApplicableError(
+            f"{raw_url} is not a podcast RSS feed (no audio/video enclosure, "
+            "iTunes namespace, or Podcasting 2.0 tag)"
+        )
+    return _extract_podcast(raw_url, platform="rss", rss_text=rss_text)
 
 
 # ── Core extraction ─────────────────────────────────────────────────────
 
-def _extract_podcast(raw_url: str, platform: str = "generic") -> SourceDoc:
+def _extract_podcast(
+    raw_url: str,
+    platform: str = "generic",
+    rss_text: str | None = None,
+) -> SourceDoc:
     """Extract podcast episode with transcript.
 
     Strategy:
@@ -138,7 +196,12 @@ def _extract_podcast(raw_url: str, platform: str = "generic") -> SourceDoc:
       5. Supadata for platforms/media it supports
       6. AssemblyAI remote URL transcription
       7. Local Whisper only as a final acquisition-dependent fallback
-      8. Metadata-only source marked as transcript unavailable
+
+    Raises:
+        RuntimeError: When neither a transcript nor an episode description could
+            be acquired. Emitting a metadata-only placeholder instead would let a
+            content-free stub reach the synthesis stage as though it were a
+            real source.
     """
     errors: list[str] = []
 
@@ -151,7 +214,7 @@ def _extract_podcast(raw_url: str, platform: str = "generic") -> SourceDoc:
 
     # Step 2: Resolve a canonical RSS episode. Spotify is cross-platform
     # discovered through iTunes/RSS; Apple already exposes its show identity.
-    asset = _resolve_episode_asset(raw_url, platform, metadata)
+    asset = _resolve_episode_asset(raw_url, platform, metadata, rss_text=rss_text)
     title = title or asset.title
     audio_url = asset.audio_url
     # RSS GUIDs are only guaranteed unique within one feed. Pair with the
@@ -229,7 +292,16 @@ def _extract_podcast(raw_url: str, platform: str = "generic") -> SourceDoc:
         else:
             errors.append("whisper: fallback unavailable or failed")
 
-    # Step 4: Build content
+    # Step 8: Build content. A source with neither a transcript nor a description
+    # carries no knowledge, so fail rather than emitting a placeholder — the
+    # caller's fallback chain and the operator both need to see this as a failure.
+    if transcript_result is None and not description:
+        raise RuntimeError(
+            f"Could not extract podcast content from {raw_url}: no transcript "
+            f"artifact and no episode description. Attempts: "
+            + ("; ".join(errors) if errors else "no audio URL resolved")
+        )
+
     parts: list[str] = []
     if author:
         parts.append(f"Host: {author}")
@@ -244,34 +316,23 @@ def _extract_podcast(raw_url: str, platform: str = "generic") -> SourceDoc:
         parts.append(f"Transcript source: {transcript_result.provider}")
         parts.append("")
         parts.append(transcript_result.text)
-    elif description:
+    else:
         parts.append("")
         parts.append("## Episode Description")
         parts.append("")
         parts.append(description)
-    else:
-        parts.extend([
-            "",
-            "## Transcript Status",
-            "",
-            "Transcript unavailable: no publisher artifact or configured "
-            "remote/local transcription provider produced usable text.",
-        ])
 
-    content = "\n".join(parts)
-    if not content.strip():
-        raise RuntimeError(
-            f"Could not extract podcast content from {raw_url}: "
-            + "; ".join(errors)
-        )
-
-    if not title:
-        title = raw_url
-
-    return SourceDoc(title=title, content=content.strip(), url=raw_url)
+    return SourceDoc(
+        title=title or raw_url,
+        content="\n".join(parts).strip(),
+        url=raw_url,
+    )
 
 
 # ── defuddle.md metadata ────────────────────────────────────────────────
+
+_FRONTMATTER_KEYS = frozenset(("title", "author", "published", "description"))
+
 
 def _fetch_defuddle_md_metadata(url: str) -> dict[str, str]:
     """Fetch episode metadata via defuddle.md web service."""
@@ -300,14 +361,14 @@ def _fetch_defuddle_md_metadata(url: str) -> dict[str, str]:
             if fm_end > 0:
                 fm_text = text[3:fm_end].strip()
                 for line in fm_text.split("\n"):
-                    if line.startswith("title:"):
-                        metadata["title"] = line[6:].strip().strip('"').strip("'")
-                    elif line.startswith("author:"):
-                        metadata["author"] = line[7:].strip().strip('"').strip("'")
-                    elif line.startswith("published:"):
-                        metadata["published"] = line[11:].strip().strip('"').strip("'")
-                    elif line.startswith("description:"):
-                        metadata["description"] = line[12:].strip().strip('"').strip("'")
+                    # Split on the first colon rather than slicing at a hardcoded
+                    # index — `line[11:]` for the 10-character "published:" was
+                    # dropping the first character of values with no space after
+                    # the colon.
+                    key, separator, value = line.partition(":")
+                    key = key.strip().lower()
+                    if separator and key in _FRONTMATTER_KEYS:
+                        metadata[key] = value.strip().strip('"').strip("'")
                 metadata["body"] = text[fm_end + 3:].strip()
         else:
             metadata["body"] = text
@@ -346,10 +407,16 @@ def _resolve_episode_asset(
     raw_url: str,
     platform: str,
     metadata: dict[str, str],
+    rss_text: str | None = None,
 ) -> EpisodeAsset:
-    """Resolve an episode's public RSS enclosure and transcript artifact."""
+    """Resolve an episode's public RSS enclosure and transcript artifact.
+
+    ``rss_text`` lets a caller that already fetched the feed pass it through
+    rather than paying for a second request.
+    """
     if platform == "rss":
-        return _find_episode_asset_in_rss(_fetch_rss_text(raw_url), allow_first=True)
+        feed = rss_text if rss_text is not None else _fetch_rss_text(raw_url)
+        return _find_episode_asset_in_rss(feed, allow_first=True)
     if platform == "apple":
         return _find_apple_episode_asset(
             raw_url,
@@ -391,7 +458,13 @@ def _local_name(tag: str) -> str:
 
 
 def _item_text(item, local_name: str) -> str:
-    for child in item.iter():
+    """Return the text of an item's *direct* child element.
+
+    Iterating descendants here would let a nested ``<itunes:image><title>`` or
+    ``<image><title>`` shadow the item's own ``<title>``. RSS item metadata is
+    always a direct child, so scan one level only.
+    """
+    for child in item:
         if _local_name(child.tag) == local_name and child.text:
             return child.text.strip()
     return ""
@@ -421,11 +494,24 @@ def _find_episode_asset_in_rss(
     for item in root.iter():
         if _local_name(item.tag) != "item":
             continue
-        fallback_item = fallback_item or item
-        item_xml = ElementTree.tostring(item, encoding="unicode")
+        # `fallback_item or item` tested the Element's truth value, which is
+        # False for a childless element and is deprecated outright.
+        if fallback_item is None:
+            fallback_item = item
         item_title = _item_text(item, "title")
         title_normalized = _normalise_title(item_title)
-        id_match = bool(episode_id and episode_id in item_xml)
+        # Match the episode ID against the identity fields only. Searching the
+        # whole serialized item XML let an ID like "1000123456" collide with a
+        # duration, byte length, or enclosure URL in an unrelated item and
+        # return the wrong episode's audio.
+        id_match = bool(
+            episode_id
+            and any(
+                episode_id in field
+                for field in (_item_text(item, "guid"), _item_text(item, "link"))
+                if field
+            )
+        )
         title_match = bool(
             target_normalized
             and title_normalized
@@ -617,7 +703,6 @@ def _find_episode_audio_by_title(rss_text: str, target_title: str) -> str:
 
 def _get_supadata_key() -> str:
     """Get the Supadata API key from environment."""
-    import os
     return os.environ.get("SUPADATA_API_KEY", "")
 
 
@@ -629,7 +714,7 @@ def _supadata_transcribe_audio(audio_url: str, api_key: str) -> str:
     """
     try:
         supadata_rate_limit()
-        with httpx.Client(timeout=30) as client:
+        with httpx.Client(**make_client_kwargs(timeout=30)) as client:
             # Submit transcription job
             resp = client.get(
                 "https://api.supadata.ai/v1/transcript",
@@ -672,7 +757,7 @@ def _poll_supadata_job(job_id: str, api_key: str, max_polls: int = 60) -> str:
     for _i in range(max_polls):
         try:
             supadata_rate_limit()
-            with httpx.Client(timeout=30) as client:
+            with httpx.Client(**make_client_kwargs(timeout=30)) as client:
                 resp = client.get(
                     f"https://api.supadata.ai/v1/transcript/{job_id}",
                     headers={"x-api-key": api_key},
@@ -745,8 +830,11 @@ def _whisper_fallback_transcribe(audio_url: str) -> str:
         with tempfile.NamedTemporaryFile(
             suffix=".mp3", delete=False,
         ) as tmp:
+            # Route through the configured proxy: this downloads the publisher's
+            # media enclosure from the pipeline host, which is exactly the fetch
+            # RESIDENTIAL_PROXY_URL exists to unblock.
             with httpx.Client(
-                timeout=120, follow_redirects=True,
+                **make_client_kwargs(timeout=120, follow_redirects=True),
                 headers={"User-Agent": BROWSER_HEADERS["User-Agent"]},
             ) as client:
                 resp = client.get(audio_url)
@@ -786,13 +874,3 @@ def _whisper_fallback_transcribe(audio_url: str) -> str:
         if tmp_path is not None:
             with suppress(OSError):
                 os.unlink(tmp_path)
-
-
-# ── Import httpx ─────────────────────────────────────────────────────────
-
-try:
-    import httpx
-    _DEPS_AVAILABLE = True
-except ImportError:
-    _DEPS_AVAILABLE = False
-    logger.warning("httpx not available — podcast extractor disabled")

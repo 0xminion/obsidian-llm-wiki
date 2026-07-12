@@ -170,7 +170,7 @@ def test_podcast_prefers_cached_transcript_over_all_remote_providers(monkeypatch
         guid="episode-guid-42",
     )
     monkeypatch.setattr(podcast, "_fetch_defuddle_md_metadata", lambda _url: {})
-    monkeypatch.setattr(podcast, "_resolve_episode_asset", lambda *_args: asset)
+    monkeypatch.setattr(podcast, "_resolve_episode_asset", lambda *_args, **_kwargs: asset)
     monkeypatch.setattr(podcast, "load_transcript_cache", lambda _identity: cached)
     monkeypatch.setattr(
         podcast,
@@ -203,7 +203,7 @@ def test_podcast_prefers_assemblyai_before_supadata(monkeypatch):
         text=_LONG_TEXT, provider="assemblyai_remote_url",
     )
     monkeypatch.setattr(podcast, "_fetch_defuddle_md_metadata", lambda _url: {})
-    monkeypatch.setattr(podcast, "_resolve_episode_asset", lambda *_args: asset)
+    monkeypatch.setattr(podcast, "_resolve_episode_asset", lambda *_args, **_kwargs: asset)
     monkeypatch.setattr(podcast, "load_transcript_cache", lambda _identity: None)
     monkeypatch.setattr(podcast, "get_assemblyai_key", lambda: "test-key")
     monkeypatch.setattr(
@@ -226,7 +226,7 @@ def test_podcast_uses_supadata_when_assemblyai_returns_no_transcript(monkeypatch
         title="Provider Fallback", audio_url="https://cdn.example/episode.mp3",
     )
     monkeypatch.setattr(podcast, "_fetch_defuddle_md_metadata", lambda _url: {})
-    monkeypatch.setattr(podcast, "_resolve_episode_asset", lambda *_args: asset)
+    monkeypatch.setattr(podcast, "_resolve_episode_asset", lambda *_args, **_kwargs: asset)
     monkeypatch.setattr(podcast, "load_transcript_cache", lambda _identity: None)
     monkeypatch.setattr(podcast, "get_assemblyai_key", lambda: "test-key")
     monkeypatch.setattr(podcast, "assemblyai_transcribe_url", lambda *_args: None)

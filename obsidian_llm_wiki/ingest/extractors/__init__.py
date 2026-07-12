@@ -29,7 +29,19 @@ from obsidian_llm_wiki.ingest.web import extract_web
 
 logger = logging.getLogger("obswiki.ingest.extractors")
 
-__all__ = ["extract", "register_extractor"]
+__all__ = ["ExtractorNotApplicableError", "extract", "register_extractor"]
+
+
+class ExtractorNotApplicableError(RuntimeError):
+    """Raised when an extractor matched a URL pattern but the content isn't its type.
+
+    URL patterns are necessarily coarse — ``/feed`` and ``.xml`` identify a
+    *possible* podcast feed, not a definite one. An extractor that can only tell
+    from the fetched body raises this to disclaim the URL. Unlike a genuine
+    extraction failure, it does not trip the fail-closed policy in ``extract``:
+    dispatch continues to the remaining extractors and, if none claim the URL,
+    to ``extract_web``.
+    """
 
 # ── Registry ────────────────────────────────────────────────────────────
 
@@ -100,6 +112,15 @@ def extract(raw_url: str) -> SourceDoc:
             logger.debug("Routing '%s' to %s", raw_url, extractor_fn.__name__)
             try:
                 return extractor_fn(raw_url)
+            except ExtractorNotApplicableError as exc:
+                # The extractor disclaimed the URL after inspecting the content.
+                # This is not a failure, so it must not fail closed — keep the
+                # ordinary fallback chain (other extractors, then extract_web).
+                logger.debug(
+                    "Extractor %s disclaimed %s: %s",
+                    extractor_fn.__name__, raw_url, exc,
+                )
+                continue
             except Exception as exc:
                 logger.warning(
                     "Extractor %s failed for %s: %s; trying fallback",

@@ -35,6 +35,8 @@ from typing import Any
 
 import httpx
 
+from obsidian_llm_wiki.ingest.proxy import make_client_kwargs
+
 logger = logging.getLogger("obswiki.ingest.supadata_utils")
 
 __all__ = [
@@ -66,25 +68,23 @@ def reset_rate_limiter() -> None:
 def supadata_rate_limit() -> None:
     """Enforce a minimum delay between Supadata API calls.
 
-    Sleeps if the last call was less than ``SUPADATA_RATE_LIMIT_SECONDS`` ago.
-    Updates ``_last_call_time`` after sleeping (or immediately if enough time
-    has elapsed). Thread-safe via ``_rate_lock``.
+    Sleeps if the last call was less than ``SUPADATA_RATE_LIMIT_SECONDS`` ago,
+    then stamps ``_last_call_time``. Thread-safe via ``_rate_lock``.
+
+    The lock is deliberately held *across* the sleep. Releasing it during the
+    sleep (as an earlier version did) let every waiting thread read the same
+    stale ``_last_call_time``, sleep concurrently, and then issue its request in
+    the same instant — so N concurrent extractors burst N calls at the API and
+    earned exactly the 429s this limiter exists to avoid. Serializing callers is
+    the purpose, not a side effect.
     """
     global _last_call_time
     with _rate_lock:
-        now = time.monotonic()
-        elapsed = now - _last_call_time
+        elapsed = time.monotonic() - _last_call_time
         if elapsed < SUPADATA_RATE_LIMIT_SECONDS:
             sleep_duration = SUPADATA_RATE_LIMIT_SECONDS - elapsed
-            logger.debug(
-                "Supadata rate limit: sleeping %.1fs", sleep_duration,
-            )
-            # Release lock during sleep so other threads aren't blocked.
-            _rate_lock.release()
-            try:
-                time.sleep(sleep_duration)
-            finally:
-                _rate_lock.acquire()
+            logger.debug("Supadata rate limit: sleeping %.1fs", sleep_duration)
+            time.sleep(sleep_duration)
         _last_call_time = time.monotonic()
 
 
@@ -205,7 +205,7 @@ def validate_supadata_key(api_key: str | None = None) -> bool:
 
     supadata_rate_limit()
     try:
-        with httpx.Client(timeout=10) as client:
+        with httpx.Client(**make_client_kwargs(timeout=10)) as client:
             resp = client.get(
                 "https://api.supadata.ai/v1/transcript",
                 params={"url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ"},

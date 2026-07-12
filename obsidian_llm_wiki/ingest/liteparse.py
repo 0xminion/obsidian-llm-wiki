@@ -28,13 +28,21 @@ class LiteParseUnavailableError(RuntimeError):
 
 
 _DOCUMENT_SUFFIXES = frozenset((".pdf", ".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx", ".epub"))
+
+# Content types that identify a *binary document* response. HTML is deliberately
+# absent: an HTML response is a landing page to search for citation links, not a
+# document to hand to LiteParse. Including it here would route every ordinary web
+# page through LiteParse ahead of trafilatura and make _document_candidates()
+# unreachable.
 _CONTENT_TYPE_SUFFIXES = {
     "application/pdf": ".pdf",
     "application/epub+zip": ".epub",
     "application/msword": ".doc",
     "application/vnd.ms-excel": ".xls",
     "application/vnd.ms-powerpoint": ".ppt",
-    "text/html": ".html",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ".xlsx",
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation": ".pptx",
 }
 
 
