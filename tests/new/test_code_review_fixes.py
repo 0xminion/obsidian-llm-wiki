@@ -523,37 +523,56 @@ class TestAssignOrphansErrorHandling:
         assert "orphan" not in moc.concept_slugs
 
 
-# ── 10. Dead code: frontmatter.py, bilingual.py, crossrefs.py ────────────
+# ── 10. Extracted modules are the single implementation ──────────────────
 
 
-class TestDeadCodeModules:
-    """Verify that the extracted modules (frontmatter.py, bilingual.py,
-    crossrefs.py) are not imported anywhere — they are dead code because
-    obsidian.py has inline definitions that are actually used.
+class TestExtractedModulesAreCanonical:
+    """frontmatter.py, bilingual.py, and crossrefs.py are the single home of
+    these helpers; render/obsidian.py imports and re-exports them. If
+    obsidian.py grows its own copy again, these identity checks fail.
     """
 
-    def test_frontmatter_py_not_imported(self):
-        """frontmatter.py should not be importable from the package
-        (it exists but is never imported by any module)."""
-        # The module file exists, but no code imports from it.
-        # We verify the module can be imported standalone (it's syntactically
-        # valid) but note it's dead code.
-        import obsidian_llm_wiki.render.frontmatter as fm
-        # The extract_links in frontmatter.py extracts wikilinks,
-        # while the one in obsidian.py extracts markdown links.
-        # They are different functions — this is a code smell.
-        result = fm.extract_links("Some [[slug|alias]] text")
-        assert result == [("slug", "alias")]
+    def test_obsidian_reexports_frontmatter_helpers(self):
+        from obsidian_llm_wiki.render import frontmatter as fm
+        from obsidian_llm_wiki.render import obsidian as ob
 
-    def test_bilingual_py_not_imported(self):
-        import obsidian_llm_wiki.render.bilingual as bi
-        assert bi.is_chinese("你好") is True
-        assert bi.is_chinese("hello") is False
+        assert ob.slugify is fm.slugify
+        assert ob.parse_frontmatter is fm.parse_frontmatter
+        assert ob.build_frontmatter is fm.build_frontmatter
+        assert ob.extract_links is fm.extract_links
+        assert ob.safe_read_file is fm.safe_read_file
+        assert ob.atomic_write is fm.atomic_write
 
-    def test_crossrefs_py_not_imported(self):
-        import obsidian_llm_wiki.render.crossrefs as cr
-        # Just verify it imports without error
-        assert hasattr(cr, "build_cross_ref_diagram")
+    def test_obsidian_uses_bilingual_and_crossref_modules(self):
+        from obsidian_llm_wiki.render import bilingual as bi
+        from obsidian_llm_wiki.render import crossrefs as cr
+        from obsidian_llm_wiki.render import obsidian as ob
+
+        assert ob._is_chinese is bi.is_chinese
+        assert (
+            ob._normalize_bilingual_titles_and_slugs
+            is bi.normalize_bilingual_titles_and_slugs
+        )
+        assert ob._build_cross_ref_diagram is cr.build_cross_ref_diagram
+        assert ob._build_moc_cross_ref_diagram is cr.build_moc_cross_ref_diagram
+
+    def test_extract_links_and_wikilinks_are_distinct(self):
+        """One name, one meaning: extract_links = markdown links (what
+        validate.py needs); extract_wikilinks = [[wikilinks]]."""
+        from obsidian_llm_wiki.render import frontmatter as fm
+
+        body = "See [example](https://example.com) and [[slug|alias]]."
+        assert fm.extract_links(body) == [("example", "https://example.com")]
+        assert fm.extract_wikilinks(body) == [("slug", "alias")]
+
+    def test_parse_frontmatter_rejects_non_dict_yaml(self):
+        """The hardened parse_frontmatter (dict guard + body lstrip) is the
+        shared one — the drifted copy lost both."""
+        from obsidian_llm_wiki.render.frontmatter import parse_frontmatter
+
+        meta, body = parse_frontmatter("---\njust a scalar\n---\n\n\nBody text")
+        assert meta == {}
+        assert body == "Body text"
 
 
 # ── 11. _synthesize_with_retry truncation logic ──────────────────────────

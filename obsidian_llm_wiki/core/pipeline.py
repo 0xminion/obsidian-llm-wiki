@@ -63,8 +63,24 @@ from obsidian_llm_wiki.synth.prompts import build_synthesis_prompt
 logger = logging.getLogger("obswiki.core.pipeline")
 
 # ── Retry truncation levels ────────────────────────────────────────────────
-# When a source fails synthesis, progressively truncate content and retry.
+# When a source fails synthesis for a SIZE-RELATED reason, progressively
+# truncate content and retry.
 _TRUNCATION_LEVELS = [None, 50_000, 20_000]  # full → 50K → 20K
+
+
+def _is_size_related_failure(exc: BaseException) -> bool:
+    """Whether truncating the source content could plausibly fix *exc*.
+
+    Only timeouts qualify: on a local LLM they usually mean the prompt is too
+    large for the model/host to finish in time. Everything else (connection
+    refused, HTTP errors, auth, bugs) is NOT fixed by discarding content —
+    the provider layer already retried transient errors with backoff, and
+    "retrying" such a failure at 20K of a 200K source would just build the
+    wiki from a fraction of the document while reporting success.
+    """
+    import httpx
+
+    return isinstance(exc, TimeoutError | httpx.TimeoutException)
 
 
 async def run_pipeline(
@@ -285,6 +301,35 @@ async def run_pipeline(
         if overlay_dirty:
             save_resynthesis_overlay(config.llmwiki_dir, overlay)
 
+        # ── Corpus normalization: semantic dedup + MoC assignment ─────
+        # These mutate the bundle (merge concepts, rewrite slugs), so they
+        # belong in the synthesis stage — before rendering AND before the
+        # state write — not buried inside render_vault where their failures
+        # were previously swallowed at debug level. Both no-op when
+        # embeddings are unavailable; an exception here is a real bug and
+        # must be visible, but should not kill an otherwise good build.
+        from obsidian_llm_wiki.synth.dedupe import (
+            assign_orphans_to_mocs,
+            semantic_dedupe_concepts,
+        )
+        embeddings_cache: dict[str, list[float]] = {}
+        try:
+            semantic_dedupe_concepts(
+                bundle,
+                threshold=config.similarity_dedup_threshold,
+                embeddings_cache=embeddings_cache,
+            )
+        except Exception as exc:
+            logger.warning("Semantic dedup failed (continuing without): %s", exc)
+        try:
+            assign_orphans_to_mocs(
+                bundle,
+                threshold=config.moc_assignment_threshold,
+                embeddings_cache=embeddings_cache,
+            )
+        except Exception as exc:
+            logger.warning("MoC orphan assignment failed (continuing without): %s", exc)
+
         # ── Render: full corpus deterministic markdown ─────────────────
         logger.info(
             "Rendering %d concepts, %d MOCs from %d sources...",
@@ -453,14 +498,30 @@ async def _synthesize_with_retry(
                     success=False,
                     error_type=type(exc).__name__,
                 )
-            if level_idx < len(_TRUNCATION_LEVELS) - 1:
+            # Truncation only helps size-related failures. Anything else
+            # (connection errors, HTTP failures, bugs) re-raises immediately:
+            # the provider layer already retried transient errors, and
+            # silently discarding content would disguise data loss as
+            # recovery.
+            if (
+                _is_size_related_failure(exc)
+                and level_idx < len(_TRUNCATION_LEVELS) - 1
+            ):
                 continue
-            # Last level — re-raise so the caller handles it as a failure
             raise
 
         synth_time = time.monotonic() - synth_start
 
         if synth is not None:
+            if level_idx > 0:
+                # Success on truncated content is a degraded result, not a
+                # clean one — the wiki was built from a fraction of the source.
+                logger.warning(
+                    "Synthesized '%s' from TRUNCATED content (%s of %d chars) "
+                    "after %d failed attempt(s) — concepts beyond the cut "
+                    "are missing.",
+                    filename, level_label, len(source.content), level_idx,
+                )
             if metrics:
                 metrics.record_synthesis(
                     source_file=filename,

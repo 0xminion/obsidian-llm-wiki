@@ -236,9 +236,32 @@ def propagate_backlinks(bundle: SynthesisBundle) -> None:
 # ── Semantic concept deduplication ──────────────────────────────────────
 
 
+def _embed_concept(
+    concept: ConceptNote,
+    embeddings_cache: dict[str, list[float]] | None,
+) -> list[float]:
+    """Embed a concept's title+summary, consulting the shared cache first.
+
+    Each embed_text call is a network round-trip to the embedding service
+    (up to seconds when the model is cold), so semantic dedup and MoC
+    orphan assignment share one cache instead of re-embedding the same
+    concepts back to back.
+    """
+    if embeddings_cache is not None and concept.slug in embeddings_cache:
+        return embeddings_cache[concept.slug]
+    from obsidian_llm_wiki.synth.embedding import embed_text
+
+    emb = embed_text(f"{concept.title}. {concept.summary or ''}")
+    if emb and embeddings_cache is not None:
+        embeddings_cache[concept.slug] = emb
+    return emb
+
+
 def semantic_dedupe_concepts(
     bundle: SynthesisBundle,
     threshold: float = 0.85,
+    *,
+    embeddings_cache: dict[str, list[float]] | None = None,
 ) -> None:
     """Merge same-language concepts with high embedding cosine similarity.
 
@@ -254,7 +277,7 @@ def semantic_dedupe_concepts(
     Gated behind ``EMBEDDINGS_ENABLED`` — no-ops if embeddings are unavailable
     (the Ollama embedding service is down or the env var is not set).
     """
-    from obsidian_llm_wiki.synth.embedding import cosine_similarity, embed_text
+    from obsidian_llm_wiki.synth.embedding import cosine_similarity
     from obsidian_llm_wiki.synth.language import detect_language
 
     if not bundle.concepts or len(bundle.concepts) < 2:
@@ -265,11 +288,12 @@ def semantic_dedupe_concepts(
     concept_langs: dict[str, str] = {}
 
     for concept in bundle.concepts:
-        text = f"{concept.title}. {concept.summary or ''}"
-        emb = embed_text(text)
+        emb = _embed_concept(concept, embeddings_cache)
         if emb:
             embeddings[concept.slug] = emb
-            concept_langs[concept.slug] = detect_language(text)
+            concept_langs[concept.slug] = detect_language(
+                f"{concept.title}. {concept.summary or ''}",
+            )
 
     if len(embeddings) < 2:
         logger.info(
@@ -397,6 +421,8 @@ def _merge_into(survivor: ConceptNote, victim: ConceptNote) -> None:
 def assign_orphans_to_mocs(
     bundle: SynthesisBundle,
     threshold: float = 0.55,
+    *,
+    embeddings_cache: dict[str, list[float]] | None = None,
 ) -> None:
     """Assign concepts not in any MoC to the most semantically similar MoC.
 
@@ -405,9 +431,12 @@ def assign_orphans_to_mocs(
     If the cosine similarity to a MoC's average exceeds ``threshold``, the
     orphan is added to that MoC's ``concept_slugs``.
 
+    Pass the ``embeddings_cache`` used by :func:`semantic_dedupe_concepts` to
+    avoid re-embedding every member concept (one network call each).
+
     Gated behind ``EMBEDDINGS_ENABLED`` — no-ops if embeddings are unavailable.
     """
-    from obsidian_llm_wiki.synth.embedding import cosine_similarity, embed_text
+    from obsidian_llm_wiki.synth.embedding import cosine_similarity
 
     if not bundle.concepts or not bundle.maps:
         return
@@ -421,11 +450,16 @@ def assign_orphans_to_mocs(
     if not orphans:
         return
 
+    # A concept in k MoCs would otherwise be embedded k times; also avoids
+    # an O(concepts) scan per MoC member.
+    concept_by_slug = {c.slug: c for c in bundle.concepts}
+    if embeddings_cache is None:
+        embeddings_cache = {}
+
     # Compute embeddings for orphans.
     orphan_embs: dict[str, list[float]] = {}
     for orphan in orphans:
-        text = f"{orphan.title}. {orphan.summary or ''}"
-        emb = embed_text(text)
+        emb = _embed_concept(orphan, embeddings_cache)
         if emb:
             orphan_embs[orphan.slug] = emb
 
@@ -438,10 +472,9 @@ def assign_orphans_to_mocs(
     for moc in bundle.maps:
         moc_embeddings: list[list[float]] = []
         for slug in moc.concept_slugs:
-            concept = next((c for c in bundle.concepts if c.slug == slug), None)
+            concept = concept_by_slug.get(slug)
             if concept:
-                text = f"{concept.title}. {concept.summary or ''}"
-                emb = embed_text(text)
+                emb = _embed_concept(concept, embeddings_cache)
                 if emb:
                     moc_embeddings.append(emb)
         if moc_embeddings:

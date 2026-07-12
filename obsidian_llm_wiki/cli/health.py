@@ -87,6 +87,10 @@ def _generate_health_report(bundle_dir: Path) -> str:
     sections: list[str] = []
     all_md_files = sorted(bundle_dir.rglob("*.md"))
     all_stems = {f.stem for f in all_md_files}
+    # Per-directory stem sets — membership tests instead of a filesystem
+    # stat per wikilink (a 2K-file vault averages tens of thousands of links).
+    concept_stems = {f.stem for f in all_md_files if f.parent.name == "concepts"}
+    source_stems = {f.stem for f in all_md_files if f.parent.name == "sources"}
 
     broken_wikilinks: list[str] = []
     orphan_concepts: list[str] = []
@@ -112,10 +116,7 @@ def _generate_health_report(bundle_dir: Path) -> str:
             moc_links = _WIKILINK_RE.findall(body)
             moc_slugs = [_normalize_wikilink_target(link[0]) for link in moc_links]
             # Filter to only concept-directory files.
-            moc_concept_slugs = [
-                s for s in moc_slugs
-                if (bundle_dir / "concepts" / f"{s}.md").exists()
-            ]
+            moc_concept_slugs = [s for s in moc_slugs if s in concept_stems]
             moc_concept_counts[moc_file.stem] = len(moc_concept_slugs)
             moced_slugs.update(moc_concept_slugs)
 
@@ -186,7 +187,7 @@ def _generate_health_report(bundle_dir: Path) -> str:
         if type_val == "Entry":
             has_source = any(
                 target.strip().lower().startswith("source")
-                or (bundle_dir / "sources" / f"{target.strip()}.md").exists()
+                or _normalize_wikilink_target(target) in source_stems
                 for target in [
                     match.group(1).strip()
                     for match in _WIKILINK_RE.finditer(body)

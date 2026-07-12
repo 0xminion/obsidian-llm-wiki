@@ -1,6 +1,8 @@
 """YAML frontmatter, wikilinks, tags, and file I/O utilities.
 
-Extracted from render/obsidian.py for modularity.
+Extracted from render/obsidian.py. This module is the single home for these
+helpers — render/obsidian.py imports them from here and re-exports the names
+for its existing callers.
 """
 
 from __future__ import annotations
@@ -22,6 +24,7 @@ __all__ = [
     "build_frontmatter",
     "parse_frontmatter",
     "extract_links",
+    "extract_wikilinks",
     "safe_read_file",
     "atomic_write",
     "timestamp",
@@ -83,28 +86,53 @@ _FM_RE = re.compile(r"^---\n(.*?)\n---\n?(.*)$", re.DOTALL)
 
 
 def parse_frontmatter(raw: str) -> tuple[dict, str]:
-    """Parse YAML frontmatter from ``raw``. Returns (meta, body)."""
+    """Parse YAML frontmatter from ``raw``.  Returns (meta, body).
+
+    Handles edge cases the old ``partition``-based approach missed:
+      * Body starting immediately after closing ``---`` (no leading newline)
+      * No trailing newline after the closing ``---``
+      * A YAML scalar (non-dict) frontmatter block
+    """
     if not raw.startswith("---\n"):
         return {}, raw
     match = _FM_RE.match(raw)
     if not match:
         return {}, raw
+    yaml_block, body = match.group(1), match.group(2)
     try:
-        meta = yaml.safe_load(match.group(1)) or {}
+        meta = yaml.safe_load(yaml_block)
     except yaml.YAMLError:
         return {}, raw
-    body = match.group(2)
+    if not isinstance(meta, dict):
+        meta = {}
+    body = body.lstrip("\n")
     return meta, body
 
 
+# Standard markdown link: [text](url). Excludes images ![alt](url).
+_LINK_RE = re.compile(r"(?<!\!)\[([^\]]*)\]\(([^)]*)\)")
+
+_WIKILINK_RE = re.compile(r"\[\[([^\]|]+)(?:\|([^\]]+))?\]\]")
+
+
 def extract_links(body: str) -> list[tuple[str, str]]:
+    """Extract standard markdown ``[text](url)`` links from ``body``.
+
+    Returns a list of ``(text, url)`` tuples in document order. For Obsidian
+    ``[[wikilinks]]`` use :func:`extract_wikilinks` — the two link syntaxes
+    are deliberately separate functions.
+    """
+    return [(m.group(1), m.group(2)) for m in _LINK_RE.finditer(body)]
+
+
+def extract_wikilinks(body: str) -> list[tuple[str, str]]:
     """Extract all ``[[wikilinks]]`` from a markdown body.
 
     Returns a list of (slug, alias) tuples. Alias is empty when no
     alias is present.
     """
     links: list[tuple[str, str]] = []
-    for m in re.finditer(r"\[\[([^\]|]+)(?:\|([^\]]+))?\]\]", body):
+    for m in _WIKILINK_RE.finditer(body):
         slug = m.group(1).strip()
         alias = (m.group(2) or "").strip()
         links.append((slug, alias))
@@ -130,7 +158,9 @@ def atomic_write(path: str | Path, content: str) -> None:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(content)
         os.replace(tmp, p)
-    except Exception:
+    except BaseException:
+        # BaseException so the temp file is cleaned up even on
+        # KeyboardInterrupt/SystemExit.
         with suppress(OSError):
             os.unlink(tmp)
         raise

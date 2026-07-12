@@ -85,14 +85,15 @@ def export_graph(bundle: SynthesisBundle, output_dir: Path) -> None:
 
 
 def _slugify_source_id(raw_id: str) -> str:
-    """Slugify a source file or title for use as a graph node ID."""
-    import re
-    # Strip .md extension if present, then slugify.
-    raw_id = raw_id.replace(".md", "")
-    cleaned = re.sub(r"[^\w\s-]", "", raw_id, flags=re.UNICODE)
-    cleaned = re.sub(r"\s+", "-", cleaned)
-    cleaned = re.sub(r"-+", "-", cleaned)
-    return cleaned.strip("-").lower() or "untitled"
+    """Slugify a source file or title for use as a graph node ID.
+
+    Uses the shared slugify so graph node IDs stay consistent with the
+    wikilink slugs the renderer emits. Only a trailing .md is stripped —
+    a blanket replace would mangle names like ``notes.mdx``.
+    """
+    from obsidian_llm_wiki.render.frontmatter import slugify
+
+    return slugify(raw_id.removesuffix(".md"))
 
 
 def _mermaid_safe_id(slug: str) -> str:
@@ -153,43 +154,42 @@ def _build_graph_dict(bundle: SynthesisBundle) -> dict[str, Any]:
             "moc": "",
         })
 
-    # Edges: concept-to-concept (from related links)
+    # Edges: concept-to-concept (from related links).
+    # Index lookups keep this O(concepts + edges) — a linear concept scan per
+    # edge and a linear edge rescan per duplicate would make large corpora
+    # quadratic.
+    concept_by_slug = {c.slug: c for c in bundle.concepts}
     edges: list[dict[str, Any]] = []
-    seen_edges: set[tuple[str, str, str]] = set()
+    edge_by_key: dict[tuple[str, str, str], dict[str, Any]] = {}
 
     for concept in bundle.concepts:
         for link in concept.related:
             edge_key = (concept.slug, link.slug, link.relation)
             reverse_key = (link.slug, concept.slug, link.relation)
-            if edge_key in seen_edges or reverse_key in seen_edges:
-                # Edge already added — mark as bidirectional.
-                for e in edges:
-                    if (
-                        e["source"] == link.slug
-                        and e["target"] == concept.slug
-                        and e["relation"] == link.relation
-                    ):
-                        e["bidirectional"] = True
-                        break
+            if edge_key in edge_by_key:
+                continue
+            existing_reverse = edge_by_key.get(reverse_key)
+            if existing_reverse is not None:
+                # Edge already added in the other direction — mark it.
+                existing_reverse["bidirectional"] = True
                 continue
 
             # Check if reverse edge exists.
-            target_concept = next(
-                (c for c in bundle.concepts if c.slug == link.slug), None
-            )
+            target_concept = concept_by_slug.get(link.slug)
             has_reverse = False
             if target_concept:
                 has_reverse = any(
                     r.slug == concept.slug for r in target_concept.related
                 )
 
-            edges.append({
+            edge = {
                 "source": concept.slug,
                 "target": link.slug,
                 "relation": link.relation,
                 "bidirectional": has_reverse,
-            })
-            seen_edges.add(edge_key)
+            }
+            edges.append(edge)
+            edge_by_key[edge_key] = edge
 
     # Edges: MoC-to-concept (membership)
     for moc in bundle.maps:
@@ -221,6 +221,7 @@ def _build_graph_dict(bundle: SynthesisBundle) -> dict[str, Any]:
 def _build_mermaid(bundle: SynthesisBundle) -> str:
     """Build a Mermaid graph diagram from a SynthesisBundle."""
     lines: list[str] = ["graph LR"]
+    concept_by_slug = {c.slug: c for c in bundle.concepts}
 
     # MoC nodes with subgraph grouping
     for moc in bundle.maps:
@@ -229,9 +230,7 @@ def _build_mermaid(bundle: SynthesisBundle) -> str:
         lines.append(f"  subgraph {moc_id}[{moc_label}]")
 
         for slug in moc.concept_slugs:
-            concept = next(
-                (c for c in bundle.concepts if c.slug == slug), None
-            )
+            concept = concept_by_slug.get(slug)
             if concept:
                 label = _mermaid_safe_label(concept.title)
                 lines.append(f'    {_mermaid_safe_id(slug)}["{label}"]')
