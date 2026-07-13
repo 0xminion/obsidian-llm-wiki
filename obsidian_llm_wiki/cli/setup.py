@@ -74,9 +74,7 @@ def setup():
         "03-Raw-Annotations": "Manual notes, highlights, and commentary on sources",
         "04-Wiki": "LLM-compiled wiki (sources, entries, concepts, mocs)",
         "05-Queries": "Saved query results and analyses filed back into the vault",
-        "06-Config": "Pipeline configuration, edges, telemetry, URL index",
         "07-Templates": "Wiki schema, page templates, MoC templates",
-        "08-Archive-Raw": "Archived raw source URLs",
     }
     for dirname, _desc in vault_dirs.items():
         (vault / dirname).mkdir(parents=True, exist_ok=True)

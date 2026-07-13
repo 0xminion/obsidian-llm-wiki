@@ -292,6 +292,15 @@ def ingest(
     # ── Collect clippings ──────────────────────────────────────────────
     from obsidian_llm_wiki.ingest.clippings import collect_clippings
 
+    # ── Scan 00-Inbox for .url files ───────────────────────────────────
+    # The 00-Inbox directory is the URL queue: each .url file contains
+    # one URL on the first line. These are merged with explicit --url
+    # args and deduplicated.
+    inbox_urls = _scan_inbox_urls(config)
+    if inbox_urls and not json_output:
+        typer.echo(f"📥 Found {len(inbox_urls)} URL(s) in 00-Inbox/")
+    all_urls = list(dict.fromkeys([*requested_urls, *inbox_urls]))
+
     clipping_sources = collect_clippings(config)
     clipping_by_path = {str(path): source for path, source in clipping_sources}
     planned: list[_PlannedSource]
@@ -312,14 +321,14 @@ def ingest(
         }
         planned.extend(
             ("url", url, None, False)
-            for url in requested_urls
+            for url in all_urls
             if ("url", url) not in resumed_keys
         )
     else:
         planned = [
             ("clipping", str(path), source, False) for path, source in clipping_sources
         ]
-        planned.extend(("url", url, None, False) for url in requested_urls)
+        planned.extend(("url", url, None, False) for url in all_urls)
 
     if plan_mode:
         for source_kind, identifier, source, _resuming in planned:
@@ -705,3 +714,29 @@ def _reload_config_with_concurrency(vault_path: Path, parallel: int):
         VAULT_PATH=str(vault_path),
         COMPILE_CONCURRENCY=str(parallel),
     )
+
+
+def _scan_inbox_urls(config: Any) -> list[str]:
+    """Scan 00-Inbox/ for .url files and return the URLs they contain.
+
+    Each .url file should contain a single URL on the first non-empty line.
+    Files are not deleted — the caller decides whether to archive them.
+    """
+    inbox_dir = config.vault / "00-Inbox"
+    if not inbox_dir.is_dir():
+        return []
+
+    urls: list[str] = []
+    for f in sorted(inbox_dir.iterdir()):
+        if f.suffix != ".url" or not f.is_file():
+            continue
+        try:
+            for line in f.read_text(encoding="utf-8").splitlines():
+                url = line.strip()
+                if url and url.startswith(("http://", "https://")):
+                    urls.append(url)
+                    break
+        except OSError:
+            continue
+
+    return urls
