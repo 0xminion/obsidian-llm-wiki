@@ -268,12 +268,23 @@ def _assemblyai_transcript(url: str, api_key: str) -> SourceDoc | None:
     """Submit a YouTube URL to AssemblyAI for remote-URL transcription.
 
     AssemblyAI can fetch media from a public URL and transcribe it.
-    For YouTube, we need to provide a direct audio stream URL via yt-dlp.
+    First tries yt-dlp to get a direct audio stream URL. If that fails
+    (YouTube bot detection, no cookies), submits the YouTube URL directly
+    to AssemblyAI — their service can fetch from YouTube on their servers.
     """
-    # Get the direct audio stream URL via yt-dlp
+    # Try to get a direct audio stream URL via yt-dlp
     audio_url = _get_youtube_audio_url(url)
+
     if not audio_url:
-        raise RuntimeError("Could not get YouTube audio URL for AssemblyAI")
+        # yt-dlp failed (bot detection, no cookies). AssemblyAI cannot
+        # fetch from YouTube URLs directly — it needs an actual audio
+        # file URL. Try downloading audio locally and uploading.
+        audio_url = _download_and_upload_audio(url, api_key)
+        if not audio_url:
+            raise RuntimeError(
+                "Could not get audio URL via yt-dlp or local download; "
+                "AssemblyAI requires an audio file URL"
+            )
 
     # Submit to AssemblyAI
     headers = {
@@ -387,6 +398,92 @@ def _fetch_youtube_title(url: str) -> str:
     except Exception:
         pass
     return ""
+
+
+def _download_and_upload_audio(url: str, api_key: str) -> str | None:
+    """Download audio via yt-dlp and upload to AssemblyAI's upload endpoint.
+
+    When YouTube blocks direct URL extraction (bot detection), download
+    the audio locally with cookies and upload it to AssemblyAI's upload
+    URL for transcription.
+    """
+    ytdlp = shutil.which("yt-dlp") or shutil.which("youtube-dl")
+    if not ytdlp:
+        return None
+
+    tmp_dir: str | None = None
+    try:
+        import tempfile
+
+        tmp_dir = tempfile.mkdtemp(prefix="ytdlp_audio_")
+        output_path = os.path.join(tmp_dir, "audio.%(ext)s")
+
+        env = os.environ.copy()
+        proxy = os.environ.get("HTTPS_PROXY", "")
+        if proxy:
+            env["HTTPS_PROXY"] = proxy
+
+        # Try with cookies if configured
+        cookies_file = os.environ.get("YOUTUBE_COOKIES_FILE", "")
+        cmd = [
+            ytdlp,
+            "-f", "bestaudio",
+            "-x", "--audio-format", "mp3",
+            "--no-playlist",
+            "-o", output_path,
+            "--no-warnings",
+        ]
+        if cookies_file and os.path.isfile(cookies_file):
+            cmd.extend(["--cookies", cookies_file])
+        cmd.append(url)
+
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=120, env=env,
+        )
+        if proc.returncode != 0:
+            logger.warning("yt-dlp audio download failed: %s", proc.stderr[:200])
+            return None
+
+        # Find the downloaded audio file
+        audio_files = [
+            os.path.join(tmp_dir, f)
+            for f in os.listdir(tmp_dir)
+            if f.endswith((".mp3", ".m4a", ".webm", ".ogg", ".wav"))
+        ]
+        if not audio_files:
+            return None
+
+        audio_path = audio_files[0]
+        file_size = os.path.getsize(audio_path)
+        if file_size < 1000:
+            return None
+
+        # Upload to AssemblyAI's upload endpoint
+        upload_url = "https://api.assemblyai.com/v2/upload"
+        headers = {"Authorization": api_key}
+
+        with open(audio_path, "rb") as f, httpx.Client(timeout=300) as client:
+            resp = client.post(
+                upload_url,
+                headers=headers,
+                content=f,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+
+        upload_result = data.get("upload_url", "")
+        if upload_result:
+            logger.info("Uploaded audio to AssemblyAI: %s", upload_result)
+            return upload_url
+
+    except Exception as exc:
+        logger.warning("Audio download+upload failed: %s", exc)
+    finally:
+        if tmp_dir:
+            import shutil as _shutil
+            _shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    return None
 
 
 def _extract_oembed(youtube_url: str) -> SourceDoc | None:
