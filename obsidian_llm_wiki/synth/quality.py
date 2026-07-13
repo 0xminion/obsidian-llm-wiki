@@ -900,12 +900,14 @@ def filter_thin_concepts(
 
 def _parse_concept_json(response: str) -> dict[str, Any] | None:
     """Extract and parse a JSON object from an LLM response."""
-    from obsidian_llm_wiki.synth.parser import _extract_json
+    from obsidian_llm_wiki.synth.parser import _extract_json, _sanitize_latex_artifacts
 
     if not response or not response.strip():
         return None
     data = _extract_json(response)
-    return data if isinstance(data, dict) else None
+    if not isinstance(data, dict):
+        return None
+    return _sanitize_latex_artifacts(data)
 
 
 def _build_concept_from_expand(data: dict[str, Any], fallback_slug: str) -> ConceptNote:
