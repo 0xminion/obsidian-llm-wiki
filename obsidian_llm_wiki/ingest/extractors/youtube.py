@@ -63,9 +63,10 @@ def extract_youtube_video(raw_url: str) -> SourceDoc:
 
     Strategy:
       1. yt-dlp subtitle extraction (downloads auto-generated or manual subtitles)
-      2. AssemblyAI remote-URL transcription (submits YouTube URL to AAI)
-      3. Invidious API (metadata + description fallback)
-      4. oEmbed metadata (title + channel only, last resort)
+      2. Supadata YouTube transcript API (Whisper AI fallback when no captions)
+      3. AssemblyAI remote-URL transcription (submits YouTube URL to AAI)
+      4. Invidious API (metadata + description fallback)
+      5. oEmbed metadata (title + channel only, last resort)
 
     Raises:
         RuntimeError: If all methods fail.
@@ -84,7 +85,25 @@ def extract_youtube_video(raw_url: str) -> SourceDoc:
     except Exception as exc:
         errors.append(f"yt-dlp: {exc}")
 
-    # ── Fallback 1: AssemblyAI remote-URL transcription ──────────────
+    # ── Fallback 1: Supadata YouTube transcript API ──────────────────
+    # Supadata fetches transcripts server-side, with Whisper AI fallback
+    # when no captions exist. Does not require yt-dlp or proxy access.
+    supadata_key = os.environ.get("SUPADATA_API_KEY", "").strip() or None
+    if supadata_key:
+        try:
+            source = _supadata_transcript(raw_url, supadata_key)
+            if source:
+                logger.info(
+                    "Supadata: extracted %d chars for %s",
+                    len(source.content), raw_url,
+                )
+                return source
+        except Exception as exc:
+            errors.append(f"supadata: {exc}")
+    else:
+        errors.append("supadata: API key not set")
+
+    # ── Fallback 2: AssemblyAI remote-URL transcription ──────────────
     aai_key = _get_assemblyai_key()
     if aai_key:
         try:
@@ -124,6 +143,69 @@ def extract_youtube_video(raw_url: str) -> SourceDoc:
     )
 
 
+# ── Supadata YouTube transcript API ─────────────────────────────────────
+
+
+def _supadata_transcript(url: str, api_key: str) -> SourceDoc | None:
+    """Fetch YouTube transcript via Supadata API.
+
+    Supadata fetches transcripts server-side and uses Whisper AI as a
+    fallback when no captions exist. This does not require yt-dlp or
+    proxy access — Supadata's servers handle the YouTube fetch.
+
+    API docs: https://supadata.ai/youtube-transcript-api
+    Endpoint: GET https://api.supadata.ai/v1/youtube/transcript?url=<url>
+    Auth: x-api-key header
+    """
+    from urllib.parse import quote
+
+    api_url = (
+        f"https://api.supadata.ai/v1/youtube/transcript"
+        f"?url={quote(url, safe='')}"
+    )
+    headers = {"x-api-key": api_key}
+
+    try:
+        with httpx.Client(timeout=120, follow_redirects=True) as client:
+            resp = client.get(api_url, headers=headers)
+            if resp.status_code == 404:
+                raise RuntimeError(f"Supadata: transcript not found for {url}")
+            if resp.status_code == 429:
+                raise RuntimeError("Supadata: rate limit exceeded")
+            resp.raise_for_status()
+            data = resp.json()
+
+        # Supadata returns {"content": [{"text": "...", "start": 0, "dur": 5}, ...], "lang": "en"}
+        content_segments = data.get("content", []) or []
+        if not content_segments:
+            raise RuntimeError("Supadata: empty transcript response")
+
+        # Concatenate transcript segments
+        text_parts = []
+        for seg in content_segments:
+            if isinstance(seg, dict):
+                seg_text = seg.get("text", "").strip()
+                if seg_text:
+                    text_parts.append(seg_text)
+
+        text = " ".join(text_parts).strip()
+        if not text or len(text) < 200:
+            raise RuntimeError(
+                f"Supadata transcript too short ({len(text)} chars)"
+            )
+
+        # Get title via oEmbed
+        title = _fetch_youtube_title(url) or f"YouTube video {_video_id(url)}"
+
+        return SourceDoc(title=title, content=text, url=url)
+
+    except httpx.HTTPStatusError as exc:
+        raise RuntimeError(
+            f"Supadata API error {exc.response.status_code}: "
+            f"{exc.response.text[:200]}"
+        ) from exc
+
+
 # ── yt-dlp subtitle extraction ──────────────────────────────────────────
 
 
@@ -159,15 +241,20 @@ def _ytdlp_transcript(url: str) -> SourceDoc | None:
             "--convert-sub", "vtt",
             "--no-playlist",
             "-o", os.path.join(tmp_dir, "%(title)s.%(ext)s"),
-            url,
         ]
 
-        env = os.environ.copy()
-        # yt-dlp needs proxy for YouTube access
-        proxy = os.environ.get("HTTPS_PROXY", "")
+        # Route yt-dlp through the residential proxy / Tailscale exit node
+        # when configured. YouTube blocks requests from datacenter IPs;
+        # a residential IP or Tailscale exit node bypasses the bot check.
+        proxy = (
+            os.environ.get("RESIDENTIAL_PROXY_URL", "").strip()
+            or os.environ.get("HTTPS_PROXY", "").strip()
+        )
         if proxy:
-            env["HTTPS_PROXY"] = proxy
+            cmd.extend(["--proxy", proxy])
+        cmd.append(url)
 
+        env = os.environ.copy()
         proc = subprocess.run(
             cmd, capture_output=True, text=True, timeout=60, env=env,
         )
@@ -356,13 +443,18 @@ def _get_youtube_audio_url(url: str) -> str | None:
         "-f", "bestaudio",
         "-g",  # print direct URL only
         "--no-playlist",
-        url,
     ]
 
-    env = os.environ.copy()
-    proxy = os.environ.get("HTTPS_PROXY", "")
+    # Route through residential proxy / Tailscale exit node when configured
+    proxy = (
+        os.environ.get("RESIDENTIAL_PROXY_URL", "").strip()
+        or os.environ.get("HTTPS_PROXY", "").strip()
+    )
     if proxy:
-        env["HTTPS_PROXY"] = proxy
+        cmd.extend(["--proxy", proxy])
+    cmd.append(url)
+
+    env = os.environ.copy()
 
     try:
         proc = subprocess.run(
@@ -419,9 +511,6 @@ def _download_and_upload_audio(url: str, api_key: str) -> str | None:
         output_path = os.path.join(tmp_dir, "audio.%(ext)s")
 
         env = os.environ.copy()
-        proxy = os.environ.get("HTTPS_PROXY", "")
-        if proxy:
-            env["HTTPS_PROXY"] = proxy
 
         # Try with cookies if configured
         cookies_file = os.environ.get("YOUTUBE_COOKIES_FILE", "")
@@ -433,6 +522,13 @@ def _download_and_upload_audio(url: str, api_key: str) -> str | None:
             "-o", output_path,
             "--no-warnings",
         ]
+        # Route through residential proxy / Tailscale exit node when configured
+        proxy = (
+            os.environ.get("RESIDENTIAL_PROXY_URL", "").strip()
+            or os.environ.get("HTTPS_PROXY", "").strip()
+        )
+        if proxy:
+            cmd.extend(["--proxy", proxy])
         if cookies_file and os.path.isfile(cookies_file):
             cmd.extend(["--cookies", cookies_file])
         cmd.append(url)
