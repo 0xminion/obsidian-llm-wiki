@@ -264,7 +264,17 @@ def _is_ssrn_url(url: str) -> bool:
 
 def _is_journal_xml_url(url: str) -> bool:
     """Check if URL is a journal XML article URL."""
-    return url.endswith(".xml") or "/article-" in url
+    if url.endswith(".xml"):
+        return True
+    # akjournals.com uses /article-p294.xml pattern — only match on known journal domains
+    try:
+        from urllib.parse import urlparse
+        host = urlparse(url).hostname or ""
+        if "akjournals" in host and "/article-" in url:
+            return True
+    except Exception:
+        pass
+    return False
 
 
 def _is_bad_title(title: str) -> bool:
@@ -314,13 +324,25 @@ def _extract_defuddle_md(url: str, timeout: int) -> SourceDoc:
     title = ""
     content = text
     if text.startswith("---"):
-        fm_end = text.find("---", 3)
-        if fm_end > 0:
-            fm_text = text[3:fm_end].strip()
-            content = text[fm_end + 3:].strip()
-            for line in fm_text.split("\n"):
-                if line.startswith("title:"):
-                    title = line[6:].strip().strip('"').strip("'")
+        # Use partition to find the closing --- (handles --- in values better)
+        _, sep, rest = text[3:].partition("\n---\n")
+        if sep:
+            fm_text = text[3:3 + len(sep) + len(text[3:]) - len(rest)].strip()
+            # Simpler: split on lines to extract frontmatter block
+            lines = text.split("\n")
+            fm_lines = []
+            found_close = False
+            for _i, line in enumerate(lines[1:], 1):  # skip first ---
+                if line.strip() == "---":
+                    found_close = True
+                    break
+                fm_lines.append(line)
+            if found_close:
+                fm_text = "\n".join(fm_lines)
+                content = "\n".join(lines[1 + len(fm_lines):]).lstrip()
+                for line in fm_text.split("\n"):
+                    if line.startswith("title:"):
+                        title = line[6:].strip().strip('"').strip("'")
 
     if not title:
         for line in content.split("\n", 5):

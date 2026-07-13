@@ -28,7 +28,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import re
 from typing import Any
 
 from obsidian_llm_wiki.core.models import (
@@ -782,8 +781,8 @@ def filter_thin_concepts(
 
     This is a strict-mode gate, NOT applied by default in the pipeline.
     The default single-pass and two-pass paths retain all concepts — thin
-    concepts get ``confidence: 0.3`` via the two-pass quality gate, not
-    silent deletion.
+    concepts get a gradient confidence score via ``gradient_confidence()``,
+    not silent deletion.
 
     This function is available for future ``QUALITY_GATE_MODE=strict`` or
     CI validation use. It prunes:
@@ -859,38 +858,12 @@ def filter_thin_concepts(
 
 def _parse_concept_json(response: str) -> dict[str, Any] | None:
     """Extract and parse a JSON object from an LLM response."""
+    from obsidian_llm_wiki.synth.parser import _extract_json
+
     if not response or not response.strip():
         return None
-
-    text = response.strip()
-    # Strip code fences.
-    text = re.sub(r"^```(?:json)?\s*", "", text)
-    text = re.sub(r"\s*```\s*$", "", text)
-    text = text.strip()
-
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        pass
-
-    # Find first { and try progressive parsing.
-    start = text.find("{")
-    if start == -1:
-        return None
-    text = text[start:]
-
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        pass
-
-    for end in range(len(text), 1, -1):
-        try:
-            return json.loads(text[:end])
-        except json.JSONDecodeError:
-            continue
-
-    return None
+    data = _extract_json(response)
+    return data if isinstance(data, dict) else None
 
 
 def _build_concept_from_expand(data: dict[str, Any], fallback_slug: str) -> ConceptNote:
