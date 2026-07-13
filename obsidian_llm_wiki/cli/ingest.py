@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import json
 import os
+import shutil
 import signal
 import threading
 import uuid
@@ -23,6 +24,7 @@ from obsidian_llm_wiki.cli._helpers import print_result_summary, resolve_vault
 from obsidian_llm_wiki.core.models import SourceDoc
 from obsidian_llm_wiki.core.operations import OperationRecord, OperationStatus, OperationStore
 from obsidian_llm_wiki.ingest.sources import load_sources_from_dir
+from obsidian_llm_wiki.render.frontmatter import parse_frontmatter
 from obsidian_llm_wiki.render.obsidian import atomic_write, slugify
 
 _PlannedSource = tuple[str, str, SourceDoc | None, bool]
@@ -145,6 +147,65 @@ def _collision_safe_path(sources_dir: Path, source: SourceDoc) -> Path:
     raise RuntimeError(f"Too many source filename collisions for {source.title!r}")
 
 
+def _content_hash_matches_existing(
+    sources_dir: Path,
+    content: str,
+) -> Path | None:
+    """Return the existing source file whose body SHA-256 matches, if any.
+
+    Compares the stripped body of existing source files (excluding frontmatter
+    and the title heading) against the new source's content hash. This catches
+    both same-URL re-extraction and different-URL-same-content duplicates.
+    """
+    target_hash = hashlib.sha256(content.strip().encode("utf-8")).hexdigest()
+    if not sources_dir.is_dir():
+        return None
+    for existing in sources_dir.glob("*.md"):
+        if existing.name in {"failed_urls.md", "index.md"}:
+            continue
+        try:
+            raw = existing.read_text(encoding="utf-8")
+            _, body = parse_frontmatter(raw)
+            # Strip the leading title heading so two sources with different
+            # titles but identical body content are recognized as duplicates.
+            body_stripped = body.strip()
+            for prefix in ("# ",):
+                if body_stripped.startswith(prefix):
+                    first_newline = body_stripped.find("\n")
+                    if first_newline > 0:
+                        body_stripped = body_stripped[first_newline + 1 :].strip()
+            from obsidian_llm_wiki.core.state import hash_content
+
+            if hash_content(body_stripped) == target_hash:
+                return existing
+        except OSError:
+            continue
+    return None
+
+
+def _archive_clipping(clipping_path: Path, config: Any) -> Path | None:
+    """Move a processed clipping to 02-Clippings/processed/, preserving its name.
+
+    Returns the destination path, or None if the move failed.
+    """
+    archive_dir = config.clippings_dir / "processed"
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    dest = archive_dir / clipping_path.name
+    if dest.exists():
+        # Collision in archive — append a short suffix.
+        stem = clipping_path.stem
+        for i in range(1, 100):
+            candidate = archive_dir / f"{stem}-{i}.md"
+            if not candidate.exists():
+                dest = candidate
+                break
+    try:
+        shutil.move(str(clipping_path), str(dest))
+        return dest
+    except OSError:
+        return None
+
+
 def _operation_for_source(
     store: OperationStore,
     *,
@@ -202,6 +263,10 @@ def ingest(
     inventories. ``--preview`` performs real extraction while keeping the vault
     unchanged. ``--json`` writes newline-delimited JSON events, one terminal
     source event per source, for tooling and the local Obsidian bridge.
+
+    Clippings from ``02-Clippings/`` are moved to ``02-Clippings/processed/``
+    after successful ingestion. Duplicate sources (same content hash) are
+    detected and skipped.
     """
     plan_mode = plan or dry_run
     if plan_mode and preview:
@@ -224,7 +289,7 @@ def ingest(
         f"📂 Vault: {vault_path}\n🤖 Model: {config.llm.model}",
     )
 
-    # Reading clipping files is local-only and is allowed in plan/preview.
+    # ── Collect clippings ──────────────────────────────────────────────
     from obsidian_llm_wiki.ingest.clippings import collect_clippings
 
     clipping_sources = collect_clippings(config)
@@ -242,21 +307,27 @@ def ingest(
             )
             for marker in resume_sources
         ]
-        resumed_keys = {(marker["source_kind"], marker["source"]) for marker in resume_sources}
+        resumed_keys = {
+            (marker["source_kind"], marker["source"]) for marker in resume_sources
+        }
         planned.extend(
             ("url", url, None, False)
             for url in requested_urls
             if ("url", url) not in resumed_keys
         )
     else:
-        planned = [("clipping", str(path), source, False) for path, source in clipping_sources]
+        planned = [
+            ("clipping", str(path), source, False) for path, source in clipping_sources
+        ]
         planned.extend(("url", url, None, False) for url in requested_urls)
 
     if plan_mode:
         for source_kind, identifier, source, _resuming in planned:
             details: dict[str, Any] = {"run_id": run_id}
             if source is not None:
-                bounded_source, truncated = _bounded_source(source, config.max_source_chars)
+                bounded_source, truncated = _bounded_source(
+                    source, config.max_source_chars
+                )
                 details.update(
                     title=bounded_source.title,
                     bytes=len(bounded_source.content.encode("utf-8")),
@@ -264,7 +335,9 @@ def ingest(
                 )
             _emit(
                 json_output,
-                _source_event(identifier, source_kind, OperationStatus.PLANNED, **details),
+                _source_event(
+                    identifier, source_kind, OperationStatus.PLANNED, **details
+                ),
                 f"   🔍 Would extract: {identifier}",
             )
         _emit(
@@ -276,9 +349,12 @@ def ingest(
 
     new_count = 0
     failed_urls: list[tuple[str, str]] = []
+    processed_clipping_paths: list[Path] = []
     cancellation = _CancellationToken()
     with _cooperative_sigint(cancellation):
-        for index, (source_kind, identifier, clipped_source, resuming_source) in enumerate(planned):
+        for index, (source_kind, identifier, clipped_source, resuming_source) in enumerate(
+            planned
+        ):
             if cancellation.cancelled:
                 _cancel_remaining(
                     store,
@@ -315,6 +391,52 @@ def ingest(
                     from obsidian_llm_wiki.render.obsidian import render_source_page
 
                     config.sources_dir.mkdir(parents=True, exist_ok=True)
+
+                    # ── Content-hash dedup ──────────────────────────────
+                    # Before writing a new source file, check whether an
+                    # existing source already has the same content hash.
+                    # This catches both same-URL re-extraction and
+                    # different-URL-same-content duplicates.
+                    dup_path = _content_hash_matches_existing(
+                        config.sources_dir, source.content
+                    )
+                    if dup_path is not None:
+                        _emit(
+                            json_output,
+                            _source_event(
+                                identifier,
+                                source_kind,
+                                OperationStatus.SUCCEEDED,
+                                run_id=run_id,
+                                title=source.title,
+                                bytes=size,
+                                output_file=dup_path.name,
+                                truncated=truncated,
+                                preview=preview_mode,
+                                duplicate_of=dup_path.name,
+                            ),
+                            f"   ⏭ {source.title[:60]} — duplicate of {dup_path.name}",
+                        )
+                        if record is not None:
+                            store.transition(
+                                record,
+                                OperationStatus.SUCCEEDED,
+                                title=source.title,
+                                bytes_extracted=size,
+                                output_file=dup_path.name,
+                            )
+                            if resuming_source:
+                                store.remove_resume_source(identifier, source_kind)
+                        # Archive the clipping even though it's a duplicate —
+                        # it's been "processed" (just found to be a dup).
+                        if source_kind == "clipping":
+                            clipping_path = Path(identifier)
+                            if clipping_path.exists():
+                                archive_dest = _archive_clipping(clipping_path, config)
+                                if archive_dest is not None:
+                                    processed_clipping_paths.append(archive_dest)
+                        continue
+
                     filepath = (
                         config.sources_dir / Path(identifier).name
                         if source_kind == "clipping"
@@ -332,6 +454,17 @@ def ingest(
                     )
                     if resuming_source:
                         store.remove_resume_source(identifier, source_kind)
+
+                    # ── Archive processed clippings ────────────────────
+                    # Move successfully ingested clippings to
+                    # 02-Clippings/processed/ so they're not re-processed
+                    # on the next run.
+                    if source_kind == "clipping":
+                        clipping_path = Path(identifier)
+                        if clipping_path.exists():
+                            archive_dest = _archive_clipping(clipping_path, config)
+                            if archive_dest is not None:
+                                processed_clipping_paths.append(archive_dest)
                 new_count += 1
                 _emit(
                     json_output,
@@ -377,6 +510,13 @@ def ingest(
                     ),
                     f"   ❌ {identifier}: {error}",
                 )
+
+    # Report archived clippings.
+    if processed_clipping_paths and not json_output:
+        typer.echo(
+            f"\n   📁 Archived {len(processed_clipping_paths)} clipping(s) to "
+            f"02-Clippings/processed/"
+        )
 
     if not preview_mode and failed_urls:
         ledger_path = _update_failed_ledger(config.sources_dir, failed_urls)
@@ -447,7 +587,12 @@ def ingest(
 
     _emit(
         json_output,
-        {"type": "pipeline", "event": "started", "run_id": run_id, "sources": len(full_corpus)},
+        {
+            "type": "pipeline",
+            "event": "started",
+            "run_id": run_id,
+            "sources": len(full_corpus),
+        },
         f"\n📦 Total corpus: {len(full_corpus)} source(s)\n\n🤖 Running LLM synthesis pipeline...",
     )
     from obsidian_llm_wiki.core.pipeline import run_pipeline
@@ -539,7 +684,8 @@ def _update_failed_ledger(sources_dir: Path, new_failures: list[tuple[str, str]]
     for url, error in new_failures:
         existing[url] = error
     rows = [
-        f"| {ts} | {url} | {error[:120].replace(chr(10), ' ')} |" for url, error in existing.items()
+        f"| {ts} | {url} | {error[:120].replace(chr(10), ' ')} |"
+        for url, error in existing.items()
     ]
     content = LEDGER_TEMPLATE.format(
         timestamp=datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
