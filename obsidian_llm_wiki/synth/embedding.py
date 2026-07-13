@@ -31,15 +31,11 @@ __all__ = [
 ]
 
 _EMBEDDING_MODEL = os.environ.get(
-    "EMBEDDING_MODEL", "embeddinggemma:300m"
+    "EMBEDDING_MODEL", "nomic-embed-text:v1.5"
 )
 _OLLAMA_HOST = os.environ.get("LLM_HOST", "http://localhost:11435")
 _SIMILARITY_THRESHOLD = 0.60
-_EMBEDDINGS_ENABLED = (
-    os.environ.get("EMBEDDINGS_ENABLED", "false").strip().lower()
-    in ("true", "1", "yes")
-)
-_EMBED_TIMEOUT = 10  # seconds — short to avoid hanging renders
+_EMBED_TIMEOUT = 30  # seconds — allow for cold model loading
 
 
 def embed_text(text: str) -> list[float] | None:
@@ -47,7 +43,8 @@ def embed_text(text: str) -> list[float] | None:
 
     Returns None if embeddings are disabled or the service is unavailable.
     """
-    if not _EMBEDDINGS_ENABLED:
+    # Check at call time so env changes (e.g. loading .env) take effect.
+    if os.environ.get("EMBEDDINGS_ENABLED", "false").strip().lower() not in ("true", "1", "yes"):
         return None
 
     if not text.strip():
@@ -55,20 +52,35 @@ def embed_text(text: str) -> list[float] | None:
 
     try:
         with httpx.Client(timeout=_EMBED_TIMEOUT) as client:
+            # Use /api/embed (Ollama 0.4+) with fallback to /api/embeddings (older)
             resp = client.post(
-                f"{_OLLAMA_HOST}/api/embeddings",
+                f"{_OLLAMA_HOST}/api/embed",
                 json={
                     "model": _EMBEDDING_MODEL,
-                    "prompt": text[:2000],  # Truncate to avoid timeout
+                    "input": text[:2000],  # Truncate to avoid timeout
                 },
             )
             if resp.status_code != 200:
-                logger.debug(
-                    "Embedding API returned %d — model may not be loaded",
-                    resp.status_code,
+                # Fallback to old API
+                resp = client.post(
+                    f"{_OLLAMA_HOST}/api/embeddings",
+                    json={
+                        "model": _EMBEDDING_MODEL,
+                        "prompt": text[:2000],
+                    },
                 )
-                return None
+                if resp.status_code != 200:
+                    logger.debug(
+                        "Embedding API returned %d — model may not be loaded",
+                        resp.status_code,
+                    )
+                    return None
             data = resp.json()
+            # /api/embed returns {"embeddings": [...]}, old API returns
+            # {"embedding": [...]} — handle both response shapes.
+            if "embeddings" in data:
+                embeddings = data["embeddings"]
+                return embeddings[0] if embeddings else None
             return data.get("embedding")
     except Exception as exc:
         logger.debug("Embedding API unavailable: %s", exc)

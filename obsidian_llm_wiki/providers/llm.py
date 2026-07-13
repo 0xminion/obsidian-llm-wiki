@@ -232,6 +232,7 @@ def _configured_task_models(config: LLMProviderConfig) -> dict[str, str]:
         "ingest": resolve_task_model(config, "ingest"),
         "maintenance": resolve_task_model(config, "maintenance"),
         "query": resolve_task_model(config, "query"),
+        "expand": resolve_task_model(config, "expand"),
     }
 
 

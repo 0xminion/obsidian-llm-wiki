@@ -447,8 +447,8 @@ async def _synthesize_source(
     )
 
     if config.synthesis_mode == "two_pass":
-        from obsidian_llm_wiki.synth.quality import quality_synthesize_source
-        synth = await quality_synthesize_source(
+        from obsidian_llm_wiki.synth.quality import multi_model_entry_synthesize_source
+        synth = await multi_model_entry_synthesize_source(
             config, filename, source, existing_concepts,
             schema_policy=schema_policy,
             granularity=granularity,

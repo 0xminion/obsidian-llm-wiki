@@ -560,8 +560,7 @@ def test_concept_page_with_relations_frontmatter():
     assert meta["confidence"] == 0.85
     assert meta["provenance"] == "extracted"
     assert "relations" in meta
-    assert meta["relations"][0]["target"] == "other-concept"
-    assert meta["relations"][0]["type"] == "depends_on"
+    assert meta["relations"][0] == "other-concept|depends_on|Other"
     assert "## Related Concepts" not in body
     assert "[[other-concept|Other]]" not in body
 

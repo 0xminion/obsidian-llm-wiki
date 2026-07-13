@@ -275,9 +275,11 @@ def render_concept_page(
     if concept.aliases:
         fm["aliases"] = concept.aliases
     if concept.related:
+        # Serialize as pipe-separated strings so Obsidian's Properties panel
+        # treats ``relations`` as a simple list of strings (no nested-object
+        # warning). Format: "slug|relation_type|display_label".
         fm["relations"] = [
-            {"target": r.slug, "type": r.relation, "display": r.display or r.slug}
-            for r in concept.related
+            f"{r.slug}|{r.relation}|{r.display or r.slug}" for r in concept.related
         ]
 
     parts: list[str] = [f"# {concept.title}", ""]
@@ -385,6 +387,10 @@ def render_moc_page(
 
     # ── 关联图谱 / Cross-References in MoC ──────────────────────────
     # ASCII flow diagram in a code block + clickable wikilinks outside.
+    # Every MoC with ≥2 concepts gets a Cross-References section for
+    # structural consistency — even when no inter-concept relations exist
+    # yet, a placeholder message is shown instead of silently omitting
+    # the section.
     if all_concepts and moc.concept_slugs:
         moc_concepts = [
             all_concepts[s] for s in moc.concept_slugs
@@ -392,8 +398,8 @@ def render_moc_page(
         ]
         if len(moc_concepts) >= 2:
             diagram_lines = _build_moc_cross_ref_diagram(moc_concepts, all_concepts)
+            parts.extend(["## Cross-References / 关联图谱", ""])
             if diagram_lines:
-                parts.extend(["## Cross-References / 关联图谱", ""])
                 parts.append("```text")
                 parts.extend(diagram_lines)
                 parts.append("```")
@@ -403,6 +409,13 @@ def render_moc_page(
                 if moc_cross_links:
                     parts.extend(moc_cross_links)
                     parts.append("")
+            else:
+                # No inter-concept relations yet — show placeholder so
+                # all MoCs have a consistent section structure.
+                parts.extend([
+                    "*No cross-references available yet.*",
+                    "",
+                ])
 
     # ── Cross-lingual links from embedding ──────────────────────────
     # Instead of a separate section, merge cross-lingual concepts into the
@@ -551,6 +564,22 @@ def render_vault(
             written.append(str(path))
 
     # ── Render entry pages ───────────────────────────────────────────
+    # Remove stale entry files from previous runs.
+    from obsidian_llm_wiki.core.review import is_reviewed_page
+    current_entry_slugs = {
+        normalize_slug(slugify(s.source_title), s.source_title)
+        for s in bundle.sources
+    }
+    current_entry_slugs.add("index.md")
+    for old_file in dirs["entries"].glob("*.md"):
+        if (
+            old_file.stem not in current_entry_slugs
+            and old_file.name != "index.md"
+            and not is_reviewed_page(old_file.read_text(encoding="utf-8"))
+        ):
+            old_file.unlink()
+            logger.debug("Removed stale entry: %s", old_file.name)
+
     # Build a lookup from slugified source_title → actual source filename
     # so the Source wikilink in each entry resolves to the real source note.
     source_filename_lookup: dict[str, str] = {}
@@ -615,6 +644,29 @@ def render_vault(
         logger.debug("Embedding-based linking skipped: %s", exc)
 
     # ── Render concept pages ─────────────────────────────────────────
+    # First, remove stale concept files from previous runs that are no
+    # longer in the current bundle. When the LLM produces different slugs
+    # across runs (e.g. "jump-risk" → "jump-risk-prediction-markets"), the
+    # old files remain on disk and pollute the vault.
+    from obsidian_llm_wiki.core.review import is_reviewed_page
+
+    current_concept_slugs = {c.slug for c in bundle.concepts}
+    for old_file in dirs["concepts"].glob("*.md"):
+        if old_file.name == "index.md":
+            continue
+        if old_file.stem in current_concept_slugs:
+            continue
+        old_content = old_file.read_text(encoding="utf-8")
+        if is_reviewed_page(old_content):
+            continue
+        # Don't delete orphaned concepts — they're intentionally kept
+        # when their source is deleted but the concept still has value.
+        old_meta, _ = parse_frontmatter(old_content)
+        if old_meta.get("orphaned") is True:
+            continue
+        old_file.unlink()
+        logger.debug("Removed stale concept: %s", old_file.name)
+
     for concept in bundle.concepts:
         page = render_concept_page(concept, ts, all_concepts=concept_map)
         path = _safe_page_path(dirs["concepts"], concept.slug, concept.title)
@@ -622,6 +674,17 @@ def render_vault(
             written.append(str(path))
 
     # ── Render MOC pages ─────────────────────────────────────────────
+    # Remove stale MoC files from previous runs.
+    current_moc_slugs = {m.slug for m in bundle.maps}
+    for old_file in dirs["mocs"].glob("*.md"):
+        if (
+            old_file.stem not in current_moc_slugs
+            and old_file.name != "index.md"
+            and not is_reviewed_page(old_file.read_text(encoding="utf-8"))
+        ):
+            old_file.unlink()
+            logger.debug("Removed stale MoC: %s", old_file.name)
+
     for moc in bundle.maps:
         page = render_moc_page(
             moc, ts,
@@ -665,5 +728,47 @@ def render_vault(
         written.append(str(graph_dir / "graph.mmd"))
     except Exception as exc:
         logger.debug("Graph export skipped: %s", exc)
+
+    # ── Dataview / Bases views ───────────────────────────────────────
+    # Generate live Dataview views (concepts by confidence, MoCs by count,
+    # contradictions by status, sources by freshness) for Obsidian users.
+    try:
+        from obsidian_llm_wiki.render.dataview import render_dataview_views
+        written.extend(
+            render_dataview_views(bundle_dir, bundle, sources)
+        )
+    except Exception as exc:
+        logger.debug("Dataview views skipped: %s", exc)
+
+    # ── Source dependency graph ──────────────────────────────────────
+    # Export which sources contributed to which concepts (JSON + Mermaid).
+    try:
+        from obsidian_llm_wiki.render.source_graph import export_source_dependency_graph
+        dep_graph_dir = bundle_dir / ".llmwiki"
+        dep_graph_paths = export_source_dependency_graph(bundle, dep_graph_dir)
+        written.extend(dep_graph_paths)
+    except Exception as exc:
+        logger.debug("Source dependency graph skipped: %s", exc)
+
+    # ── Vault log.md ─────────────────────────────────────────────────
+    # Append a chronological entry recording this build/render action.
+    try:
+        from obsidian_llm_wiki.render.log import append_log
+        body_lines = [
+            f"- sources: {source_count}",
+            f"- entries: {entry_count}",
+            f"- concepts: {concept_count}",
+            f"- mocs: {moc_count}",
+        ]
+        if bundle.errors:
+            body_lines.append(f"- errors: {len(bundle.errors)}")
+        log_path = append_log(
+            bundle_dir, "build",
+            f"rendered vault ({source_count} sources, {concept_count} concepts)",
+            body=body_lines,
+        )
+        written.append(str(log_path))
+    except Exception as exc:
+        logger.debug("Vault log append skipped: %s", exc)
 
     return written
