@@ -129,6 +129,11 @@ def load_sources_from_dir(sources_dir: Path) -> dict[str, SourceDoc]:
         return {}
     result: dict[str, SourceDoc] = {}
     for f in sorted(sources_dir.glob("*.md")):
+        # Never process the failed URL ledger or index files as sources —
+        # they are pipeline metadata, not extracted content. Processing
+        # them pollutes the vault with concepts about error handling.
+        if f.name in {"failed_urls.md", "index.md"}:
+            continue
         doc = load_source_file(f)
         if doc is not None:
             result[f.name] = doc

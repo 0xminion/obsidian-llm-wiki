@@ -63,10 +63,9 @@ def extract_youtube_video(raw_url: str) -> SourceDoc:
 
     Strategy:
       1. yt-dlp subtitle extraction (downloads auto-generated or manual subtitles)
-      2. Supadata YouTube transcript API (Whisper AI fallback when no captions)
-      3. AssemblyAI remote-URL transcription (submits YouTube URL to AAI)
-      4. Invidious API (metadata + description fallback)
-      5. oEmbed metadata (title + channel only, last resort)
+      2. AssemblyAI remote-URL transcription (submits YouTube URL to AAI)
+      3. Invidious API (metadata + description fallback)
+      4. oEmbed metadata (title + channel only, last resort)
 
     Raises:
         RuntimeError: If all methods fail.
@@ -85,25 +84,7 @@ def extract_youtube_video(raw_url: str) -> SourceDoc:
     except Exception as exc:
         errors.append(f"yt-dlp: {exc}")
 
-    # ── Fallback 1: Supadata YouTube transcript API ──────────────────
-    # Supadata fetches transcripts server-side, with Whisper AI fallback
-    # when no captions exist. Does not require yt-dlp or proxy access.
-    supadata_key = os.environ.get("SUPADATA_API_KEY", "").strip() or None
-    if supadata_key:
-        try:
-            source = _supadata_transcript(raw_url, supadata_key)
-            if source:
-                logger.info(
-                    "Supadata: extracted %d chars for %s",
-                    len(source.content), raw_url,
-                )
-                return source
-        except Exception as exc:
-            errors.append(f"supadata: {exc}")
-    else:
-        errors.append("supadata: API key not set")
-
-    # ── Fallback 2: AssemblyAI remote-URL transcription ──────────────
+    # ── Fallback 1: AssemblyAI remote-URL transcription ──────────────
     aai_key = _get_assemblyai_key()
     if aai_key:
         try:
@@ -141,69 +122,6 @@ def extract_youtube_video(raw_url: str) -> SourceDoc:
         f"YouTube transcript extraction failed for {raw_url}: " +
         "; ".join(errors)
     )
-
-
-# ── Supadata YouTube transcript API ─────────────────────────────────────
-
-
-def _supadata_transcript(url: str, api_key: str) -> SourceDoc | None:
-    """Fetch YouTube transcript via Supadata API.
-
-    Supadata fetches transcripts server-side and uses Whisper AI as a
-    fallback when no captions exist. This does not require yt-dlp or
-    proxy access — Supadata's servers handle the YouTube fetch.
-
-    API docs: https://supadata.ai/youtube-transcript-api
-    Endpoint: GET https://api.supadata.ai/v1/youtube/transcript?url=<url>
-    Auth: x-api-key header
-    """
-    from urllib.parse import quote
-
-    api_url = (
-        f"https://api.supadata.ai/v1/youtube/transcript"
-        f"?url={quote(url, safe='')}"
-    )
-    headers = {"x-api-key": api_key}
-
-    try:
-        with httpx.Client(timeout=120, follow_redirects=True) as client:
-            resp = client.get(api_url, headers=headers)
-            if resp.status_code == 404:
-                raise RuntimeError(f"Supadata: transcript not found for {url}")
-            if resp.status_code == 429:
-                raise RuntimeError("Supadata: rate limit exceeded")
-            resp.raise_for_status()
-            data = resp.json()
-
-        # Supadata returns {"content": [{"text": "...", "start": 0, "dur": 5}, ...], "lang": "en"}
-        content_segments = data.get("content", []) or []
-        if not content_segments:
-            raise RuntimeError("Supadata: empty transcript response")
-
-        # Concatenate transcript segments
-        text_parts = []
-        for seg in content_segments:
-            if isinstance(seg, dict):
-                seg_text = seg.get("text", "").strip()
-                if seg_text:
-                    text_parts.append(seg_text)
-
-        text = " ".join(text_parts).strip()
-        if not text or len(text) < 200:
-            raise RuntimeError(
-                f"Supadata transcript too short ({len(text)} chars)"
-            )
-
-        # Get title via oEmbed
-        title = _fetch_youtube_title(url) or f"YouTube video {_video_id(url)}"
-
-        return SourceDoc(title=title, content=text, url=url)
-
-    except httpx.HTTPStatusError as exc:
-        raise RuntimeError(
-            f"Supadata API error {exc.response.status_code}: "
-            f"{exc.response.text[:200]}"
-        ) from exc
 
 
 # ── yt-dlp subtitle extraction ──────────────────────────────────────────

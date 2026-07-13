@@ -88,7 +88,44 @@ def parse_single_source_synthesis(response: str) -> SourceSynthesis | None:
     if not isinstance(data, dict):
         return None
 
+    # Sanitize LaTeX artifacts: LLMs sometimes produce $\rightarrow$ or
+    # $\leftarrow$ in text fields. JSON parsing interprets \r as carriage
+    # return, eating the 'r' and leaving 'ightarrow'. Fix by restoring
+    # the intended LaTeX arrows as Unicode arrows before parsing.
+    data = _sanitize_latex_artifacts(data)
+
     return source_synthesis_from_dict(data)
+
+
+def _sanitize_latex_artifacts(data: Any) -> Any:
+    """Fix LaTeX arrow artifacts that get mangled by JSON escape parsing.
+
+    LLMs produce $\\rightarrow$ and $\\leftarrow$ in text. JSON's \\r
+    escape eats the 'r', producing '$ightarrow$'. We replace these with
+    Unicode arrows (→ ←) that render correctly in Obsidian markdown.
+    """
+    arrow_map = {
+        "$ightarrow$": "→",
+        "$eftarrow$": "←",
+        "\\rightarrow": "→",
+        "\\leftarrow": "←",
+        "\\Rightarrow": "⇒",
+        "\\Leftarrow": "⇐",
+        "\\leftrightarrow": "↔",
+        "\\Leftrightarrow": "⇔",
+        "$\\rightarrow$": "→",
+        "$\\leftarrow$": "←",
+    }
+    if isinstance(data, dict):
+        return {k: _sanitize_latex_artifacts(v) for k, v in data.items()}
+    if isinstance(data, list):
+        return [_sanitize_latex_artifacts(v) for v in data]
+    if isinstance(data, str):
+        result = data
+        for latex, arrow in arrow_map.items():
+            result = result.replace(latex, arrow)
+        return result
+    return data
 
 
 # ── JSON extraction ─────────────────────────────────────────────────────

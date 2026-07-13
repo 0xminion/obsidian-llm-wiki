@@ -519,7 +519,7 @@ def ingest(
         )
 
     if not preview_mode and failed_urls:
-        ledger_path = _update_failed_ledger(config.sources_dir, failed_urls)
+        ledger_path = _update_failed_ledger(config.llmwiki_dir, failed_urls)
         _emit(
             json_output,
             {"type": "ledger", "event": "updated", "path": str(ledger_path)},
@@ -670,7 +670,7 @@ def _cancel_remaining(
 
 
 def _update_failed_ledger(sources_dir: Path, new_failures: list[tuple[str, str]]) -> Path:
-    """Append failed URLs to the failed_urls.md ledger."""
+    """Append failed URLs to the failed_urls.md ledger in .llmwiki/."""
     ledger_path = sources_dir / "failed_urls.md"
     ts = datetime.now(UTC).strftime("%Y-%m-%d")
     existing: dict[str, str] = {}
