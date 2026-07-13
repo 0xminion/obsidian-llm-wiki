@@ -551,6 +551,22 @@ def render_vault(
             written.append(str(path))
 
     # ── Render entry pages ───────────────────────────────────────────
+    # Remove stale entry files from previous runs.
+    from obsidian_llm_wiki.core.review import is_reviewed_page
+    current_entry_slugs = {
+        normalize_slug(slugify(s.source_title), s.source_title)
+        for s in bundle.sources
+    }
+    current_entry_slugs.add("index.md")
+    for old_file in dirs["entries"].glob("*.md"):
+        if (
+            old_file.stem not in current_entry_slugs
+            and old_file.name != "index.md"
+            and not is_reviewed_page(old_file.read_text(encoding="utf-8"))
+        ):
+            old_file.unlink()
+            logger.debug("Removed stale entry: %s", old_file.name)
+
     # Build a lookup from slugified source_title → actual source filename
     # so the Source wikilink in each entry resolves to the real source note.
     source_filename_lookup: dict[str, str] = {}
@@ -615,6 +631,29 @@ def render_vault(
         logger.debug("Embedding-based linking skipped: %s", exc)
 
     # ── Render concept pages ─────────────────────────────────────────
+    # First, remove stale concept files from previous runs that are no
+    # longer in the current bundle. When the LLM produces different slugs
+    # across runs (e.g. "jump-risk" → "jump-risk-prediction-markets"), the
+    # old files remain on disk and pollute the vault.
+    from obsidian_llm_wiki.core.review import is_reviewed_page
+
+    current_concept_slugs = {c.slug for c in bundle.concepts}
+    for old_file in dirs["concepts"].glob("*.md"):
+        if old_file.name == "index.md":
+            continue
+        if old_file.stem in current_concept_slugs:
+            continue
+        old_content = old_file.read_text(encoding="utf-8")
+        if is_reviewed_page(old_content):
+            continue
+        # Don't delete orphaned concepts — they're intentionally kept
+        # when their source is deleted but the concept still has value.
+        old_meta, _ = parse_frontmatter(old_content)
+        if old_meta.get("orphaned") is True:
+            continue
+        old_file.unlink()
+        logger.debug("Removed stale concept: %s", old_file.name)
+
     for concept in bundle.concepts:
         page = render_concept_page(concept, ts, all_concepts=concept_map)
         path = _safe_page_path(dirs["concepts"], concept.slug, concept.title)
@@ -622,6 +661,17 @@ def render_vault(
             written.append(str(path))
 
     # ── Render MOC pages ─────────────────────────────────────────────
+    # Remove stale MoC files from previous runs.
+    current_moc_slugs = {m.slug for m in bundle.maps}
+    for old_file in dirs["mocs"].glob("*.md"):
+        if (
+            old_file.stem not in current_moc_slugs
+            and old_file.name != "index.md"
+            and not is_reviewed_page(old_file.read_text(encoding="utf-8"))
+        ):
+            old_file.unlink()
+            logger.debug("Removed stale MoC: %s", old_file.name)
+
     for moc in bundle.maps:
         page = render_moc_page(
             moc, ts,
