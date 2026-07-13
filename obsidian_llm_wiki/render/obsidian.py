@@ -23,6 +23,7 @@ from obsidian_llm_wiki.core.models import (
     SourceDoc,
     SourceSynthesis,
     SynthesisBundle,
+    normalize_slug,
 )
 
 # Shared helpers live in their own modules; the names are re-exported here
@@ -97,6 +98,26 @@ def render_source_page(source: SourceDoc, timestamp: str | None = None) -> str:
         "url": source.url or "",
         "timestamp": ts,
     }
+    if source.aliases:
+        fm["aliases"] = source.aliases
+    if source.tags:
+        fm["tags"] = source.tags
+    if source.source_type:
+        fm["source_type"] = source.source_type
+    provenance = {
+        "requested_url": source.provenance.requested_url,
+        "resolved_url": source.provenance.resolved_url,
+        "extracted_url": source.provenance.extracted_url,
+        "extractor_chain": list(source.provenance.extractor_chain),
+        "content_type": source.provenance.content_type,
+        "document_format": source.provenance.document_format,
+        "retrieved_at": source.provenance.retrieved_at,
+        "content_sha256": source.provenance.content_sha256,
+        "diagnostics": list(source.provenance.diagnostics),
+    }
+    provenance = {key: value for key, value in provenance.items() if value}
+    if provenance:
+        fm["provenance"] = provenance
     content = source.content.strip()
     title_clean = source.title.strip()
 
@@ -113,6 +134,64 @@ def render_source_page(source: SourceDoc, timestamp: str | None = None) -> str:
     else:
         body = f"# {source.title}\n\n{content}"
     return f"{build_frontmatter(fm)}\n{body}"
+
+
+def _write_generated_page(path: Path, page: str, bundle_dir: Path) -> bool:
+    """Atomically replace changed generated content while preserving human work.
+
+    Every automatic rewrite snapshots the exact previous bytes first.  A
+    byte-identical render is a no-op: it neither makes a backup nor replaces the
+    inode.  Reviewed pages retain their body while their generated metadata is
+    refreshed.
+    """
+    if path.exists():
+        existing = safe_read_file(path)
+        try:
+            from obsidian_llm_wiki.core.backups import backup_file
+            from obsidian_llm_wiki.core.review import is_reviewed_page
+
+            if is_reviewed_page(existing):
+                generated_meta, _ = parse_frontmatter(page)
+                _, reviewed_body = parse_frontmatter(existing)
+                generated_meta["reviewed"] = True
+                page = f"{build_frontmatter(generated_meta)}\n{reviewed_body.lstrip()}"
+
+            if page == existing:
+                return False
+            backup_file(path, bundle_dir / ".llmwiki" / "backups")
+        except Exception as exc:
+            raise RuntimeError(f"Could not safely replace generated page {path}: {exc}") from exc
+
+    atomic_write(path, page)
+    return True
+
+
+def _safe_page_path(directory: Path, slug: object, title: object) -> Path:
+    """Return a normalized page path proven to be inside ``directory``."""
+    normalized_slug = normalize_slug(slug, title)
+    root = directory.resolve()
+    candidate = (directory / f"{normalized_slug}.md").resolve()
+    try:
+        candidate.relative_to(root)
+    except ValueError as exc:
+        raise ValueError(f"Refusing to write outside {directory}: {candidate}") from exc
+    return candidate
+
+
+def _normalize_bundle_output_slugs(bundle: SynthesisBundle) -> None:
+    """Defend direct renderer callers that bypass the synthesis JSON parser."""
+    for concept in bundle.concepts:
+        concept.slug = normalize_slug(concept.slug, concept.title)
+        for link in concept.related:
+            link.slug = normalize_slug(link.slug)
+    for synthesis in bundle.sources:
+        for concept in synthesis.concepts:
+            concept.slug = normalize_slug(concept.slug, concept.title)
+            for link in concept.related:
+                link.slug = normalize_slug(link.slug)
+    for moc in bundle.maps:
+        moc.slug = normalize_slug(moc.slug, moc.title)
+        moc.concept_slugs = [normalize_slug(slug) for slug in moc.concept_slugs]
 
 
 def render_entry_page(
@@ -213,13 +292,6 @@ def render_concept_page(
         parts.extend(["## Claims", ""])
         for claim in concept.claims:
             parts.append(f"- {claim.text}")
-        parts.append("")
-
-    if concept.related:
-        parts.extend(["## Related Concepts", ""])
-        for link in concept.related:
-            display = link.display or link.slug
-            parts.append(f"- {make_wikilink(link.slug, display)} — `{link.relation}`")
         parts.append("")
 
     # ── 关联图谱 / Cross-References ──────────────────────────────────
@@ -442,6 +514,7 @@ def render_vault(
     # not always comply. Rendering is the last safe choke point before filenames
     # and wikilinks are written, so normalize here and remap slugs consistently.
     _normalize_bilingual_titles_and_slugs(bundle)
+    _normalize_bundle_output_slugs(bundle)
 
     # Ensure directories exist.
     dirs = {
@@ -457,8 +530,8 @@ def render_vault(
     for filename, source in sources.items():
         page = render_source_page(source, ts)
         path = dirs["sources"] / filename
-        atomic_write(path, page)
-        written.append(str(path))
+        if _write_generated_page(path, page, bundle_dir):
+            written.append(str(path))
 
     # ── Render entry pages ───────────────────────────────────────────
     # Build a lookup from slugified source_title → actual source filename
@@ -497,13 +570,13 @@ def render_vault(
                             break
 
     for synthesis in bundle.sources:
-        entry_slug = slugify(synthesis.source_title)
+        entry_slug = normalize_slug(slugify(synthesis.source_title), synthesis.source_title)
         actual_source_stem = source_filename_lookup.get(entry_slug, entry_slug)
         concept_slugs = [c.slug for c in synthesis.concepts]
         page = render_entry_page(synthesis, actual_source_stem, concept_slugs, ts)
-        path = dirs["entries"] / f"{entry_slug}.md"
-        atomic_write(path, page)
-        written.append(str(path))
+        path = _safe_page_path(dirs["entries"], entry_slug, synthesis.source_title)
+        if _write_generated_page(path, page, bundle_dir):
+            written.append(str(path))
 
     # Build concept map for cross-reference linking.
     concept_map: dict[str, ConceptNote] = {
@@ -527,9 +600,9 @@ def render_vault(
     # ── Render concept pages ─────────────────────────────────────────
     for concept in bundle.concepts:
         page = render_concept_page(concept, ts, all_concepts=concept_map)
-        path = dirs["concepts"] / f"{concept.slug}.md"
-        atomic_write(path, page)
-        written.append(str(path))
+        path = _safe_page_path(dirs["concepts"], concept.slug, concept.title)
+        if _write_generated_page(path, page, bundle_dir):
+            written.append(str(path))
 
     # ── Render MOC pages ─────────────────────────────────────────────
     for moc in bundle.maps:
@@ -538,9 +611,9 @@ def render_vault(
             all_concepts=concept_map,
             cross_lingual_links=cross_lingual_links or None,
         )
-        path = dirs["mocs"] / f"{moc.slug}.md"
-        atomic_write(path, page)
-        written.append(str(path))
+        path = _safe_page_path(dirs["mocs"], moc.slug, moc.title)
+        if _write_generated_page(path, page, bundle_dir):
+            written.append(str(path))
 
     # ── Per-directory index.md ───────────────────────────────────────
     for dir_name, dir_path in dirs.items():
@@ -549,8 +622,8 @@ def render_vault(
         if md_files:
             idx = render_directory_index(dir_name, md_files, bundle_dir)
             idx_path = dir_path / "index.md"
-            atomic_write(idx_path, idx)
-            written.append(str(idx_path))
+            if _write_generated_page(idx_path, idx, bundle_dir):
+                written.append(str(idx_path))
 
     # ── Bundle-root index.md ─────────────────────────────────────────
     source_count = len(sources)
@@ -561,8 +634,8 @@ def render_vault(
         bundle_dir, concept_count, entry_count, moc_count, source_count
     )
     bundle_idx_path = bundle_dir / "index.md"
-    atomic_write(bundle_idx_path, bundle_idx)
-    written.append(str(bundle_idx_path))
+    if _write_generated_page(bundle_idx_path, bundle_idx, bundle_dir):
+        written.append(str(bundle_idx_path))
 
     # ── Graph visualization export ───────────────────────────────────
     # Export the knowledge graph as JSON (for D3.js / Obsidian graph view)

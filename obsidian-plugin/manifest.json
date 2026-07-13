@@ -1,0 +1,9 @@
+{
+  "id": "obsidian-llm-wiki-bridge",
+  "name": "Obsidian LLM Wiki Bridge",
+  "version": "0.1.0",
+  "minAppVersion": "1.5.0",
+  "description": "Runs the local olw CLI and displays its structured events.",
+  "author": "obsidian-llm-wiki contributors",
+  "isDesktopOnly": true
+}

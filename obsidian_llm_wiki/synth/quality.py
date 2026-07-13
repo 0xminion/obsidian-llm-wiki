@@ -28,6 +28,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from collections.abc import Mapping
 from typing import Any
 
 from obsidian_llm_wiki.core.models import (
@@ -40,6 +41,7 @@ from obsidian_llm_wiki.core.models import (
     SourceSynthesis,
     normalize_relation,
 )
+from obsidian_llm_wiki.core.schema import Granularity, SchemaPolicy, format_schema_guidance
 from obsidian_llm_wiki.synth.parser import parse_single_source_synthesis
 
 logger = logging.getLogger("obswiki.synth.quality")
@@ -264,6 +266,8 @@ def build_extract_prompt(
     source_content: str,
     existing_concepts: list[str] | None = None,
     language: str = "",
+    schema_policy: SchemaPolicy | Mapping[str, Any] | None = None,
+    granularity: Granularity | str | None = None,
 ) -> str:
     """Build the Pass 1 extraction prompt — concept skeleton only."""
     existing_str = (
@@ -273,6 +277,7 @@ def build_extract_prompt(
     )
     schema_json = json.dumps(_EXTRACT_SCHEMA, indent=2, ensure_ascii=False)
     lang_instruction = f"\nWrite all content in **{language}**." if language else ""
+    schema_guidance = format_schema_guidance(schema_policy, granularity)
 
     return f"""You are a knowledge extraction engine.  Analyse the source document \
 and identify the key concepts it covers.  Return ONLY a JSON object — no prose, \
@@ -289,6 +294,7 @@ Rules:
 3-5 sentences of insightful synthesis — NOT a generic one-liner. Explain \
 the key tension, how the concepts interact, and why this grouping matters.
 * Tags must be lowercase, 2-4 per concept.{lang_instruction}
+{schema_guidance}
 
 --- EXISTING CONCEPT INDEX ---
 {existing_str}
@@ -345,6 +351,8 @@ def build_expand_prompt(
     source_content: str,
     all_concepts: list[dict[str, str]],
     language: str = "",
+    schema_policy: SchemaPolicy | Mapping[str, Any] | None = None,
+    granularity: Granularity | str | None = None,
 ) -> str:
     """Build the Pass 2 expansion prompt for one concept."""
     from obsidian_llm_wiki.synth.prompts import RELATIONSHIP_FEWSHOT
@@ -356,6 +364,7 @@ def build_expand_prompt(
         if c.get("slug") != concept_slug
     )
     lang_instruction = f"\nWrite all content in **{language}**." if language else ""
+    schema_guidance = format_schema_guidance(schema_policy, granularity)
 
     return f"""You are a knowledge synthesis engine.  Write a deep, evidence-backed \
 section for the concept "{concept_title}" based on the source document below.
@@ -372,6 +381,7 @@ Rules:
 * Do NOT repeat what the source says verbatim — synthesise and explain.
 * Sections must have substantive points OR prose — never both empty.\
 {lang_instruction}
+{schema_guidance}
 
 {RELATIONSHIP_FEWSHOT}
 
@@ -480,6 +490,9 @@ async def quality_synthesize_source(
     filename: str,
     source: SourceDoc,
     existing_concepts: list[str],
+    *,
+    schema_policy: SchemaPolicy | Mapping[str, Any] | None = None,
+    granularity: Granularity | str | None = None,
 ) -> SourceSynthesis | None:
     """Run the two-pass quality synthesis for one source.
 
@@ -528,12 +541,14 @@ async def quality_synthesize_source(
                     chunk_content,
                     existing_concepts=existing_concepts,
                     language=source_lang or config.output_language,
+                    schema_policy=schema_policy,
+                    granularity=granularity,
                 )
                 msgs = [
                     {"role": "system", "content": _SYSTEM_EXTRACT},
                     {"role": "user", "content": prompt},
                 ]
-                return await acall_llm(prompt, msgs, config)
+                return await acall_llm(prompt, msgs, config, task="ingest")
 
         # Let every chunk finish, then fail loudly if ANY chunk failed. A
         # partial skeleton must never propagate as success: the pipeline would
@@ -591,6 +606,8 @@ async def quality_synthesize_source(
             source.content,
             existing_concepts=existing_concepts,
             language=source_lang or config.output_language,
+            schema_policy=schema_policy,
+            granularity=granularity,
         )
         messages = [
             {"role": "system", "content": _SYSTEM_EXTRACT},
@@ -598,7 +615,7 @@ async def quality_synthesize_source(
         ]
 
         try:
-            response = await acall_llm(extract_prompt, messages, config)
+            response = await acall_llm(extract_prompt, messages, config, task="ingest")
         except Exception as exc:
             logger.error("Pass 1 (extract) failed for '%s': %s", filename, exc)
             raise
@@ -652,6 +669,8 @@ async def quality_synthesize_source(
                 _expand_one_concept(
                     config, concept, source, all_concept_dicts, source_lang,
                     rationale=rationales.get(concept.slug, ""),
+                    schema_policy=schema_policy,
+                    granularity=granularity,
                 )
             )
             for concept in skeleton.concepts
@@ -742,6 +761,9 @@ async def _expand_one_concept(
     all_concepts: list[dict[str, str]],
     source_lang: str = "",
     rationale: str = "",
+    *,
+    schema_policy: SchemaPolicy | Mapping[str, Any] | None = None,
+    granularity: Granularity | str | None = None,
 ) -> ConceptNote | None:
     """Expand a single concept via a focused LLM call."""
     from obsidian_llm_wiki.providers.llm import acall_llm
@@ -754,6 +776,8 @@ async def _expand_one_concept(
         source_content=source.content,
         all_concepts=all_concepts,
         language=source_lang or config.output_language,
+        schema_policy=schema_policy,
+        granularity=granularity,
     )
     messages = [
         {"role": "system", "content": _SYSTEM_SYNTH},
@@ -761,7 +785,7 @@ async def _expand_one_concept(
     ]
 
     try:
-        response = await acall_llm(prompt, messages, config)
+        response = await acall_llm(prompt, messages, config, task="ingest")
     except Exception as exc:
         logger.error("Pass 2 LLM call failed for '%s': %s", concept.slug, exc)
         raise
@@ -1022,7 +1046,7 @@ Return JSON:
     ]
 
     try:
-        response = await acall_llm(prompt, messages, config)
+        response = await acall_llm(prompt, messages, config, task="ingest")
     except Exception as exc:
         logger.error("Concept re-synthesis failed for '%s': %s", concept.slug, exc)
         return None

@@ -16,13 +16,10 @@ from __future__ import annotations
 
 import logging
 import os
-import tempfile
 from collections.abc import Callable
 from contextlib import suppress
 from pathlib import Path
 from urllib.parse import urlparse
-
-import httpx
 
 from obsidian_llm_wiki.core.models import SourceDoc
 from obsidian_llm_wiki.ingest.web import extract_web
@@ -43,15 +40,13 @@ class ExtractorNotApplicableError(RuntimeError):
     to ``extract_web``.
     """
 
+
 # ── Registry ────────────────────────────────────────────────────────────
 
 # Each entry: (match_fn, extractor_fn)
 # match_fn takes a parsed URL + raw input string, returns True if this
 # extractor should handle it.
 _EXTRACTORS: list[tuple[Callable[..., bool], Callable[..., SourceDoc]]] = []
-
-# File extensions that require download-then-extract for remote URLs.
-_REMOTE_FILE_EXTENSIONS = frozenset((".pdf", ".docx", ".doc", ".pptx", ".xlsx"))
 
 
 def register_extractor(
@@ -65,6 +60,7 @@ def register_extractor(
         def extract_youtube(raw_url: str) -> SourceDoc:
             ...
     """
+
     def decorator(
         fn: Callable[..., SourceDoc],
     ) -> Callable[..., SourceDoc]:
@@ -94,9 +90,20 @@ def extract(raw_url: str) -> SourceDoc:
     Raises:
         RuntimeError: If all extraction strategies fail.
     """
-    # Check if it's a local file path.
+    # Local and direct remote binary documents are centrally dispatched before
+    # generic extractors.  This prevents a failed download page from becoming
+    # bogus HTML source content.
     if _looks_like_file_path(raw_url):
-        return _extract_file(raw_url)
+        from obsidian_llm_wiki.ingest.documents import dispatch_document, is_document_path
+
+        if is_document_path(raw_url):
+            return _stamp_extracted_source(dispatch_document(raw_url), raw_url, "document_dispatch")
+        return _stamp_extracted_source(_extract_file(raw_url), raw_url, "local_file")
+
+    from obsidian_llm_wiki.ingest.documents import dispatch_document, is_direct_document_url
+
+    if is_direct_document_url(raw_url):
+        return _stamp_extracted_source(dispatch_document(raw_url), raw_url, "document_dispatch")
 
     # Parse as URL.
     parsed = urlparse(raw_url)
@@ -111,20 +118,26 @@ def extract(raw_url: str) -> SourceDoc:
         if match_fn(parsed, raw_url):
             logger.debug("Routing '%s' to %s", raw_url, extractor_fn.__name__)
             try:
-                return extractor_fn(raw_url)
+                return _stamp_extracted_source(
+                    extractor_fn(raw_url), raw_url, extractor_fn.__name__
+                )
             except ExtractorNotApplicableError as exc:
                 # The extractor disclaimed the URL after inspecting the content.
                 # This is not a failure, so it must not fail closed — keep the
                 # ordinary fallback chain (other extractors, then extract_web).
                 logger.debug(
                     "Extractor %s disclaimed %s: %s",
-                    extractor_fn.__name__, raw_url, exc,
+                    extractor_fn.__name__,
+                    raw_url,
+                    exc,
                 )
                 continue
             except Exception as exc:
                 logger.warning(
                     "Extractor %s failed for %s: %s; trying fallback",
-                    extractor_fn.__name__, raw_url, exc,
+                    extractor_fn.__name__,
+                    raw_url,
+                    exc,
                 )
                 matched_errors.append((extractor_fn.__name__, exc))
                 continue
@@ -135,12 +148,15 @@ def extract(raw_url: str) -> SourceDoc:
             + "; ".join(f"{n}: {e}" for n, e in matched_errors)
         )
 
-    # Remote binary file (PDF/DOCX in URL path) → download to temp, then extract.
-    if _is_remote_file(raw_url):
-        return _extract_remote_file(raw_url)
-
     # Fallback: web extraction.
-    return extract_web(raw_url)
+    return _stamp_extracted_source(extract_web(raw_url), raw_url, "web_fallback")
+
+
+def _stamp_extracted_source(source: SourceDoc, raw_url: str, extractor: str) -> SourceDoc:
+    """Attach baseline immutable provenance at the public extractor boundary."""
+    from obsidian_llm_wiki.ingest.provenance import stamp_source
+
+    return stamp_source(source, requested_url=raw_url, extractor=extractor)
 
 
 def _looks_like_file_path(raw_url: str) -> bool:
@@ -151,64 +167,6 @@ def _looks_like_file_path(raw_url: str) -> bool:
     # Expand and check if file exists.
     expanded = Path(os.path.expanduser(raw_url))
     return expanded.is_file()
-
-
-def _is_remote_file(raw_url: str) -> bool:
-    """Check if a URL points to a binary file requiring download-then-extract."""
-    if not raw_url.startswith(("http://", "https://")):
-        return False
-    parsed = urlparse(raw_url)
-    path = parsed.path.lower()
-    # Strip query string already done by urlparse, but check extension.
-    return any(path.endswith(ext) for ext in _REMOTE_FILE_EXTENSIONS)
-
-
-def _extract_remote_file(url: str) -> SourceDoc:
-    """Download a remote binary file to a temp file, then extract it.
-
-    Routes to the appropriate registered extractor based on file extension.
-    Falls back to web extraction if no extractor matches.
-    """
-    parsed = urlparse(url)
-    suffix = Path(parsed.path).suffix.lower()
-
-    # Download to temp file.
-    tmp_path: str | None = None
-    try:
-        from obsidian_llm_wiki.ingest.proxy import make_client_kwargs
-        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-            with httpx.Client(**make_client_kwargs(follow_redirects=True, timeout=60)) as client:
-                resp = client.get(url)
-                resp.raise_for_status()
-                tmp.write(resp.content)
-            tmp_path = tmp.name
-
-        file_size = os.path.getsize(tmp_path) if tmp_path else 0
-        logger.debug("Downloaded '%s' to '%s' (%d bytes)", url, tmp_path, file_size)
-
-        # Route to registered extractors for this file type.
-        for match_fn, extractor_fn in _EXTRACTORS:
-            if match_fn(urlparse(""), tmp_path):
-                logger.debug("Routing remote file '%s' to %s", url, extractor_fn.__name__)
-                source = extractor_fn(tmp_path)
-                # Preserve the original URL, not the temp file path.
-                source.url = url
-                return source
-
-        # Plain text/markdown: read directly.
-        if suffix in (".txt", ".md", ".markdown", ".rst"):
-            content = Path(tmp_path).read_text(encoding="utf-8")
-            title = Path(parsed.path).stem
-            return SourceDoc(title=title, content=content, url=url)
-
-        # No extractor matched — fall back to web (extracts the HTML download page).
-        logger.warning("No extractor for remote file type '%s', trying web extraction", suffix)
-        return extract_web(url)
-
-    finally:
-        if tmp_path is not None:
-            with suppress(OSError):
-                os.unlink(tmp_path)
 
 
 def _extract_file(file_path: str) -> SourceDoc:

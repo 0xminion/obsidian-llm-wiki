@@ -1,93 +1,70 @@
 """Optional local LiteParse CLI integration for structured documents.
 
-LiteParse is deliberately invoked through its ``lit`` CLI so this module has
-no import-time dependency on the optional package. Install it with
-``pip install liteparse`` to enable the fallback.
+The optional ``lit`` executable is kept behind a subprocess boundary.  Its
+runtime and captured diagnostics are bounded by :class:`~obsidian_llm_wiki.config.Config`.
 """
 
 from __future__ import annotations
 
-import os
 import shutil
 import subprocess
-import tempfile
-from contextlib import suppress
-from html.parser import HTMLParser
+import threading
 from pathlib import Path
-from urllib.parse import urljoin, urlparse
 
-import httpx
-
+from obsidian_llm_wiki.config import Config, load_config
 from obsidian_llm_wiki.core.models import SourceDoc
-from obsidian_llm_wiki.ingest.http_headers import BROWSER_HEADERS
-from obsidian_llm_wiki.ingest.proxy import make_client_kwargs
 
 
 class LiteParseUnavailableError(RuntimeError):
     """Raised when the optional LiteParse CLI is not installed."""
 
 
-_DOCUMENT_SUFFIXES = frozenset((".pdf", ".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx", ".epub"))
+def parse_document(
+    path: str | Path,
+    *,
+    source_url: str | None = None,
+    config: Config | None = None,
+) -> SourceDoc:
+    """Parse a local document with bounded LiteParse CLI output.
 
-# Content types that identify a *binary document* response. HTML is deliberately
-# absent: an HTML response is a landing page to search for citation links, not a
-# document to hand to LiteParse. Including it here would route every ordinary web
-# page through LiteParse ahead of trafilatura and make _document_candidates()
-# unreachable.
-_CONTENT_TYPE_SUFFIXES = {
-    "application/pdf": ".pdf",
-    "application/epub+zip": ".epub",
-    "application/msword": ".doc",
-    "application/vnd.ms-excel": ".xls",
-    "application/vnd.ms-powerpoint": ".ppt",
-    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
-    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ".xlsx",
-    "application/vnd.openxmlformats-officedocument.presentationml.presentation": ".pptx",
-}
-
-
-def parse_document(path: str | Path, *, source_url: str | None = None) -> SourceDoc:
-    """Parse a local document with LiteParse and return Markdown in a SourceDoc.
-
-    Raises:
-        LiteParseUnavailableError: When the optional ``lit`` executable is unavailable.
-        RuntimeError: When LiteParse cannot parse the document.
+    Raises ``LiteParseUnavailableError`` when optional LiteParse is not
+    installed and chains the original subprocess error for callers that need to
+    retain the cause in diagnostics.
     """
     document = Path(path)
+    cfg = config or load_config()
     lit = shutil.which("lit")
     if not lit:
         raise LiteParseUnavailableError(
             "LiteParse CLI is unavailable; install it with `pip install liteparse`"
         )
 
+    command = [
+        lit,
+        "parse",
+        str(document),
+        "--format",
+        "markdown",
+        "--image-mode",
+        "off",
+        "--quiet",
+    ]
     try:
-        proc = subprocess.run(
-            [
-                lit,
-                "parse",
-                str(document),
-                "--format",
-                "markdown",
-                "--image-mode",
-                "off",
-                "--quiet",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=120,
-        )
+        returncode, stdout, stderr = _run_liteparse(command, cfg)
     except FileNotFoundError as exc:
         raise LiteParseUnavailableError(
             "LiteParse CLI is unavailable; install it with `pip install liteparse`"
         ) from exc
     except subprocess.TimeoutExpired as exc:
         raise RuntimeError(f"LiteParse timed out parsing {document}") from exc
+    except OSError as exc:
+        raise RuntimeError(f"LiteParse could not start for {document}") from exc
 
-    if proc.returncode != 0:
-        detail = proc.stderr.strip() or "no stderr"
-        raise RuntimeError(f"LiteParse exited {proc.returncode}: {detail[:300]}")
+    if returncode != 0:
+        detail = stderr.decode("utf-8", errors="replace").strip() or "no stderr"
+        raise RuntimeError(f"LiteParse exited {returncode}: {detail}")
 
-    content = proc.stdout.strip()
+    content = stdout.decode("utf-8", errors="replace").strip()
     if not content:
         raise RuntimeError("LiteParse returned empty Markdown")
 
@@ -98,138 +75,88 @@ def parse_document(path: str | Path, *, source_url: str | None = None) -> Source
     )
 
 
-def extract_document_fallback(url: str, timeout: int) -> SourceDoc:
-    """Download a direct or discovered document URL and parse it with LiteParse.
-
-    The original page URL remains the SourceDoc URL when a citation link is
-    discovered, preserving provenance for callers. Every temporary download is
-    removed after parsing, including when LiteParse is unavailable.
-    """
-    with httpx.Client(
-        **make_client_kwargs(timeout=timeout, follow_redirects=True), headers=BROWSER_HEADERS
-    ) as client:
-        response = client.get(url)
-        response.raise_for_status()
-        if _is_document_response(url, response):
-            return _parse_download(response.content, url, response.headers, source_url=url)
-
-        candidates = _document_candidates(response.text, url)
-        if not candidates:
-            raise RuntimeError("No direct document or citation document link found")
-
-        errors: list[str] = []
-        for candidate in candidates:
-            try:
-                document_response = client.get(candidate)
-                document_response.raise_for_status()
-                return _parse_download(
-                    document_response.content,
-                    candidate,
-                    document_response.headers,
-                    source_url=url,
-                )
-            except Exception as exc:
-                errors.append(f"{candidate}: {exc}")
-
-    raise RuntimeError("LiteParse document fallback failed: " + "; ".join(errors))
-
-
-def _parse_download(
-    content: bytes, document_url: str, headers: httpx.Headers, *, source_url: str
-) -> SourceDoc:
-    """Write a document response to a temporary file and invoke LiteParse."""
-    if not content:
-        raise RuntimeError(f"Downloaded empty document from {document_url}")
-
-    suffix = _document_suffix(document_url, headers)
-    temp_path: str | None = None
+def _run_liteparse(command: list[str], config: Config) -> tuple[int, bytes, bytes]:
+    """Run LiteParse while draining pipes into bounded byte buffers."""
+    process = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    assert process.stdout is not None
+    assert process.stderr is not None
+    stdout = _BoundedPipe(process.stdout, config.max_parser_stdout_bytes)
+    stderr = _BoundedPipe(process.stderr, config.max_parser_stderr_bytes)
+    stdout.start()
+    stderr.start()
     try:
-        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as handle:
-            handle.write(content)
-            temp_path = handle.name
-        return parse_document(temp_path, source_url=source_url)
+        returncode = process.wait(timeout=config.parser_timeout_seconds)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait()
+        raise
     finally:
-        if temp_path is not None:
-            with suppress(OSError):
-                os.unlink(temp_path)
+        stdout.join()
+        stderr.join()
+    return returncode, stdout.value, stderr.value
 
 
-def _is_document_response(url: str, response: httpx.Response) -> bool:
-    """Whether an HTTP response is a direct downloadable document."""
-    return Path(urlparse(url).path).suffix.lower() in _DOCUMENT_SUFFIXES or _content_type(
-        response.headers
-    ) in _CONTENT_TYPE_SUFFIXES
+class _BoundedPipe:
+    """Drain a subprocess stream without retaining more than ``limit`` bytes."""
+
+    def __init__(self, stream, limit: int) -> None:
+        self._stream = stream
+        self._limit = max(0, limit)
+        self._buffer = bytearray()
+        self._thread = threading.Thread(target=self._drain, daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def join(self) -> None:
+        self._thread.join()
+
+    @property
+    def value(self) -> bytes:
+        return bytes(self._buffer)
+
+    def _drain(self) -> None:
+        while chunk := self._stream.read(65_536):
+            remaining = self._limit - len(self._buffer)
+            if remaining > 0:
+                self._buffer.extend(chunk[:remaining])
 
 
-def _document_suffix(url: str, headers: httpx.Headers) -> str:
-    """Choose a useful temporary-file suffix from the URL or content type."""
-    suffix = Path(urlparse(url).path).suffix.lower()
-    if suffix:
-        return suffix
-    content_type = _content_type(headers)
-    if content_type in _CONTENT_TYPE_SUFFIXES:
-        return _CONTENT_TYPE_SUFFIXES[content_type]
-    if "word" in content_type:
-        return ".docx"
-    if "spreadsheet" in content_type or "excel" in content_type:
-        return ".xlsx"
-    if "presentation" in content_type or "powerpoint" in content_type:
-        return ".pptx"
-    return ".bin"
+def extract_document_fallback(url: str, timeout: int) -> SourceDoc:
+    """Discover a same-site document candidate and dispatch it safely."""
+    from obsidian_llm_wiki.ingest.documents import extract_discovered_document
+
+    return extract_discovered_document(url, timeout)
 
 
-def _content_type(headers: httpx.Headers) -> str:
-    return headers.get("content-type", "").split(";", 1)[0].strip().lower()
+def _is_document_response(url: str, response) -> bool:
+    """Compatibility predicate for callers that classify HTTP responses.
+
+    Classification alone does not validate a document: the unified dispatcher
+    subsequently verifies content type, bounded size, and file signature before
+    invoking a parser. HTML is intentionally excluded unless a document suffix
+    explicitly identifies the URL.
+    """
+    from obsidian_llm_wiki.ingest.documents import _CONTENT_TYPE_SUFFIXES, is_document_path
+
+    content_type = response.headers.get("content-type", "").split(";", 1)[0].lower()
+    return is_document_path(url) or content_type in _CONTENT_TYPE_SUFFIXES
 
 
 def _document_candidates(html: str, page_url: str) -> list[str]:
-    """Find citation metadata and PDF links in an HTML landing page.
-
-    Only same-site candidates are returned to avoid routing extraction through
-    external mirrors or third-party access workarounds.
-    """
-    parser = _DocumentLinkParser()
-    parser.feed(html)
-    parser.close()
-
-    page_host = (urlparse(page_url).hostname or "").lower()
-    seen: set[str] = set()
-    candidates: list[str] = []
-    for raw_candidate in parser.candidates:
-        if not raw_candidate:
-            continue
-        resolved = urljoin(page_url, raw_candidate)
-        if resolved in seen:
-            continue
-        candidate_host = (urlparse(resolved).hostname or "").lower()
-        if candidate_host and candidate_host != page_host:
-            continue
-        seen.add(resolved)
-        candidates.append(resolved)
-    return candidates
+    """Compatibility wrapper for existing callers of candidate discovery."""
+    return document_candidates(html, page_url, max_candidates=load_config().max_document_candidates)
 
 
-class _DocumentLinkParser(HTMLParser):
-    """Extract citation document URLs without adding an HTML-parser dependency."""
+def document_candidates(html: str, page_url: str, *, max_candidates: int) -> list[str]:
+    """Delay importing the dispatcher to avoid an import cycle with parse_document."""
+    from obsidian_llm_wiki.ingest.documents import document_candidates as candidates
 
-    def __init__(self) -> None:
-        super().__init__()
-        self.candidates: list[str] = []
-
-    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        attributes = {name.lower(): value or "" for name, value in attrs}
-        href = attributes.get("href", "")
-        if tag == "meta":
-            name = attributes.get("name", attributes.get("property", "")).lower()
-            content = attributes.get("content", "").strip()
-            if name in {"citation_pdf_url", "citation_fulltext_html_url"} and content:
-                self.candidates.append(content)
-        elif tag in {"a", "link"} and href.strip():
-            relation = " ".join(
-                (attributes.get("rel", ""), attributes.get("type", ""), attributes.get("title", ""))
-            ).lower()
-            if "pdf" in href.lower() or "pdf" in relation:
-                self.candidates.append(href.strip())
+    return candidates(html, page_url, max_candidates=max_candidates)
 
 
 def _markdown_title(markdown: str) -> str:

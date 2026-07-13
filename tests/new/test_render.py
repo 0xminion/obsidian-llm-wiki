@@ -108,8 +108,10 @@ def test_render_concept_page_with_related():
         related=[ConceptLink(slug="sgd", relation="variant_of", display="SGD")],
     )
     page = render_concept_page(c)
-    assert "## Related Concepts" in page
-    assert "[[sgd|SGD]]" in page
+    meta, body = parse_frontmatter(page)
+    assert meta["relations"] == [{"target": "sgd", "type": "variant_of", "display": "SGD"}]
+    assert "## Related Concepts" not in body
+    assert "[[sgd|SGD]]" not in body
 
 
 def test_render_concept_page_with_claims():

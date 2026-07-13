@@ -13,6 +13,8 @@ independently inventing its own tags and summaries.
 
 from __future__ import annotations
 
+import re
+import unicodedata
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
@@ -68,6 +70,50 @@ class RelationType(StrEnum):
 VALID_RELATIONS: frozenset[str] = frozenset(r.value for r in RelationType)
 
 
+# Slugs become filenames in the renderer.  Keep this deliberately narrower
+# than a general identifier: no separators, dots, or controls can cross the
+# parser boundary.  Unicode letters/digits remain supported for existing
+# bilingual vault filenames.
+_MAX_SLUG_LENGTH = 80
+
+
+def _is_safe_slug(value: object) -> bool:
+    """Accept bounded identifier characters but never path syntax or controls."""
+    return (
+        isinstance(value, str)
+        and bool(value)
+        and len(value) <= _MAX_SLUG_LENGTH
+        and value[0].isalnum()
+        and all(char.isalnum() or char in "_-" for char in value)
+    )
+
+
+def _regenerate_slug(value: object) -> str:
+    """Produce a bounded ASCII slug from arbitrary untrusted text."""
+    if not isinstance(value, str):
+        return ""
+    ascii_value = unicodedata.normalize("NFKD", value).encode("ascii", "ignore").decode()
+    cleaned = re.sub(r"[^a-z0-9]+", "-", ascii_value.lower())
+    return cleaned.strip("-_")[:_MAX_SLUG_LENGTH].rstrip("-_")
+
+
+def normalize_slug(value: object, fallback: object = "untitled") -> str:
+    """Return a strict filename-safe slug, regenerating invalid values.
+
+    Existing bounded identifier slugs (including legacy underscores and Unicode
+    letters/digits) are kept byte-for-byte.  Everything else is regenerated
+    from ``fallback`` when possible, so an LLM-provided traversal string can
+    never become a path.
+    """
+    if isinstance(value, str) and _is_safe_slug(value):
+        return value
+    regenerated = _regenerate_slug(fallback)
+    if _is_safe_slug(regenerated):
+        return regenerated
+    regenerated = _regenerate_slug(value)
+    return regenerated if _is_safe_slug(regenerated) else "untitled"
+
+
 def normalize_relation(value: str) -> str:
     """Normalise a relation string to a valid RelationType value.
 
@@ -78,6 +124,33 @@ def normalize_relation(value: str) -> str:
 
 
 # ── Ingest ──────────────────────────────────────────────────────────────
+
+
+_MAX_PROVENANCE_DIAGNOSTICS = 20
+
+
+@dataclass(frozen=True)
+class SourceProvenance:
+    """Immutable retrieval and extraction metadata for a source document."""
+
+    requested_url: str = ""
+    resolved_url: str = ""
+    extracted_url: str = ""
+    extractor_chain: tuple[str, ...] = ()
+    content_type: str = ""
+    document_format: str = ""
+    retrieved_at: str = ""
+    content_sha256: str = ""
+    diagnostics: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        """Normalise collection fields and cap persisted diagnostic entries."""
+        object.__setattr__(self, "extractor_chain", tuple(self.extractor_chain))
+        object.__setattr__(
+            self,
+            "diagnostics",
+            tuple(self.diagnostics[:_MAX_PROVENANCE_DIAGNOSTICS]),
+        )
 
 
 @dataclass
@@ -92,6 +165,10 @@ class SourceDoc:
     content: str
     url: str | None = None
     source_file: str | None = None  # filename within sources/ dir
+    provenance: SourceProvenance = field(default_factory=SourceProvenance)
+    aliases: list[str] = field(default_factory=list)
+    tags: list[str] = field(default_factory=list)
+    source_type: str = ""
 
 
 # ── Synthesis schema ────────────────────────────────────────────────────
@@ -291,7 +368,7 @@ def _concept_from_dict(data: dict[str, Any]) -> ConceptNote:
     ]
     related = [
         ConceptLink(
-            slug=r.get("slug", ""),
+            slug=normalize_slug(r.get("slug", "")),
             relation=normalize_relation(r.get("relation", "related_to")),
             display=r.get("display", ""),
         )
@@ -306,7 +383,7 @@ def _concept_from_dict(data: dict[str, Any]) -> ConceptNote:
         confidence = 1.0
     return ConceptNote(
         title=data.get("title", ""),
-        slug=data.get("slug", ""),
+        slug=normalize_slug(data.get("slug", ""), data.get("title", "")),
         summary=data.get("summary", ""),
         tags=list(data.get("tags", []) or []),
         aliases=list(data.get("aliases", []) or []),
@@ -323,10 +400,10 @@ def _moc_from_dict(data: dict[str, Any]) -> MapOfContent:
     """Build a MapOfContent from a raw dict."""
     return MapOfContent(
         title=data.get("title", ""),
-        slug=data.get("slug", ""),
+        slug=normalize_slug(data.get("slug", ""), data.get("title", "")),
         summary=data.get("summary", ""),
         tags=list(data.get("tags", []) or []),
-        concept_slugs=list(data.get("concept_slugs", []) or []),
+        concept_slugs=[normalize_slug(slug) for slug in data.get("concept_slugs", []) or []],
     )
 
 

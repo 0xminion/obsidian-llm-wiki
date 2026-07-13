@@ -33,6 +33,47 @@ def test_load_source_file_with_frontmatter(tmp_path: Path):
     assert doc.source_file == "article.md"
 
 
+def test_load_source_file_preserves_sanitized_aliases_tags_and_source_type(tmp_path: Path):
+    """Source frontmatter aliases/tags survive loading without unsafe values."""
+    path = tmp_path / "article.md"
+    path.write_text(
+        build_frontmatter(
+            {
+                "type": "Source",
+                "title": "My Article",
+                "aliases": ["  Alternate Name  ", "Alternate Name", ""],
+                "tags": [" AI Research ", "#Knowledge", "AI Research"],
+                "source_type": "scientific-paper",
+            }
+        )
+        + "\nBody text.",
+        encoding="utf-8",
+    )
+
+    doc = load_source_file(path)
+
+    assert doc is not None
+    assert doc.aliases == ["Alternate Name"]
+    assert doc.tags == ["ai-research", "knowledge"]
+    assert doc.source_type == "scientific-paper"
+
+
+def test_load_source_file_ignores_non_list_alias_and_tag_frontmatter(tmp_path: Path):
+    """Untrusted scalar/mapping frontmatter cannot create malformed metadata."""
+    path = tmp_path / "untrusted.md"
+    path.write_text(
+        "---\ntitle: Untrusted\naliases: not-a-list\ntags: {bad: value}\n---\nBody.",
+        encoding="utf-8",
+    )
+
+    doc = load_source_file(path)
+
+    assert doc is not None
+    assert doc.aliases == []
+    assert doc.tags == []
+    assert doc.source_type == ""
+
+
 def test_load_source_file_no_frontmatter(tmp_path: Path):
     """load_source_file uses filename as title when no frontmatter."""
     path = tmp_path / "no-fm.md"

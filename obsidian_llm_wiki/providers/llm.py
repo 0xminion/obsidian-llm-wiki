@@ -11,12 +11,37 @@ import logging
 import time
 from abc import ABC, abstractmethod
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 
 from obsidian_llm_wiki.config import LLMProviderConfig
+from obsidian_llm_wiki.core.task_models import resolve_task_model
 
 logger = logging.getLogger("obswiki.providers.llm")
+
+
+def _endpoint_url(host: str, suffix: str) -> str:
+    """Build a request/diagnostic URL without propagating URL credentials.
+
+    Provider hosts are configuration, not a secret transport.  Deliberately
+    discard userinfo, query parameters, and fragments so diagnostics and
+    raised HTTP errors cannot expose credentials embedded in a copied URL.
+    """
+    parsed = urlsplit(host)
+    if not parsed.scheme or not parsed.hostname:
+        return f"{host.rstrip('/')}{suffix}"
+
+    hostname = parsed.hostname
+    if ":" in hostname and not hostname.startswith("["):
+        hostname = f"[{hostname}]"
+    try:
+        port = parsed.port
+    except ValueError:
+        port = None
+    netloc = f"{hostname}:{port}" if port is not None else hostname
+    path = f"{parsed.path.rstrip('/')}{suffix}"
+    return urlunsplit((parsed.scheme, netloc, path, "", ""))
 
 
 # ── Abstract base ───────────────────────────────────────────────────────
@@ -41,7 +66,7 @@ class OllamaClient(LLMClient):
         self._timeout = httpx.Timeout(config.timeout_ms / 1000.0)
 
     def chat(self, system: str, user: str, **kwargs: Any) -> str:
-        url = f"{self.config.host.rstrip('/')}/api/chat"
+        url = _endpoint_url(self.config.host, "/api/chat")
         body: dict[str, Any] = {
             "model": kwargs.pop("model", self.config.model),
             "messages": [
@@ -96,7 +121,7 @@ class OpenAICompatibleClient(LLMClient):
         return headers
 
     def chat(self, system: str, user: str, **kwargs: Any) -> str:
-        url = f"{self.config.host.rstrip('/')}/v1/chat/completions"
+        url = _endpoint_url(self.config.host, "/v1/chat/completions")
         body: dict[str, Any] = {
             "model": kwargs.pop("model", self.config.model),
             "messages": [
@@ -134,6 +159,134 @@ def create_llm_client(config: LLMProviderConfig) -> LLMClient:
     )
 
 
+# ── Provider discovery and preflight ──────────────────────────────────────
+
+
+def _models_url(config: LLMProviderConfig) -> str:
+    return _endpoint_url(config.host, "/v1/models")
+
+
+def _ollama_tags_url(config: LLMProviderConfig) -> str:
+    return _endpoint_url(config.host, "/api/tags")
+
+
+def _auth_headers(config: LLMProviderConfig) -> dict[str, str]:
+    if config.api_key:
+        return {"Authorization": f"Bearer {config.api_key}"}
+    return {}
+
+
+def _request_timeout(config: LLMProviderConfig) -> httpx.Timeout:
+    return httpx.Timeout(config.timeout_ms / 1000.0)
+
+
+def _openai_model_ids(payload: Any) -> list[str]:
+    """Extract sorted model identifiers from an OpenAI-compatible response."""
+    data = payload.get("data", []) if isinstance(payload, dict) else []
+    return sorted(
+        {
+            item["id"].strip()
+            for item in data
+            if isinstance(item, dict) and isinstance(item.get("id"), str) and item["id"].strip()
+        }
+    )
+
+
+def _ollama_model_names(payload: Any) -> list[str]:
+    """Extract sorted model names from an Ollama ``/api/tags`` response."""
+    models = payload.get("models", []) if isinstance(payload, dict) else []
+    return sorted(
+        {
+            item["name"].strip()
+            for item in models
+            if isinstance(item, dict) and isinstance(item.get("name"), str) and item["name"].strip()
+        }
+    )
+
+
+def list_provider_models(config: LLMProviderConfig) -> list[str]:
+    """List models from ``/v1/models``, falling back to Ollama's native tags API.
+
+    Older Ollama installations may not implement the OpenAI-compatible endpoint;
+    their ``/api/tags`` response remains a supported, read-only fallback.
+    """
+    try:
+        with httpx.Client(timeout=_request_timeout(config)) as client:
+            response = client.get(_models_url(config), headers=_auth_headers(config))
+            response.raise_for_status()
+            return _openai_model_ids(response.json())
+    except httpx.HTTPError:
+        if config.provider.lower().strip() != "ollama":
+            raise
+
+    with httpx.Client(timeout=_request_timeout(config)) as client:
+        response = client.get(_ollama_tags_url(config))
+        response.raise_for_status()
+        return _ollama_model_names(response.json())
+
+
+def _configured_task_models(config: LLMProviderConfig) -> dict[str, str]:
+    """Return the effective model for the default and each declared task."""
+    return {
+        "default": config.model,
+        "ingest": resolve_task_model(config, "ingest"),
+        "maintenance": resolve_task_model(config, "maintenance"),
+        "query": resolve_task_model(config, "query"),
+    }
+
+
+def check_provider(config: LLMProviderConfig) -> dict[str, Any]:
+    """Return a secret-free, structured provider endpoint/auth/model diagnostic."""
+    configured = _configured_task_models(config)
+    provider = config.provider.lower().strip()
+    endpoint: dict[str, Any] = {"url": _models_url(config), "reachable": False}
+    auth_status = "not_required" if provider == "ollama" else (
+        "configured" if config.api_key else "missing"
+    )
+    available: list[str] | None = None
+
+    try:
+        available = list_provider_models(config)
+        endpoint["reachable"] = True
+        endpoint["status_code"] = 200
+    except httpx.HTTPStatusError as exc:
+        endpoint["reachable"] = True
+        endpoint["status_code"] = exc.response.status_code
+        endpoint["error"] = f"HTTP {exc.response.status_code}"
+        if exc.response.status_code in (401, 403):
+            auth_status = "rejected" if config.api_key else "missing"
+    except httpx.HTTPError as exc:
+        endpoint["error"] = type(exc).__name__
+    except (TypeError, ValueError) as exc:
+        endpoint["error"] = type(exc).__name__
+
+    model_diagnostics: dict[str, dict[str, Any]] = {}
+    for task, model in configured.items():
+        if available is None:
+            status = "unknown"
+            is_available: bool | None = None
+        elif model in available:
+            status = "available"
+            is_available = True
+        else:
+            status = "not_listed"
+            is_available = False
+        model_diagnostics[task] = {"name": model, "status": status, "available": is_available}
+
+    ok = (
+        endpoint["reachable"]
+        and auth_status not in {"missing", "rejected"}
+        and all(item["available"] is not False for item in model_diagnostics.values())
+    )
+    return {
+        "ok": ok,
+        "provider": provider,
+        "endpoint": endpoint,
+        "auth": {"configured": bool(config.api_key), "status": auth_status},
+        "models": model_diagnostics,
+    }
+
+
 # ── Convenience wrappers with retry ─────────────────────────────────────
 
 
@@ -164,6 +317,8 @@ def call_llm(
     system: str,
     messages: list[dict] | str,
     config: Any,
+    *,
+    task: str | None = None,
     **kwargs: Any,
 ) -> str:
     """Synchronous LLM call with exponential-backoff retry.
@@ -171,14 +326,23 @@ def call_llm(
     When *messages* is a list of structured message dicts (with role/content),
     the messages are passed directly to the LLM client. When *messages* is a
     string or a flat list without role info, *system* is used as the system
-    prompt and *messages* as the user content (legacy behaviour).
+    prompt and *messages* as the user content (legacy behaviour). Pass an
+    optional *task* (``ingest``, ``maintenance``, or ``query``) to use its
+    configured model override; omitted *task* preserves the unified model.
     """
     llm_config = _resolve_llm_config(config)
     client = create_llm_client(llm_config)
     max_retries = getattr(config, "retry_count", 3)
 
+    # A task-specific model is opt-in, preserving the existing no-task call
+    # contract. An explicit ``model=`` still takes precedence for advanced callers.
+    resolved_model = (
+        resolve_task_model(llm_config, task) if task is not None else llm_config.model
+    )
+
     # Filter kwargs the sync clients don't understand.
     chat_kwargs = {k: v for k, v in kwargs.items() if k not in ("tools", "on_token")}
+    chat_kwargs.setdefault("model", resolved_model)
 
     # Check if messages is a structured list with role dicts.
     is_structured = (

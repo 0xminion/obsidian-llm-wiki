@@ -24,6 +24,7 @@ is pure functions in ``render.obsidian``.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import time
 from datetime import UTC, datetime
@@ -37,6 +38,11 @@ from obsidian_llm_wiki.core.cache import (
     save_resynthesis_overlay,
     save_synthesis,
 )
+from obsidian_llm_wiki.core.contradictions import (
+    ContradictionRecord,
+    ContradictionStore,
+    SourceRevision,
+)
 from obsidian_llm_wiki.core.lock import acquire_lock, release_lock
 from obsidian_llm_wiki.core.metrics import MetricsCollector
 from obsidian_llm_wiki.core.models import (
@@ -48,6 +54,12 @@ from obsidian_llm_wiki.core.models import (
     WikiState,
 )
 from obsidian_llm_wiki.core.orphan import mark_orphaned_concepts
+from obsidian_llm_wiki.core.schema import (
+    DEFAULT_SCHEMA_POLICY,
+    SchemaPolicy,
+    load_schema_policy,
+    select_synthesis_granularity,
+)
 from obsidian_llm_wiki.core.state import (
     hash_content,
     read_state,
@@ -116,6 +128,10 @@ async def run_pipeline(
         env_file = str(vault / ".env") if (vault / ".env").exists() else None
         config = load_config(env_file=env_file, VAULT_PATH=str(vault))
 
+    # Policy is vault-level configuration, so read it once per compilation and
+    # pass the same sanitized object to every source synthesis task.
+    schema_policy = load_schema_policy(vault)
+
     bundle_dir = config.wiki_dir
     bundle_dir.mkdir(parents=True, exist_ok=True)
 
@@ -156,6 +172,7 @@ async def run_pipeline(
         # ── Classify sources: compile vs reuse cache ───────────────────
         to_compile: dict[str, SourceDoc] = {}
         all_syntheses_by_file: dict[str, SourceSynthesis] = {}
+        changed_sources: dict[str, tuple[str, SourceSynthesis | None]] = {}
 
         for filename, source in sources.items():
             # Source length gate (B3 fix).
@@ -197,6 +214,8 @@ async def run_pipeline(
                 result.skipped += 1
             else:
                 to_compile[filename] = source
+                if prev is not None and prev.hash != current_hash:
+                    changed_sources[filename] = (prev.hash, cache)
 
         if not to_compile and not deleted_filenames:
             # Everything unchanged — re-render full corpus from cache.
@@ -215,8 +234,12 @@ async def run_pipeline(
             async def _synth_one(filename: str, source: SourceDoc):
                 async with sem:
                     return await _synthesize_with_retry(
-                        config, filename, source, existing_concepts,
-                        metrics,
+                        config,
+                        filename,
+                        source,
+                        existing_concepts,
+                        metrics=metrics,
+                        schema_policy=schema_policy,
                     )
 
             synth_results = await asyncio.gather(
@@ -363,6 +386,13 @@ async def run_pipeline(
 
         # ── Update state for compiled sources ─────────────────────────
         compiled_at = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+        _persist_changed_source_revisions(
+            config,
+            changed_sources,
+            filenames_done,
+            to_compile,
+            all_syntheses_by_file,
+        )
         for filename in filenames_done:
             source = to_compile[filename]
             synth = all_syntheses_by_file.get(filename)
@@ -395,6 +425,8 @@ async def _synthesize_source(
     filename: str,
     source: SourceDoc,
     existing_concepts: list[str],
+    *,
+    schema_policy: SchemaPolicy = DEFAULT_SCHEMA_POLICY,
 ) -> SourceSynthesis | None:
     """Call the LLM to synthesise one source into a SourceSynthesis.
 
@@ -405,13 +437,21 @@ async def _synthesize_source(
     Language is always detected from source content (not config.output_language)
     so that Chinese sources stay Chinese, English stays English, etc.
     """
-    # Detect language once — used by both single and two-pass paths
+    # Detect language and choose detail once per source — used by both single
+    # and two-pass paths, while the vault-level policy is shared across sources.
     source_lang = _detect_source_language(source.content, filename)
+    granularity = select_synthesis_granularity(
+        source.content,
+        source.source_type,
+        schema_policy.granularity_override,
+    )
 
     if config.synthesis_mode == "two_pass":
         from obsidian_llm_wiki.synth.quality import quality_synthesize_source
         synth = await quality_synthesize_source(
             config, filename, source, existing_concepts,
+            schema_policy=schema_policy,
+            granularity=granularity,
         )
         if synth is not None and source_lang and not synth.language:
             synth.language = source_lang
@@ -424,6 +464,8 @@ async def _synthesize_source(
         source.content,
         existing_concepts=existing_concepts,
         language=source_lang,
+        schema_policy=schema_policy,
+        granularity=granularity,
     )
 
     messages = [
@@ -432,7 +474,7 @@ async def _synthesize_source(
     ]
 
     try:
-        response = await acall_llm(prompt, messages, config)
+        response = await acall_llm(prompt, messages, config, task="ingest")
     except Exception as exc:
         logger.error("LLM call failed for '%s': %s", filename, exc)
         raise
@@ -459,6 +501,8 @@ async def _synthesize_with_retry(
     source: SourceDoc,
     existing_concepts: list[str],
     metrics: MetricsCollector | None = None,
+    *,
+    schema_policy: SchemaPolicy = DEFAULT_SCHEMA_POLICY,
 ) -> SourceSynthesis | None:
     """Synthesize a source with progressive content truncation on failure.
 
@@ -492,7 +536,11 @@ async def _synthesize_with_retry(
         synth_start = time.monotonic()
         try:
             synth = await _synthesize_source(
-                config, filename, truncated_source, existing_concepts,
+                config,
+                filename,
+                truncated_source,
+                existing_concepts,
+                schema_policy=schema_policy,
             )
         except Exception as exc:
             synth_time = time.monotonic() - synth_start
@@ -587,6 +635,10 @@ async def recompile_single_source(
         env_file = str(vault / ".env") if (vault / ".env").exists() else None
         config = load_config(env_file=env_file, VAULT_PATH=str(vault))
 
+    # Policy is vault-level configuration, so read it once per compilation and
+    # pass the same sanitized object to every source synthesis task.
+    schema_policy = load_schema_policy(vault)
+
     bundle_dir = config.wiki_dir
     bundle_dir.mkdir(parents=True, exist_ok=True)
 
@@ -627,7 +679,12 @@ async def recompile_single_source(
         existing_concepts = _existing_concept_slugs(state)
 
         synth = await _synthesize_with_retry(
-            config, source_file, source, existing_concepts, metrics,
+            config,
+            source_file,
+            source,
+            existing_concepts,
+            metrics=metrics,
+            schema_policy=schema_policy,
         )
 
         if synth is None:
@@ -695,6 +752,116 @@ def _source_from_synthesis(synth: SourceSynthesis) -> SourceDoc:
         content=synth.source_summary or "",
         source_file=synth.source_file,
     )
+
+
+def _persist_changed_source_revisions(
+    config: Config,
+    changed_sources: dict[str, tuple[str, SourceSynthesis | None]],
+    filenames_done: list[str],
+    compiled_sources: dict[str, SourceDoc],
+    syntheses: dict[str, SourceSynthesis],
+) -> None:
+    """Persist successful changed-source revisions and conservative conflicts.
+
+    A record is only detected when both revisions contain exactly one claim for
+    the same ``(concept slug, source reference)`` key and the normalized claim
+    text changed. This avoids guessing that changed summaries, unkeyed claims,
+    or ambiguous repeated claims are contradictions.
+    """
+    successful_changes = sorted(set(filenames_done) & set(changed_sources))
+    if not successful_changes:
+        return
+
+    store = ContradictionStore(config.llmwiki_dir / "contradictions.json")
+    known_record_ids = {record.id for record in store.records()}
+    for filename in successful_changes:
+        previous_hash, previous_synthesis = changed_sources[filename]
+        current_synthesis = syntheses.get(filename)
+        source = compiled_sources[filename]
+        current_hash = hash_content(source.content)
+        previous_revision = SourceRevision(filename, previous_hash, previous_hash)
+        current_revision = SourceRevision(filename, current_hash, current_hash)
+        store.add_source_revision(previous_revision)
+        store.add_source_revision(current_revision)
+
+        if previous_synthesis is None or current_synthesis is None:
+            continue
+        for record in _detect_changed_claims(
+            filename,
+            previous_revision,
+            current_revision,
+            previous_synthesis,
+            current_synthesis,
+        ):
+            if record.id not in known_record_ids:
+                store.add(record)
+                known_record_ids.add(record.id)
+
+
+def _detect_changed_claims(
+    filename: str,
+    previous_revision: SourceRevision,
+    current_revision: SourceRevision,
+    previous_synthesis: SourceSynthesis,
+    current_synthesis: SourceSynthesis,
+) -> list[ContradictionRecord]:
+    """Return deterministic records for materially changed, stable claim keys."""
+    previous_claims = _keyed_claims(previous_synthesis)
+    current_claims = _keyed_claims(current_synthesis)
+    records: list[ContradictionRecord] = []
+    for key in sorted(previous_claims.keys() & current_claims.keys()):
+        old_claim = previous_claims[key]
+        new_claim = current_claims[key]
+        if old_claim is None or new_claim is None:
+            continue
+        concept_slug, source_ref, old_text = old_claim
+        _, _, new_text = new_claim
+        if _normalized_claim_text(old_text) == _normalized_claim_text(new_text):
+            continue
+        record_id_material = "\x1f".join(
+            (filename, previous_revision.content_hash, current_revision.content_hash, key)
+        )
+        record_id = "source-revision-" + hashlib.sha256(
+            record_id_material.encode("utf-8")
+        ).hexdigest()[:20]
+        records.append(
+            ContradictionRecord(
+                id=record_id,
+                summary=(
+                    f"{filename}: claim for concept '{concept_slug}' at "
+                    f"'{source_ref}' changed between source revisions."
+                ),
+                sources=(previous_revision, current_revision),
+                evidence=(f"previous: {old_text}", f"current: {new_text}"),
+            )
+        )
+    return records
+
+
+def _keyed_claims(
+    synthesis: SourceSynthesis,
+) -> dict[str, tuple[str, str, str] | None]:
+    """Index only unique, explicitly sourced claims for safe comparison."""
+    indexed: dict[str, tuple[str, str, str] | None] = {}
+    for concept in synthesis.concepts:
+        for claim in concept.claims:
+            concept_slug = (claim.concept_slug or concept.slug).strip()
+            source_ref = " ".join(claim.source_ref.split())
+            text = claim.text.strip()
+            if not concept_slug or not source_ref or not text:
+                continue
+            key = f"{concept_slug.casefold()}\x1f{source_ref.casefold()}"
+            candidate = (concept_slug, source_ref, text)
+            if key in indexed:
+                indexed[key] = None
+            else:
+                indexed[key] = candidate
+    return indexed
+
+
+def _normalized_claim_text(text: str) -> str:
+    """Normalize harmless case and whitespace variation before comparison."""
+    return " ".join(text.casefold().split())
 
 
 async def _resynthesize_referenced_concepts(

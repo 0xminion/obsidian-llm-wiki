@@ -93,7 +93,7 @@ def test_pipeline_runs_dedup_before_state_write(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(pl, "render_vault", lambda *a, **k: order.append("render") or [])
 
-    async def fake_retry(config, filename, source, existing, metrics=None):
+    async def fake_retry(config, filename, source, existing, *_args, metrics=None, **_kwargs):
         return SourceSynthesis(
             source_title="T", source_summary="s", source_file=filename,
             concepts=[_concept("alpha")],
@@ -124,7 +124,7 @@ def test_pipeline_dedup_failure_is_survivable_and_visible(tmp_path, monkeypatch,
     monkeypatch.setattr(dedupe, "semantic_dedupe_concepts", boom)
     monkeypatch.setattr(pl, "render_vault", lambda *a, **k: [])
 
-    async def fake_retry(config, filename, source, existing, metrics=None):
+    async def fake_retry(config, filename, source, existing, *_args, metrics=None, **_kwargs):
         return SourceSynthesis(
             source_title="T", source_summary="s", source_file=filename,
             concepts=[_concept("alpha")],
@@ -156,7 +156,7 @@ def test_connection_error_does_not_trigger_truncation_retry():
 
     calls: list[int] = []
 
-    async def dead_server(config, filename, src, existing):
+    async def dead_server(config, filename, src, existing, **_kwargs):
         calls.append(len(src.content))
         raise httpx.ConnectError("connection refused")
 
@@ -176,7 +176,7 @@ def test_timeout_still_escalates_through_truncation_levels():
 
     calls: list[int] = []
 
-    async def times_out_when_large(config, filename, src, existing):
+    async def times_out_when_large(config, filename, src, existing, **_kwargs):
         calls.append(len(src.content))
         if len(src.content) > 20_000:
             raise httpx.ReadTimeout("model too slow for this prompt")

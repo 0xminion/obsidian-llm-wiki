@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import re
+from dataclasses import replace
 from html.parser import HTMLParser
 from urllib.parse import urljoin, urlparse
 
@@ -18,12 +19,45 @@ import httpx
 from obsidian_llm_wiki.core.models import SourceDoc
 from obsidian_llm_wiki.ingest.extractors import register_extractor
 from obsidian_llm_wiki.ingest.http_headers import BROWSER_HEADERS, DEFAULT_TIMEOUT
-from obsidian_llm_wiki.ingest.proxy import make_client_kwargs
 
 logger = logging.getLogger("obswiki.ingest.extractors.scientific")
 
 _ARXIV_HOSTS = frozenset(("arxiv.org", "www.arxiv.org", "export.arxiv.org"))
 _MIN_DOCUMENT_CHARS = 100
+_MIN_SUBSTANTIVE_FULLTEXT_CHARS = 500
+_SCIENTIFIC_HOST_MARKERS = frozenset(
+    (
+        "academic",
+        "arxiv",
+        "journals",
+        "journal",
+        "papers",
+        "pubmed",
+        "research",
+        "science",
+        "sciences",
+    )
+)
+_SCIENTIFIC_OFFICIAL_DOMAINS = frozenset(
+    (
+        "arxiv.org",
+        "bmj.com",
+        "cell.com",
+        "jamanetwork.com",
+        "nature.com",
+        "nih.gov",
+        "plos.org",
+        "sciencedirect.com",
+        "science.org",
+        "springer.com",
+        "ssrn.com",
+        "tandfonline.com",
+        "thelancet.com",
+        "wiley.com",
+    )
+)
+_MAX_CANDIDATE_ERRORS = 3
+_MAX_CANDIDATE_ERROR_CHARS = 240
 
 
 def _is_arxiv_url(parsed, raw: str) -> bool:
@@ -64,11 +98,18 @@ def arxiv_paper_id(url: str) -> str | None:
 def _fetch_public_html(url: str, timeout: int) -> str:
     """Fetch a public document without cookies, credentials, or browser bypasses."""
     with httpx.Client(
-        **make_client_kwargs(timeout=timeout, follow_redirects=True),
+        timeout=timeout,
+        follow_redirects=True,
+        trust_env=False,
         headers=BROWSER_HEADERS,
     ) as client:
         response = client.get(url)
     response.raise_for_status()
+    resolved_url = str(getattr(response, "url", ""))
+    if resolved_url.startswith(("http://", "https://")) and not _same_official_site(
+        resolved_url, url
+    ):
+        raise RuntimeError("public document redirected off the official site")
     html = response.text
     if len(html.strip()) < _MIN_DOCUMENT_CHARS:
         raise RuntimeError(f"public HTML response was too short ({len(html)} chars)")
@@ -132,6 +173,24 @@ def _same_official_site(candidate_url: str, landing_url: str) -> bool:
     return candidate_host.endswith(".ssrn.com") and landing_host.endswith(".ssrn.com")
 
 
+def is_likely_scientific_landing_page(url: str) -> bool:
+    """Return whether a URL merits the narrow scientific preflight.
+
+    The check uses explicit scholarly URL markers rather than fetching every
+    page only to inspect metadata.  Ordinary blogs therefore retain their
+    generic extraction path without an additional request.
+    """
+    host = (urlparse(url).hostname or "").lower()
+    if not host:
+        return False
+    labels = frozenset(host.split("."))
+    is_known_scientific_domain = any(
+        host == domain or host.endswith(f".{domain}")
+        for domain in _SCIENTIFIC_OFFICIAL_DOMAINS
+    )
+    return bool(labels & _SCIENTIFIC_HOST_MARKERS or is_known_scientific_domain)
+
+
 def discover_scientific_documents(html: str, landing_url: str) -> list[tuple[str, str]]:
     """Find public same-publisher full-text HTML and PDF links in a landing page.
 
@@ -177,6 +236,29 @@ def extract_scientific_html(html: str, source_url: str) -> SourceDoc:
     return SourceDoc(title=title, content=content.strip(), url=source_url)
 
 
+def _is_substantive_fulltext(document: SourceDoc) -> bool:
+    """Reject thin or untitled HTML candidates that are likely abstracts."""
+    title = document.title.strip()
+    if len(title) < 4 or title.startswith(("http://", "https://", "<")):
+        return False
+    content = document.content.strip()
+    return len(content) >= _MIN_SUBSTANTIVE_FULLTEXT_CHARS and len(content.split()) >= 80
+
+
+def _record_selection(document: SourceDoc, landing_url: str, kind: str) -> SourceDoc:
+    """Preserve a bounded scientific-selection decision in existing provenance."""
+    provenance = document.provenance
+    diagnostics = (*provenance.diagnostics, f"scientific selection: official {kind} candidate")
+    document.provenance = replace(
+        provenance,
+        requested_url=provenance.requested_url or landing_url,
+        extracted_url=provenance.extracted_url or document.url or "",
+        extractor_chain=(*provenance.extractor_chain, f"scientific_public_{kind}"),
+        diagnostics=diagnostics,
+    )
+    return document
+
+
 def extract_discovered_scientific_document(
     landing_url: str,
     timeout: int = DEFAULT_TIMEOUT,
@@ -194,18 +276,25 @@ def extract_discovered_scientific_document(
         raise RuntimeError(f"No public scientific document links found at {landing_url}")
 
     errors: list[str] = []
-    for kind, document_url in candidates:
+    ranked_candidates = sorted(
+        enumerate(candidates), key=lambda item: (0 if item[1][0] == "html" else 1, item[0])
+    )
+    for _, (kind, document_url) in ranked_candidates:
         try:
             if kind == "html":
                 html = _fetch_public_html(document_url, timeout)
-                return extract_scientific_html(html, document_url)
-            return _extract_pdf(document_url)
+                document = extract_scientific_html(html, document_url)
+                if not _is_substantive_fulltext(document):
+                    raise RuntimeError("public HTML candidate was not substantive full text")
+                return _record_selection(document, landing_url, kind)
+            return _record_selection(_extract_pdf(document_url), landing_url, kind)
         except Exception as exc:
-            errors.append(f"{document_url}: {exc}")
+            if len(errors) < _MAX_CANDIDATE_ERRORS:
+                errors.append(f"{document_url}: {str(exc)[:_MAX_CANDIDATE_ERROR_CHARS]}")
 
     raise RuntimeError(
         f"Public scientific document links were unavailable for {landing_url}: "
-        + "; ".join(errors)
+        + "; ".join(errors or ["no usable candidates"])
     )
 
 

@@ -164,7 +164,7 @@ class TestRetryWithTruncation:
         # Mock _synthesize_source to track content lengths it receives
         call_lengths: list[int] = []
 
-        async def mock_synth(config, filename, src, existing_concepts):
+        async def mock_synth(config, filename, src, existing_concepts, **_kwargs):
             call_lengths.append(len(src.content))
             # Fail on full and 50K, succeed on 20K
             if len(src.content) > 20_000:
@@ -206,7 +206,7 @@ class TestRetryWithTruncation:
             source_file="test.md",
         )
 
-        async def mock_synth_always_none(config, filename, src, existing_concepts):
+        async def mock_synth_always_none(config, filename, src, existing_concepts, **_kwargs):
             return None
 
         with mock.patch(
@@ -234,7 +234,7 @@ class TestRetryWithTruncation:
 
         call_lengths: list[int] = []
 
-        async def mock_synth(config, filename, src, existing_concepts):
+        async def mock_synth(config, filename, src, existing_concepts, **_kwargs):
             call_lengths.append(len(src.content))
             from obsidian_llm_wiki.core.models import SourceSynthesis
             return SourceSynthesis(
