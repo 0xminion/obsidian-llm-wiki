@@ -50,15 +50,24 @@ class OllamaClient(LLMClient):
             ],
             "stream": False,
         }
-        # Pass context window to Ollama as num_ctx if not explicitly overridden.
+        # Pass context window and output limit to Ollama via the "options" object.
         # Ollama only reads runtime parameters like num_ctx from the "options"
         # object — a top-level num_ctx is silently ignored.
+        #
+        # num_predict controls the maximum number of output tokens. Without it,
+        # Ollama uses a model-specific default (often as low as 128 or 4096),
+        # which truncates large synthesis JSON responses mid-object. For a
+        # 200K-char source, the synthesis JSON can easily exceed 20K tokens.
+        # Set num_predict to -1 (unlimited) so the model generates until it
+        # naturally stops — the timeout is the real safety net.
         options: dict[str, Any] = kwargs.pop("options", {})
         num_ctx = kwargs.pop("num_ctx", None)
         if num_ctx is None and self.config.context_window:
             num_ctx = self.config.context_window
         if num_ctx:
             options.setdefault("num_ctx", num_ctx)
+        # Allow unlimited output tokens — the timeout is the real ceiling.
+        options.setdefault("num_predict", -1)
         if options:
             body["options"] = options
         body.update(kwargs)
@@ -93,7 +102,9 @@ class OpenAICompatibleClient(LLMClient):
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
             ],
-            "max_tokens": kwargs.pop("max_tokens", 8192),
+            "max_tokens": kwargs.pop(
+                "max_tokens", 65536,  # 64K output — enough for full synthesis JSON
+            ),
             "stream": False,
         }
         body.update(kwargs)
