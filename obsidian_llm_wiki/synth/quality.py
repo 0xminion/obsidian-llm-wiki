@@ -8,7 +8,7 @@ instead of the default single-shot synthesis:
 
   **Pass 2 — Expand:** For each concept, a focused LLM call sends the source
   excerpt + the full concept list and asks the model to write a deep section
-  (300-500 words minimum) with specific evidence from the source.
+  (500-800 words minimum, at least 3 sections) with specific evidence.
 
   **Quality gate:** After expansion, any concept whose total body chars
   fall below ``config.concept_min_body_chars`` gets a gradient confidence
@@ -374,7 +374,10 @@ Return ONLY a JSON object matching this schema — no prose, no code fences:
 {schema_json}
 
 Rules:
-* Write at least 300 words of substantive content across sections.
+* Write at least 500-800 words of substantive content across sections.
+* Produce at least 3 distinct sections, each covering a different facet \
+of the concept (e.g. definition, mechanism, evidence, implications, \
+comparison, limitations).
 * Use specific evidence, statistics, quotes, or examples from the source.
 * Every claim must be grounded in the source — cite where it appears.
 * Link to other concepts from this source using their slugs.
@@ -785,7 +788,7 @@ async def _expand_one_concept(
     ]
 
     try:
-        response = await acall_llm(prompt, messages, config, task="ingest")
+        response = await acall_llm(prompt, messages, config, task="expand")
     except Exception as exc:
         logger.error("Pass 2 LLM call failed for '%s': %s", concept.slug, exc)
         raise

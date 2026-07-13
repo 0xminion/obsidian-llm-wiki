@@ -414,3 +414,125 @@ async def test_pipeline_dispatches_to_two_pass():
     assert called is True
     assert result is not None
     assert result.source_title == "Test"
+
+
+# ── Deeper concept prompt tests ──────────────────────────────────────────
+
+
+def test_build_expand_prompt_asks_for_500_to_800_words():
+    """The expand prompt asks for 500-800 words (not the old 300)."""
+    prompt = build_expand_prompt(
+        concept_title="Test",
+        concept_slug="test",
+        concept_rationale="Reason",
+        source_title="Source",
+        source_content="Body text. " * 50,
+        all_concepts=[{"slug": "test", "title": "Test"}],
+    )
+    assert "500-800 words" in prompt
+    assert "300 words" not in prompt
+
+
+def test_build_expand_prompt_requires_at_least_3_sections():
+    """The expand prompt asks for at least 3 distinct sections."""
+    prompt = build_expand_prompt(
+        concept_title="Test",
+        concept_slug="test",
+        concept_rationale="Reason",
+        source_title="Source",
+        source_content="Body text. " * 50,
+        all_concepts=[{"slug": "test", "title": "Test"}],
+    )
+    assert "at least 3 distinct sections" in prompt
+
+
+# ── Pass 2 model override tests ──────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_expand_one_concept_uses_expand_task():
+    """_expand_one_concept passes task='expand' to acall_llm."""
+    from obsidian_llm_wiki.synth.quality import _expand_one_concept
+
+    source = SourceDoc(title="Source", content="Content here. " * 20)
+    concept = ConceptNote(
+        title="My Concept", slug="my-concept", summary="A concept.", tags=["t"],
+    )
+    config = _MockConfig()
+
+    captured_tasks: list[str | None] = []
+
+    async def _mock_acall(prompt, messages, config, **kwargs):
+        captured_tasks.append(kwargs.get("task"))
+        return json.dumps({
+            "title": "My Concept",
+            "slug": "my-concept",
+            "summary": "Expanded.",
+            "sections": [{"heading": "S", "points": ["point one"]}],
+        })
+
+    with patch(
+        "obsidian_llm_wiki.providers.llm.acall_llm",
+        new_callable=AsyncMock,
+        side_effect=_mock_acall,
+    ):
+        result = await _expand_one_concept(
+            config, concept, source,
+            [{"slug": "my-concept", "title": "My Concept"}],
+        )
+
+    assert result is not None
+    assert len(captured_tasks) == 1
+    assert captured_tasks[0] == "expand"
+
+
+@pytest.mark.asyncio
+async def test_expand_one_concept_resolves_pass2_model():
+    """When PASS2_MODEL is set, _expand_one_concept routes to it via task='expand'."""
+    from obsidian_llm_wiki.config import LLMProviderConfig
+    from obsidian_llm_wiki.synth.quality import _expand_one_concept
+
+    source = SourceDoc(title="Source", content="Content here. " * 20)
+    concept = ConceptNote(
+        title="My Concept", slug="my-concept", summary="A concept.", tags=["t"],
+    )
+
+    class _ConfigWithLLM:
+        output_language = ""
+        compile_concurrency = 2
+        concept_min_body_chars = 800
+        chunk_size = 30_000
+        llm = LLMProviderConfig(
+            model="default-model",
+            expand_model="glm-5.2:cloud",
+        )
+        retry_count = 1
+        retry_base_ms = 1
+        retry_multiplier = 1
+
+    captured: dict[str, object] = {}
+
+    class FakeClient:
+        def chat(self, system, user, **kwargs):
+            captured.update(kwargs)
+            return json.dumps({
+                "title": "My Concept",
+                "slug": "my-concept",
+                "summary": "Expanded.",
+                "sections": [{"heading": "S", "points": ["point one"]}],
+            })
+
+    config = _ConfigWithLLM()
+
+    with patch(
+        "obsidian_llm_wiki.providers.llm.create_llm_client",
+        return_value=FakeClient(),
+    ):
+        result = await _expand_one_concept(
+            config, concept, source,
+            [{"slug": "my-concept", "title": "My Concept"}],
+        )
+
+    assert result is not None
+    # The model should have been resolved to the expand_model override.
+    assert captured.get("model") == "glm-5.2:cloud"

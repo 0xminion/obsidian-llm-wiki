@@ -275,9 +275,11 @@ def render_concept_page(
     if concept.aliases:
         fm["aliases"] = concept.aliases
     if concept.related:
+        # Serialize as pipe-separated strings so Obsidian's Properties panel
+        # treats ``relations`` as a simple list of strings (no nested-object
+        # warning). Format: "slug|relation_type|display_label".
         fm["relations"] = [
-            {"target": r.slug, "type": r.relation, "display": r.display or r.slug}
-            for r in concept.related
+            f"{r.slug}|{r.relation}|{r.display or r.slug}" for r in concept.related
         ]
 
     parts: list[str] = [f"# {concept.title}", ""]

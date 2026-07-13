@@ -183,7 +183,7 @@ async def test_golden_pipeline_end_to_end(tmp_path: Path):
     assert "attention" in meta["tags"]
     assert "neural-network" in meta["tags"]
     assert meta["aliases"] == ["scaled dot-product attention"]
-    assert {relation["target"] for relation in meta["relations"]} == {
+    assert {rel.split("|")[0] for rel in meta["relations"]} == {
         "multi-head-attention",
         "positional-encoding",
     }

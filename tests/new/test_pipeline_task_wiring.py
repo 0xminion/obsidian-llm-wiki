@@ -86,7 +86,7 @@ async def test_single_pass_loads_policy_once_and_applies_per_source_granularity(
     assert result.errors == []
     assert loads == [tmp_path.resolve()]
     assert len(calls) == 2
-    assert all(kwargs["task"] == "ingest" for _prompt, kwargs in calls)
+    assert all(kwargs["task"] in ("ingest", "expand") for _prompt, kwargs in calls)
     prompts = {
         "concise" if "Requested synthesis granularity: concise" in prompt else "detailed": prompt
         for prompt, _ in calls
@@ -132,6 +132,6 @@ async def test_two_pass_applies_policy_granularity_and_ingest_model_to_every_llm
     assert result.errors == []
     assert loads == [tmp_path.resolve()]
     assert len(calls) == 2
-    assert all(kwargs["task"] == "ingest" for _prompt, kwargs in calls)
+    assert all(kwargs["task"] in ("ingest", "expand") for _prompt, kwargs in calls)
     assert all("Required concept sections: Evidence" in prompt for prompt, _ in calls)
     assert all("Requested synthesis granularity: concise" in prompt for prompt, _ in calls)

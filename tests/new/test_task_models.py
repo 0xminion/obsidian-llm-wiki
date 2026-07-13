@@ -10,7 +10,7 @@ from obsidian_llm_wiki.core.task_models import TaskModelConfig, resolve_task_mod
 from obsidian_llm_wiki.providers import llm
 
 
-@pytest.mark.parametrize("task", ["ingest", "maintenance", "query"])
+@pytest.mark.parametrize("task", ["ingest", "maintenance", "query", "expand"])
 def test_resolve_task_model_uses_unified_model_when_no_override_is_set(task: str):
     """Existing single-model configurations route every supported task to that model."""
     config = TaskModelConfig(model="gemma3:27b")
@@ -24,6 +24,7 @@ def test_resolve_task_model_uses_unified_model_when_no_override_is_set(task: str
         ("ingest", "ingest_model", "qwen3:32b"),
         ("maintenance", "maintenance_model", "gemma3:12b"),
         ("query", "query_model", "qwen3:8b"),
+        ("expand", "expand_model", "glm-5.2:cloud"),
     ],
 )
 def test_resolve_task_model_uses_the_matching_task_override(
@@ -35,7 +36,10 @@ def test_resolve_task_model_uses_the_matching_task_override(
     assert resolve_task_model(config, task) == override_model
 
 
-@pytest.mark.parametrize("override_name", ["ingest_model", "maintenance_model", "query_model"])
+@pytest.mark.parametrize(
+    "override_name",
+    ["ingest_model", "maintenance_model", "query_model", "expand_model"],
+)
 def test_task_model_config_rejects_blank_task_override(override_name: str):
     """An explicitly blank override cannot silently replace the unified model."""
     with pytest.raises(ValueError, match="must not be blank"):
@@ -44,7 +48,7 @@ def test_task_model_config_rejects_blank_task_override(override_name: str):
 
 @pytest.mark.parametrize("task", ["", "synthesis", "INGEST"])
 def test_resolve_task_model_rejects_unsupported_task_names(task: str):
-    """Routing is deliberately limited to the three declared pipeline tasks."""
+    """Routing is deliberately limited to the declared pipeline tasks."""
     config = TaskModelConfig(model="gemma3:27b")
 
     with pytest.raises(ValueError, match="Unsupported task"):
@@ -57,18 +61,20 @@ def test_resolve_task_model_does_not_apply_another_tasks_override():
 
     assert resolve_task_model(config, "maintenance") == "gemma3:27b"
     assert resolve_task_model(config, "query") == "gemma3:27b"
+    assert resolve_task_model(config, "expand") == "gemma3:27b"
 
 
 def test_load_config_wires_task_model_environment_overrides(monkeypatch, tmp_path):
     """Task model env vars override their task while LLM_MODEL remains the fallback."""
-    for key in ("LLM_MODEL", "INGEST_MODEL", "MAINTENANCE_MODEL", "QUERY_MODEL"):
+    for key in ("LLM_MODEL", "INGEST_MODEL", "MAINTENANCE_MODEL", "QUERY_MODEL", "PASS2_MODEL"):
         monkeypatch.delenv(key, raising=False)
     env_file = tmp_path / ".env"
     env_file.write_text(
         "LLM_MODEL=default-model\n"
         "INGEST_MODEL=ingest-model\n"
         "MAINTENANCE_MODEL=maintenance-model\n"
-        "QUERY_MODEL=query-model\n",
+        "QUERY_MODEL=query-model\n"
+        "PASS2_MODEL=glm-5.2:cloud\n",
         encoding="utf-8",
     )
 
@@ -78,6 +84,7 @@ def test_load_config_wires_task_model_environment_overrides(monkeypatch, tmp_pat
     assert config.llm.ingest_model == "ingest-model"
     assert config.llm.maintenance_model == "maintenance-model"
     assert config.llm.query_model == "query-model"
+    assert config.llm.expand_model == "glm-5.2:cloud"
 
 
 @pytest.mark.parametrize(
@@ -86,6 +93,7 @@ def test_load_config_wires_task_model_environment_overrides(monkeypatch, tmp_pat
         ("ingest", "ingest-model"),
         ("maintenance", "maintenance-model"),
         ("query", "query-model"),
+        ("expand", "expand-model"),
     ],
 )
 def test_call_llm_routes_explicit_tasks_to_their_configured_model(
@@ -106,6 +114,7 @@ def test_call_llm_routes_explicit_tasks_to_their_configured_model(
         INGEST_MODEL="ingest-model",
         MAINTENANCE_MODEL="maintenance-model",
         QUERY_MODEL="query-model",
+        PASS2_MODEL="expand-model",
         RETRY_COUNT="1",
     )
     monkeypatch.setattr(llm, "create_llm_client", lambda _: FakeClient())

@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "skills": {
+    "dune": {
+      "source": "duneanalytics/skills",
+      "sourceType": "github",
+      "skillPath": "skills/dune/SKILL.md",
+      "computedHash": "085c4d5553f7abe9840fd75258f3807649393f451668bade4cda4d1bd93c7408"
+    },
+    "sim": {
+      "source": "duneanalytics/skills",
+      "sourceType": "github",
+      "skillPath": "skills/sim/SKILL.md",
+      "computedHash": "c8505073459dfd40e49000c474a93f3c7203081f6f62846fe9d38a0c36c4bb64"
+    }
+  }
+}

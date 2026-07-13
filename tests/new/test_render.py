@@ -109,7 +109,7 @@ def test_render_concept_page_with_related():
     )
     page = render_concept_page(c)
     meta, body = parse_frontmatter(page)
-    assert meta["relations"] == [{"target": "sgd", "type": "variant_of", "display": "SGD"}]
+    assert meta["relations"] == ["sgd|variant_of|SGD"]
     assert "## Related Concepts" not in body
     assert "[[sgd|SGD]]" not in body
 

@@ -33,6 +33,9 @@ class LLMProviderConfig:
     ingest_model: str | None = None
     maintenance_model: str | None = None
     query_model: str | None = None
+    # Pass 2 (expand) model override — for perspective diversity in two-pass
+    # synthesis.  When unset, falls back to the default ``model``.
+    expand_model: str | None = None
     api_key: str | None = None
     timeout_ms: int = 1_800_000  # 30 minutes
     context_window: int = 256_000  # 256K tokens for cloud models (e.g. gemma4:31b-cloud)
@@ -68,7 +71,7 @@ class Config:
     synthesis_mode: str = "single"
 
     # ── Quality gates ───────────────────────────────
-    concept_min_body_chars: int = 800
+    concept_min_body_chars: int = 1200
     entry_min_body_chars: int = 500
     clipping_min_body_chars: int = 500
 
@@ -220,6 +223,7 @@ def load_config(env_file: str | None = None, **overrides: str) -> Config:
         ingest_model=_optional_model_env("INGEST_MODEL"),
         maintenance_model=_optional_model_env("MAINTENANCE_MODEL"),
         query_model=_optional_model_env("QUERY_MODEL"),
+        expand_model=_optional_model_env("PASS2_MODEL"),
         api_key=os.getenv("LLM_API_KEY"),
         timeout_ms=_int_env("LLM_TIMEOUT_MS", 1_800_000),
         context_window=_int_env("LLM_CONTEXT_WINDOW", 256_000),
@@ -234,7 +238,7 @@ def load_config(env_file: str | None = None, **overrides: str) -> Config:
         compile_concurrency=_int_env("COMPILE_CONCURRENCY", 3),
         output_language=os.getenv("OUTPUT_LANGUAGE", ""),
         synthesis_mode=os.getenv("SYNTHESIS_MODE", "single"),
-        concept_min_body_chars=_int_env("CONCEPT_MIN_BODY_CHARS", 800),
+        concept_min_body_chars=_int_env("CONCEPT_MIN_BODY_CHARS", 1200),
         entry_min_body_chars=_int_env("ENTRY_MIN_BODY_CHARS", 500),
         clipping_min_body_chars=_int_env("CLIPPING_MIN_BODY_CHARS", 500),
         similarity_dedup_threshold=_float_env("SIMILARITY_DEDUP_THRESHOLD", 0.85),

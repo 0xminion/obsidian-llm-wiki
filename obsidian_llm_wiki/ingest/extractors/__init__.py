@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from collections.abc import Callable
 from contextlib import suppress
 from pathlib import Path
@@ -26,7 +27,69 @@ from obsidian_llm_wiki.ingest.web import extract_web
 
 logger = logging.getLogger("obswiki.ingest.extractors")
 
-__all__ = ["ExtractorNotApplicableError", "extract", "register_extractor"]
+__all__ = [
+    "ExtractorNotApplicableError",
+    "extract",
+    "register_extractor",
+    "_check_extraction_quality",
+]
+
+
+# ── Extraction quality gate ────────────────────────────────────────────
+
+
+def _check_extraction_quality(source: SourceDoc) -> tuple[bool, str]:
+    """Verify the extraction produced full content, not a stub or abstract.
+
+    Returns ``(passed, reason)``.  When *passed* is ``False``, *reason*
+    describes the quality issue.  This is a diagnostic gate — it never
+    fails extraction.  Callers should log a WARNING and add the reason to
+    provenance diagnostics.
+
+    Checks:
+      1. Content < 500 chars → "too short, likely stub"
+      2. Content contains the stub-fallback sentinel → "stub fallback"
+      3. Content has "Abstract:" but no "## Full Text" or body sections → "abstract only"
+      4. Content is mostly metadata (Title:/Channel:/Published:) → "metadata only"
+    """
+    content = source.content or ""
+
+    # 1. Too short to be real content.
+    if len(content) < 500:
+        return (False, "too short, likely stub")
+
+    # 2. Stub-fallback sentinel from transcript resolver.
+    stub_markers = (
+        "Note: Full transcript unavailable",
+        "Full transcript unavailable",
+    )
+    for marker in stub_markers:
+        if marker in content:
+            return (False, "stub fallback")
+
+    # 3. Abstract-only — has an abstract but no full-text or body sections.
+    if "Abstract:" in content:
+        has_full_text = "## Full Text" in content or "## Full text" in content
+        has_body_sections = bool(
+            re.search(r"^#{1,4}\s+\S", content, re.MULTILINE)
+        )
+        # Allow content that has body sections beyond the abstract.
+        if not has_full_text and not has_body_sections:
+            return (False, "abstract only")
+
+    # 4. Metadata-only — content is dominated by metadata fields.
+    metadata_prefixes = ("Title:", "Channel:", "Published:", "URL:", "Duration:")
+    lines = [line.strip() for line in content.splitlines() if line.strip()]
+    if lines:
+        metadata_lines = sum(
+            1 for line in lines
+            if any(line.startswith(p) for p in metadata_prefixes)
+        )
+        # If >60% of non-blank lines are metadata, it's metadata-only.
+        if metadata_lines / len(lines) > 0.6:
+            return (False, "metadata only")
+
+    return (True, "")
 
 
 class ExtractorNotApplicableError(RuntimeError):
@@ -153,10 +216,31 @@ def extract(raw_url: str) -> SourceDoc:
 
 
 def _stamp_extracted_source(source: SourceDoc, raw_url: str, extractor: str) -> SourceDoc:
-    """Attach baseline immutable provenance at the public extractor boundary."""
+    """Attach baseline immutable provenance at the public extractor boundary.
+
+    Also runs the extraction quality gate.  When the gate fails, a WARNING
+    is logged and the reason is appended to provenance diagnostics.
+    Extraction is never failed — the source is still returned.
+    """
     from obsidian_llm_wiki.ingest.provenance import stamp_source
 
-    return stamp_source(source, requested_url=raw_url, extractor=extractor)
+    # Run the quality gate (diagnostic only — never fails extraction).
+    passed, reason = _check_extraction_quality(source)
+    if not passed:
+        logger.warning(
+            "Extraction quality gate: %s for '%s' (extractor=%s, content_len=%d)",
+            reason, raw_url, extractor, len(source.content or ""),
+        )
+        diagnostics = (f"extraction_quality: {reason}",)
+    else:
+        diagnostics = ()
+
+    return stamp_source(
+        source,
+        requested_url=raw_url,
+        extractor=extractor,
+        diagnostics=diagnostics,
+    )
 
 
 def _looks_like_file_path(raw_url: str) -> bool:
