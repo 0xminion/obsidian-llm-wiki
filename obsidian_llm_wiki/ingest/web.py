@@ -274,7 +274,7 @@ def _is_ssrn_url(url: str) -> bool:
     try:
         from urllib.parse import urlparse
         host = urlparse(url).hostname or ""
-        return "ssrn.com" in host
+        return host.endswith("ssrn.com")
     except Exception:
         return False
 
@@ -344,8 +344,7 @@ def _extract_defuddle_md(url: str, timeout: int) -> SourceDoc:
         # Use partition to find the closing --- (handles --- in values better)
         _, sep, rest = text[3:].partition("\n---\n")
         if sep:
-            fm_text = text[3:3 + len(sep) + len(text[3:]) - len(rest)].strip()
-            # Simpler: split on lines to extract frontmatter block
+            # Split on lines to extract frontmatter block
             lines = text.split("\n")
             fm_lines = []
             found_close = False
@@ -356,7 +355,7 @@ def _extract_defuddle_md(url: str, timeout: int) -> SourceDoc:
                 fm_lines.append(line)
             if found_close:
                 fm_text = "\n".join(fm_lines)
-                content = "\n".join(lines[1 + len(fm_lines):]).lstrip()
+                content = "\n".join(lines[2 + len(fm_lines):]).lstrip()
                 for line in fm_text.split("\n"):
                     if line.startswith("title:"):
                         title = line[6:].strip().strip('"').strip("'")

@@ -244,9 +244,11 @@ class MetricsCollector:
             runs = runs[-50:]
 
         output = {"runs": runs, "latest": current_run}
-        self.metrics_file.write_text(
+        from obsidian_llm_wiki.render.obsidian import atomic_write
+
+        atomic_write(
+            self.metrics_file,
             json.dumps(output, indent=2, ensure_ascii=False),
-            encoding="utf-8",
         )
         logger.debug("Metrics saved to %s", self.metrics_file)
 
