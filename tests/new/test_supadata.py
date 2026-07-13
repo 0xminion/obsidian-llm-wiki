@@ -1,7 +1,7 @@
-"""Regression tests for Supadata YouTube transcript extraction.
+"""Regression tests for YouTube transcript extraction.
 
-Tests the public API (extract_youtube_video) by mocking the HTTP client
-at the httpx level so no real network calls are made.
+Tests the public API (extract_youtube_video) by mocking yt-dlp and the
+AssemblyAI HTTP client so no real network calls are made.
 """
 from __future__ import annotations
 
@@ -12,12 +12,11 @@ from obsidian_llm_wiki.core.models import SourceDoc
 from obsidian_llm_wiki.ingest.extractors import youtube
 
 
-class TestSupadataExtraction:
-    """Supadata transcript extraction with fallback chain."""
+class TestYouTubeExtraction:
+    """YouTube transcript extraction with fallback chain."""
 
-    def test_supadata_success_returns_transcript(self):
-        """Supadata job completes → transcript returned."""
-        # Transcript must be >= 200 chars to pass the minimum-length check
+    def test_ytdlp_success_returns_transcript(self):
+        """yt-dlp subtitle extraction succeeds → transcript returned."""
         long_transcript = (
             "Hello world this is the transcript. "
             "It contains multiple sentences to ensure we exceed "
@@ -27,57 +26,39 @@ class TestSupadataExtraction:
             "More content here to ensure we pass the check."
         )
 
-        def get_side_effect(url, params=None, headers=None, **kwargs):
-            if "abc123" in str(url):
-                return mock.Mock(
-                    status_code=200,
-                    json=lambda: {
-                        "status": "completed",
-                        "result": {"content": long_transcript, "lang": "en"},
-                    },
-                    raise_for_status=mock.Mock(),
+        with mock.patch.object(youtube.shutil, "which", return_value="/usr/bin/yt-dlp"), \
+             mock.patch.object(youtube, "_parse_subtitle_file", return_value=long_transcript), \
+             mock.patch.object(youtube, "_fetch_youtube_title", return_value="Test Video"), \
+             mock.patch.object(youtube.subprocess, "run") as mock_run:
+            mock_run.return_value = mock.Mock(returncode=0, stdout="", stderr="")
+            # Mock tempfile and os.listdir
+            with mock.patch.object(youtube.tempfile, "mkdtemp", return_value="/tmp/fake"), \
+                 mock.patch.object(youtube.os, "listdir", return_value=["sub.vtt"]):
+                result = youtube._ytdlp_transcript(
+                    "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
                 )
-            return mock.Mock(
-                status_code=202,
-                json=lambda: {"jobId": "abc123", "status": "pending"},
-                raise_for_status=mock.Mock(),
-            )
-
-        mock_client = mock.Mock()
-        mock_client.__enter__ = mock.Mock(return_value=mock_client)
-        mock_client.__exit__ = mock.Mock(return_value=False)
-        mock_client.get.side_effect = get_side_effect
-
-        with mock.patch.object(
-            youtube.httpx, "Client", return_value=mock_client
-        ):
-            result = youtube._supadata_transcript("dQw4w9WgXcQ", "fake-key")
 
         assert result is not None
         assert "Hello world" in result.content
 
-    def test_oembed_fallback_on_supadata_failure(self):
-        """Supadata fails → oEmbed metadata used as last resort."""
-        env = {"SUPADATA_API_KEY": "sk_test_fake_key"}
-
-        fake_response = mock.Mock(status_code=401)
-        fake_response.raise_for_status.side_effect = youtube.httpx.HTTPStatusError(
-            "401", request=mock.Mock(), response=fake_response,
-        )
-
-        mock_client = mock.Mock()
-        mock_client.__enter__ = mock.Mock(return_value=mock_client)
-        mock_client.__exit__ = mock.Mock(return_value=False)
-        mock_client.get.return_value = fake_response
+    def test_oembed_fallback_on_all_failures(self):
+        """All transcript methods fail → oEmbed metadata used as last resort."""
+        env = {"ASSEMBLYAI_API_KEY": "test-key"}
 
         oembed_result = SourceDoc(
             title="Test Video",
-            content="Title: Test Video\nChannel: TestChannel",
+            content="Title: Test Video\nChannel: TestChannel\n\nNote: Full transcript unavailable "
+            "(yt-dlp and AssemblyAI could not extract subtitles). "
+            "Only video metadata was extracted.",
             url="https://youtube.com/watch?v=dQw4w9WgXcQ",
         )
 
         with mock.patch.dict(os.environ, env, clear=False), \
-             mock.patch.object(youtube.httpx, "Client", return_value=mock_client), \
+             mock.patch.object(youtube.shutil, "which", return_value=None), \
+             mock.patch.object(
+                 youtube, "_assemblyai_transcript",
+                 side_effect=RuntimeError("fail"),
+             ), \
              mock.patch.object(youtube, "_extract_oembed", return_value=oembed_result):
             result = youtube.extract_youtube_video(
                 "https://youtube.com/watch?v=dQw4w9WgXcQ"
@@ -85,3 +66,24 @@ class TestSupadataExtraction:
 
         assert result is not None
         assert "Test Video" in result.content
+
+    def test_assemblyai_key_not_set_falls_through(self):
+        """When AssemblyAI key is not set, falls through to next fallback."""
+        oembed_result = SourceDoc(
+            title="Fallback Video",
+            content="Title: Fallback Video\nChannel: TestChannel\n\n"
+            "Note: Full transcript unavailable "
+            "(yt-dlp and AssemblyAI could not extract subtitles). "
+            "Only video metadata was extracted.",
+            url="https://youtube.com/watch?v=test",
+        )
+
+        with mock.patch.dict(os.environ, {}, clear=True), \
+             mock.patch.object(youtube.shutil, "which", return_value=None), \
+             mock.patch.object(youtube, "_extract_oembed", return_value=oembed_result):
+            result = youtube.extract_youtube_video(
+                "https://youtube.com/watch?v=test"
+            )
+
+        assert result is not None
+        assert "Fallback Video" in result.content

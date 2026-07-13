@@ -113,21 +113,24 @@ def test_extract_youtube_url_routes_to_youtube_extractor():
         reg._EXTRACTORS[:] = original_extractors
 
 
-def test_extract_youtube_url_raises_when_no_api_key():
-    """YouTube extractor raises RuntimeError when SUPADATA_API_KEY is not set."""
+def test_extract_youtube_url_raises_when_all_fallbacks_fail():
+    """YouTube extractor raises RuntimeError when all fallback methods fail."""
     from obsidian_llm_wiki.ingest.extractors import youtube as yt_mod
 
-    # Save and nullify the env var
-    original_key = os.environ.get("SUPADATA_API_KEY")
-    os.environ.pop("SUPADATA_API_KEY", None)
+    # Save and nullify all API keys so all fallbacks fail
+    original_aai = os.environ.get("ASSEMBLYAI_API_KEY")
+    os.environ.pop("ASSEMBLYAI_API_KEY", None)
     try:
-        yt_mod.extract_youtube_video("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
-        pytest.fail("Expected RuntimeError but extract_youtube_video succeeded")
-    except RuntimeError as exc:
-        assert "SUPADATA_API_KEY" in str(exc)
+        # Mock yt-dlp as unavailable, Invidious and oEmbed as failing
+        with patch("obsidian_llm_wiki.ingest.extractors.youtube.shutil.which", return_value=None), \
+             patch.object(yt_mod, "_extract_oembed", return_value=None):
+            yt_mod.extract_youtube_video("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+            pytest.fail("Expected RuntimeError but extract_youtube_video succeeded")
+    except RuntimeError:
+        pass  # Expected — all fallbacks failed
     finally:
-        if original_key is not None:
-            os.environ["SUPADATA_API_KEY"] = original_key
+        if original_aai is not None:
+            os.environ["ASSEMBLYAI_API_KEY"] = original_aai
 
 
 # ── Video ID extraction ─────────────────────────────────────────────────────

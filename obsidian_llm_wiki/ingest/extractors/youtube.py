@@ -1,53 +1,48 @@
-"""YouTube/media transcript extraction via Supadata API.
+"""YouTube transcript extraction via yt-dlp and AssemblyAI.
 
-Supadata provides transcript extraction for YouTube, TikTok, Instagram,
-X (Twitter), Facebook, and public video files. It can fetch existing
-transcripts (mode=native) or generate them with AI (mode=auto/generate).
+Strategy:
+  1. yt-dlp subtitle extraction — downloads auto-generated or manual subtitles
+  2. AssemblyAI remote-URL transcription — submits the YouTube URL to AssemblyAI
+  3. Invidious API (metadata + description fallback)
+  4. oEmbed metadata (title + channel only, last resort)
 
-API docs: https://docs.supadata.ai/get-transcript
-Endpoint: GET https://api.supadata.ai/v1/transcript
-Auth: x-api-key header
-Pricing: 1 native transcript = 1 credit, 1 generated minute = 2 credits
-
-The API supports async job processing for long videos (HTTP 202 + job ID polling).
+AssemblyAI API docs: https://www.assemblyai.com/docs/api-v2/transcript
+Endpoint: POST https://api.assemblyai.com/v2/transcript
+Auth: Authorization header with API key
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import shutil
+import subprocess
+import tempfile
 import time
+from urllib.parse import quote, urlparse
 
 import httpx
 
 from obsidian_llm_wiki.core.models import SourceDoc
 from obsidian_llm_wiki.ingest.extractors import register_extractor
-from obsidian_llm_wiki.ingest.http_headers import DEFAULT_TIMEOUT
-from obsidian_llm_wiki.ingest.proxy import make_client_kwargs
-from obsidian_llm_wiki.ingest.supadata_utils import (
-    supadata_rate_limit,
-    track_supadata_call,
-    validate_supadata_key,
-)
 
 logger = logging.getLogger("obswiki.ingest.youtube")
 
-__all__ = ["extract_youtube_video", "validate_supadata_key"]
+__all__ = ["extract_youtube_video"]
 
-_SUPADATA_API_BASE = "https://api.supadata.ai/v1"
-_POLL_INTERVAL = 3  # seconds between job status checks
-_POLL_MAX_ATTEMPTS = 40  # ~2 minutes max polling
+_ASSEMBLYAI_API_BASE = "https://api.assemblyai.com/v2"
+_POLL_INTERVAL = 5  # seconds between job status checks
+_POLL_MAX_ATTEMPTS = 120  # ~10 minutes max polling
 
 
-def _get_api_key() -> str | None:
-    """Read the Supadata API key from env at call time (not import time)."""
-    return os.environ.get("SUPADATA_API_KEY", "").strip() or None
+def _get_assemblyai_key() -> str | None:
+    """Read the AssemblyAI API key from env at call time."""
+    return os.environ.get("ASSEMBLYAI_API_KEY", "").strip() or None
 
 
 def _video_id(url: str) -> str | None:
     """Extract 11-char video ID from any YouTube URL."""
     import re
-    from urllib.parse import urlparse
     parsed = urlparse(url)
     if parsed.hostname in ("youtu.be",):
         return parsed.path.strip("/")[:11]
@@ -62,54 +57,50 @@ def _video_id(url: str) -> str | None:
     return None
 
 
-def _is_supported_media_url(url: str) -> bool:
-    """Check if URL is a supported media platform for Supadata."""
-    try:
-        from urllib.parse import urlparse
-        host = urlparse(url).hostname or ""
-        return any(h in host for h in (
-            "youtube.com", "youtu.be", "tiktok.com",
-            "instagram.com", "x.com", "twitter.com",
-            "facebook.com", "fb.watch",
-        ))
-    except Exception:
-        return False
-
-
 @register_extractor(lambda parsed, raw: raw.startswith("http") and bool(_video_id(raw)))
 def extract_youtube_video(raw_url: str) -> SourceDoc:
-    """Extract transcript from a YouTube video via Supadata API.
+    """Extract transcript from a YouTube video.
 
     Strategy:
-      1. Supadata API (mode=auto — try native transcript, fallback to AI generation)
-      2. Invidious API (metadata + description fallback)
-      3. oEmbed metadata (title + channel only, last resort)
+      1. yt-dlp subtitle extraction (downloads auto-generated or manual subtitles)
+      2. AssemblyAI remote-URL transcription (submits YouTube URL to AAI)
+      3. Invidious API (metadata + description fallback)
+      4. oEmbed metadata (title + channel only, last resort)
 
     Raises:
-        RuntimeError: If SUPADATA_API_KEY is not set or all methods fail.
+        RuntimeError: If all methods fail.
     """
-    api_key = _get_api_key()
-    if not api_key:
-        raise RuntimeError(
-            "SUPADATA_API_KEY not set — set it in your .env or environment. "
-            "Get your key at https://dash.supadata.ai/organizations/api-key"
-        )
-
     errors: list[str] = []
 
-    # ── Primary: Supadata API ────────────────────────────────────────
+    # ── Primary: yt-dlp subtitle extraction ──────────────────────────
     try:
-        source = _supadata_transcript(raw_url, api_key)
+        source = _ytdlp_transcript(raw_url)
         if source:
             logger.info(
-                "Supadata: extracted %d chars for %s",
+                "yt-dlp: extracted %d chars for %s",
                 len(source.content), raw_url,
             )
             return source
     except Exception as exc:
-        errors.append(f"supadata: {exc}")
+        errors.append(f"yt-dlp: {exc}")
 
-    # ── Fallback 1: Invidious API (metadata + description, no transcript) ──
+    # ── Fallback 1: AssemblyAI remote-URL transcription ──────────────
+    aai_key = _get_assemblyai_key()
+    if aai_key:
+        try:
+            source = _assemblyai_transcript(raw_url, aai_key)
+            if source:
+                logger.info(
+                    "AssemblyAI: extracted %d chars for %s",
+                    len(source.content), raw_url,
+                )
+                return source
+        except Exception as exc:
+            errors.append(f"assemblyai: {exc}")
+    else:
+        errors.append("assemblyai: API key not set")
+
+    # ── Fallback 2: Invidious API (metadata + description, no transcript) ──
     try:
         from obsidian_llm_wiki.ingest.alt_source import extract_via_invidious
         source = extract_via_invidious(raw_url)
@@ -118,7 +109,7 @@ def extract_youtube_video(raw_url: str) -> SourceDoc:
     except Exception as exc:
         errors.append(f"invidious: {exc}")
 
-    # ── Fallback 2: oEmbed metadata (title + author only, minimal) ──
+    # ── Fallback 3: oEmbed metadata (title + author only, minimal) ──
     try:
         source = _extract_oembed(raw_url)
         if source:
@@ -133,141 +124,249 @@ def extract_youtube_video(raw_url: str) -> SourceDoc:
     )
 
 
-def _supadata_transcript(url: str, api_key: str) -> SourceDoc | None:
-    """Fetch transcript via Supadata API with async job support.
+# ── yt-dlp subtitle extraction ──────────────────────────────────────────
 
-    Returns None if no transcript available (not an error — caller falls through).
-    Raises RuntimeError on auth/billing errors.
+
+def _ytdlp_transcript(url: str) -> SourceDoc | None:
+    """Extract transcript via yt-dlp subtitle download.
+
+    yt-dlp can download auto-generated subtitles and convert them to plain text.
+    This requires the yt-dlp CLI to be installed.
     """
+    ytdlp = shutil.which("yt-dlp") or shutil.which("youtube-dl")
+    if not ytdlp:
+        raise RuntimeError("yt-dlp not found — install with: pip install yt-dlp")
 
-    params = {
-        "url": url,
-        "text": "true",  # plain text transcript
-        "mode": "auto",  # try native, fallback to AI generation
+    vid = _video_id(url)
+    if not vid:
+        raise RuntimeError(f"Could not extract video ID from {url}")
+
+    # Use yt-dlp to download subtitles (auto-generated + manual)
+    # --write-auto-sub: download auto-generated subtitles
+    # --sub-lang en: prefer English subtitles
+    # --skip-download: don't download the video
+    # --convert-sub vtt: convert to VTT format
+    tmp_dir: str | None = None
+    try:
+        tmp_dir = tempfile.mkdtemp(prefix="ytdlp_")
+        cmd = [
+            ytdlp,
+            "--skip-download",
+            "--write-auto-sub",
+            "--write-sub",
+            "--sub-lang", "en,en-US,en-GB",
+            "--sub-format", "vtt/srt",
+            "--convert-sub", "vtt",
+            "--no-playlist",
+            "-o", os.path.join(tmp_dir, "%(title)s.%(ext)s"),
+            url,
+        ]
+
+        env = os.environ.copy()
+        # yt-dlp needs proxy for YouTube access
+        proxy = os.environ.get("HTTPS_PROXY", "")
+        if proxy:
+            env["HTTPS_PROXY"] = proxy
+
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=60, env=env,
+        )
+
+        # Find subtitle files
+        sub_files = []
+        if tmp_dir:
+            for f in os.listdir(tmp_dir):
+                if f.endswith((".vtt", ".srt", ".ass", ".json3")):
+                    sub_files.append(os.path.join(tmp_dir, f))
+
+        if not sub_files:
+            # yt-dlp may have failed silently — check stderr
+            if proc.returncode != 0:
+                stderr = proc.stderr.strip()[:200]
+                raise RuntimeError(f"yt-dlp exited {proc.returncode}: {stderr}")
+            raise RuntimeError("yt-dlp: no subtitle files downloaded")
+
+        # Parse the first available subtitle file
+        sub_path = sorted(sub_files)[0]
+        text = _parse_subtitle_file(sub_path)
+
+        if not text or len(text) < 200:
+            raise RuntimeError(
+                f"yt-dlp transcript too short ({len(text)} chars) — "
+                "video may have no speech or no subtitles"
+            )
+
+        # Get title from yt-dlp output or subtitle filename
+        title = _fetch_youtube_title(url)
+        if not title:
+            # Try to extract from filename
+            title = os.path.basename(sub_path).rsplit(".", 2)[0]
+        if not title:
+            title = f"YouTube video {vid}"
+
+        return SourceDoc(title=title, content=text, url=url)
+
+    finally:
+        if tmp_dir:
+            import shutil as _shutil
+            _shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def _parse_subtitle_file(path: str) -> str:
+    """Parse VTT/SRT subtitle file into plain text."""
+    with open(path, encoding="utf-8", errors="replace") as f:
+        raw = f.read()
+
+    lines = raw.split("\n")
+    text_parts: list[str] = []
+    seen_lines: set[str] = set()
+
+    for line in lines:
+        line = line.strip()
+        # Skip VTT header
+        if line.startswith("WEBVTT"):
+            continue
+        # Skip timestamp lines (00:00:01.000 --> 00:00:05.000)
+        if "-->" in line:
+            continue
+        # Skip cue identifiers and numbers
+        if line.isdigit():
+            continue
+        # Skip empty lines
+        if not line:
+            continue
+        # Skip VTT styling/positioning blocks (multi-line cues)
+        if line.startswith("NOTE") or line.startswith("STYLE") or line.startswith("REGION"):
+            continue
+        # Skip pure VTT tag lines like <c>, but NOT content with inline tags
+        if (
+            line.startswith("<")
+            and line.endswith(">")
+            and not any(
+                c.isalpha()
+                for c in line[1:-1]
+                if c not in "c/."
+            )
+        ):
+            continue
+
+        # Strip HTML tags from subtitle text
+        import re
+        clean = re.sub(r"<[^>]+>", "", line)
+        clean = clean.strip()
+        if clean and clean not in seen_lines:
+            seen_lines.add(clean)
+            text_parts.append(clean)
+
+    return " ".join(text_parts)
+
+
+# ── AssemblyAI remote-URL transcription ─────────────────────────────────
+
+
+def _assemblyai_transcript(url: str, api_key: str) -> SourceDoc | None:
+    """Submit a YouTube URL to AssemblyAI for remote-URL transcription.
+
+    AssemblyAI can fetch media from a public URL and transcribe it.
+    For YouTube, we need to provide a direct audio stream URL via yt-dlp.
+    """
+    # Get the direct audio stream URL via yt-dlp
+    audio_url = _get_youtube_audio_url(url)
+    if not audio_url:
+        raise RuntimeError("Could not get YouTube audio URL for AssemblyAI")
+
+    # Submit to AssemblyAI
+    headers = {
+        "Authorization": api_key,
+        "Content-Type": "application/json",
+    }
+    body = {
+        "audio_url": audio_url,
+        "language_code": "en",  # default to English
     }
 
-    supadata_rate_limit()
-    with httpx.Client(
-        **make_client_kwargs(timeout=DEFAULT_TIMEOUT, follow_redirects=True),
-    ) as client:
-        resp = client.get(
-            f"{_SUPADATA_API_BASE}/transcript",
-            params=params,
-            headers={
-                "x-api-key": api_key,
-                "Accept": "application/json",
-            },
+    with httpx.Client(timeout=30) as client:
+        resp = client.post(
+            f"{_ASSEMBLYAI_API_BASE}/transcript",
+            json=body,
+            headers=headers,
         )
+        resp.raise_for_status()
+        transcript_data = resp.json()
 
-    track_supadata_call(resp)
+    transcript_id = transcript_data.get("id")
+    if not transcript_id:
+        raise RuntimeError("AssemblyAI: no transcript ID returned")
 
-    # Auth errors
-    if resp.status_code == 401:
-        raise RuntimeError(
-            "Supadata API key invalid — check SUPADATA_API_KEY at "
-            "https://dash.supadata.ai/organizations/api-key"
-        )
-    if resp.status_code == 402:
-        raise RuntimeError(
-            "Supadata: insufficient credits — check your billing at "
-            "https://dash.supadata.ai"
-        )
-    if resp.status_code == 403:
-        raise RuntimeError(
-            "Supadata: video is private/restricted/age-gated"
-        )
-
-    # Async job — poll for results
-    if resp.status_code == 202:
-        job_data = resp.json()
-        job_id = job_data.get("jobId")
-        if not job_id:
-            raise RuntimeError("Supadata returned 202 but no jobId")
-        return _poll_supadata_job(job_id, api_key)
-
-    resp.raise_for_status()
-    data = resp.json()
-
-    # Check for transcript unavailable (206)
-    if resp.status_code == 206:
-        raise RuntimeError(
-            "Supadata: no transcript available for this video"
-        )
-
-    return _parse_supadata_response(data, url)
-
-
-def _poll_supadata_job(job_id: str, api_key: str) -> SourceDoc | None:
-    """Poll Supadata job status until completed or failed."""
-    with httpx.Client(
-        **make_client_kwargs(timeout=30, follow_redirects=True),
-    ) as client:
+    # Poll for completion
+    with httpx.Client(timeout=30) as client:
         for attempt in range(_POLL_MAX_ATTEMPTS):
             time.sleep(_POLL_INTERVAL)
-            supadata_rate_limit()
             resp = client.get(
-                f"{_SUPADATA_API_BASE}/transcript/{job_id}",
-                headers={"x-api-key": api_key, "Accept": "application/json"},
+                f"{_ASSEMBLYAI_API_BASE}/transcript/{transcript_id}",
+                headers=headers,
             )
-            track_supadata_call(resp)
-            if resp.status_code == 404:
-                raise RuntimeError(f"Supadata job {job_id} expired")
             resp.raise_for_status()
             data = resp.json()
             status = data.get("status", "")
+
             if status == "completed":
-                result = data.get("result", data)
-                return _parse_supadata_response(result, data.get("url", ""))
-            if status == "failed":
+                text = data.get("text", "")
+                if not text or len(text) < 200:
+                    raise RuntimeError(
+                        f"AssemblyAI transcript too short ({len(text)} chars)"
+                    )
+                title = _fetch_youtube_title(url) or f"YouTube video {_video_id(url)}"
+                return SourceDoc(title=title, content=text, url=url)
+
+            if status == "error":
                 error = data.get("error", "unknown error")
-                raise RuntimeError(f"Supadata job {job_id} failed: {error}")
-            # queued or active — keep polling
-            logger.debug("Supadata job %s: %s (attempt %d)", job_id, status, attempt + 1)
+                raise RuntimeError(f"AssemblyAI transcription failed: {error}")
+
+            logger.debug(
+                "AssemblyAI transcript %s: %s (attempt %d)",
+                transcript_id, status, attempt + 1,
+            )
 
     raise RuntimeError(
-        f"Supadata job {job_id} timed out after {_POLL_MAX_ATTEMPTS * _POLL_INTERVAL}s"
+        f"AssemblyAI transcript {transcript_id} timed out after "
+        f"{_POLL_MAX_ATTEMPTS * _POLL_INTERVAL}s"
     )
 
 
-def _parse_supadata_response(data: dict, url: str) -> SourceDoc | None:
-    """Parse Supadata transcript response into SourceDoc."""
-    # Response format: {"content": "transcript text...", "lang": "en", ...}
-    # Or for chunked: {"content": [{"text": "...", "start": 0, "duration": 5}, ...]}
-    content_raw = data.get("content", "")
-    lang = data.get("lang", "")
+def _get_youtube_audio_url(url: str) -> str | None:
+    """Get a direct audio stream URL from YouTube via yt-dlp."""
+    ytdlp = shutil.which("yt-dlp") or shutil.which("youtube-dl")
+    if not ytdlp:
+        return None
 
-    if isinstance(content_raw, list):
-        # Chunked format — join text segments
-        text = " ".join(
-            seg.get("text", "").strip()
-            for seg in content_raw
-            if seg.get("text")
+    cmd = [
+        ytdlp,
+        "-f", "bestaudio",
+        "-g",  # print direct URL only
+        "--no-playlist",
+        url,
+    ]
+
+    env = os.environ.copy()
+    proxy = os.environ.get("HTTPS_PROXY", "")
+    if proxy:
+        env["HTTPS_PROXY"] = proxy
+
+    try:
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=30, env=env,
         )
-    elif isinstance(content_raw, str):
-        text = content_raw.strip()
-    else:
-        text = ""
+        if proc.returncode == 0:
+            url_out = proc.stdout.strip().split("\n")[0]
+            if url_out.startswith("http"):
+                return url_out
+    except Exception:
+        pass
+    return None
 
-    if not text or len(text) < 200:
-        raise RuntimeError(
-            f"Supadata transcript too short ({len(text)} chars) — "
-            "video may have no speech"
-        )
 
-    # Title from response or fetch via oEmbed
-    title = data.get("title", "") or ""
-    if not title:
-        # Supadata doesn't always return a title — fetch via oEmbed
-        title = _fetch_youtube_title(url)
-    if not title:
-        vid = _video_id(url)
-        title = f"YouTube video {vid}" if vid else url
-
-    # Add language note if non-English
-    if lang and lang != "en":
-        text = f"[Transcript language: {lang}]\n\n{text}"
-
-    return SourceDoc(title=title, content=text, url=url)
+# ── Metadata helpers ────────────────────────────────────────────────────
 
 
 def _fetch_youtube_title(url: str) -> str:
@@ -275,7 +374,6 @@ def _fetch_youtube_title(url: str) -> str:
 
     Returns empty string if the fetch fails.
     """
-    from urllib.parse import quote
     oembed_url = (
         f"https://www.youtube.com/oembed"
         f"?url={quote(url, safe='')}&format=json"
@@ -293,8 +391,6 @@ def _fetch_youtube_title(url: str) -> str:
 
 def _extract_oembed(youtube_url: str) -> SourceDoc | None:
     """Fetch video metadata via YouTube oEmbed API (no auth required)."""
-    from urllib.parse import quote
-
     oembed_url = f"https://www.youtube.com/oembed?url={quote(youtube_url, safe='')}&format=json"
     with httpx.Client(timeout=15, follow_redirects=True) as client:
         resp = client.get(oembed_url)
@@ -310,7 +406,7 @@ def _extract_oembed(youtube_url: str) -> SourceDoc | None:
         f"Channel: {author}",
         "",
         "Note: Full transcript unavailable "
-        "(Supadata API key not configured or insufficient credits).",
+        "(yt-dlp and AssemblyAI could not extract subtitles).",
         "Only video metadata was extracted.",
     ]
 

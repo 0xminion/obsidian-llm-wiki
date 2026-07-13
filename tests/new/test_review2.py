@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 # ── embedding.py: cosine_similarity edge cases ──────────────────────────────
 
@@ -213,79 +213,53 @@ def test_update_failed_ledger_dedup_same_url(tmp_path):
     assert "old error" not in content
 
 
-# ── ingest/extractors/youtube.py: Supadata error paths ─────────────────────
+# ── ingest/extractors/youtube.py: subtitle parsing ─────────────────────
 
 
-def test_supadata_402_credits_error():
-    """402 response raises RuntimeError with billing message."""
-    from obsidian_llm_wiki.ingest.extractors import youtube as yt_mod
-    mock_resp = MagicMock()
-    mock_resp.status_code = 402
-    mock_resp.json.return_value = {"error": "insufficient credits"}
-    with patch("httpx.Client") as mock_client_cls:
-        mock_client = MagicMock()
-        mock_client.get.return_value = mock_resp
-        mock_client_cls.return_value.__enter__ = MagicMock(return_value=mock_client)
-        mock_client_cls.return_value.__exit__ = MagicMock(return_value=False)
-        with patch.object(yt_mod, "_get_api_key", return_value="fake-key"):
-            try:
-                yt_mod._supadata_transcript("https://youtube.com/watch?v=test", "fake-key")
-                raise AssertionError("Should have raised")
-            except RuntimeError as e:
-                assert "credit" in str(e).lower() or "billing" in str(e).lower()
+def test_parse_subtitle_file_vtt():
+    """VTT subtitle file is parsed into plain text."""
+    import os
+    import tempfile
 
-
-def test_supadata_403_restricted_video():
-    """403 response raises RuntimeError with restricted message."""
-    from obsidian_llm_wiki.ingest.extractors import youtube as yt_mod
-    mock_resp = MagicMock()
-    mock_resp.status_code = 403
-    with patch("httpx.Client") as mock_client_cls:
-        mock_client = MagicMock()
-        mock_client.get.return_value = mock_resp
-        mock_client_cls.return_value.__enter__ = MagicMock(return_value=mock_client)
-        mock_client_cls.return_value.__exit__ = MagicMock(return_value=False)
+    from obsidian_llm_wiki.ingest.extractors.youtube import _parse_subtitle_file
+    vtt_content = (
+        "WEBVTT\n\n"
+        "00:00:01.000 --> 00:00:05.000\n"
+        "Hello world this is a test\n\n"
+        "00:00:05.000 --> 00:00:10.000\n"
+        "This is another line of text\n"
+    )
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".vtt", delete=False) as f:
+        f.write(vtt_content)
+        f.flush()
         try:
-            yt_mod._supadata_transcript("https://youtube.com/watch?v=test", "fake-key")
-            raise AssertionError("Should have raised")
-        except RuntimeError as e:
-            assert "private" in str(e).lower() or "restricted" in str(e).lower()
+            result = _parse_subtitle_file(f.name)
+            assert "Hello world" in result
+            assert "another line" in result
+        finally:
+            os.unlink(f.name)
 
 
-def test_parse_supadata_response_chunked():
-    """Chunked content (list of segments) is joined correctly."""
-    from obsidian_llm_wiki.ingest.extractors.youtube import _parse_supadata_response
-    data = {
-        "content": [
-            {"text": "Hello world this is a test transcript that is long "
-             "enough to pass the minimum length check of two hundred "
-             "characters. " * 3, "start": 0, "duration": 10},
-        ],
-        "lang": "en",
-    }
-    result = _parse_supadata_response(data, "https://youtube.com/watch?v=test")
-    assert result is not None
-    assert "Hello world" in result.content
+def test_parse_subtitle_file_strips_html():
+    """HTML tags in subtitle text are stripped."""
+    import os
+    import tempfile
 
-
-def test_parse_supadata_response_non_english():
-    """Non-English transcript gets language prefix."""
-    from obsidian_llm_wiki.ingest.extractors.youtube import _parse_supadata_response
-    data = {"content": "这是一个中文的转录文本，足够长以通过最小长度检查。" * 10, "lang": "zh"}
-    result = _parse_supadata_response(data, "https://youtube.com/watch?v=test")
-    assert result is not None
-    assert "[Transcript language: zh]" in result.content
-
-
-def test_parse_supadata_response_short_transcript():
-    """Transcript < 200 chars raises RuntimeError."""
-    from obsidian_llm_wiki.ingest.extractors.youtube import _parse_supadata_response
-    data = {"content": "Too short.", "lang": "en"}
-    try:
-        _parse_supadata_response(data, "https://youtube.com/watch?v=test")
-        raise AssertionError("Should have raised")
-    except RuntimeError:
-        pass
+    from obsidian_llm_wiki.ingest.extractors.youtube import _parse_subtitle_file
+    vtt_content = (
+        "WEBVTT\n\n"
+        "00:00:01.000 --> 00:00:05.000\n"
+        "<c>Hello world this is a test that is long enough</c>\n"
+    )
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".vtt", delete=False) as f:
+        f.write(vtt_content)
+        f.flush()
+        try:
+            result = _parse_subtitle_file(f.name)
+            assert "<c>" not in result
+            assert "Hello world" in result
+        finally:
+            os.unlink(f.name)
 
 
 # ── ingest/web.py: full 6-layer failure ─────────────────────────────────────
