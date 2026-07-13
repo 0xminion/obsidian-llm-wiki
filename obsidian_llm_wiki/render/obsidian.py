@@ -430,15 +430,12 @@ def render_vault(
     written: list[str] = []
     ts = _timestamp()
 
-    # ── Backlink propagation: ensure bidirectional edges ──────────────
-    # This runs inside render_vault so it works even when re-rendering
-    # from cache without going through the full pipeline. Semantic dedup
-    # and MoC orphan assignment do NOT run here: they mutate the bundle
-    # (merging concepts, rewriting slugs), so the pipeline runs them in the
-    # synthesis stage — before rendering and before the state write — where
-    # their failures are visible instead of swallowed.
-    from obsidian_llm_wiki.synth.dedupe import propagate_backlinks
-    propagate_backlinks(bundle)
+    # ── Backlink propagation ─────────────────────────────────────────
+    # NOTE: propagate_backlinks is called in run_pipeline() before rendering.
+    # It is NOT called here to avoid double-propagation with incorrect
+    # reverse relation types on the second pass. If render_vault is called
+    # standalone (e.g. from a test), the caller is responsible for calling
+    # propagate_backlinks first.
 
     # Make the language policy deterministic. The synthesis prompt asks Chinese
     # sources to use English-first bilingual titles, but smaller/local models do

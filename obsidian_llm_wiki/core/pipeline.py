@@ -226,8 +226,7 @@ async def run_pipeline(
 
             # ── Collect successful syntheses + cache them ──────────────
             filenames_done: list[str] = []
-            for i, res in enumerate(synth_results):
-                filename = list(to_compile.keys())[i]
+            for filename, res in zip(to_compile.keys(), synth_results, strict=True):
                 # Failure metrics were already recorded per attempt inside
                 # _synthesize_with_retry — recording again here would count
                 # one failed source as 4 failures in metrics.json.
