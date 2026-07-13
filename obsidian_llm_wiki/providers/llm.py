@@ -66,8 +66,9 @@ class OllamaClient(LLMClient):
             num_ctx = self.config.context_window
         if num_ctx:
             options.setdefault("num_ctx", num_ctx)
-        # Allow unlimited output tokens — the timeout is the real ceiling.
-        options.setdefault("num_predict", -1)
+        # Allow generous output tokens — the timeout is the real ceiling.
+        # Some Ollama proxies reject num_predict=-1, so use a large positive value.
+        options.setdefault("num_predict", 65536)
         if options:
             body["options"] = options
         body.update(kwargs)
