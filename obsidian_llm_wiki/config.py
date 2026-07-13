@@ -28,6 +28,11 @@ class LLMProviderConfig:
     provider: str = "ollama"
     host: str = "http://localhost:11434"
     model: str = "gemma3:27b"
+    # Optional task-specific overrides.  When absent, each task uses ``model``
+    # so existing LLM_MODEL-only environments retain their current behavior.
+    ingest_model: str | None = None
+    maintenance_model: str | None = None
+    query_model: str | None = None
     api_key: str | None = None
     timeout_ms: int = 1_800_000  # 30 minutes
     context_window: int = 256_000  # 256K tokens for cloud models (e.g. gemma4:31b-cloud)
@@ -77,6 +82,15 @@ class Config:
     retry_count: int = 3
     retry_base_ms: int = 1_000
     retry_multiplier: int = 4
+
+    # ── Document safety boundaries ────────────────────────────────
+    # Limits apply to every direct/discovered binary document download and
+    # optional LiteParse subprocess invocation.
+    max_document_bytes: int = 50_000_000
+    max_document_candidates: int = 10
+    parser_timeout_seconds: int = 120
+    max_parser_stdout_bytes: int = 1_000_000
+    max_parser_stderr_bytes: int = 16_384
 
     # ── Extraction fallbacks ─────────────────────────────────────
     # Residential proxy URL (socks5h:// or http://) for blocked sites.
@@ -188,6 +202,9 @@ def load_config(env_file: str | None = None, **overrides: str) -> Config:
         provider=os.getenv("LLM_PROVIDER", "ollama"),
         host=os.getenv("LLM_HOST", "http://localhost:11434"),
         model=os.getenv("LLM_MODEL", "gemma3:27b"),
+        ingest_model=_optional_model_env("INGEST_MODEL"),
+        maintenance_model=_optional_model_env("MAINTENANCE_MODEL"),
+        query_model=_optional_model_env("QUERY_MODEL"),
         api_key=os.getenv("LLM_API_KEY"),
         timeout_ms=_int_env("LLM_TIMEOUT_MS", 1_800_000),
         context_window=_int_env("LLM_CONTEXT_WINDOW", 256_000),
@@ -210,6 +227,11 @@ def load_config(env_file: str | None = None, **overrides: str) -> Config:
         retry_count=_int_env("RETRY_COUNT", 3),
         retry_base_ms=_int_env("RETRY_BASE_MS", 1_000),
         retry_multiplier=_int_env("RETRY_MULTIPLIER", 4),
+        max_document_bytes=_int_env("MAX_DOCUMENT_BYTES", 50_000_000),
+        max_document_candidates=_int_env("MAX_DOCUMENT_CANDIDATES", 10),
+        parser_timeout_seconds=_int_env("PARSER_TIMEOUT_SECONDS", 120),
+        max_parser_stdout_bytes=_int_env("MAX_PARSER_STDOUT_BYTES", 1_000_000),
+        max_parser_stderr_bytes=_int_env("MAX_PARSER_STDERR_BYTES", 16_384),
         residential_proxy_url=os.getenv("RESIDENTIAL_PROXY_URL", ""),
         youtube_cookies_file=os.getenv("YOUTUBE_COOKIES_FILE", ""),
         transcript_api_key=os.getenv("TRANSCRIPT_API_KEY", ""),
@@ -218,6 +240,14 @@ def load_config(env_file: str | None = None, **overrides: str) -> Config:
         podcast_index_api_key=os.getenv("PODCAST_INDEX_API_KEY", ""),
         podcast_index_api_secret=os.getenv("PODCAST_INDEX_API_SECRET", ""),
     )
+
+
+def _optional_model_env(key: str) -> str | None:
+    """Return a configured task model, treating empty values as no override."""
+    value = os.getenv(key)
+    if value is None or not value.strip():
+        return None
+    return value.strip()
 
 
 def _int_env(key: str, default: int) -> int:

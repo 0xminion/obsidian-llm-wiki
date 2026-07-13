@@ -9,7 +9,10 @@ deterministically by the renderers — the LLM never writes markdown.
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from typing import Any
+
+from obsidian_llm_wiki.core.schema import Granularity, SchemaPolicy, format_schema_guidance
 
 __all__ = [
     "build_synthesis_prompt",
@@ -98,6 +101,8 @@ def build_synthesis_prompt(
     source_content: str,
     existing_concepts: list[str] | None = None,
     language: str = "",
+    schema_policy: SchemaPolicy | Mapping[str, Any] | None = None,
+    granularity: Granularity | str | None = None,
 ) -> str:
     """Build the single-call synthesis prompt for one source.
 
@@ -107,6 +112,10 @@ def build_synthesis_prompt(
         existing_concepts: Slugs of already-known concepts (for dedup).
         language: ISO 639-1 language code — controls the language instruction
             injected into the prompt. If empty, auto-detected by detect_language().
+        schema_policy: Optional bounded, vault-local user preferences. This never
+            changes the fixed JSON response contract.
+        granularity: Optional concise/standard/detailed extraction preference.
+            When omitted, no granularity guidance is added (backward compatible).
 
     Returns:
         The complete system prompt string.
@@ -126,6 +135,9 @@ def build_synthesis_prompt(
         li = get_language_instruction(language)
         if li:
             lang_instruction = f"\n{li}"
+
+    # User policy is deliberately isolated from fixed rules and source content.
+    schema_guidance = format_schema_guidance(schema_policy, granularity)
 
     # Key findings instruction — surface ALL, no cap
     findings_instruction = (
@@ -159,7 +171,7 @@ the key tension, how the concepts interact, and why this grouping matters.
 * Surface ALL available insights — do not produce stubs or shallow summaries.
 * Claims should be specific, evidence-backed statements from the source.
 {findings_instruction}{lang_instruction}
-
+{schema_guidance}
 {RELATIONSHIP_FEWSHOT}
 
 --- EXISTING CONCEPT INDEX ---

@@ -183,6 +183,10 @@ async def test_golden_pipeline_end_to_end(tmp_path: Path):
     assert "attention" in meta["tags"]
     assert "neural-network" in meta["tags"]
     assert meta["aliases"] == ["scaled dot-product attention"]
+    assert {relation["target"] for relation in meta["relations"]} == {
+        "multi-head-attention",
+        "positional-encoding",
+    }
 
     assert "# Self-Attention" in body
     assert "## Core concept" in body
@@ -191,9 +195,10 @@ async def test_golden_pipeline_end_to_end(tmp_path: Path):
     assert "Self-attention allows each position" in body
     assert "## Claims" in body
     assert "Self-attention complexity is O(n^2)" in body
-    assert "## Related Concepts" in body
-    assert "[[multi-head-attention|Multi-Head Attention]]" in body
-    assert "[[positional-encoding]]" in body
+    assert "## Related Concepts" not in body
+    assert "## Cross-References / 关联图谱" in body
+    assert "[[multi-head-attention|" in body
+    assert "[[positional-encoding|" in body
 
     # ── Assert entry page content ───────────────────────────────────────
     entry_page = safe_read_file(bundle / "entries" / "attention-is-all-you-need.md")

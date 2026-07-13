@@ -180,10 +180,14 @@ def test_registry_forwards_original_arxiv_abstract_url_to_specialized_route() ->
     original_extractors = list(registry._EXTRACTORS)
     registry._EXTRACTORS.insert(0, (match_arxiv, extract_specialized))
     try:
-        assert registry.extract("https://arxiv.org/abs/1706.03762?ref=reader") is source
+        result = registry.extract("https://arxiv.org/abs/1706.03762?ref=reader")
     finally:
         registry._EXTRACTORS[:] = original_extractors
 
+    assert result.title == source.title
+    assert result.content == source.content
+    assert result.provenance.requested_url == "https://arxiv.org/abs/1706.03762?ref=reader"
+    assert result.provenance.extractor_chain == ("extract_specialized",)
     assert received == ["https://arxiv.org/abs/1706.03762?ref=reader"]
 
 

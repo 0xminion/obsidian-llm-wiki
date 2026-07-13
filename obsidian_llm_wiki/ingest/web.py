@@ -30,64 +30,81 @@ logger = logging.getLogger("obswiki.ingest.web")
 __all__ = ["extract_web"]
 
 _TIMEOUT = DEFAULT_TIMEOUT
+_MAX_EXTRACTION_ERRORS = 12
+_MAX_EXTRACTION_ERROR_CHARS = 240
+
+
+def _record_error(errors: list[str], stage: str, exc: Exception) -> None:
+    """Keep fallback diagnostics informative without allowing unbounded errors."""
+    if len(errors) < _MAX_EXTRACTION_ERRORS:
+        errors.append(f"{stage}: {str(exc)[:_MAX_EXTRACTION_ERROR_CHARS]}")
 
 
 def extract_web(url: str, timeout: int = _TIMEOUT) -> SourceDoc:
     """Extract full article content from a web URL.
 
     Strategy (in order):
-      1. defuddle.md web service — best structured markdown for articles/blogs
-      2. LiteParse local document parser — direct files and citation-linked papers
-      3. trafilatura extract — fallback for non-JS pages
-      4. defuddle CLI — local defuddle fallback
-      5. public publisher HTML/PDF links — same-site citation metadata only
-      6. Invidious API — YouTube-only metadata fallback
-      7. Semantic Scholar — SSRN metadata/abstract fallback
-      8. journal direct-page fallback
-      9. archive.org Wayback Machine — last resort
+      1. public scientific full-text preflight for known scholarly landing pages
+      2. defuddle.md web service — best markdown quality for articles/blogs
+      3. LiteParse local document parser — direct files and citation-linked papers
+      4. trafilatura extract — fallback for non-JS pages
+      5. defuddle CLI — local defuddle fallback
+      6. specialist and archive fallbacks
 
     Raises:
         RuntimeError: When all strategies fail.
     """
     errors: list[str] = []
+    scientific_preflight_attempted = False
+
+    # A short abstract is often a perfectly valid generic extraction, so known
+    # scholarly landing pages get their official public full-text links first.
+    # This narrow URL gate avoids adding a network request for ordinary blogs.
+    if not _is_youtube_url(url):
+        from obsidian_llm_wiki.ingest.extractors.scientific import (
+            extract_discovered_scientific_document,
+            is_likely_scientific_landing_page,
+        )
+
+        if is_likely_scientific_landing_page(url):
+            scientific_preflight_attempted = True
+            try:
+                return extract_discovered_scientific_document(url, timeout)
+            except Exception as exc:
+                _record_error(errors, "public_scientific_preflight", exc)
 
     # Layer 1: defuddle.md web service (best markdown quality for articles/blogs)
     try:
         return _extract_defuddle_md(url, timeout)
     except Exception as exc:
-        errors.append(f"defuddle.md: {exc}")
+        _record_error(errors, "defuddle.md", exc)
 
     # Layer 2: LiteParse local document fallback. This is optional; a missing
     # CLI is recorded and the ordinary HTML fallbacks continue.
     try:
         return _extract_liteparse_document(url, timeout)
     except Exception as exc:
-        errors.append(f"liteparse: {exc}")
+        _record_error(errors, "liteparse", exc)
 
     # Layer 3: trafilatura
     try:
         return _extract_trafilatura(url, timeout)
     except Exception as exc:
-        errors.append(f"trafilatura: {exc}")
+        _record_error(errors, "trafilatura", exc)
 
     # Layer 4: defuddle CLI (no proxy — it has its own UA handling)
     try:
         return _extract_defuddle(url, timeout)
     except Exception as exc:
-        errors.append(f"defuddle: {exc}")
+        _record_error(errors, "defuddle", exc)
 
-    # Layer 5: public publisher document links.  This is deliberately limited
-    # to same-publisher citation metadata/direct PDF links and never uses
-    # cookies, credentials, or third-party mirrors to bypass access controls.
-    if not _is_youtube_url(url):
+    # A non-scientific URL may still expose an official paper link, but avoid
+    # repeating discovery when the preflight already tried the same landing.
+    if not _is_youtube_url(url) and not scientific_preflight_attempted:
         try:
-            from obsidian_llm_wiki.ingest.extractors.scientific import (
-                extract_discovered_scientific_document,
-            )
-
             return extract_discovered_scientific_document(url, timeout)
         except Exception as exc:
-            errors.append(f"public_scientific_document: {exc}")
+            _record_error(errors, "public_scientific_document", exc)
 
     # Layer 6: Invidious (YouTube only)
     if _is_youtube_url(url):
@@ -95,7 +112,7 @@ def extract_web(url: str, timeout: int = _TIMEOUT) -> SourceDoc:
             from obsidian_llm_wiki.ingest.alt_source import extract_via_invidious
             return extract_via_invidious(url, timeout)
         except Exception as exc:
-            errors.append(f"invidious: {exc}")
+            _record_error(errors, "invidious", exc)
 
     # Layer 7: SSRN via Semantic Scholar (academic paper fallback)
     if _is_ssrn_url(url):
@@ -103,7 +120,7 @@ def extract_web(url: str, timeout: int = _TIMEOUT) -> SourceDoc:
             from obsidian_llm_wiki.ingest.alt_source import extract_via_semantic_scholar
             return extract_via_semantic_scholar(url, timeout)
         except Exception as exc:
-            errors.append(f"semantic_scholar: {exc}")
+            _record_error(errors, "semantic_scholar", exc)
 
     # Layer 8: akjournals / journal XML direct-page fallback
     if _is_journal_xml_url(url):
@@ -111,13 +128,13 @@ def extract_web(url: str, timeout: int = _TIMEOUT) -> SourceDoc:
             from obsidian_llm_wiki.ingest.alt_source import extract_via_journal_page
             return extract_via_journal_page(url, timeout)
         except Exception as exc:
-            errors.append(f"journal_direct: {exc}")
+            _record_error(errors, "journal_direct", exc)
 
     # Layer 9: Wayback Machine
     try:
         return _extract_wayback(url, timeout)
     except Exception as exc:
-        errors.append(f"wayback: {exc}")
+        _record_error(errors, "wayback", exc)
 
     raise RuntimeError(
         f"All extraction strategies failed for {url}:\n  " + "\n  ".join(errors)

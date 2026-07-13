@@ -108,8 +108,10 @@ def test_render_concept_page_with_related():
         related=[ConceptLink(slug="sgd", relation="variant_of", display="SGD")],
     )
     page = render_concept_page(c)
-    assert "## Related Concepts" in page
-    assert "[[sgd|SGD]]" in page
+    meta, body = parse_frontmatter(page)
+    assert meta["relations"] == [{"target": "sgd", "type": "variant_of", "display": "SGD"}]
+    assert "## Related Concepts" not in body
+    assert "[[sgd|SGD]]" not in body
 
 
 def test_render_concept_page_with_claims():
@@ -214,7 +216,7 @@ def test_render_vault_full(tmp_path: Path):
 
     # Check concept page has wikilinks.
     concept_a = (bundle_dir / "concepts" / "concept-a.md").read_text()
-    assert "[[concept-b]]" in concept_a
+    assert "[[concept-b|" in concept_a
 
     # Check entry has concept wikilinks.
     entry = (bundle_dir / "entries" / "paper-a.md").read_text()
@@ -223,4 +225,4 @@ def test_render_vault_full(tmp_path: Path):
     # Check MOC has concept wikilinks.
     moc = (bundle_dir / "mocs" / "ml-topic.md").read_text()
     assert "[[concept-a]]" in moc
-    assert "[[concept-b]]" in moc
+    assert "[[concept-b|" in moc

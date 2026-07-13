@@ -562,10 +562,8 @@ def test_concept_page_with_relations_frontmatter():
     assert "relations" in meta
     assert meta["relations"][0]["target"] == "other-concept"
     assert meta["relations"][0]["type"] == "depends_on"
-
-    assert "## Related Concepts" in body
-    assert "[[other-concept|Other]]" in body
-    assert "`depends_on`" in body
+    assert "## Related Concepts" not in body
+    assert "[[other-concept|Other]]" not in body
 
 
 def test_concept_page_no_relations():

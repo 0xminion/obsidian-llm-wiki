@@ -1,24 +1,14 @@
-"""PDF extractor — extracts text with PyMuPDF, then optional LiteParse.
-
-PyMuPDF is preferred for direct text PDFs. When it is unavailable, cannot
-open a document, or returns no text (for example a scanned PDF), the optional
-LiteParse CLI is tried before extraction fails.
-"""
+"""PDF extractor — PyMuPDF-first with a bounded LiteParse fallback."""
 
 from __future__ import annotations
 
 import logging
-import os
-import tempfile
-from contextlib import suppress
 from pathlib import Path
 from urllib.parse import urlparse
 
-import httpx
-
+from obsidian_llm_wiki.config import Config
 from obsidian_llm_wiki.core.models import SourceDoc
 from obsidian_llm_wiki.ingest.extractors import register_extractor
-from obsidian_llm_wiki.ingest.proxy import make_client_kwargs
 
 logger = logging.getLogger("obswiki.ingest.extractors.pdf")
 
@@ -44,69 +34,58 @@ def _is_pdf(parsed, raw: str) -> bool:
 
 @register_extractor(_is_pdf)
 def extract_pdf(raw_url_or_path: str) -> SourceDoc:
-    """Extract a local or remote PDF, falling back to LiteParse if needed."""
+    """Extract a local or remote PDF through the shared document boundary."""
     if raw_url_or_path.startswith(("http://", "https://")):
         return _extract_remote_pdf(raw_url_or_path)
     return _extract_local_pdf(raw_url_or_path)
 
 
-def _extract_local_pdf(raw_path: str) -> SourceDoc:
+def _extract_local_pdf(
+    raw_path: str,
+    *,
+    source_url: str | None = None,
+    config: Config | None = None,
+) -> SourceDoc:
     """Extract a local PDF, invoking LiteParse after any PyMuPDF failure."""
     path = Path(raw_path)
+    display_url = source_url or str(path)
     if not path.is_file():
         raise RuntimeError(f"PDF file not found: {raw_path}")
     if not _DEPS_AVAILABLE:
-        return _fallback_to_liteparse(path, str(path), RuntimeError("PyMuPDF is unavailable"))
+        return _fallback_to_liteparse(
+            path, display_url, RuntimeError("PyMuPDF is unavailable"), config=config
+        )
 
     try:
         doc = fitz.open(str(path))  # type: ignore[union-attr]
         try:
-            return _extract_text_from_doc(doc, str(path))
+            return _extract_text_from_doc(doc, display_url)
         finally:
             doc.close()
     except Exception as exc:
-        return _fallback_to_liteparse(path, str(path), exc)
+        return _fallback_to_liteparse(path, display_url, exc, config=config)
 
 
 def _extract_remote_pdf(url: str) -> SourceDoc:
-    """Download a PDF once and use LiteParse if PyMuPDF cannot extract it."""
-    with httpx.Client(**make_client_kwargs(follow_redirects=True, timeout=60)) as client:
-        response = client.get(url)
-        response.raise_for_status()
-        pdf_bytes = response.content
+    """Route remote PDFs through the shared bounded document dispatcher."""
+    from obsidian_llm_wiki.ingest.documents import dispatch_document
 
-    if not pdf_bytes or len(pdf_bytes) < 100:
-        raise RuntimeError(f"Downloaded empty/short PDF from {url}")
-
-    temp_path: str | None = None
-    try:
-        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as handle:
-            handle.write(pdf_bytes)
-            temp_path = handle.name
-        path = Path(temp_path)
-
-        if not _DEPS_AVAILABLE:
-            return _fallback_to_liteparse(path, url, RuntimeError("PyMuPDF is unavailable"))
-
-        try:
-            doc = fitz.open(stream=pdf_bytes, filetype="pdf")  # type: ignore[union-attr]
-            try:
-                return _extract_text_from_doc(doc, url)
-            finally:
-                doc.close()
-        except Exception as exc:
-            return _fallback_to_liteparse(path, url, exc)
-    finally:
-        if temp_path is not None:
-            with suppress(OSError):
-                os.unlink(temp_path)
+    return dispatch_document(url)
 
 
-def _fallback_to_liteparse(path: Path, source_url: str, pymupdf_error: Exception) -> SourceDoc:
-    """Attempt the optional parser and retain both failure reasons if it cannot run."""
+def _fallback_to_liteparse(
+    path: Path,
+    source_url: str,
+    pymupdf_error: Exception,
+    *,
+    config: Config | None = None,
+) -> SourceDoc:
+    """Attempt optional LiteParse and retain both failure reasons if it fails."""
     logger.info("PyMuPDF extraction failed for %s; trying LiteParse: %s", source_url, pymupdf_error)
     try:
-        return _extract_with_liteparse(path, source_url)
+        if config is None:
+            return _extract_with_liteparse(path, source_url)
+        return _extract_with_liteparse(path, source_url, config=config)
     except Exception as liteparse_error:
         raise RuntimeError(
             f"PyMuPDF extraction failed for {source_url}: {pymupdf_error}; "
@@ -114,11 +93,18 @@ def _fallback_to_liteparse(path: Path, source_url: str, pymupdf_error: Exception
         ) from liteparse_error
 
 
-def _extract_with_liteparse(path: Path, source_url: str) -> SourceDoc:
-    """Import the optional LiteParse integration only when the fallback is needed."""
+def _extract_with_liteparse(
+    path: Path,
+    source_url: str,
+    *,
+    config: Config | None = None,
+) -> SourceDoc:
+    """Import optional LiteParse only when the PDF text fallback is needed."""
     from obsidian_llm_wiki.ingest.liteparse import parse_document
 
-    return parse_document(path, source_url=source_url)
+    if config is None:
+        return parse_document(path, source_url=source_url)
+    return parse_document(path, source_url=source_url, config=config)
 
 
 def _extract_text_from_doc(doc, source_url: str) -> SourceDoc:

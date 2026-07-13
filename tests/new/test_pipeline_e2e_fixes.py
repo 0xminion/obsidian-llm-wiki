@@ -222,7 +222,7 @@ def test_chunk_gate_is_config_chunk_size(monkeypatch):
 
     prompts_seen: list[str] = []
 
-    async def counting_llm(prompt, messages, config):
+    async def counting_llm(prompt, messages, config, **_kwargs):
         prompts_seen.append(prompt)
         return json.dumps({
             "source_title": "T",
@@ -463,7 +463,7 @@ def test_recompile_strips_frontmatter_and_matches_build_hash(tmp_path, monkeypat
 
     seen: dict = {}
 
-    async def fake_retry(config, filename, source, existing, metrics=None):
+    async def fake_retry(config, filename, source, existing, *_args, metrics=None, **_kwargs):
         seen["title"] = source.title
         seen["content"] = source.content
         synth = SourceSynthesis(
@@ -501,7 +501,7 @@ def test_pipeline_does_not_double_record_synthesis_failures(tmp_path, monkeypatc
 
     monkeypatch.setenv("VAULT_PATH", str(tmp_path))
 
-    async def fake_retry(config, filename, source, existing, metrics=None):
+    async def fake_retry(config, filename, source, existing, *_args, metrics=None, **_kwargs):
         # Simulate the real helper: it records once per attempt (here: one),
         # then re-raises on the final level.
         if metrics:

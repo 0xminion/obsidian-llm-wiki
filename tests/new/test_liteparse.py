@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-import subprocess
+import io
 from pathlib import Path
 from unittest.mock import patch
 
-import httpx
 import pytest
 
 from obsidian_llm_wiki.core.models import SourceDoc
@@ -18,37 +17,41 @@ def test_parse_document_runs_lit_cli_and_returns_markdown(tmp_path: Path):
 
     document = tmp_path / "paper.pdf"
     document.write_bytes(b"%PDF-pretend")
-    completed = subprocess.CompletedProcess(
-        args=[],
-        returncode=0,
-        stdout="# Parsed Paper\n\nParsed document body.",
-        stderr="",
-    )
-
+    command = [
+        "/usr/bin/lit",
+        "parse",
+        str(document),
+        "--format",
+        "markdown",
+        "--image-mode",
+        "off",
+        "--quiet",
+    ]
     with (
         patch("obsidian_llm_wiki.ingest.liteparse.shutil.which", return_value="/usr/bin/lit"),
-        patch("obsidian_llm_wiki.ingest.liteparse.subprocess.run", return_value=completed) as run,
+        patch(
+            "obsidian_llm_wiki.ingest.liteparse._run_liteparse",
+            return_value=(0, b"# Parsed Paper\n\nParsed document body.", b""),
+        ) as run,
     ):
         source = parse_document(document, source_url="https://example.com/paper.pdf")
 
     assert source.title == "Parsed Paper"
     assert source.content == "# Parsed Paper\n\nParsed document body."
     assert source.url == "https://example.com/paper.pdf"
-    run.assert_called_once_with(
-        [
-            "/usr/bin/lit",
-            "parse",
-            str(document),
-            "--format",
-            "markdown",
-            "--image-mode",
-            "off",
-            "--quiet",
-        ],
-        capture_output=True,
-        text=True,
-        timeout=120,
-    )
+    assert run.call_args.args[0] == command
+    assert run.call_args.args[1].parser_timeout_seconds == 120
+
+
+def test_liteparse_pipe_capture_is_bounded():
+    """Parser diagnostics cannot retain more than their configured byte cap."""
+    from obsidian_llm_wiki.ingest.liteparse import _BoundedPipe
+
+    pipe = _BoundedPipe(io.BytesIO(b"abcdefgh"), 3)
+    pipe.start()
+    pipe.join()
+
+    assert pipe.value == b"abc"
 
 
 def test_parse_document_reports_missing_cli_without_hiding_later_fallbacks(tmp_path: Path):
@@ -62,49 +65,22 @@ def test_parse_document_reports_missing_cli_without_hiding_later_fallbacks(tmp_p
         parse_document(tmp_path / "paper.pdf")
 
 
-def test_document_fallback_downloads_direct_pdf_parses_and_removes_temp_file():
-    """A direct document URL is downloaded to a temporary file for LiteParse."""
+def test_document_fallback_delegates_to_safe_discovery():
+    """Web fallback uses the same dispatcher as discovered document candidates."""
     from obsidian_llm_wiki.ingest import liteparse
 
-    class FakeClient:
-        def __init__(self, **_kwargs):
-            pass
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_args):
-            return None
-
-        def get(self, _url):
-            return httpx.Response(
-                200,
-                content=b"%PDF-direct-document",
-                headers={"content-type": "application/pdf"},
-                request=httpx.Request("GET", "https://example.com/report.pdf"),
-            )
-
-    parsed_paths: list[Path] = []
-
-    def fake_parse(path: str | Path, *, source_url: str | None = None) -> SourceDoc:
-        parsed_path = Path(path)
-        parsed_paths.append(parsed_path)
-        assert parsed_path.read_bytes() == b"%PDF-direct-document"
-        return SourceDoc(title="Downloaded PDF", content="Parsed body", url=source_url)
-
-    with (
-        patch("obsidian_llm_wiki.ingest.liteparse.httpx.Client", FakeClient),
-        patch("obsidian_llm_wiki.ingest.liteparse.parse_document", side_effect=fake_parse),
-    ):
-        source = liteparse.extract_document_fallback("https://example.com/report.pdf", timeout=9)
-
-    assert source == SourceDoc(
-        title="Downloaded PDF",
-        content="Parsed body",
-        url="https://example.com/report.pdf",
+    expected = SourceDoc(
+        title="Downloaded PDF", content="Parsed body", url="https://example.com/report.pdf"
     )
-    assert len(parsed_paths) == 1
-    assert not parsed_paths[0].exists()
+    with patch(
+        "obsidian_llm_wiki.ingest.documents.extract_discovered_document", return_value=expected
+    ) as discover:
+        assert (
+            liteparse.extract_document_fallback("https://example.com/report.pdf", timeout=9)
+            == expected
+        )
+
+    discover.assert_called_once_with("https://example.com/report.pdf", 9)
 
 
 def test_document_candidates_include_citation_html_and_pdf_link_metadata():
@@ -153,54 +129,26 @@ def test_document_candidates_skip_empty_meta_content():
 
 
 def test_document_fallback_discovers_citation_pdf_from_html_page():
-    """Citation PDF metadata is preferred over a generic landing-page HTML parser."""
+    """Landing-page fallback delegates candidate fetching to the safe dispatcher."""
     from obsidian_llm_wiki.ingest import liteparse
 
     page_url = "https://journal.example/article"
-    pdf_url = "https://journal.example/files/article.pdf"
-    html = '<meta name="citation_pdf_url" content="/files/article.pdf">'
+    expected = SourceDoc(title="Citation PDF", content="Body", url=page_url)
+    with patch(
+        "obsidian_llm_wiki.ingest.documents.extract_discovered_document", return_value=expected
+    ) as discover:
+        assert liteparse.extract_document_fallback(page_url, timeout=9) == expected
 
-    class FakeClient:
-        def __init__(self, **_kwargs):
-            self.urls: list[str] = []
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_args):
-            return None
-
-        def get(self, url):
-            self.urls.append(url)
-            if url == page_url:
-                return httpx.Response(200, text=html, request=httpx.Request("GET", url))
-            assert url == pdf_url
-            return httpx.Response(
-                200,
-                content=b"%PDF-citation",
-                headers={"content-type": "application/pdf"},
-                request=httpx.Request("GET", url),
-            )
-
-    with (
-        patch("obsidian_llm_wiki.ingest.liteparse.httpx.Client", FakeClient),
-        patch(
-            "obsidian_llm_wiki.ingest.liteparse.parse_document",
-            return_value=SourceDoc(title="Citation PDF", content="Body", url=page_url),
-        ) as parse,
-    ):
-        source = liteparse.extract_document_fallback(page_url, timeout=9)
-
-    assert source.url == page_url
-    assert parse.call_args.kwargs["source_url"] == page_url
-    assert Path(parse.call_args.args[0]).suffix == ".pdf"
+    discover.assert_called_once_with(page_url, 9)
 
 
 def test_extract_web_tries_document_fallback_before_trafilatura():
     """LiteParse document parsing is the first local fallback after hosted Defuddle."""
     from obsidian_llm_wiki.ingest import web
 
-    expected = SourceDoc(title="Parsed PDF", content="LiteParse text", url="https://example.com/page")
+    expected = SourceDoc(
+        title="Parsed PDF", content="LiteParse text", url="https://example.com/page"
+    )
     with (
         patch.object(web, "_extract_defuddle_md", side_effect=RuntimeError("hosted failure")),
         patch.object(web, "_extract_liteparse_document", return_value=expected),
@@ -268,44 +216,15 @@ def test_local_pdf_uses_liteparse_when_pymupdf_returns_empty_text(tmp_path: Path
     fallback.assert_called_once_with(path, str(path))
 
 
-def test_remote_pdf_uses_liteparse_when_pymupdf_fails():
-    """A remote PDF with a corrupt/encrypted text layer falls back to LiteParse."""
+def test_remote_pdf_routes_through_shared_document_dispatcher():
+    """Remote PDFs use the bounded shared dispatcher before any parser runs."""
     from obsidian_llm_wiki.ingest.extractors import pdf
 
     url = "https://example.com/corrupt.pdf"
     expected = SourceDoc(title="Recovered", content="LiteParse recovered text", url=url)
+    with patch(
+        "obsidian_llm_wiki.ingest.documents.dispatch_document", return_value=expected
+    ) as dispatch:
+        assert pdf._extract_remote_pdf(url) == expected
 
-    class FailingFitz:
-        @staticmethod
-        def open(*_args, **_kwargs):
-            raise RuntimeError("pymupdf cannot open this PDF")
-
-    class FakeClient:
-        def __init__(self, **_kwargs):
-            pass
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_args):
-            return None
-
-        def get(self, _url):
-            import httpx
-            return httpx.Response(
-                200,
-                content=b"%PDF-corrupt" + b"X" * 200,
-                headers={"content-type": "application/pdf"},
-                request=httpx.Request("GET", url),
-            )
-
-    with (
-        patch.object(pdf, "fitz", FailingFitz),
-        patch.object(pdf.httpx, "Client", FakeClient),
-        patch.object(pdf, "_extract_with_liteparse", return_value=expected) as fallback,
-    ):
-        result = pdf._extract_remote_pdf(url)
-
-    assert result == expected
-    fallback.assert_called_once()
-    assert fallback.call_args.args[1] == url  # source_url is the second positional arg
+    dispatch.assert_called_once_with(url)

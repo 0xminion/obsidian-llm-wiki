@@ -14,7 +14,7 @@ import httpx
 import pytest
 
 from obsidian_llm_wiki.core.models import SourceDoc
-from obsidian_llm_wiki.ingest import liteparse, supadata_utils
+from obsidian_llm_wiki.ingest import documents, supadata_utils
 from obsidian_llm_wiki.ingest.extractors import ExtractorNotApplicableError, podcast
 
 _LONG_TEXT = " ".join(["A usable transcript sentence."] * 20)
@@ -37,72 +37,74 @@ _BLOG_ATOM_FEED = """<?xml version='1.0'?>
 # ── LiteParse must not treat every HTML page as a document ────────────────
 
 
-def test_html_response_is_not_a_document():
-    """text/html is a landing page to search, not a document to hand to LiteParse.
-
-    Listing text/html in _CONTENT_TYPE_SUFFIXES made _is_document_response True
-    for every web page, so LiteParse hijacked all of extract_web ahead of
-    trafilatura and the citation-discovery branch below became unreachable.
-    """
-    response = httpx.Response(
-        200, headers={"content-type": "text/html; charset=utf-8"}, text="<html></html>",
-    )
-
-    assert liteparse._is_document_response("https://example.com/blog/post", response) is False
+def test_html_url_is_not_a_direct_binary_document():
+    """Ordinary HTML pages remain eligible for web extraction, not document parsing."""
+    assert documents.is_direct_document_url("https://example.com/blog/post") is False
 
 
 @pytest.mark.parametrize(
-    ("content_type", "url"),
+    "url",
     [
-        ("application/pdf", "https://example.com/paper"),
-        ("application/epub+zip", "https://example.com/book"),
-        ("text/html", "https://example.com/paper.pdf"),  # suffix still wins
+        "https://example.com/paper.pdf",
+        "https://example.com/book.epub",
+        "https://example.com/slides.pptx",
+        "https://example.com/sheet.xlsx",
     ],
 )
-def test_real_documents_are_still_detected(content_type, url):
-    """Narrowing the content-type map must not stop detecting actual documents."""
-    response = httpx.Response(200, headers={"content-type": content_type}, content=b"%PDF-")
-
-    assert liteparse._is_document_response(url, response) is True
+def test_supported_document_urls_are_directly_dispatched(url):
+    assert documents.is_direct_document_url(url) is True
 
 
-def test_html_landing_page_reaches_citation_discovery(monkeypatch):
-    """An HTML landing page must fall through to citation_pdf_url discovery.
-
-    This is the path _document_candidates() exists for. Before the fix it was
-    unreachable: the landing page was itself parsed as a '.html document'.
-    """
+def test_html_landing_page_reaches_citation_discovery(monkeypatch, tmp_path):
+    """HTML landing-page citation links reach the same bounded document dispatcher."""
     landing = "https://journal.example/articles/42"
+    candidate = "https://journal.example/pdf/42.pdf"
     landing_html = '<meta name="citation_pdf_url" content="/pdf/42.pdf">'
-    fetched: list[str] = []
 
-    def fake_get(self, url, *args, **kwargs):
-        fetched.append(url)
-        if url == landing:
+    class LandingClient:
+        def __init__(self, **_kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def get(self, url):
+            assert url == landing
             return httpx.Response(
-                200, headers={"content-type": "text/html"}, text=landing_html,
+                200,
+                headers={"content-type": "text/html"},
+                text=landing_html,
                 request=httpx.Request("GET", url),
             )
-        return httpx.Response(
-            200, headers={"content-type": "application/pdf"}, content=b"%PDF-1.4 body",
-            request=httpx.Request("GET", url),
-        )
 
-    monkeypatch.setattr(httpx.Client, "get", fake_get)
-    monkeypatch.setattr(
-        liteparse,
-        "parse_document",
-        lambda path, *, source_url=None: SourceDoc(
-            title="Paper", content="parsed body", url=source_url or "",
-        ),
+    document = tmp_path / "42.pdf"
+    document.write_bytes(b"%PDF-1.4 body")
+    downloaded = documents.DownloadedDocument(
+        path=document,
+        source_url=candidate,
+        resolved_url=candidate,
+        content_type="application/pdf",
+        suffix=".pdf",
     )
+    expected = SourceDoc(title="Paper", content="parsed body", url=landing)
+    downloaded_urls: list[str] = []
 
-    source = liteparse.extract_document_fallback(landing, timeout=10)
+    def fake_download(url: str, **_kwargs):
+        downloaded_urls.append(url)
+        return downloaded
 
-    # The discovered PDF was fetched, and provenance stays on the landing page.
-    assert fetched == [landing, "https://journal.example/pdf/42.pdf"]
-    assert source.url == landing
-    assert source.content == "parsed body"
+    monkeypatch.setattr(documents.httpx, "Client", LandingClient)
+    monkeypatch.setattr(documents, "download_document", fake_download)
+    monkeypatch.setattr(documents, "_parse_local_document", lambda *_args, **_kwargs: expected)
+
+    source = documents.extract_discovered_document(landing, timeout=10)
+
+    assert source == expected
+    assert downloaded_urls == [candidate]
+    assert not document.exists()
 
 
 # ── The podcast extractor must not swallow non-podcast feeds ──────────────
