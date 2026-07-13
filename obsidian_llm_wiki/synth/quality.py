@@ -944,7 +944,7 @@ def _build_concept_from_expand(data: dict[str, Any], fallback_slug: str) -> Conc
 
     return ConceptNote(
         title=data.get("title", ""),
-        slug=data.get("slug", fallback_slug),
+        slug=fallback_slug,
         summary=data.get("summary", ""),
         tags=[],
         aliases=list(data.get("aliases", []) or []),
@@ -953,16 +953,6 @@ def _build_concept_from_expand(data: dict[str, Any], fallback_slug: str) -> Conc
         related=related,
         confidence=1.0,
     )
-
-
-def _extract_rationale(data: dict) -> str:
-    """Extract rationale from Pass 1 JSON (separate from summary).
-
-    The Pass 1 schema has both 'rationale' (why this concept matters)
-    and 'summary' (1-2 sentence summary). We use rationale for the
-    Pass 2 expand prompt and summary for the concept page.
-    """
-    return data.get("rationale", "") or data.get("summary", "")
 
 
 # ── Incremental concept re-synthesis ────────────────────────────────────
@@ -1092,7 +1082,7 @@ Return JSON:
 
     return ConceptNote(
         title=data.get("title", concept.title),
-        slug=data.get("slug", concept.slug),
+        slug=concept.slug,
         summary=data.get("summary", concept.summary),
         tags=normalise_tags(list(dict.fromkeys(concept.tags + data.get("tags", [])))),
         aliases=concept.aliases,
