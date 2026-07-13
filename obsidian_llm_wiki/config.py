@@ -165,6 +165,21 @@ class Config:
         return self.vault / "02-Clippings"
 
     @property
+    def annotations_dir(self) -> Path:
+        """Manual notes and annotations directory."""
+        return self.vault / "03-Raw-Annotations"
+
+    @property
+    def queries_dir(self) -> Path:
+        """Saved query results and analyses directory."""
+        return self.vault / "05-Queries"
+
+    @property
+    def templates_dir(self) -> Path:
+        """Wiki schema, page templates, and configuration directory."""
+        return self.vault / "07-Templates"
+
+    @property
     def llmwiki_dir(self) -> Path:
         """Internal pipeline state directory."""
         return self.wiki_dir / ".llmwiki"

@@ -36,7 +36,9 @@ def query(
     instructions: str = typer.Option("", "--instructions", help="Extra query-only instructions"),
     profile: str = typer.Option("default", "--profile", help="Vault-local query profile"),
     save_answer: str | None = typer.Option(
-        None, "--save-answer", help="Explicit Markdown destination for the answer"
+        None,
+        "--save-answer",
+        help="Save the answer to a Markdown file (defaults to 05-Queries/)",
     ),
     force: bool = typer.Option(False, "--force", help="Allow --save-answer to replace a file"),
 ):
@@ -51,8 +53,13 @@ def query(
     session_id = session.strip() or str(uuid.uuid4())
     instructions = instructions.strip()[:MAX_PROFILE_INSTRUCTIONS]
 
+    destination: Path | None = None
     if save_answer:
         destination = Path(save_answer).expanduser()
+        # If the path is relative, resolve it under 05-Queries/.
+        if not destination.is_absolute():
+            destination = config.queries_dir / destination
+        destination.parent.mkdir(parents=True, exist_ok=True)
         if destination.exists() and not force:
             _fail(
                 (
@@ -133,8 +140,9 @@ def query(
     session_store.save(saved_session)
 
     if save_answer:
+        assert destination is not None
         try:
-            _save_answer(Path(save_answer).expanduser(), answer)
+            _save_answer(destination, answer)
         except OSError as exc:
             _fail(
                 f"Could not save answer: {exc}",
@@ -158,7 +166,8 @@ def query(
         f"\n---\n*Answer based on {len(sections)} wiki page(s). Model: {config.llm.model}*"
     )
     if save_answer:
-        typer.echo(f"Saved answer: {Path(save_answer).expanduser()}")
+        assert destination is not None
+        typer.echo(f"Saved answer: {destination}")
 
 
 def _build_system(profile_instructions: str, instructions: str, sections: tuple) -> str:
