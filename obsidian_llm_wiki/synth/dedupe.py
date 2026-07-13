@@ -388,6 +388,10 @@ def semantic_dedupe_concepts(
         remapped_concepts = []
         for concept in synthesis.concepts:
             concept.slug = merge_map.get(concept.slug, concept.slug)
+            # Also remap related links on source-local concepts
+            for link in concept.related:
+                if link.slug in merge_map:
+                    link.slug = merge_map[link.slug]
             if concept.slug in seen_source_slugs:
                 continue  # two of this source's concepts merged into one
             seen_source_slugs.add(concept.slug)

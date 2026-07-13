@@ -1048,25 +1048,29 @@ Return JSON:
 
     sections = []
     for s in data.get("sections", []):
-        sections.append(BodySection(
-            heading=s.get("heading", ""),
-            points=s.get("points", []),
-            prose=s.get("prose", ""),
-        ))
+        if isinstance(s, dict):
+            sections.append(BodySection(
+                heading=s.get("heading", ""),
+                points=s.get("points", []),
+                prose=s.get("prose", ""),
+            ))
 
     claims = []
     for c in data.get("claims", []):
-        claims.append(Claim(
-            text=c.get("text", ""),
-            concept_slug=concept.slug,
-            source_ref=c.get("source_ref", ""),
-        ))
+        if isinstance(c, dict):
+            claims.append(Claim(
+                text=c.get("text", ""),
+                concept_slug=concept.slug,
+                source_ref=c.get("source_ref", ""),
+            ))
+
+    from obsidian_llm_wiki.synth.dedupe import normalise_tags
 
     return ConceptNote(
         title=data.get("title", concept.title),
         slug=data.get("slug", concept.slug),
         summary=data.get("summary", concept.summary),
-        tags=list(dict.fromkeys(concept.tags + data.get("tags", []))),
+        tags=normalise_tags(list(dict.fromkeys(concept.tags + data.get("tags", [])))),
         aliases=concept.aliases,
         sections=sections,
         claims=claims,
