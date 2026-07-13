@@ -166,14 +166,68 @@ def call_llm(
     config: Any,
     **kwargs: Any,
 ) -> str:
-    """Synchronous LLM call with exponential-backoff retry."""
+    """Synchronous LLM call with exponential-backoff retry.
+
+    When *messages* is a list of structured message dicts (with role/content),
+    the messages are passed directly to the LLM client. When *messages* is a
+    string or a flat list without role info, *system* is used as the system
+    prompt and *messages* as the user content (legacy behaviour).
+    """
     llm_config = _resolve_llm_config(config)
     client = create_llm_client(llm_config)
     max_retries = getattr(config, "retry_count", 3)
-    user = _extract_user_content(messages)
 
     # Filter kwargs the sync clients don't understand.
     chat_kwargs = {k: v for k, v in kwargs.items() if k not in ("tools", "on_token")}
+
+    # Check if messages is a structured list with role dicts.
+    is_structured = (
+        isinstance(messages, list)
+        and messages
+        and isinstance(messages[0], dict)
+        and "role" in messages[0]
+    )
+    if is_structured:
+        # Structured messages — pass directly to client.
+        # The OllamaClient/OpenAICompatibleClient.chat() expects (system, user)
+        # but we bypass that and build the request body directly.
+        structured_messages = messages
+        # Extract system from the structured messages if present.
+        sys_content = ""
+        user_content = ""
+        for msg in structured_messages:
+            if msg.get("role") == "system":
+                sys_content = msg.get("content", "")
+            elif msg.get("role") == "user":
+                user_content = msg.get("content", "")
+        # If no system in messages, fall back to the system arg (but only if
+        # it's not the same as user_content — which happens when the pipeline
+        # passes the prompt as both system and in messages).
+        if not sys_content and system and system != user_content:
+            sys_content = system
+        # Use a short system prompt if none was provided.
+        if not sys_content:
+            sys_content = "You are a helpful assistant."
+
+        for attempt in range(max_retries):
+            try:
+                return client.chat(sys_content, user_content, **chat_kwargs)
+            except Exception:
+                if attempt == max_retries - 1:
+                    raise
+                delay = (
+                    getattr(config, "retry_base_ms", 1000)
+                    * (getattr(config, "retry_multiplier", 4) ** attempt)
+                ) / 1000.0
+                logger.warning(
+                    "LLM call attempt %d/%d failed. Retrying in %.1fs…",
+                    attempt + 1, max_retries, delay,
+                )
+                time.sleep(delay)
+        raise RuntimeError("LLM call exhausted retries")  # pragma: no cover
+
+    # Legacy path: system + user content
+    user = _extract_user_content(messages)
 
     for attempt in range(max_retries):
         try:
