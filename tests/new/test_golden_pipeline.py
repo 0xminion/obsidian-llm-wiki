@@ -197,8 +197,8 @@ async def test_golden_pipeline_end_to_end(tmp_path: Path):
     assert "Self-attention complexity is O(n^2)" in body
     assert "## Related Concepts" not in body
     assert "## Cross-References / 关联图谱" in body
-    assert "[[multi-head-attention]]" in body
-    assert "[[positional-encoding]]" in body
+    assert "[[multi-head-attention|" in body
+    assert "[[positional-encoding|" in body
 
     # ── Assert entry page content ───────────────────────────────────────
     entry_page = safe_read_file(bundle / "entries" / "attention-is-all-you-need.md")

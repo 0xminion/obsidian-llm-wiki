@@ -41,7 +41,13 @@ from obsidian_llm_wiki.render.bilingual import (
     normalize_bilingual_titles_and_slugs as _normalize_bilingual_titles_and_slugs,
 )
 from obsidian_llm_wiki.render.crossrefs import (
+    build_cross_links as _build_cross_links,
+)
+from obsidian_llm_wiki.render.crossrefs import (
     build_cross_ref_diagram as _build_cross_ref_diagram,
+)
+from obsidian_llm_wiki.render.crossrefs import (
+    build_moc_cross_links as _build_moc_cross_links,
 )
 from obsidian_llm_wiki.render.crossrefs import (
     build_moc_cross_ref_diagram as _build_moc_cross_ref_diagram,
@@ -295,9 +301,10 @@ def render_concept_page(
         parts.append("")
 
     # ── 关联图谱 / Cross-References ──────────────────────────────────
-    # Typed-edge relationship graph. Shown when all_concepts is provided.
-    # Renders inside a markdown code block (```text) for monospace display
-    # with copy icon in Obsidian, matching the user's screenshot format.
+    # The ASCII flow diagram goes inside a ```text code block for monospace
+    # display. The cross-link wikilinks are rendered as regular markdown
+    # outside the code block so Obsidian treats them as live, clickable
+    # links — wikilinks inside code blocks are literal text.
     if all_concepts and concept.related:
         cross_ref_lines = _build_cross_ref_diagram(concept, all_concepts)
         if cross_ref_lines:
@@ -306,6 +313,11 @@ def render_concept_page(
             parts.extend(cross_ref_lines)
             parts.append("```")
             parts.append("")
+            # Clickable cross-links outside the code block
+            cross_links = _build_cross_links(concept, all_concepts)
+            if cross_links:
+                parts.extend(cross_links)
+                parts.append("")
 
     body = "\n".join(parts)
     return f"{build_frontmatter(fm)}\n{body}"
@@ -372,7 +384,7 @@ def render_moc_page(
         parts.append("")
 
     # ── 关联图谱 / Cross-References in MoC ──────────────────────────
-    # Show relationship diagram between concepts in this MoC
+    # ASCII flow diagram in a code block + clickable wikilinks outside.
     if all_concepts and moc.concept_slugs:
         moc_concepts = [
             all_concepts[s] for s in moc.concept_slugs
@@ -386,6 +398,11 @@ def render_moc_page(
                 parts.extend(diagram_lines)
                 parts.append("```")
                 parts.append("")
+                # Clickable cross-links outside the code block
+                moc_cross_links = _build_moc_cross_links(moc_concepts, all_concepts)
+                if moc_cross_links:
+                    parts.extend(moc_cross_links)
+                    parts.append("")
 
     # ── Cross-lingual links from embedding ──────────────────────────
     # Instead of a separate section, merge cross-lingual concepts into the

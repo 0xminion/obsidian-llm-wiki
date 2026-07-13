@@ -216,7 +216,7 @@ def test_render_vault_full(tmp_path: Path):
 
     # Check concept page has wikilinks.
     concept_a = (bundle_dir / "concepts" / "concept-a.md").read_text()
-    assert "[[concept-b]]" in concept_a
+    assert "[[concept-b|" in concept_a
 
     # Check entry has concept wikilinks.
     entry = (bundle_dir / "entries" / "paper-a.md").read_text()
@@ -225,4 +225,4 @@ def test_render_vault_full(tmp_path: Path):
     # Check MOC has concept wikilinks.
     moc = (bundle_dir / "mocs" / "ml-topic.md").read_text()
     assert "[[concept-a]]" in moc
-    assert "[[concept-b]]" in moc
+    assert "[[concept-b|" in moc

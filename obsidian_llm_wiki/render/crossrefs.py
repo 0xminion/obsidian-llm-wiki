@@ -10,7 +10,9 @@ from obsidian_llm_wiki.core.models import ConceptNote
 
 __all__ = [
     "build_cross_ref_diagram",
+    "build_cross_links",
     "build_moc_cross_ref_diagram",
+    "build_moc_cross_links",
     # Backward-compat aliases
     "_build_cross_ref_diagram",
     "_build_moc_cross_ref_diagram",
@@ -21,17 +23,11 @@ def build_cross_ref_diagram(
     concept: ConceptNote,
     all_concepts: dict[str, ConceptNote],
 ) -> list[str]:
-    """Build the typed-edge cross-reference section as an ASCII flow diagram.
+    """Build the typed-edge cross-reference ASCII flow diagram.
 
-    Renders inside a code block (```text) so Obsidian shows it as monospace
-    with a copy icon.
-
-    Format:
-      Concept A
-          ↓ relation
-      Concept B → Concept C
-
-      Cross-links: [[slug]] (descriptor)
+    Returns only the diagram lines (for a ```text code block). Cross-link
+    wikilinks are produced separately by :func:`build_cross_links` so they
+    can be rendered as clickable markdown outside the code block.
     """
     lines: list[str] = []
 
@@ -77,37 +73,36 @@ def build_cross_ref_diagram(
         else:
             lines.append(f"{target_display}")
 
-    # Cross-links section
-    if lines and concept.related:
-        cross_link_lines: list[str] = []
-        for link in concept.related:
-            target = all_concepts.get(link.slug)
-            if target:
-                descriptor = link.relation or "related"
-                cross_link_lines.append(
-                    f"  [[{link.slug}]] ({descriptor})"
-                )
-        if cross_link_lines:
-            lines.append("")
-            lines.append("Cross-links:")
-            lines.extend(cross_link_lines)
-
     return lines
+
+
+def build_cross_links(
+    concept: ConceptNote,
+    all_concepts: dict[str, ConceptNote],
+) -> list[str]:
+    """Return clickable wikilink lines for cross-references.
+
+    These are rendered as regular markdown (outside any code block) so
+    Obsidian treats the ``[[slug]]`` syntax as live, navigable links.
+    """
+    cross_link_lines: list[str] = []
+    for link in concept.related:
+        target = all_concepts.get(link.slug)
+        if target:
+            descriptor = link.relation or "related"
+            display = link.display or target.title
+            cross_link_lines.append(f"- [[{link.slug}|{display}]] ({descriptor})")
+    return cross_link_lines
 
 
 def build_moc_cross_ref_diagram(
     moc_concepts: list[ConceptNote],
     all_concepts: dict[str, ConceptNote],
 ) -> list[str]:
-    """Build ASCII flow diagram matching concept cross-ref format.
+    """Build ASCII flow diagram for MoC cross-references.
 
-    Format (consistent with build_cross_ref_diagram):
-      Concept A
-          ↓ relation
-      Concept B
-
-      Cross-links:
-        [[slug-a]] (relation)
+    Returns only the diagram lines (for a ```text code block). Cross-link
+    wikilinks are produced separately by :func:`build_moc_cross_links`.
     """
     lines: list[str] = []
     seen_pairs: set[tuple[str, str]] = set()
@@ -141,30 +136,39 @@ def build_moc_cross_ref_diagram(
                 lines.append(f"{target.title}")
             lines.append("")
 
-    # Cross-links section
-    if lines:
-        cross_links: list[str] = []
-        seen_link_slugs: set[str] = set()
-        for concept in moc_concepts:
-            for link in concept.related or []:
-                if link.slug not in moc_slugs:
-                    continue
-                pair = tuple(sorted([concept.slug, link.slug]))
-                if pair in seen_link_slugs:
-                    continue
-                seen_link_slugs.add(pair)
-                descriptor = link.relation or "related"
-                cross_links.append(
-                    f"  [[{link.slug}]] ({descriptor})"
-                )
-        if cross_links:
-            if lines and lines[-1] == "":
-                lines.pop()
-            lines.append("")
-            lines.append("Cross-links:")
-            lines.extend(cross_links)
+    # Remove trailing blank line so the code block closes cleanly.
+    if lines and lines[-1] == "":
+        lines.pop()
 
     return lines
+
+
+def build_moc_cross_links(
+    moc_concepts: list[ConceptNote],
+    all_concepts: dict[str, ConceptNote],
+) -> list[str]:
+    """Return clickable wikilink lines for MoC cross-references.
+
+    Rendered as regular markdown outside the code block for navigation.
+    """
+    moc_slugs = {c.slug for c in moc_concepts}
+    cross_links: list[str] = []
+    seen_link_slugs: set[tuple[str, str]] = set()
+
+    for concept in moc_concepts:
+        for link in concept.related or []:
+            if link.slug not in moc_slugs:
+                continue
+            pair = tuple(sorted([concept.slug, link.slug]))
+            if pair in seen_link_slugs:
+                continue
+            seen_link_slugs.add(pair)
+            target = all_concepts.get(link.slug)
+            descriptor = link.relation or "related"
+            display = link.display or (target.title if target else link.slug)
+            cross_links.append(f"- [[{link.slug}|{display}]] ({descriptor})")
+
+    return cross_links
 
 
 # Backward-compat aliases
