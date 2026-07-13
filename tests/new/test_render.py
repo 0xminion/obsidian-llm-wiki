@@ -226,3 +226,21 @@ def test_render_vault_full(tmp_path: Path):
     moc = (bundle_dir / "mocs" / "ml-topic.md").read_text()
     assert "[[concept-a]]" in moc
     assert "[[concept-b|" in moc
+
+    # ── Dataview views, source dependency graph, and log.md ──────────
+    # render_vault should now also generate views/, source-dependency-graph,
+    # and log.md.
+    assert (bundle_dir / "views" / "concepts-by-confidence.md").exists()
+    assert (bundle_dir / "views" / "mocs-by-count.md").exists()
+    assert (bundle_dir / "views" / "contradictions-by-status.md").exists()
+    assert (bundle_dir / "views" / "sources-by-freshness.md").exists()
+    assert (bundle_dir / "views" / "index.md").exists()
+    assert (bundle_dir / ".llmwiki" / "source-dependency-graph.json").exists()
+    assert (bundle_dir / ".llmwiki" / "source-dependency-graph.mmd").exists()
+    assert (bundle_dir / "log.md").exists()
+
+    # log.md should have at least one grep-parseable entry.
+    log_content = (bundle_dir / "log.md").read_text(encoding="utf-8")
+    log_entries = [ln for ln in log_content.splitlines() if ln.startswith("## [")]
+    assert len(log_entries) >= 1
+    assert any("BUILD" in ln for ln in log_entries)

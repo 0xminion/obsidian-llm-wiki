@@ -94,6 +94,78 @@ def test_moc_cross_ref_diagram_unidirectional():
     assert "↔" not in joined
 
 
+# ── render/obsidian.py: MoC cross-refs with no inter-concept relations ──────
+
+
+def test_moc_cross_ref_diagram_no_inter_concept_relations_shows_placeholder():
+    """MoC with ≥2 concepts but no inter-concept relations shows placeholder message."""
+    from obsidian_llm_wiki.core.models import MapOfContent
+    from obsidian_llm_wiki.render.obsidian import render_moc_page
+
+    a = _make_concept("concept-a", "Concept A", related=[])
+    b = _make_concept("concept-b", "Concept B", related=[])
+    moc = MapOfContent(
+        title="Empty Relations MoC", slug="empty-relations-moc",
+        summary="MoC with no inter-concept relations.",
+        concept_slugs=["concept-a", "concept-b"],
+    )
+    page = render_moc_page(
+        moc, all_concepts={"concept-a": a, "concept-b": b},
+    )
+    # Section heading must always be present for structural consistency
+    assert "## Cross-References / 关联图谱" in page
+    # Placeholder message must appear
+    assert "No cross-references available yet" in page
+    # No code block (since there's no diagram to render)
+    assert "```text" not in page
+
+
+def test_moc_cross_ref_diagram_with_relations_still_works():
+    """MoC with inter-concept relations renders the diagram as before."""
+    from obsidian_llm_wiki.core.models import ConceptLink, MapOfContent
+    from obsidian_llm_wiki.render.obsidian import render_moc_page
+
+    a = _make_concept(
+        "concept-a", "Concept A",
+        related=[ConceptLink(slug="concept-b", relation="enables")],
+    )
+    b = _make_concept(
+        "concept-b", "Concept B",
+        related=[ConceptLink(slug="concept-a", relation="enabled_by")],
+    )
+    moc = MapOfContent(
+        title="Related MoC", slug="related-moc",
+        summary="MoC with inter-concept relations.",
+        concept_slugs=["concept-a", "concept-b"],
+    )
+    page = render_moc_page(
+        moc, all_concepts={"concept-a": a, "concept-b": b},
+    )
+    assert "## Cross-References / 关联图谱" in page
+    assert "```text" in page
+    assert "↔" in page
+    # Placeholder should NOT appear when relations exist
+    assert "No cross-references available yet" not in page
+
+
+def test_moc_cross_ref_diagram_single_concept_no_section():
+    """MoC with only 1 concept still has no Cross-References section."""
+    from obsidian_llm_wiki.core.models import MapOfContent
+    from obsidian_llm_wiki.render.obsidian import render_moc_page
+
+    a = _make_concept("concept-a", "Concept A", related=[])
+    moc = MapOfContent(
+        title="Single MoC", slug="single-moc",
+        summary="MoC with only one concept.",
+        concept_slugs=["concept-a"],
+    )
+    page = render_moc_page(
+        moc, all_concepts={"concept-a": a},
+    )
+    assert "## Cross-References / 关联图谱" not in page
+    assert "No cross-references available yet" not in page
+
+
 # ── render/obsidian.py: render_moc_page cross-lingual links ─────────────────
 
 

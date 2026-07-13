@@ -59,6 +59,8 @@ _SYSTEM_SYNTH = (
 
 __all__ = [
     "quality_synthesize_source",
+    "multi_model_entry_synthesize_source",
+    "merge_entry_syntheses",
     "build_extract_prompt",
     "build_expand_prompt",
     "concept_body_chars",
@@ -192,6 +194,199 @@ def merge_skeletons(skeletons: list[SourceSynthesis]) -> SourceSynthesis:
     merged.maps = list(moc_by_slug.values())
 
     return merged
+
+
+# ── Multi-model entry synthesis (section merging) ──────────────────────
+
+
+def _section_key(section: BodySection) -> str:
+    """Normalised heading used to match sections across models."""
+    return (section.heading or "").strip().lower()
+
+
+def merge_entry_syntheses(
+    primary: SourceSynthesis,
+    secondary: SourceSynthesis,
+    *,
+    concept_min_body_chars: int = 0,
+) -> SourceSynthesis:
+    """Merge two per-source syntheses by taking the deepest sections.
+
+    For each concept slug present in *primary*, the merged concept keeps
+    all sections from *primary*.  For sections also present in *secondary*
+    (matched by normalised heading), the **deeper** version wins — deeper
+    meaning more total body chars (points + prose).  Sections unique to
+    *secondary* are appended.
+
+    Concepts that only appear in *secondary* (model B found a concept the
+    default model missed) are appended to the result.
+
+    Entry-level fields (``source_summary``, ``key_points``,
+    ``open_questions``, ``source_tags``) are unioned, keeping the primary
+    model's values first.
+
+    MoCs are merged the same way as in ``merge_skeletons``: union by slug,
+    ``concept_slugs`` unioned.
+
+    Parameters
+    ----------
+    primary
+        Synthesis from the default model (gemma4:31b-cloud).
+    secondary
+        Synthesis from the pass-2 model (GLM-5.2:cloud).
+    concept_min_body_chars
+        If > 0, used only for logging which model's section won.
+    """
+    merged = SourceSynthesis(
+        source_title=primary.source_title or secondary.source_title,
+        source_summary=primary.source_summary or secondary.source_summary,
+        source_file=primary.source_file or secondary.source_file,
+        language=primary.language or secondary.language,
+    )
+
+    # ── Union entry-level metadata ──────────────────────────────────
+    all_tags: set[str] = set(primary.source_tags) | set(secondary.source_tags)
+    merged.source_tags = sorted(all_tags)
+
+    seen_points: set[str] = set()
+    for kp in primary.key_points:
+        if kp not in seen_points:
+            seen_points.add(kp)
+            merged.key_points.append(kp)
+    for kp in secondary.key_points:
+        if kp not in seen_points:
+            seen_points.add(kp)
+            merged.key_points.append(kp)
+
+    seen_q: set[str] = set()
+    for q in primary.open_questions:
+        if q not in seen_q:
+            seen_q.add(q)
+            merged.open_questions.append(q)
+    for q in secondary.open_questions:
+        if q not in seen_q:
+            seen_q.add(q)
+            merged.open_questions.append(q)
+
+    # ── Merge concepts by slug ──────────────────────────────────────
+    concept_by_slug: dict[str, ConceptNote] = {}
+
+    for concept in primary.concepts:
+        concept_by_slug[concept.slug] = concept
+
+    for concept in secondary.concepts:
+        if concept.slug not in concept_by_slug:
+            # Secondary model found a concept the primary missed — keep it.
+            concept_by_slug[concept.slug] = concept
+            continue
+
+        existing = concept_by_slug[concept.slug]
+
+        # Build a section map from primary, keyed by normalised heading.
+        merged_sections: list[BodySection] = []
+        section_map: dict[str, int] = {}  # heading key → index in merged_sections
+
+        for sec in existing.sections:
+            merged_sections.append(sec)
+            section_map[_section_key(sec)] = len(merged_sections) - 1
+
+        # Merge in secondary sections: replace if deeper, else append.
+        for sec in concept.sections:
+            key = _section_key(sec)
+            if key in section_map:
+                idx = section_map[key]
+                primary_chars = _section_body_chars(merged_sections[idx])
+                secondary_chars = _section_body_chars(sec)
+                if secondary_chars > primary_chars:
+                    if concept_min_body_chars > 0:
+                        logger.debug(
+                            "merge_entry: concept '%s' section '%s' — "
+                            "secondary deeper (%d > %d chars)",
+                            concept.slug, sec.heading or "(untitled)",
+                            secondary_chars, primary_chars,
+                        )
+                    merged_sections[idx] = sec
+            else:
+                merged_sections.append(sec)
+                section_map[key] = len(merged_sections) - 1
+
+        # Union tags.
+        merged_tags = list(existing.tags)
+        for tag in concept.tags:
+            if tag not in merged_tags:
+                merged_tags.append(tag)
+
+        # Union claims (dedup by text).
+        merged_claims = list(existing.claims)
+        seen_claim_texts: set[str] = {c.text for c in existing.claims}
+        for claim in concept.claims:
+            if claim.text not in seen_claim_texts:
+                seen_claim_texts.add(claim.text)
+                merged_claims.append(claim)
+
+        # Union related (dedup by slug).
+        merged_related = list(existing.related)
+        seen_rel_slugs: set[str] = {r.slug for r in existing.related}
+        for link in concept.related:
+            if link.slug not in seen_rel_slugs:
+                seen_rel_slugs.add(link.slug)
+                merged_related.append(link)
+
+        # Union aliases.
+        merged_aliases = list(existing.aliases)
+        for alias in concept.aliases:
+            if alias not in merged_aliases:
+                merged_aliases.append(alias)
+
+        # Use the longer summary.
+        chosen_summary = (
+            existing.summary
+            if len(existing.summary) >= len(concept.summary)
+            else concept.summary
+        )
+
+        concept_by_slug[concept.slug] = ConceptNote(
+            title=existing.title or concept.title,
+            slug=existing.slug,
+            summary=chosen_summary,
+            tags=merged_tags,
+            aliases=merged_aliases,
+            sections=merged_sections,
+            claims=merged_claims,
+            related=merged_related,
+            confidence=max(existing.confidence, concept.confidence),
+            provenance="merged",
+            is_new=existing.is_new and concept.is_new,
+        )
+
+    merged.concepts = list(concept_by_slug.values())
+
+    # ── Merge MoCs by slug (same logic as merge_skeletons) ───────────
+    moc_by_slug: dict[str, MapOfContent] = {}
+    for moc in primary.maps:
+        moc_by_slug[moc.slug] = moc
+    for moc in secondary.maps:
+        if moc.slug in moc_by_slug:
+            existing_moc = moc_by_slug[moc.slug]
+            for slug in moc.concept_slugs:
+                if slug not in existing_moc.concept_slugs:
+                    existing_moc.concept_slugs.append(slug)
+            for tag in moc.tags:
+                if tag not in existing_moc.tags:
+                    existing_moc.tags.append(tag)
+        else:
+            moc_by_slug[moc.slug] = moc
+    merged.maps = list(moc_by_slug.values())
+
+    return merged
+
+
+def _section_body_chars(section: BodySection) -> int:
+    """Count body characters in a single section."""
+    total = len(section.prose)
+    for point in section.points:
+        total += len(point)
+    return total
 
 
 # ── Gradient confidence scoring ─────────────────────────────────────────
@@ -755,6 +950,134 @@ async def quality_synthesize_source(
             filename, len(skeleton.concepts),
         )
     return skeleton
+
+
+def _swap_llm(
+    config: Any,
+    *,
+    model: str | None = None,
+    ingest_model: str | None = None,
+    expand_model: str | None = None,
+) -> Any:
+    """Return a config copy with the LLM model overrides swapped.
+
+    Works with both dataclass Config (via ``dataclasses.replace``) and
+    plain test stubs (via shallow copy + attribute assignment).
+    """
+    import copy
+    import dataclasses
+
+    new_llm = dataclasses.replace(
+        config.llm,
+        model=model if model is not None else config.llm.model,
+        ingest_model=ingest_model,
+        expand_model=expand_model,
+    )
+
+    if dataclasses.is_dataclass(config):
+        return dataclasses.replace(config, llm=new_llm)
+
+    # Fallback for non-dataclass test stubs: shallow copy + attribute set.
+    new_config = copy.copy(config)
+    new_config.llm = new_llm
+    return new_config
+
+
+async def multi_model_entry_synthesize_source(
+    config: Any,
+    filename: str,
+    source: SourceDoc,
+    existing_concepts: list[str],
+    *,
+    schema_policy: SchemaPolicy | Mapping[str, Any] | None = None,
+    granularity: Granularity | str | None = None,
+) -> SourceSynthesis | None:
+    """Run entry synthesis with both the default and PASS2 model, then merge.
+
+    When ``config.llm.expand_model`` is set (e.g. ``PASS2_MODEL=GLM-5.2:cloud``),
+    this function runs the full two-pass synthesis **twice**:
+
+    1. **Primary run** — both Pass 1 (extract) and Pass 2 (expand) use the
+       default model (``config.llm.model``).
+    2. **Secondary run** — both passes use the expand model override
+       (``config.llm.expand_model``).
+
+    The two syntheses are merged with :func:`merge_entry_syntheses`, which
+    takes the deepest section for each concept (by body char count) and
+    unions entry-level metadata, tags, claims, and related links.
+
+    If no ``expand_model`` is configured, falls back to the standard
+    :func:`quality_synthesize_source` (which uses the default model for
+    Pass 1 and the expand model for Pass 2 — or the default model for both
+    when there is no override).
+
+    If either run fails (returns ``None``), the other run's result is used
+    as-is. If both fail, ``None`` is returned.
+    """
+    expand_model = getattr(config.llm, "expand_model", None)
+    if not expand_model:
+        return await quality_synthesize_source(
+            config, filename, source, existing_concepts,
+            schema_policy=schema_policy, granularity=granularity,
+        )
+
+    logger.info(
+        "Multi-model entry synthesis for '%s': primary=%s, secondary=%s",
+        filename, config.llm.model, expand_model,
+    )
+
+    default_model = config.llm.model
+
+    # ── Primary run: default model for both passes ──────────────────
+    # Override model overrides to None so Pass 1 and Pass 2 both use
+    # config.llm.model.
+    config_primary = _swap_llm(
+        config,
+        model=default_model,
+        ingest_model=None,
+        expand_model=None,
+    )
+
+    primary = await quality_synthesize_source(
+        config_primary, filename, source, existing_concepts,
+        schema_policy=schema_policy, granularity=granularity,
+    )
+
+    # ── Secondary run: PASS2_MODEL for both passes ───────────────────
+    config_secondary = _swap_llm(
+        config,
+        model=expand_model,
+        ingest_model=None,
+        expand_model=expand_model,
+    )
+
+    secondary = await quality_synthesize_source(
+        config_secondary, filename, source, existing_concepts,
+        schema_policy=schema_policy, granularity=granularity,
+    )
+
+    # ── Merge or fall back ──────────────────────────────────────────
+    if primary is None and secondary is None:
+        return None
+    if primary is None:
+        return secondary
+    if secondary is None:
+        return primary
+
+    merged = merge_entry_syntheses(
+        primary, secondary,
+        concept_min_body_chars=getattr(config, "concept_min_body_chars", 0),
+    )
+
+    logger.info(
+        "Multi-model merge for '%s': %d primary + %d secondary → %d concepts, "
+        "%d sections total",
+        filename,
+        len(primary.concepts), len(secondary.concepts),
+        len(merged.concepts),
+        sum(len(c.sections) for c in merged.concepts),
+    )
+    return merged
 
 
 async def _expand_one_concept(

@@ -33,6 +33,49 @@ _JATS_HOSTS = frozenset((
 ))
 
 
+def _try_publisher_pdf(raw_url: str) -> SourceDoc | None:
+    """Try to download a PDF from the publisher's direct PDF URL.
+
+    Many academic publishers (akjournals, etc.) serve PDFs at a
+    ``/downloadpdf/view/`` path even when the XML/HTML endpoints are
+    captcha-walled. This constructs the PDF URL from the article URL
+    and attempts to download and extract it via the PDF extractor.
+    """
+    from urllib.parse import urlparse
+
+    parsed = urlparse(raw_url)
+    host = (parsed.hostname or "").lower()
+    path = parsed.path
+
+    # Only attempt for known JATS publishers with PDF endpoints.
+    if "akjournals" not in host:
+        return None
+
+    # akjournals pattern:
+    #   /view/journals/2054/9/3/article-p294.xml
+    # → /downloadpdf/view/journals/2054/9/3/article-p294.pdf
+    if "/view/journals/" not in path:
+        return None
+
+    pdf_path = path.replace("/view/", "/downloadpdf/view/")
+    if pdf_path.endswith(".xml"):
+        pdf_path = pdf_path[:-4] + ".pdf"
+    elif not pdf_path.endswith(".pdf"):
+        pdf_path += ".pdf"
+
+    pdf_url = f"{parsed.scheme}://{host}{pdf_path}"
+
+    try:
+        from obsidian_llm_wiki.ingest.documents import dispatch_document
+        logger.info("Trying publisher PDF: %s", pdf_url)
+        source = dispatch_document(pdf_url)
+        logger.info("Publisher PDF extracted %d chars", len(source.content))
+        return source
+    except Exception as exc:
+        logger.debug("Publisher PDF failed: %s", exc)
+        return None
+
+
 def _guess_doi_from_url(url: str) -> str:
     """Attempt to construct a DOI from an akjournals-style URL.
 
@@ -105,7 +148,15 @@ def extract_jats(raw_url: str) -> SourceDoc:
                 return extract_web(html_url)
             except Exception:
                 pass
-            # If extract_web also failed (captcha/405), try Semantic Scholar
+            # Try the publisher's direct PDF download URL.
+            # Many publishers (akjournals, etc.) serve a PDF at a
+            # /downloadpdf/view/... path even when the XML/HTML is
+            # captcha-walled. The residential proxy (RESIDENTIAL_PROXY_URL)
+            # bypasses the bot detection that blocks datacenter IPs.
+            pdf_source = _try_publisher_pdf(raw_url)
+            if pdf_source is not None:
+                return pdf_source
+            # If PDF also failed, try Semantic Scholar
             # title search as a last-resort academic fallback.
             try:
                 from obsidian_llm_wiki.ingest.alt_source import _semantic_scholar_search

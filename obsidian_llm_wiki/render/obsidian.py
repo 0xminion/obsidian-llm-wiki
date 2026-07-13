@@ -387,6 +387,10 @@ def render_moc_page(
 
     # ── 关联图谱 / Cross-References in MoC ──────────────────────────
     # ASCII flow diagram in a code block + clickable wikilinks outside.
+    # Every MoC with ≥2 concepts gets a Cross-References section for
+    # structural consistency — even when no inter-concept relations exist
+    # yet, a placeholder message is shown instead of silently omitting
+    # the section.
     if all_concepts and moc.concept_slugs:
         moc_concepts = [
             all_concepts[s] for s in moc.concept_slugs
@@ -394,8 +398,8 @@ def render_moc_page(
         ]
         if len(moc_concepts) >= 2:
             diagram_lines = _build_moc_cross_ref_diagram(moc_concepts, all_concepts)
+            parts.extend(["## Cross-References / 关联图谱", ""])
             if diagram_lines:
-                parts.extend(["## Cross-References / 关联图谱", ""])
                 parts.append("```text")
                 parts.extend(diagram_lines)
                 parts.append("```")
@@ -405,6 +409,13 @@ def render_moc_page(
                 if moc_cross_links:
                     parts.extend(moc_cross_links)
                     parts.append("")
+            else:
+                # No inter-concept relations yet — show placeholder so
+                # all MoCs have a consistent section structure.
+                parts.extend([
+                    "*No cross-references available yet.*",
+                    "",
+                ])
 
     # ── Cross-lingual links from embedding ──────────────────────────
     # Instead of a separate section, merge cross-lingual concepts into the
@@ -717,5 +728,47 @@ def render_vault(
         written.append(str(graph_dir / "graph.mmd"))
     except Exception as exc:
         logger.debug("Graph export skipped: %s", exc)
+
+    # ── Dataview / Bases views ───────────────────────────────────────
+    # Generate live Dataview views (concepts by confidence, MoCs by count,
+    # contradictions by status, sources by freshness) for Obsidian users.
+    try:
+        from obsidian_llm_wiki.render.dataview import render_dataview_views
+        written.extend(
+            render_dataview_views(bundle_dir, bundle, sources)
+        )
+    except Exception as exc:
+        logger.debug("Dataview views skipped: %s", exc)
+
+    # ── Source dependency graph ──────────────────────────────────────
+    # Export which sources contributed to which concepts (JSON + Mermaid).
+    try:
+        from obsidian_llm_wiki.render.source_graph import export_source_dependency_graph
+        dep_graph_dir = bundle_dir / ".llmwiki"
+        dep_graph_paths = export_source_dependency_graph(bundle, dep_graph_dir)
+        written.extend(dep_graph_paths)
+    except Exception as exc:
+        logger.debug("Source dependency graph skipped: %s", exc)
+
+    # ── Vault log.md ─────────────────────────────────────────────────
+    # Append a chronological entry recording this build/render action.
+    try:
+        from obsidian_llm_wiki.render.log import append_log
+        body_lines = [
+            f"- sources: {source_count}",
+            f"- entries: {entry_count}",
+            f"- concepts: {concept_count}",
+            f"- mocs: {moc_count}",
+        ]
+        if bundle.errors:
+            body_lines.append(f"- errors: {len(bundle.errors)}")
+        log_path = append_log(
+            bundle_dir, "build",
+            f"rendered vault ({source_count} sources, {concept_count} concepts)",
+            body=body_lines,
+        )
+        written.append(str(log_path))
+    except Exception as exc:
+        logger.debug("Vault log append skipped: %s", exc)
 
     return written
