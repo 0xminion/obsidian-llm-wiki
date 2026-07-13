@@ -83,6 +83,8 @@ def read_state(state_file: str | Path) -> WikiState:
 
     sources: dict[str, SourceState] = {}
     for filename, entry in data.get("sources", {}).items():
+        if not isinstance(entry, dict):
+            continue
         sources[filename] = SourceState(
             hash=entry.get("hash", ""),
             concepts=entry.get("concepts", []),

@@ -9,7 +9,10 @@ __all__ = ["acquire_lock", "release_lock"]
 
 
 def acquire_lock(lock_file: str | Path) -> bool:
-    """Try to acquire a compile lock.  Returns True on success."""
+    """Try to acquire a compile lock.  Returns True on success.
+
+    Uses O_CREAT|O_EXCL for atomic creation — no TOCTOU race.
+    """
     lf = Path(lock_file)
     if lf.exists():
         try:
@@ -21,8 +24,17 @@ def acquire_lock(lock_file: str | Path) -> bool:
             pass  # Stale/corrupt lock — reclaim it.
 
     lf.parent.mkdir(parents=True, exist_ok=True)
-    lf.write_text(str(os.getpid()))
-    return True
+    try:
+        # Atomic create-or-fail — eliminates TOCTOU race.
+        fd = os.open(str(lf), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        try:
+            os.write(fd, str(os.getpid()).encode())
+        finally:
+            os.close(fd)
+        return True
+    except FileExistsError:
+        # Another process created the lock between our check and create.
+        return False
 
 
 def release_lock(lock_file: str | Path) -> None:

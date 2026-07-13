@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -32,13 +33,18 @@ from obsidian_llm_wiki.config import Config, load_config
 from obsidian_llm_wiki.core.cache import (
     delete_cached_synthesis,
     load_all_cached_syntheses,
+    load_resynthesis_overlay,
+    save_resynthesis_overlay,
     save_synthesis,
 )
 from obsidian_llm_wiki.core.lock import acquire_lock, release_lock
+from obsidian_llm_wiki.core.metrics import MetricsCollector
 from obsidian_llm_wiki.core.models import (
     CompileResult,
+    ConceptNote,
     SourceDoc,
     SourceSynthesis,
+    SynthesisBundle,
     WikiState,
 )
 from obsidian_llm_wiki.core.orphan import mark_orphaned_concepts
@@ -55,6 +61,33 @@ from obsidian_llm_wiki.synth.parser import parse_single_source_synthesis
 from obsidian_llm_wiki.synth.prompts import build_synthesis_prompt
 
 logger = logging.getLogger("obswiki.core.pipeline")
+
+# System prompt for LLM calls — kept short to avoid proxy system-prompt
+# truncation. The full synthesis instructions go in the user message.
+_SYSTEM_PROMPT = (
+    "You are a knowledge synthesis engine. "
+    "Return ONLY a JSON object, no prose, no code fences."
+)
+
+# ── Retry truncation levels ────────────────────────────────────────────────
+# When a source fails synthesis for a SIZE-RELATED reason, progressively
+# truncate content and retry.
+_TRUNCATION_LEVELS = [None, 50_000, 20_000]  # full → 50K → 20K
+
+
+def _is_size_related_failure(exc: BaseException) -> bool:
+    """Whether truncating the source content could plausibly fix *exc*.
+
+    Only timeouts qualify: on a local LLM they usually mean the prompt is too
+    large for the model/host to finish in time. Everything else (connection
+    refused, HTTP errors, auth, bugs) is NOT fixed by discarding content —
+    the provider layer already retried transient errors with backoff, and
+    "retrying" such a failure at 20K of a 200K source would just build the
+    wiki from a fraction of the document while reporting success.
+    """
+    import httpx
+
+    return isinstance(exc, TimeoutError | httpx.TimeoutException)
 
 
 async def run_pipeline(
@@ -90,6 +123,10 @@ async def run_pipeline(
     if not acquire_lock(config.lock_file):
         result.errors.append("lock: another compilation is running")
         return result
+
+    # ── Initialise metrics collector ──────────────────────────────────
+    metrics = MetricsCollector(vault)
+    metrics.start_run()
 
     try:
         # ── Read state ─────────────────────────────────────────────────
@@ -131,8 +168,11 @@ async def run_pipeline(
                 continue
             if content_len > config.max_source_chars:
                 logger.warning(
-                    "Source '%s' is %d chars — truncating to %d",
+                    "Source '%s' is %d chars — exceeds max_source_chars (%d), "
+                    "truncating to safety cap. Sources above chunk_size (%d) "
+                    "will be chunked during two-pass synthesis.",
                     filename, content_len, config.max_source_chars,
+                    config.chunk_size,
                 )
                 source = SourceDoc(
                     title=source.title,
@@ -168,13 +208,15 @@ async def run_pipeline(
             # ── Build existing concept index for dedup context ─────────
             existing_concepts = _existing_concept_slugs(state, all_syntheses_by_file)
 
-            # ── Synthesise: one LLM call per changed source ─────────────
+            # ── Synthesise with truncation-based retry ──────────────────
+            # Each source is tried at full content, then 50K, then 20K.
             sem = asyncio.Semaphore(config.compile_concurrency)
 
             async def _synth_one(filename: str, source: SourceDoc):
                 async with sem:
-                    return await _synthesize_source(
-                        config, filename, source, existing_concepts
+                    return await _synthesize_with_retry(
+                        config, filename, source, existing_concepts,
+                        metrics,
                     )
 
             synth_results = await asyncio.gather(
@@ -184,15 +226,20 @@ async def run_pipeline(
 
             # ── Collect successful syntheses + cache them ──────────────
             filenames_done: list[str] = []
-            for i, res in enumerate(synth_results):
-                filename = list(to_compile.keys())[i]
+            for filename, res in zip(to_compile.keys(), synth_results, strict=True):
+                # Failure metrics were already recorded per attempt inside
+                # _synthesize_with_retry — recording again here would count
+                # one failed source as 4 failures in metrics.json.
                 if isinstance(res, BaseException):
                     logger.error("Synthesis failed for '%s': %s", filename, res)
                     result.errors.append(f"synth:{filename}:{res}")
                     continue
                 if res is None:
-                    logger.warning("Synthesis produced no output for '%s'", filename)
-                    result.errors.append(f"synth:{filename}: no output")
+                    logger.warning(
+                        "Synthesis produced no output for '%s' "
+                        "(tried all truncation levels)", filename,
+                    )
+                    result.errors.append(f"synth:{filename}: no output (permanent failure)")
                     continue
                 all_syntheses_by_file[filename] = res
                 save_synthesis(res, config.llmwiki_dir, filename)
@@ -214,12 +261,80 @@ async def run_pipeline(
         result.errors.extend(bundle.errors)
 
         # ── Backlink propagation: ensure bidirectional edges ──────────
-        # After merging cached + fresh syntheses, old concepts may not
-        # have reverse links to new concepts that reference them. This
-        # pass walks all edges and adds missing reverse links so MoC
-        # cross-reference diagrams show bidirectional arrows correctly.
         from obsidian_llm_wiki.synth.dedupe import propagate_backlinks
         propagate_backlinks(bundle)
+
+        # ── Re-apply persisted resynthesized concepts ──────────────────
+        # merge_bundle rebuilt every concept from the per-source caches, which
+        # still hold pre-resynthesis bodies. Without re-applying the overlay,
+        # every coherently rewritten concept would revert to its mechanical
+        # merge on the next run. Entries whose slug was freshly extracted this
+        # run are dropped: the fresh synthesis supersedes them (and overlapping
+        # slugs get re-resynthesized below).
+        overlay = load_resynthesis_overlay(config.llmwiki_dir)
+        overlay_dirty = False
+        if overlay:
+            fresh_slugs = {
+                c.slug
+                for f in filenames_done
+                for c in all_syntheses_by_file[f].concepts
+            }
+            for slug in fresh_slugs & overlay.keys():
+                del overlay[slug]
+                overlay_dirty = True
+            concept_index = {c.slug: i for i, c in enumerate(bundle.concepts)}
+            for slug, concept in overlay.items():
+                idx = concept_index.get(slug)
+                if idx is not None:
+                    bundle.concepts[idx] = concept
+
+        # ── Incremental concept re-synthesis ──────────────────────────
+        # When new sources reference existing concepts (from cached syntheses),
+        # re-synthesize those concepts to integrate new information coherently
+        # rather than just appending sections.
+        if filenames_done and config.synthesis_mode == "two_pass":
+            try:
+                resynthesized = await _resynthesize_referenced_concepts(
+                    config, bundle, filenames_done,
+                    all_syntheses_by_file, sources, metrics,
+                )
+                if resynthesized:
+                    overlay.update(resynthesized)
+                    overlay_dirty = True
+            except Exception as exc:
+                logger.warning("Concept re-synthesis skipped: %s", exc)
+
+        if overlay_dirty:
+            save_resynthesis_overlay(config.llmwiki_dir, overlay)
+
+        # ── Corpus normalization: semantic dedup + MoC assignment ─────
+        # These mutate the bundle (merge concepts, rewrite slugs), so they
+        # belong in the synthesis stage — before rendering AND before the
+        # state write — not buried inside render_vault where their failures
+        # were previously swallowed at debug level. Both no-op when
+        # embeddings are unavailable; an exception here is a real bug and
+        # must be visible, but should not kill an otherwise good build.
+        from obsidian_llm_wiki.synth.dedupe import (
+            assign_orphans_to_mocs,
+            semantic_dedupe_concepts,
+        )
+        embeddings_cache: dict[str, list[float]] = {}
+        try:
+            semantic_dedupe_concepts(
+                bundle,
+                threshold=config.similarity_dedup_threshold,
+                embeddings_cache=embeddings_cache,
+            )
+        except Exception as exc:
+            logger.warning("Semantic dedup failed (continuing without): %s", exc)
+        try:
+            assign_orphans_to_mocs(
+                bundle,
+                threshold=config.moc_assignment_threshold,
+                embeddings_cache=embeddings_cache,
+            )
+        except Exception as exc:
+            logger.warning("MoC orphan assignment failed (continuing without): %s", exc)
 
         # ── Render: full corpus deterministic markdown ─────────────────
         logger.info(
@@ -231,9 +346,20 @@ async def run_pipeline(
             f: sources.get(f) or _source_from_synthesis(all_syntheses_by_file[f])
             for f in all_syntheses_by_file
         }
-        written = render_vault(bundle_dir, bundle, all_sources_for_render)
+        render_start = time.monotonic()
+        written = render_vault(bundle_dir, bundle, all_sources_for_render, config=config)
         result.pages.extend(written)
         result.concepts = bundle.concepts
+
+        # ── Record rendering metrics ───────────────────────────────────
+        render_time = time.monotonic() - render_start
+        metrics.record_rendering(
+            concepts_rendered=len(bundle.concepts),
+            mocs_rendered=len(bundle.maps),
+            cross_lingual_links=0,  # populated by embedding pass if enabled
+            backlinks_added=0,  # approximate: not separately tracked yet
+            time_seconds=render_time,
+        )
 
         # ── Update state for compiled sources ─────────────────────────
         compiled_at = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -258,6 +384,9 @@ async def run_pipeline(
         return result
 
     finally:
+        # ── Persist metrics ─────────────────────────────────────────────
+        metrics.finish_run()
+        metrics.save()
         release_lock(config.lock_file)
 
 
@@ -297,7 +426,10 @@ async def _synthesize_source(
         language=source_lang,
     )
 
-    messages = [{"role": "user", "content": "Synthesise the source document above."}]
+    messages = [
+        {"role": "system", "content": _SYSTEM_PROMPT},
+        {"role": "user", "content": prompt},
+    ]
 
     try:
         response = await acall_llm(prompt, messages, config)
@@ -319,6 +451,212 @@ async def _synthesize_source(
         synthesis.language = source_lang
 
     return synthesis
+
+
+async def _synthesize_with_retry(
+    config: Config,
+    filename: str,
+    source: SourceDoc,
+    existing_concepts: list[str],
+    metrics: MetricsCollector | None = None,
+) -> SourceSynthesis | None:
+    """Synthesize a source with progressive content truncation on failure.
+
+    Tries (in order):
+      1. Full content
+      2. Content truncated to 50K chars
+      3. Content truncated to 20K chars
+
+    If all attempts fail, logs as permanently failed and returns None.
+    Records each attempt via the metrics collector if provided.
+    """
+    for level_idx, truncation_chars in enumerate(_TRUNCATION_LEVELS):
+        if truncation_chars is not None and len(source.content) > truncation_chars:
+            truncated_source = SourceDoc(
+                title=source.title,
+                content=source.content[:truncation_chars],
+                url=source.url,
+                source_file=filename,
+            )
+            level_label = f"{truncation_chars // 1000}K"
+        else:
+            truncated_source = source
+            level_label = "full"
+
+        if level_idx > 0:
+            logger.info(
+                "Retrying '%s' with truncated content (%s chars, level %d)",
+                filename, level_label, level_idx,
+            )
+
+        synth_start = time.monotonic()
+        try:
+            synth = await _synthesize_source(
+                config, filename, truncated_source, existing_concepts,
+            )
+        except Exception as exc:
+            synth_time = time.monotonic() - synth_start
+            logger.error(
+                "Synthesis attempt %d failed for '%s' (%s): %s",
+                level_idx + 1, filename, level_label, exc,
+            )
+            if metrics:
+                metrics.record_synthesis(
+                    source_file=filename,
+                    pass1_time=synth_time,
+                    success=False,
+                    error_type=type(exc).__name__,
+                )
+            # Truncation only helps size-related failures. Anything else
+            # (connection errors, HTTP failures, bugs) re-raises immediately:
+            # the provider layer already retried transient errors, and
+            # silently discarding content would disguise data loss as
+            # recovery.
+            if (
+                _is_size_related_failure(exc)
+                and level_idx < len(_TRUNCATION_LEVELS) - 1
+            ):
+                continue
+            raise
+
+        synth_time = time.monotonic() - synth_start
+
+        if synth is not None:
+            if level_idx > 0:
+                # Success on truncated content is a degraded result, not a
+                # clean one — the wiki was built from a fraction of the source.
+                logger.warning(
+                    "Synthesized '%s' from TRUNCATED content (%s of %d chars) "
+                    "after %d failed attempt(s) — concepts beyond the cut "
+                    "are missing.",
+                    filename, level_label, len(source.content), level_idx,
+                )
+            if metrics:
+                metrics.record_synthesis(
+                    source_file=filename,
+                    pass1_time=synth_time,
+                    concepts_extracted=len(synth.concepts),
+                    success=True,
+                )
+            return synth
+
+        # synth is None — no output, try next truncation level
+        if metrics:
+            metrics.record_synthesis(
+                source_file=filename,
+                pass1_time=synth_time,
+                success=False,
+                error_type="no_output",
+            )
+        logger.warning(
+            "Synthesis produced no output for '%s' at level %d (%s)",
+            filename, level_idx + 1, level_label,
+        )
+
+    # All truncation levels exhausted — permanent failure
+    logger.error(
+        "Permanent synthesis failure for '%s': all %d truncation levels exhausted. "
+        "Content length: %d chars.",
+        filename, len(_TRUNCATION_LEVELS), len(source.content),
+    )
+    return None
+
+
+async def recompile_single_source(
+    vault_path: str | Path,
+    source_file: str,
+    config: Config | None = None,
+) -> CompileResult:
+    """Manually retry a single failed source file.
+
+    Loads the source from the vault's sources/ directory, runs synthesis
+    with truncation-based retry, and caches the result.
+
+    Args:
+        vault_path: Path to the Obsidian vault root.
+        source_file: The source filename (e.g. "my-article.md").
+        config: Pipeline config (loaded from vault_path/.env if None).
+
+    Returns:
+        CompileResult with the compilation outcome.
+    """
+    vault = Path(vault_path).resolve()
+    result = CompileResult()
+
+    if config is None:
+        env_file = str(vault / ".env") if (vault / ".env").exists() else None
+        config = load_config(env_file=env_file, VAULT_PATH=str(vault))
+
+    bundle_dir = config.wiki_dir
+    bundle_dir.mkdir(parents=True, exist_ok=True)
+
+    # Load the single source file through the same loader as `olw build`:
+    # it strips YAML frontmatter and takes the title from it. Reading the raw
+    # file here would synthesize frontmatter noise under the stem title AND
+    # store a raw-content hash that never matches the build's body hash, so
+    # the next build would immediately re-synthesize and discard this result.
+    from obsidian_llm_wiki.ingest.sources import load_source_file
+
+    source_path = config.sources_dir / source_file
+    if not source_path.exists():
+        result.errors.append(f"Source file not found: {source_path}")
+        return result
+
+    source = load_source_file(source_path)
+    if source is None:
+        result.errors.append(f"source:{source_file}: empty or unreadable")
+        return result
+
+    if len(source.content) < config.min_source_chars:
+        result.errors.append(
+            f"source:{source_file}: too short ({len(source.content)} < "
+            f"{config.min_source_chars} chars)"
+        )
+        return result
+
+    # Acquire lock
+    if not acquire_lock(config.lock_file):
+        result.errors.append("lock: another compilation is running")
+        return result
+
+    metrics = MetricsCollector(vault)
+    metrics.start_run()
+
+    try:
+        state = read_state(config.state_file)
+        existing_concepts = _existing_concept_slugs(state)
+
+        synth = await _synthesize_with_retry(
+            config, source_file, source, existing_concepts, metrics,
+        )
+
+        if synth is None:
+            result.errors.append(f"synth:{source_file}: permanent failure (all truncation levels)")
+            return result
+
+        save_synthesis(synth, config.llmwiki_dir, source_file)
+        result.compiled += 1
+        result.concepts = synth.concepts
+
+        compiled_at = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+        update_source_state(
+            state, source_file,
+            hash_content(source.content),
+            [c.slug for c in synth.concepts],
+            compiled_at,
+        )
+        write_state(config.state_file, state)
+
+        logger.info(
+            "Recompiled '%s': %d concepts extracted",
+            source_file, len(synth.concepts),
+        )
+        return result
+
+    finally:
+        metrics.finish_run()
+        metrics.save()
+        release_lock(config.lock_file)
 
 
 def _detect_source_language(content: str, filename: str) -> str:
@@ -357,3 +695,108 @@ def _source_from_synthesis(synth: SourceSynthesis) -> SourceDoc:
         content=synth.source_summary or "",
         source_file=synth.source_file,
     )
+
+
+async def _resynthesize_referenced_concepts(
+    config: Config,
+    bundle: SynthesisBundle,
+    new_filenames: list[str],
+    all_syntheses_by_file: dict[str, SourceSynthesis],
+    sources: dict[str, SourceDoc],
+    metrics: MetricsCollector | None = None,
+) -> dict[str, ConceptNote]:
+    """Re-synthesize existing concepts that are referenced by new sources.
+
+    For each concept whose slug appears in both a new synthesis and the cached
+    corpus, call resynthesize_concept() once with ALL referencing new sources'
+    content combined. One call per slug is essential: concurrent per-source
+    calls would each rewrite the same original concept and the last write
+    would silently discard the other sources' integrations.
+
+    Returns the successfully resynthesized concepts by slug so the caller can
+    persist them — the per-source caches were saved before this ran, so
+    without persistence the rewrites would revert on the next build.
+
+    Only runs in two_pass mode. Skipped if no new sources or no overlaps.
+    """
+    if not new_filenames:
+        return {}
+
+    from obsidian_llm_wiki.synth.quality import resynthesize_concept
+
+    # Build set of concept slugs from cached (unchanged) sources
+    cached_slugs: set[str] = set()
+    for filename, synth in all_syntheses_by_file.items():
+        if filename in new_filenames:
+            continue  # This is a new source
+        cached_slugs.update(c.slug for c in synth.concepts)
+
+    if not cached_slugs:
+        return {}  # No existing concepts to re-synthesize
+
+    # Group the referencing new sources by concept slug.
+    sources_by_slug: dict[str, list[tuple[str, str]]] = {}  # slug → [(content, title)]
+    for filename in new_filenames:
+        synth = all_syntheses_by_file.get(filename)
+        if not synth:
+            continue
+        source = sources.get(filename)
+        source_content = source.content if source else ""
+        source_title = source.title if source else synth.source_title
+
+        for concept in synth.concepts:
+            if concept.slug in cached_slugs:
+                sources_by_slug.setdefault(concept.slug, []).append(
+                    (source_content, source_title),
+                )
+
+    if not sources_by_slug:
+        return {}
+
+    logger.info(
+        "Re-synthesizing %d concepts referenced by new sources...",
+        len(sources_by_slug),
+    )
+
+    # Build concept map from bundle
+    concept_map = {c.slug: c for c in bundle.concepts}
+
+    # Re-synthesize each concept once, with all referencing sources combined.
+    sem = asyncio.Semaphore(config.compile_concurrency)
+
+    async def _resynth_one(slug: str, refs: list[tuple[str, str]]):
+        async with sem:
+            existing = concept_map.get(slug)
+            if not existing:
+                return None
+            combined_content = "\n\n---\n\n".join(
+                f"### Source: {title}\n\n{content}" for content, title in refs
+            )
+            combined_title = ", ".join(dict.fromkeys(title for _, title in refs))
+            return await resynthesize_concept(
+                config, existing, combined_content, combined_title,
+            )
+
+    slugs = list(sources_by_slug.keys())
+    results = await asyncio.gather(
+        *[_resynth_one(slug, sources_by_slug[slug]) for slug in slugs],
+        return_exceptions=True,
+    )
+
+    # Replace updated concepts in the bundle and collect them for persistence.
+    concept_index = {c.slug: i for i, c in enumerate(bundle.concepts)}
+    resynthesized: dict[str, ConceptNote] = {}
+    for slug, res in zip(slugs, results, strict=True):
+        if isinstance(res, BaseException) or res is None:
+            continue
+        idx = concept_index.get(slug)
+        if idx is not None:
+            bundle.concepts[idx] = res
+            resynthesized[slug] = res
+
+    if resynthesized:
+        logger.info(
+            "Re-synthesized %d/%d concepts successfully",
+            len(resynthesized), len(sources_by_slug),
+        )
+    return resynthesized

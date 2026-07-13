@@ -1,7 +1,7 @@
 """DOCX extractor — extracts text from Word .docx files using python-docx.
 
 Dependency (optional): ``python-docx``.
-Install with: ``pip install okf-pipeline[docx]``
+Install with: ``pip install obsidian-llm-wiki[docx]``
 """
 
 from __future__ import annotations

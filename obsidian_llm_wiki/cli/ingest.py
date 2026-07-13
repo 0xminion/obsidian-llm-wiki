@@ -107,6 +107,19 @@ def ingest(
                 source = extract(url)
                 filename = f"{slugify(source.title)}.md"
                 filepath = config.sources_dir / filename
+                # Collision detection: if file exists, append -1, -2, etc.
+                if filepath.exists():
+                    stem = filepath.stem
+                    i = 1
+                    while True:
+                        candidate = config.sources_dir / f"{stem}-{i}.md"
+                        if not candidate.exists():
+                            filepath = candidate
+                            filename = candidate.name
+                            break
+                        i += 1
+                        if i > 100:
+                            break
                 config.sources_dir.mkdir(parents=True, exist_ok=True)
                 page = render_source_page(source)
                 atomic_write(filepath, page)

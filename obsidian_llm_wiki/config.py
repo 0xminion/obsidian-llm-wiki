@@ -30,6 +30,7 @@ class LLMProviderConfig:
     model: str = "gemma3:27b"
     api_key: str | None = None
     timeout_ms: int = 1_800_000  # 30 minutes
+    context_window: int = 256_000  # 256K tokens for cloud models (e.g. gemma4:31b-cloud)
 
 
 @dataclass
@@ -45,6 +46,10 @@ class Config:
     # ── Content thresholds ──────────────────────────
     max_source_chars: int = 1_000_000
     min_source_chars: int = 50
+
+    # ── Chunking ─────────────────────────────────────
+    # Sources above this size (chars) are split into chunks for Pass 1.
+    chunk_size: int = 30_000
 
     # ── Concurrency ─────────────────────────────────
     compile_concurrency: int = 3
@@ -62,12 +67,18 @@ class Config:
     entry_min_body_chars: int = 500
     clipping_min_body_chars: int = 500
 
-    # ── Retry ───────────────────────────────────────
+    # ── Semantic dedup ──────────────────────────────────────
+    similarity_dedup_threshold: float = 0.85
+
+    # ── MoC orphan assignment ───────────────────────────────
+    moc_assignment_threshold: float = 0.55
+
+    # ── Retry ───────────────────────────────────────────────
     retry_count: int = 3
     retry_base_ms: int = 1_000
     retry_multiplier: int = 4
 
-    # ── Extraction fallbacks ─────────────────────────────
+    # ── Extraction fallbacks ─────────────────────────────────────
     # Residential proxy URL (socks5h:// or http://) for blocked sites.
     # Tailscale exit node: socks5h://<tailscale-ip>:1080
     residential_proxy_url: str = ""
@@ -85,6 +96,17 @@ class Config:
     # Get your key at https://dash.supadata.ai/organizations/api-key
     # Set as env SUPADATA_API_KEY=sd_...
     supadata_api_key: str = ""
+
+    # AssemblyAI is the primary remote-URL transcript provider. It
+    # fetches public RSS enclosure URLs itself, avoiding local media download.
+    # Set as env ASSEMBLYAI_API_KEY=...
+    assemblyai_api_key: str = ""
+
+    # Optional Podcast Index discovery credentials. The API finds canonical
+    # publisher RSS feeds for cross-platform podcast links; it does not supply
+    # transcript text. Set PODCAST_INDEX_API_KEY and PODCAST_INDEX_API_SECRET.
+    podcast_index_api_key: str = ""
+    podcast_index_api_secret: str = ""
 
     # ── Derived paths (lazy) ──────────────────────
     _vault: Path | None = field(default=None, repr=False)
@@ -168,6 +190,7 @@ def load_config(env_file: str | None = None, **overrides: str) -> Config:
         model=os.getenv("LLM_MODEL", "gemma3:27b"),
         api_key=os.getenv("LLM_API_KEY"),
         timeout_ms=_int_env("LLM_TIMEOUT_MS", 1_800_000),
+        context_window=_int_env("LLM_CONTEXT_WINDOW", 256_000),
     )
 
     return Config(
@@ -175,12 +198,15 @@ def load_config(env_file: str | None = None, **overrides: str) -> Config:
         vault_path=os.getenv("VAULT_PATH", str(Path.home() / "MyVault")),
         max_source_chars=_int_env("MAX_SOURCE_CHARS", 1_000_000),
         min_source_chars=_int_env("MIN_SOURCE_CHARS", 50),
+        chunk_size=_int_env("CHUNK_SIZE", 30_000),
         compile_concurrency=_int_env("COMPILE_CONCURRENCY", 3),
         output_language=os.getenv("OUTPUT_LANGUAGE", ""),
         synthesis_mode=os.getenv("SYNTHESIS_MODE", "single"),
         concept_min_body_chars=_int_env("CONCEPT_MIN_BODY_CHARS", 800),
         entry_min_body_chars=_int_env("ENTRY_MIN_BODY_CHARS", 500),
         clipping_min_body_chars=_int_env("CLIPPING_MIN_BODY_CHARS", 500),
+        similarity_dedup_threshold=_float_env("SIMILARITY_DEDUP_THRESHOLD", 0.85),
+        moc_assignment_threshold=_float_env("MOC_ASSIGNMENT_THRESHOLD", 0.55),
         retry_count=_int_env("RETRY_COUNT", 3),
         retry_base_ms=_int_env("RETRY_BASE_MS", 1_000),
         retry_multiplier=_int_env("RETRY_MULTIPLIER", 4),
@@ -188,6 +214,9 @@ def load_config(env_file: str | None = None, **overrides: str) -> Config:
         youtube_cookies_file=os.getenv("YOUTUBE_COOKIES_FILE", ""),
         transcript_api_key=os.getenv("TRANSCRIPT_API_KEY", ""),
         supadata_api_key=os.getenv("SUPADATA_API_KEY", ""),
+        assemblyai_api_key=os.getenv("ASSEMBLYAI_API_KEY", ""),
+        podcast_index_api_key=os.getenv("PODCAST_INDEX_API_KEY", ""),
+        podcast_index_api_secret=os.getenv("PODCAST_INDEX_API_SECRET", ""),
     )
 
 
@@ -198,5 +227,16 @@ def _int_env(key: str, default: int) -> int:
         return default
     try:
         return int(val)
+    except ValueError:
+        return default
+
+
+def _float_env(key: str, default: float) -> float:
+    """Parse a float from environment with fallback."""
+    val = os.getenv(key)
+    if val is None:
+        return default
+    try:
+        return float(val)
     except ValueError:
         return default

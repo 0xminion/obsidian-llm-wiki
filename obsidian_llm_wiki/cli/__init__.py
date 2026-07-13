@@ -12,7 +12,9 @@ app = typer.Typer(
 
 # Register commands by importing their modules (each decorates `app`).
 from obsidian_llm_wiki.cli import build as _build  # noqa: E402, F401
+from obsidian_llm_wiki.cli import health as _health  # noqa: E402, F401
 from obsidian_llm_wiki.cli import ingest as _ingest  # noqa: E402, F401
+from obsidian_llm_wiki.cli import ops as _ops  # noqa: E402, F401
 from obsidian_llm_wiki.cli import query as _query  # noqa: E402, F401
 from obsidian_llm_wiki.cli import setup as _setup  # noqa: E402, F401
 from obsidian_llm_wiki.cli import validate as _validate  # noqa: E402, F401

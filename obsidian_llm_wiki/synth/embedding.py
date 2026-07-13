@@ -118,6 +118,9 @@ def find_cross_lingual_links(
         logger.info("Cross-lingual linking: not enough embeddings (%d)", len(embeddings))
         return {}
 
+    # Build concept lookup by slug for O(1) access
+    concept_by_slug = {c.slug: c for c in concepts}
+
     # Compare all pairs
     links: dict[str, list[tuple[str, float, str]]] = {}
     slugs = list(embeddings.keys())
@@ -134,9 +137,7 @@ def find_cross_lingual_links(
             sim = cosine_similarity(embeddings[slug_a], embeddings[slug_b])
             if sim >= threshold:
                 # Find display text — prefer the target's title in its language
-                target_concept = next(
-                    (c for c in concepts if c.slug == slug_b), None
-                )
+                target_concept = concept_by_slug.get(slug_b)
                 display = target_concept.title if target_concept else slug_b
                 links.setdefault(slug_a, []).append((slug_b, sim, display))
                 links.setdefault(slug_b, []).append((slug_a, sim, ""))

@@ -298,6 +298,12 @@ def _concept_from_dict(data: dict[str, Any]) -> ConceptNote:
         for r in data.get("related", [])
         if isinstance(r, dict)
     ]
+    # confidence may be non-numeric from the LLM (e.g. "high", null).
+    # Guard with try/except to avoid losing the entire source on one bad field.
+    try:
+        confidence = float(data.get("confidence", 1.0))
+    except (TypeError, ValueError):
+        confidence = 1.0
     return ConceptNote(
         title=data.get("title", ""),
         slug=data.get("slug", ""),
@@ -307,7 +313,7 @@ def _concept_from_dict(data: dict[str, Any]) -> ConceptNote:
         sections=sections,
         claims=claims,
         related=related,
-        confidence=float(data.get("confidence", 1.0)),
+        confidence=confidence,
         provenance=data.get("provenance", data.get("provenance_state", "extracted")),
         is_new=data.get("is_new", True),
     )

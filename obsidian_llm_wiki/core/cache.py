@@ -17,7 +17,10 @@ from contextlib import suppress
 from pathlib import Path
 
 from obsidian_llm_wiki.core.models import (
+    ConceptNote,
     SourceSynthesis,
+    _concept_from_dict,
+    concept_note_to_dict,
     source_synthesis_from_dict,
     source_synthesis_to_dict,
 )
@@ -32,6 +35,8 @@ __all__ = [
     "load_synthesis",
     "load_all_cached_syntheses",
     "delete_cached_synthesis",
+    "load_resynthesis_overlay",
+    "save_resynthesis_overlay",
 ]
 
 
@@ -111,3 +116,55 @@ def delete_cached_synthesis(cache_root: Path, source_file: str) -> None:
     path = synthesis_cache_path(cache_root, source_file)
     with suppress(OSError):
         path.unlink(missing_ok=True)
+
+
+# ── Resynthesis overlay ─────────────────────────────────────────────────
+#
+# Incremental concept re-synthesis rewrites a concept's body coherently when a
+# new source references it. The per-source caches still hold the pre-rewrite
+# concepts (they were saved before resynthesis ran), so without a persistence
+# layer the rewritten body would revert to the mechanically-merged version on
+# the very next build. The overlay stores the rewritten concepts by slug and
+# is re-applied to the merged bundle each run; an entry is invalidated when a
+# freshly compiled source extracts the same slug (its resynthesis supersedes).
+
+
+def _overlay_path(cache_root: Path) -> Path:
+    return synthesis_cache_dir(cache_root) / "_resynthesis_overlay.json"
+
+
+def load_resynthesis_overlay(cache_root: Path) -> dict[str, ConceptNote]:
+    """Load persisted resynthesized concepts, keyed by slug."""
+    raw = safe_read_file(_overlay_path(cache_root))
+    if not raw.strip():
+        return {}
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        logger.warning("Corrupt resynthesis overlay — ignoring.")
+        return {}
+    concepts = data.get("concepts", {})
+    if not isinstance(concepts, dict):
+        return {}
+    overlay: dict[str, ConceptNote] = {}
+    for slug, concept_dict in concepts.items():
+        if isinstance(concept_dict, dict):
+            overlay[slug] = _concept_from_dict(concept_dict)
+    return overlay
+
+
+def save_resynthesis_overlay(
+    cache_root: Path,
+    overlay: dict[str, ConceptNote],
+) -> None:
+    """Persist resynthesized concepts (full rewrite of the overlay file)."""
+    data = {
+        "concepts": {
+            slug: concept_note_to_dict(concept)
+            for slug, concept in overlay.items()
+        },
+    }
+    atomic_write(
+        _overlay_path(cache_root),
+        json.dumps(data, indent=2, ensure_ascii=False),
+    )

@@ -50,6 +50,27 @@ class OllamaClient(LLMClient):
             ],
             "stream": False,
         }
+        # Pass context window and output limit to Ollama via the "options" object.
+        # Ollama only reads runtime parameters like num_ctx from the "options"
+        # object — a top-level num_ctx is silently ignored.
+        #
+        # num_predict controls the maximum number of output tokens. Without it,
+        # Ollama uses a model-specific default (often as low as 128 or 4096),
+        # which truncates large synthesis JSON responses mid-object. For a
+        # 200K-char source, the synthesis JSON can easily exceed 20K tokens.
+        # Set num_predict to -1 (unlimited) so the model generates until it
+        # naturally stops — the timeout is the real safety net.
+        options: dict[str, Any] = kwargs.pop("options", {})
+        num_ctx = kwargs.pop("num_ctx", None)
+        if num_ctx is None and self.config.context_window:
+            num_ctx = self.config.context_window
+        if num_ctx:
+            options.setdefault("num_ctx", num_ctx)
+        # Allow generous output tokens — the timeout is the real ceiling.
+        # Some Ollama proxies reject num_predict=-1, so use a large positive value.
+        options.setdefault("num_predict", 65536)
+        if options:
+            body["options"] = options
         body.update(kwargs)
         with httpx.Client(timeout=self._timeout) as client:
             resp = client.post(url, json=body)
@@ -82,7 +103,9 @@ class OpenAICompatibleClient(LLMClient):
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
             ],
-            "max_tokens": kwargs.pop("max_tokens", 8192),
+            "max_tokens": kwargs.pop(
+                "max_tokens", 65536,  # 64K output — enough for full synthesis JSON
+            ),
             "stream": False,
         }
         body.update(kwargs)
@@ -143,14 +166,68 @@ def call_llm(
     config: Any,
     **kwargs: Any,
 ) -> str:
-    """Synchronous LLM call with exponential-backoff retry."""
+    """Synchronous LLM call with exponential-backoff retry.
+
+    When *messages* is a list of structured message dicts (with role/content),
+    the messages are passed directly to the LLM client. When *messages* is a
+    string or a flat list without role info, *system* is used as the system
+    prompt and *messages* as the user content (legacy behaviour).
+    """
     llm_config = _resolve_llm_config(config)
     client = create_llm_client(llm_config)
     max_retries = getattr(config, "retry_count", 3)
-    user = _extract_user_content(messages)
 
     # Filter kwargs the sync clients don't understand.
     chat_kwargs = {k: v for k, v in kwargs.items() if k not in ("tools", "on_token")}
+
+    # Check if messages is a structured list with role dicts.
+    is_structured = (
+        isinstance(messages, list)
+        and messages
+        and isinstance(messages[0], dict)
+        and "role" in messages[0]
+    )
+    if is_structured:
+        # Structured messages — pass directly to client.
+        # The OllamaClient/OpenAICompatibleClient.chat() expects (system, user)
+        # but we bypass that and build the request body directly.
+        structured_messages = messages
+        # Extract system from the structured messages if present.
+        sys_content = ""
+        user_content = ""
+        for msg in structured_messages:
+            if msg.get("role") == "system":
+                sys_content = msg.get("content", "")
+            elif msg.get("role") == "user":
+                user_content = msg.get("content", "")
+        # If no system in messages, fall back to the system arg (but only if
+        # it's not the same as user_content — which happens when the pipeline
+        # passes the prompt as both system and in messages).
+        if not sys_content and system and system != user_content:
+            sys_content = system
+        # Use a short system prompt if none was provided.
+        if not sys_content:
+            sys_content = "You are a helpful assistant."
+
+        for attempt in range(max_retries):
+            try:
+                return client.chat(sys_content, user_content, **chat_kwargs)
+            except Exception:
+                if attempt == max_retries - 1:
+                    raise
+                delay = (
+                    getattr(config, "retry_base_ms", 1000)
+                    * (getattr(config, "retry_multiplier", 4) ** attempt)
+                ) / 1000.0
+                logger.warning(
+                    "LLM call attempt %d/%d failed. Retrying in %.1fs…",
+                    attempt + 1, max_retries, delay,
+                )
+                time.sleep(delay)
+        raise RuntimeError("LLM call exhausted retries")  # pragma: no cover
+
+    # Legacy path: system + user content
+    user = _extract_user_content(messages)
 
     for attempt in range(max_retries):
         try:

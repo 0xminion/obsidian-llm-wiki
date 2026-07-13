@@ -180,6 +180,7 @@ class _MockConfig:
     output_language = ""
     compile_concurrency = 2
     concept_min_body_chars = 800
+    chunk_size = 30_000
 
 
 @pytest.mark.asyncio
@@ -229,11 +230,12 @@ async def test_quality_synthesize_source_two_pass():
     assert gd.related[0].slug == "learning-rate"
     assert gd.related[0].relation == "depends_on"
 
-    # learning-rate: short content → quality gate triggers.
+    # learning-rate: short content → gradient confidence < 1.0
     lr = next(c for c in result.concepts if c.slug == "learning-rate")
     body = _concept_body_chars(lr)
     assert body < 800  # below threshold
-    assert lr.confidence == 0.3  # quality gate set confidence low
+    assert lr.confidence < 1.0  # gradient confidence reflects thin body
+    assert lr.confidence >= 0.1  # minimum gradient floor
 
 
 @pytest.mark.asyncio
@@ -337,9 +339,18 @@ async def test_quality_synthesize_source_pass2_failure_sets_low_confidence():
     assert good.confidence == 1.0
     assert _concept_body_chars(good) >= 800
 
-    # Failed expansions get confidence 0.3 (the fix)
-    assert null_c.confidence == 0.3, f"Expected 0.3 for None expansion, got {null_c.confidence}"
-    assert error_c.confidence == 0.3, f"Expected 0.3 for exception expansion, got {error_c.confidence}"
+    # Failed expansions get gradient confidence (body=0 → 0.1, the floor)
+    from obsidian_llm_wiki.synth.quality import gradient_confidence
+    expected_conf = gradient_confidence(0, 800)
+    assert null_c.confidence == pytest.approx(expected_conf), (
+        f"Expected {expected_conf} for None expansion, got {null_c.confidence}"
+    )
+    assert error_c.confidence == pytest.approx(expected_conf), (
+        f"Expected {expected_conf} for exception expansion, got {error_c.confidence}"
+    )
+    # Both should be below 1.0 since body is 0
+    assert null_c.confidence < 1.0
+    assert error_c.confidence < 1.0
 
     # Failed expansions have no body (skeleton only)
     assert _concept_body_chars(null_c) == 0

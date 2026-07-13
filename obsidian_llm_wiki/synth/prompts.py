@@ -14,7 +14,27 @@ from typing import Any
 __all__ = [
     "build_synthesis_prompt",
     "SYNTHESIS_SCHEMA",
+    "RELATIONSHIP_FEWSHOT",
 ]
+
+
+# ── Few-shot examples for relationship types ────────────────────────────
+
+RELATIONSHIP_FEWSHOT = """\
+Few-shot examples for choosing the right relation type:
+  Bitcoin `enables` Proof of Work
+    — Bitcoin's consensus mechanism makes PoW practically useful for settlement.
+  AMM `evolves_into` Concentrated Liquidity
+    — Uniswap V2 AMMs were extended into concentrated liquidity (V3).
+  Prediction Markets `competes_with` Opinion Polls
+    — Both forecast future events; markets use stakes, polls use sampling.
+  Clearinghouse `part_of` Exchange Infrastructure
+    — A clearinghouse is a subsystem within the broader exchange stack.
+  Kelly Criterion `measures` Optimal Position Size
+    — The Kelly formula quantifies the mathematically optimal bet fraction.
+  Futarchy `supersedes` Voting
+    — Futarchy replaces direct preference voting with market-based decision mechanisms.\
+"""
 
 
 # ── JSON schema shown to the LLM ────────────────────────────────────────
@@ -139,6 +159,8 @@ the key tension, how the concepts interact, and why this grouping matters.
 * Surface ALL available insights — do not produce stubs or shallow summaries.
 * Claims should be specific, evidence-backed statements from the source.
 {findings_instruction}{lang_instruction}
+
+{RELATIONSHIP_FEWSHOT}
 
 --- EXISTING CONCEPT INDEX ---
 {existing_str}

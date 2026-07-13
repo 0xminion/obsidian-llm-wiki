@@ -29,7 +29,19 @@ from obsidian_llm_wiki.ingest.web import extract_web
 
 logger = logging.getLogger("obswiki.ingest.extractors")
 
-__all__ = ["extract", "register_extractor"]
+__all__ = ["ExtractorNotApplicableError", "extract", "register_extractor"]
+
+
+class ExtractorNotApplicableError(RuntimeError):
+    """Raised when an extractor matched a URL pattern but the content isn't its type.
+
+    URL patterns are necessarily coarse — ``/feed`` and ``.xml`` identify a
+    *possible* podcast feed, not a definite one. An extractor that can only tell
+    from the fetched body raises this to disclaim the URL. Unlike a genuine
+    extraction failure, it does not trip the fail-closed policy in ``extract``:
+    dispatch continues to the remaining extractors and, if none claim the URL,
+    to ``extract_web``.
+    """
 
 # ── Registry ────────────────────────────────────────────────────────────
 
@@ -65,22 +77,6 @@ def register_extractor(
 # ── Dispatch ────────────────────────────────────────────────────────────
 
 
-_ARXIV_HOSTS = frozenset(("arxiv.org", "www.arxiv.org", "export.arxiv.org"))
-
-
-def _normalize_arxiv_url(url: str) -> str:
-    """Rewrite arxiv /abs/ URLs to /pdf/ for direct PDF extraction."""
-    parsed = urlparse(url)
-    host = (parsed.hostname or "").lower()
-    if host not in _ARXIV_HOSTS:
-        return url
-    path = parsed.path or ""
-    if "/abs/" in path:
-        new_path = path.replace("/abs/", "/pdf/", 1)
-        return parsed._replace(path=new_path, query="", fragment="").geturl()
-    return url
-
-
 def extract(raw_url: str) -> SourceDoc:
     """Extract content from a URL or file path using the registered extractors.
 
@@ -98,9 +94,6 @@ def extract(raw_url: str) -> SourceDoc:
     Raises:
         RuntimeError: If all extraction strategies fail.
     """
-    # Normalize arxiv /abs/ → /pdf/ before any dispatch.
-    raw_url = _normalize_arxiv_url(raw_url)
-
     # Check if it's a local file path.
     if _looks_like_file_path(raw_url):
         return _extract_file(raw_url)
@@ -119,6 +112,15 @@ def extract(raw_url: str) -> SourceDoc:
             logger.debug("Routing '%s' to %s", raw_url, extractor_fn.__name__)
             try:
                 return extractor_fn(raw_url)
+            except ExtractorNotApplicableError as exc:
+                # The extractor disclaimed the URL after inspecting the content.
+                # This is not a failure, so it must not fail closed — keep the
+                # ordinary fallback chain (other extractors, then extract_web).
+                logger.debug(
+                    "Extractor %s disclaimed %s: %s",
+                    extractor_fn.__name__, raw_url, exc,
+                )
+                continue
             except Exception as exc:
                 logger.warning(
                     "Extractor %s failed for %s: %s; trying fallback",
@@ -236,6 +238,9 @@ def _extract_file(file_path: str) -> SourceDoc:
 
 with suppress(ImportError):
     from obsidian_llm_wiki.ingest.extractors import youtube as _youtube  # noqa: F401
+
+with suppress(ImportError):
+    from obsidian_llm_wiki.ingest.extractors import scientific as _scientific  # noqa: F401
 
 with suppress(ImportError):
     from obsidian_llm_wiki.ingest.extractors import pdf as _pdf  # noqa: F401
