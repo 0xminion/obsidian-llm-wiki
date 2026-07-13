@@ -412,25 +412,6 @@ def _extract_trafilatura(url: str, timeout: int) -> SourceDoc:
     return SourceDoc(title=title or url, content=extracted.strip(), url=url)
 
 
-def _extract_regex(url: str, timeout: int) -> SourceDoc:
-    """Extract via httpx + regex HTML-to-text."""
-    with httpx.Client(**make_client_kwargs(timeout=timeout, follow_redirects=True)) as client:
-        resp = client.get(url)
-        html = resp.text
-
-    _check_cloudflare(resp, html)
-    resp.raise_for_status()
-    if not html.strip():
-        raise RuntimeError("empty response")
-
-    title = _extract_title_from_html(html)
-    content = _strip_tags(html)
-    if not content:
-        raise RuntimeError("regex produced empty content")
-
-    return SourceDoc(title=title or url, content=content, url=url)
-
-
 def _extract_wayback(url: str, timeout: int) -> SourceDoc:
     """Extract via archive.org Wayback Machine."""
     wayback_url = f"https://web.archive.org/web/2/{url}"

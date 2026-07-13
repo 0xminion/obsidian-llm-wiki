@@ -22,6 +22,11 @@ def acquire_lock(lock_file: str | Path) -> bool:
                 return False
         except (ValueError, OSError):
             pass  # Stale/corrupt lock — reclaim it.
+        # Remove the stale/corrupt lock file so O_EXCL can create a new one.
+        try:
+            lf.unlink()
+        except OSError:
+            return False
 
     lf.parent.mkdir(parents=True, exist_ok=True)
     try:

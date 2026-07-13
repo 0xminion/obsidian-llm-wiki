@@ -126,11 +126,6 @@ def _extract_youtube_video_id(url: str) -> str | None:
 # ── Semantic Scholar ─────────────────────────────────────────────────────────
 
 
-_SSRN_TITLE_TO_PAPERID: dict[str, str] = {
-    "Prediction Market Accuracy Skill Bias Polymarket": "2412.20138",
-}
-
-
 def extract_via_semantic_scholar(ssrn_url: str, timeout: int = DEFAULT_TIMEOUT) -> SourceDoc:
     """Extract paper abstract and metadata via Semantic Scholar API.
 

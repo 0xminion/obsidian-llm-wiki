@@ -627,16 +627,6 @@ def _find_apple_episode_asset(
     return EpisodeAsset()
 
 
-def _find_apple_audio_url(url: str) -> str:
-    """Backward-compatible Apple enclosure helper."""
-    return _find_apple_episode_asset(url).audio_url
-
-
-def _find_episode_audio_in_rss(rss_text: str, episode_id: str) -> str:
-    """Backward-compatible RSS enclosure helper."""
-    return _find_episode_asset_in_rss(rss_text, episode_id=episode_id).audio_url
-
-
 # ── Spotify audio URL ────────────────────────────────────────────────────
 
 def _find_asset_via_itunes(title: str, author: str = "") -> EpisodeAsset:
@@ -687,16 +677,6 @@ def _find_spotify_episode_asset(
     if by_podcast_index.audio_url or by_podcast_index.transcript_url:
         return by_podcast_index
     return _find_asset_via_itunes(title, author)
-
-
-def _find_spotify_audio_url(url: str) -> str:
-    """Backward-compatible Spotify enclosure helper."""
-    return _find_spotify_episode_asset(url).audio_url
-
-
-def _find_episode_audio_by_title(rss_text: str, target_title: str) -> str:
-    """Backward-compatible title-match enclosure helper."""
-    return _find_episode_asset_in_rss(rss_text, target_title=target_title).audio_url
 
 
 # ── Supadata transcription ───────────────────────────────────────────────

@@ -214,7 +214,6 @@ def _extract_via_vxtwitter(
     likes = data.get("likes", 0) or 0
     retweets = data.get("retweets", 0) or 0
     date = data.get("date", "") or ""
-    data.get("lang", "") or ""
 
     # Determine if this is an X Article
     is_article = bool(article) and bool(article_title)

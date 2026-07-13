@@ -575,7 +575,7 @@ def render_vault(
         if (
             old_file.stem not in current_entry_slugs
             and old_file.name != "index.md"
-            and not is_reviewed_page(old_file.read_text(encoding="utf-8"))
+            and not is_reviewed_page(safe_read_file(old_file))
         ):
             old_file.unlink()
             logger.debug("Removed stale entry: %s", old_file.name)
@@ -656,7 +656,7 @@ def render_vault(
             continue
         if old_file.stem in current_concept_slugs:
             continue
-        old_content = old_file.read_text(encoding="utf-8")
+        old_content = safe_read_file(old_file)
         if is_reviewed_page(old_content):
             continue
         # Don't delete orphaned concepts — they're intentionally kept
@@ -680,7 +680,7 @@ def render_vault(
         if (
             old_file.stem not in current_moc_slugs
             and old_file.name != "index.md"
-            and not is_reviewed_page(old_file.read_text(encoding="utf-8"))
+            and not is_reviewed_page(safe_read_file(old_file))
         ):
             old_file.unlink()
             logger.debug("Removed stale MoC: %s", old_file.name)

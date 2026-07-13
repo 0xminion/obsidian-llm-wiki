@@ -169,7 +169,15 @@ def _frontmatter_relations(meta: Mapping[str, object]) -> list[tuple[str, str]]:
     relations: list[tuple[str, str]] = []
     for item in raw:
         if isinstance(item, str):
-            relations.append((item, "relation"))
+            # Rendered relations are pipe-separated: "slug|relation_type|display".
+            # Use the first segment as the target slug; the second (if present)
+            # as the relation type.
+            parts = item.split("|")
+            target = parts[0].strip()
+            if not target:
+                continue
+            relation_type = parts[1].strip() if len(parts) > 1 and parts[1].strip() else "relation"
+            relations.append((target, relation_type))
         elif isinstance(item, Mapping):
             target = item.get("target", item.get("slug", item.get("path", "")))
             relation = item.get("relation", item.get("type", "relation"))

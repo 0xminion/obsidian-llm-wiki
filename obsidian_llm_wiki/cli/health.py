@@ -198,6 +198,24 @@ def _moced_concept_slugs(bundle_dir: Path, concept_stems: set[str]) -> set[str]:
     return moced_slugs
 
 
+def _parse_relation_target(relation: object) -> str | None:
+    """Extract the target slug from a relation entry.
+
+    Relations are serialized as pipe-separated strings
+    ``"slug|relation_type|display_label"`` so Obsidian's Properties panel
+    treats them as a simple list.  Legacy dict entries with a ``target``
+    key are still accepted for pages rendered before the format change.
+    """
+    if isinstance(relation, dict):
+        target = relation.get("target")
+        return str(target) if isinstance(target, str) and target.strip() else None
+    if isinstance(relation, str):
+        # Format: "slug|relation_type|display_label" — use the first part.
+        slug = relation.split("|", 1)[0].strip()
+        return slug or None
+    return None
+
+
 def _relation_findings(
     metadata: dict[str, Any], concept_stems: set[str], path: str, reviewed: bool
 ) -> list[MaintenanceFinding]:
@@ -206,9 +224,10 @@ def _relation_findings(
         return []
     findings: list[MaintenanceFinding] = []
     for relation in relations:
-        if not isinstance(relation, dict) or not isinstance(relation.get("target"), str):
+        raw_target = _parse_relation_target(relation)
+        if raw_target is None:
             continue
-        target = _normalize_wikilink_target(relation["target"])
+        target = _normalize_wikilink_target(raw_target)
         if target and target not in concept_stems:
             findings.append(
                 MaintenanceFinding(
