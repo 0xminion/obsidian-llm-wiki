@@ -62,6 +62,13 @@ from obsidian_llm_wiki.synth.prompts import build_synthesis_prompt
 
 logger = logging.getLogger("obswiki.core.pipeline")
 
+# System prompt for LLM calls — kept short to avoid proxy system-prompt
+# truncation. The full synthesis instructions go in the user message.
+_SYSTEM_PROMPT = (
+    "You are a knowledge synthesis engine. "
+    "Return ONLY a JSON object, no prose, no code fences."
+)
+
 # ── Retry truncation levels ────────────────────────────────────────────────
 # When a source fails synthesis for a SIZE-RELATED reason, progressively
 # truncate content and retry.
@@ -420,7 +427,10 @@ async def _synthesize_source(
         language=source_lang,
     )
 
-    messages = [{"role": "user", "content": "Synthesise the source document above."}]
+    messages = [
+        {"role": "system", "content": _SYSTEM_PROMPT},
+        {"role": "user", "content": prompt},
+    ]
 
     try:
         response = await acall_llm(prompt, messages, config)

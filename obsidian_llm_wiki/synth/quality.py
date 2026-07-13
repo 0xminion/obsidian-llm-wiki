@@ -44,6 +44,17 @@ from obsidian_llm_wiki.synth.parser import parse_single_source_synthesis
 
 logger = logging.getLogger("obswiki.synth.quality")
 
+# System prompts for LLM calls — kept short to avoid proxy system-prompt
+# truncation. The full instructions go in the user message.
+_SYSTEM_EXTRACT = (
+    "You are a knowledge extraction engine. "
+    "Return ONLY a JSON object, no prose, no code fences."
+)
+_SYSTEM_SYNTH = (
+    "You are a knowledge synthesis engine. "
+    "Return ONLY a JSON object, no prose, no code fences."
+)
+
 __all__ = [
     "quality_synthesize_source",
     "build_extract_prompt",
@@ -519,7 +530,8 @@ async def quality_synthesize_source(
                     language=source_lang or config.output_language,
                 )
                 msgs = [
-                    {"role": "user", "content": "Extract concepts from the source document above."}
+                    {"role": "system", "content": _SYSTEM_EXTRACT},
+                    {"role": "user", "content": prompt},
                 ]
                 return await acall_llm(prompt, msgs, config)
 
@@ -580,7 +592,10 @@ async def quality_synthesize_source(
             existing_concepts=existing_concepts,
             language=source_lang or config.output_language,
         )
-        messages = [{"role": "user", "content": "Extract concepts from the source document above."}]
+        messages = [
+            {"role": "system", "content": _SYSTEM_EXTRACT},
+            {"role": "user", "content": extract_prompt},
+        ]
 
         try:
             response = await acall_llm(extract_prompt, messages, config)
@@ -740,7 +755,10 @@ async def _expand_one_concept(
         all_concepts=all_concepts,
         language=source_lang or config.output_language,
     )
-    messages = [{"role": "user", "content": f'Expand the concept "{concept.title}".'}]
+    messages = [
+        {"role": "system", "content": _SYSTEM_SYNTH},
+        {"role": "user", "content": prompt},
+    ]
 
     try:
         response = await acall_llm(prompt, messages, config)
@@ -999,8 +1017,8 @@ Return JSON:
 """
 
     messages = [
-        {"role": "user",
-         "content": "Update the concept above with the new source information."},
+        {"role": "system", "content": _SYSTEM_SYNTH},
+        {"role": "user", "content": prompt},
     ]
 
     try:
