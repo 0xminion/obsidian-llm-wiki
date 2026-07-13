@@ -27,9 +27,7 @@ def test_semantic_dedupe_noop_when_embeddings_disabled():
     c2 = ConceptNote(title="BTC", slug="btc", summary="Digital currency")
     bundle = SynthesisBundle(concepts=[c1, c2], maps=[])
 
-    with mock.patch(
-        "obsidian_llm_wiki.synth.embedding._EMBEDDINGS_ENABLED", False
-    ):
+    with mock.patch.dict("os.environ", {"EMBEDDINGS_ENABLED": "false"}, clear=False):
         semantic_dedupe_concepts(bundle)
 
     assert len(bundle.concepts) == 2  # Nothing merged
@@ -59,9 +57,7 @@ def test_semantic_dedupe_merges_high_similarity_pairs():
             return fake_emb_b
         return fake_emb_a
 
-    with mock.patch(
-        "obsidian_llm_wiki.synth.embedding._EMBEDDINGS_ENABLED", True
-    ), mock.patch(
+    with mock.patch.dict("os.environ", {"EMBEDDINGS_ENABLED": "true"}, clear=False), mock.patch(
         "obsidian_llm_wiki.synth.embedding.embed_text",
         side_effect=fake_embed,
     ), mock.patch(
@@ -90,9 +86,7 @@ def test_semantic_dedupe_does_not_merge_different_languages():
 
     fake_emb = [1.0, 0.0]
 
-    with mock.patch(
-        "obsidian_llm_wiki.synth.embedding._EMBEDDINGS_ENABLED", True
-    ), mock.patch(
+    with mock.patch.dict("os.environ", {"EMBEDDINGS_ENABLED": "true"}, clear=False), mock.patch(
         "obsidian_llm_wiki.synth.embedding.embed_text",
         return_value=fake_emb,
     ), mock.patch(
@@ -131,9 +125,7 @@ def test_semantic_dedupe_updates_concept_links():
             return fake_emb_b
         return fake_emb_a
 
-    with mock.patch(
-        "obsidian_llm_wiki.synth.embedding._EMBEDDINGS_ENABLED", True
-    ), mock.patch(
+    with mock.patch.dict("os.environ", {"EMBEDDINGS_ENABLED": "true"}, clear=False), mock.patch(
         "obsidian_llm_wiki.synth.embedding.embed_text",
         side_effect=fake_embed,
     ), mock.patch(
@@ -162,9 +154,7 @@ def test_semantic_dedupe_below_threshold_no_merge():
             return fake_emb_b
         return fake_emb_a
 
-    with mock.patch(
-        "obsidian_llm_wiki.synth.embedding._EMBEDDINGS_ENABLED", True
-    ), mock.patch(
+    with mock.patch.dict("os.environ", {"EMBEDDINGS_ENABLED": "true"}, clear=False), mock.patch(
         "obsidian_llm_wiki.synth.embedding.embed_text",
         side_effect=fake_embed,
     ), mock.patch(
@@ -189,9 +179,7 @@ def test_assign_orphans_noop_when_embeddings_disabled():
     )
     bundle = SynthesisBundle(concepts=[c1, c2], maps=[moc])
 
-    with mock.patch(
-        "obsidian_llm_wiki.synth.embedding._EMBEDDINGS_ENABLED", False
-    ):
+    with mock.patch.dict("os.environ", {"EMBEDDINGS_ENABLED": "false"}, clear=False):
         assign_orphans_to_mocs(bundle)
 
     assert "orphan" not in bundle.maps[0].concept_slugs
@@ -220,9 +208,7 @@ def test_assign_orphans_assigns_to_similar_moc():
             return emb_smart
         return emb_crypto
 
-    with mock.patch(
-        "obsidian_llm_wiki.synth.embedding._EMBEDDINGS_ENABLED", True
-    ), mock.patch(
+    with mock.patch.dict("os.environ", {"EMBEDDINGS_ENABLED": "true"}, clear=False), mock.patch(
         "obsidian_llm_wiki.synth.embedding.embed_text",
         side_effect=fake_embed,
     ):
@@ -249,9 +235,7 @@ def test_assign_orphans_does_not_assign_below_threshold():
             return fake_emb_food
         return fake_emb_crypto
 
-    with mock.patch(
-        "obsidian_llm_wiki.synth.embedding._EMBEDDINGS_ENABLED", True
-    ), mock.patch(
+    with mock.patch.dict("os.environ", {"EMBEDDINGS_ENABLED": "true"}, clear=False), mock.patch(
         "obsidian_llm_wiki.synth.embedding.embed_text",
         side_effect=fake_embed,
     ):
@@ -266,9 +250,7 @@ def test_assign_orphans_no_orphans():
     moc = MapOfContent(title="M", slug="m", summary="", concept_slugs=["a"])
     bundle = SynthesisBundle(concepts=[c1], maps=[moc])
 
-    with mock.patch(
-        "obsidian_llm_wiki.synth.embedding._EMBEDDINGS_ENABLED", True
-    ), mock.patch(
+    with mock.patch.dict("os.environ", {"EMBEDDINGS_ENABLED": "true"}, clear=False), mock.patch(
         "obsidian_llm_wiki.synth.embedding.embed_text",
         return_value=[1.0],
     ):

@@ -1,6 +1,6 @@
 """Regression tests for embedding module gating.
 
-EMBEDEDDINGS_ENABLED=false (the default in CI) must make all
+EMBEDDINGS_ENABLED=false (the default in CI) must make all
 embedding functions short-circuit without any network I/O.
 """
 from __future__ import annotations
@@ -11,20 +11,20 @@ from obsidian_llm_wiki.synth.embedding import embed_text
 
 
 class TestEmbeddingGating:
-    """Embedding calls must be no-ops when _EMBEDDINGS_ENABLED is False."""
+    """Embedding calls must be no-ops when EMBEDDINGS_ENABLED is False."""
 
     def test_embed_text_returns_none_when_disabled(self):
-        """embed_text must return None immediately when _EMBEDDINGS_ENABLED is False."""
-        with mock.patch(
-            "obsidian_llm_wiki.synth.embedding._EMBEDDINGS_ENABLED", False
+        """embed_text must return None immediately when EMBEDDINGS_ENABLED is False."""
+        with mock.patch.dict(
+            "os.environ", {"EMBEDDINGS_ENABLED": "false"}, clear=False
         ):
             result = embed_text("some text to embed")
         assert result is None
 
     def test_embed_text_returns_none_on_ollama_connection_error(self):
         """Connection errors from Ollama must return None, not raise."""
-        with mock.patch(
-            "obsidian_llm_wiki.synth.embedding._EMBEDDINGS_ENABLED", True
+        with mock.patch.dict(
+            "os.environ", {"EMBEDDINGS_ENABLED": "true"}, clear=False
         ), mock.patch(
             "obsidian_llm_wiki.synth.embedding.httpx.Client"
         ) as mock_client_cls:
@@ -37,8 +37,8 @@ class TestEmbeddingGating:
 
     def test_embed_text_returns_none_on_ollama_500(self):
         """Ollama returning 500 must return None."""
-        with mock.patch(
-            "obsidian_llm_wiki.synth.embedding._EMBEDDINGS_ENABLED", True
+        with mock.patch.dict(
+            "os.environ", {"EMBEDDINGS_ENABLED": "true"}, clear=False
         ), mock.patch(
             "obsidian_llm_wiki.synth.embedding.httpx.Client"
         ) as mock_client_cls:
@@ -48,5 +48,6 @@ class TestEmbeddingGating:
                 return_value=mock.Mock(get=mock.Mock(return_value=err_resp))
             )
             mock_client_cls.return_value.__exit__ = mock.Mock(return_value=False)
+            mock_client_cls.return_value.post = mock.Mock(return_value=err_resp)
             result = embed_text("test")
         assert result is None
