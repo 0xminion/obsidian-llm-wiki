@@ -33,6 +33,23 @@ _JATS_HOSTS = frozenset((
 ))
 
 
+def _guess_doi_from_url(url: str) -> str:
+    """Attempt to construct a DOI from an akjournals-style URL.
+
+    akjournals URLs follow the pattern:
+      /view/journals/<ISSN_journal>/<vol>/<issue>/article-p<page>.xml
+    The DOI pattern is typically: 10.1556/<ISSN_journal>.<year>.<article_id>
+    Since we don't know the year, we return empty and let Semantic Scholar
+    title search handle it. For known publishers with predictable DOI
+    patterns, this could be extended.
+    """
+    # akjournals uses DOI prefix 10.1556 with the journal's ISSN-based slug
+    # The URL path is /view/journals/2054/9/3/article-p294.xml
+    # DOI: 10.1556/2054.2025.00418 (year and article number not derivable from URL)
+    # We can't reliably construct the DOI without the year, so return empty.
+    return ""
+
+
 def _strip_ns(tag: str) -> str:
     """Remove XML namespace prefix from a tag: {ns}local → local."""
     if tag.startswith("{"):
@@ -83,8 +100,31 @@ def extract_jats(raw_url: str) -> SourceDoc:
                 "XML endpoint returned %s for %s; falling back to HTML: %s",
                 exc.response.status_code, raw_url, html_url,
             )
-            from obsidian_llm_wiki.ingest.web import extract_web
-            return extract_web(html_url)
+            try:
+                from obsidian_llm_wiki.ingest.web import extract_web
+                return extract_web(html_url)
+            except Exception:
+                pass
+            # If extract_web also failed (captcha/405), try Semantic Scholar
+            # title search as a last-resort academic fallback.
+            try:
+                from obsidian_llm_wiki.ingest.alt_source import _semantic_scholar_search
+                # Extract a search query from the URL path
+                path_part = html_url.rsplit("/article-", 1)[-1]
+                search_title = path_part.replace("-", " ").strip()
+                if search_title and len(search_title) > 10:
+                    return _semantic_scholar_search(search_title, raw_url)
+            except Exception:
+                pass
+            # Try DOI-based resolution via the DOI URL
+            try:
+                from obsidian_llm_wiki.ingest.alt_source import _doi_lookup
+                # akjournals DOI pattern: 10.1556/<ISSN>.<year>.<article>
+                doi = _guess_doi_from_url(raw_url)
+                if doi:
+                    return _doi_lookup(doi, raw_url)
+            except Exception:
+                pass
         raise
 
     if not xml_text.strip():

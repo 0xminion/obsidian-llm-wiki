@@ -224,7 +224,8 @@ def extract_via_journal_page(url: str, timeout: int = DEFAULT_TIMEOUT) -> Source
 
     Publishers sometimes serve the same article at a /article-p294 URL
     without the .xml suffix. This tries that rewrite before falling back to
-    the Wayback Machine.
+    the Wayback Machine. If a captcha/verification wall is detected, tries
+    Semantic Scholar search by article title extracted from the page.
 
     Returns:
         SourceDoc with title and extracted content.
@@ -240,6 +241,7 @@ def extract_via_journal_page(url: str, timeout: int = DEFAULT_TIMEOUT) -> Source
     else:
         raise RuntimeError(f"URL does not appear to be an XML article page: {url}")
 
+    html = ""
     try:
         with httpx.Client(
             **make_client_kwargs(timeout=timeout, follow_redirects=True),
@@ -249,35 +251,142 @@ def extract_via_journal_page(url: str, timeout: int = DEFAULT_TIMEOUT) -> Source
                 raise RuntimeError(f"Direct page returned 404: {direct_url}")
             resp.raise_for_status()
             html = resp.text
+    except Exception as exc:
+        raise RuntimeError(f"Journal direct page failed for {direct_url}: {exc}") from exc
 
-        # Check for Cloudflare
-        if "just a moment" in html.lower() or "cf-challenge" in html.lower():
-            raise RuntimeError("Cloudflare challenge on direct page")
+    # Check for Cloudflare or human verification walls
+    lower_html = html.lower()
+    if (
+        "just a moment" in lower_html
+        or "cf-challenge" in lower_html
+        or "confirm you are human" in lower_html
+        or "human verification" in lower_html
+    ):
+        # Try Semantic Scholar title search as a fallback for captchas
+        title = _extract_title_from_html(html)
+        if title:
+            try:
+                return _semantic_scholar_search(title, url, timeout)
+            except Exception:
+                pass
+        raise RuntimeError("Cloudflare/human verification challenge on direct page")
 
-        if not html.strip() or len(html.strip()) < 200:
-            raise RuntimeError("Empty or near-empty response from direct page")
+    if not html.strip() or len(html.strip()) < 200:
+        raise RuntimeError("Empty or near-empty response from direct page")
 
-        # Extract title
-        title_match = re.search(
-            r'<meta[^>]+property="og:title"[^>]+content="([^"]+)"',
-            html, re.IGNORECASE,
-        )
+    # Extract title
+    title = _extract_title_from_html(html) or direct_url
+
+    # Strip tags for plain text
+    content = _strip_journal_html(html)
+    if not content or len(content.strip()) < 100:
+        raise RuntimeError("Journal page extraction produced short/empty content")
+
+    return SourceDoc(title=title, content=content, url=direct_url)
+
+
+def _extract_title_from_html(html: str) -> str:
+    """Extract the article title from meta tags or <title> element."""
+    title_match = re.search(
+        r'<meta[^>]+property="og:title"[^>]+content="([^"]+)"',
+        html, re.IGNORECASE,
+    )
+    title = title_match.group(1).strip() if title_match else ""
+    if not title:
+        title_match = re.search(r"<title[^>]*>(.*?)</title>", html, re.IGNORECASE | re.DOTALL)
         title = title_match.group(1).strip() if title_match else ""
-        if not title:
-            title_match = re.search(r"<title[^>]*>(.*?)</title>", html, re.IGNORECASE | re.DOTALL)
-            title = title_match.group(1).strip() if title_match else direct_url
+    return title
 
-        # Strip tags for plain text
-        content = _strip_journal_html(html)
-        if not content or len(content.strip()) < 100:
-            raise RuntimeError("Journal page extraction produced short/empty content")
 
-        return SourceDoc(title=title, content=content, url=direct_url)
+def _semantic_scholar_search(
+    title: str, original_url: str, timeout: int = DEFAULT_TIMEOUT
+) -> SourceDoc:
+    """Search Semantic Scholar by paper title and return abstract + metadata.
+
+    This is a last-resort fallback for academic papers behind captcha walls.
+    """
+    search_url = (
+        "https://api.semanticscholar.org/graph/v1/paper/search"
+        f"?query={title}&limit=1&fields=title,abstract,year,authors"
+    )
+    try:
+        with httpx.Client(
+            **make_client_kwargs(timeout=timeout, follow_redirects=True),
+        ) as client:
+            resp = client.get(search_url, headers=BROWSER_HEADERS)
+            if resp.status_code == 404:
+                raise RuntimeError(f"Paper not found on Semantic Scholar: {title}")
+            resp.raise_for_status()
+            data = resp.json()
+
+        papers = data.get("data", []) or []
+        if not papers:
+            raise RuntimeError(f"No results from Semantic Scholar for: {title}")
+
+        paper = papers[0]
+        title_result = paper.get("title", "") or title
+        abstract = paper.get("abstract", "") or ""
+        year = paper.get("year", "") or ""
+        authors = paper.get("authors", []) or []
+        author_names = ", ".join(
+            a.get("name", "") for a in authors if a.get("name")
+        )
+
+        content_parts = [f"Title: {title_result}"]
+        if author_names:
+            content_parts.append(f"Authors: {author_names}")
+        if year:
+            content_parts.append(f"Year: {year}")
+        if abstract:
+            content_parts.extend(["", "Abstract:", abstract])
+        else:
+            content_parts.extend(["", "Note: No abstract available via Semantic Scholar."])
+
+        content = "\n".join(content_parts).strip()
+        return SourceDoc(title=title_result, content=content, url=original_url)
 
     except Exception as exc:
         raise RuntimeError(
-            f"Journal direct page failed for {direct_url}: {exc}"
+            f"Semantic Scholar title search failed for '{title}': {exc}"
         ) from exc
+
+
+def _doi_lookup(doi: str, original_url: str, timeout: int = DEFAULT_TIMEOUT) -> SourceDoc:
+    """Resolve a DOI via Semantic Scholar's DOI endpoint and return abstract + metadata."""
+    url = (
+        f"https://api.semanticscholar.org/graph/v1/paper/DOI:{doi}"
+        f"?fields=title,abstract,year,authors"
+    )
+    try:
+        with httpx.Client(
+            **make_client_kwargs(timeout=timeout, follow_redirects=True),
+        ) as client:
+            resp = client.get(url, headers=BROWSER_HEADERS)
+            if resp.status_code == 404:
+                raise RuntimeError(f"DOI not found on Semantic Scholar: {doi}")
+            resp.raise_for_status()
+            data = resp.json()
+
+        title = data.get("title", "") or doi
+        abstract = data.get("abstract", "") or ""
+        year = data.get("year", "") or ""
+        authors = data.get("authors", []) or []
+        author_names = ", ".join(a.get("name", "") for a in authors if a.get("name"))
+
+        content_parts = [f"Title: {title}"]
+        if author_names:
+            content_parts.append(f"Authors: {author_names}")
+        if year:
+            content_parts.append(f"Year: {year}")
+        if abstract:
+            content_parts.extend(["", "Abstract:", abstract])
+        else:
+            content_parts.extend(["", "Note: No abstract available."])
+
+        content = "\n".join(content_parts).strip()
+        return SourceDoc(title=title, content=content, url=original_url)
+    except Exception as exc:
+        raise RuntimeError(f"DOI lookup failed for {doi}: {exc}") from exc
 
 
 def _strip_journal_html(html: str) -> str:
