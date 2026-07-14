@@ -318,21 +318,28 @@ def render_concept_page(
 
     if concept.claims:
         parts.extend(["## Claims", ""])
-        evidence_entries: list[tuple[int, str, str]] = []
+        evidence_entries: list[tuple[int, str, str, bool]] = []
+        # (number, quote, source_file, verified)
         for claim in concept.claims:
             evidence = claim.evidence
+            has_quote = evidence is not None and bool(evidence.quote)
+            has_source = evidence is not None and bool(evidence.source_file)
             verified = (
-                evidence is not None
+                has_quote
+                and has_source
                 and str(evidence.verification) == "verified"
-                and bool(evidence.quote)
-                and bool(evidence.source_file)
+            )
+            unverified_with_quote = (
+                has_quote
+                and has_source
+                and str(evidence.verification) != "verified"
             )
             marker = ""
-            if verified:
+            if verified or unverified_with_quote:
                 marker_number = len(evidence_entries) + 1
-                marker = f" [{marker_number}]"
+                marker = f" [{marker_number}]" if verified else f" [{marker_number}*]"
                 evidence_entries.append(
-                    (marker_number, evidence.quote, evidence.source_file)
+                    (marker_number, evidence.quote, evidence.source_file, verified)
                 )
             parts.append(f"- {claim.text}{marker}")
         parts.append("")
@@ -340,14 +347,15 @@ def render_concept_page(
             from obsidian_llm_wiki.core.source_files import validate_source_filename
 
             parts.extend(["## Evidence", ""])
-            for number, quote, source_file in evidence_entries:
+            for number, quote, source_file, verified in evidence_entries:
                 try:
                     safe_source_file = validate_source_filename(source_file)
                     source_stem = Path(safe_source_file).stem
                     source_link = make_wikilink(f"sources/{source_stem}", source_stem)
                 except ValueError:
                     source_link = source_file
-                parts.extend([f"{number}. “{quote}”", f"   — {source_link}"])
+                suffix = "" if verified else " *(unverified)*"
+                parts.extend([f'{number}. \u201c{quote}\u201d{suffix}', f"   \u2014 {source_link}"])
             parts.append("")
 
     # ── 关联图谱 / Cross-References ──────────────────────────────────

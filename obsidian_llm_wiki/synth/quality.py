@@ -397,6 +397,45 @@ def _claim_key(claim: Claim) -> tuple[str, ...]:
     )
 
 
+def _merge_claims(pass1: list[Claim], pass2: list[Claim]) -> list[Claim]:
+    """Union claims from Pass 1 and Pass 2, preferring evidence-bearing entries.
+
+    Pass 2 replaces the concept body but may omit quotes for claims that Pass 1
+    had evidence for.  This unions both lists, deduplicating by claim text
+    (case-insensitive).  When the same claim text appears in both passes, the
+    version with evidence (quote + source_file) wins; if both have evidence,
+    the Pass 2 (expanded) version wins.
+    """
+    merged: list[Claim] = []
+    seen_text: dict[str, int] = {}  # lowercased text → index in merged
+
+    for claim in pass2 + pass1:
+        key = claim.text.strip().lower()
+        if not key:
+            continue
+        if key in seen_text:
+            idx = seen_text[key]
+            existing = merged[idx]
+            # Prefer the version with evidence if one has it and the other doesn't.
+            existing_has_evidence = (
+                existing.evidence is not None
+                and bool(existing.evidence.quote)
+                and bool(existing.evidence.source_file)
+            )
+            new_has_evidence = (
+                claim.evidence is not None
+                and bool(claim.evidence.quote)
+                and bool(claim.evidence.source_file)
+            )
+            if new_has_evidence and not existing_has_evidence:
+                merged[idx] = claim
+        else:
+            seen_text[key] = len(merged)
+            merged.append(claim)
+
+    return merged
+
+
 def _section_body_chars(section: BodySection) -> int:
     """Count body characters in a single section."""
     total = len(section.prose)
@@ -931,12 +970,16 @@ async def quality_synthesize_source(
             )
             continue
 
-        # Replace skeleton concept with expanded version.
+        # Replace skeleton concept with expanded version, preserving Pass 1
+        # claims that Pass 2 didn't reproduce.  Pass 2 may omit quotes for
+        # claims that Pass 1 had evidence for — union them so evidence from
+        # the first pass survives.
         expanded = result
         expanded.tags = original.tags or expanded.tags
         expanded.confidence = original.confidence
         expanded.provenance = original.provenance
         expanded.is_new = original.is_new
+        expanded.claims = _merge_claims(original.claims, expanded.claims)
 
         skeleton.concepts[i] = expanded
 
