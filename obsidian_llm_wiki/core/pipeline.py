@@ -359,12 +359,31 @@ async def run_pipeline(
             "model": config.embedding_model,
             "host": config.embedding_host,
         }
+        # Load persisted embeddings to avoid recomputing for unchanged concepts.
+        # The cache is model-keyed — switching embedding models invalidates it.
+        embeddings_cache_path = config.llmwiki_dir / "embeddings.json"
+        if config.embeddings_enabled:
+            from obsidian_llm_wiki.synth.embedding import (
+                load_embeddings_cache,
+                save_embeddings_cache,
+            )
+            embeddings_cache = load_embeddings_cache(embeddings_cache_path)
         try:
+            # Build the set of new/changed concept slugs for incremental dedup.
+            new_slugs: set[str] | None = None
+            if filenames_done:
+                new_slugs = set()
+                for f in filenames_done:
+                    synth = all_syntheses_by_file.get(f)
+                    if synth:
+                        new_slugs.update(c.slug for c in synth.concepts)
+
             semantic_dedupe_concepts(
                 bundle,
                 threshold=config.similarity_dedup_threshold,
                 embeddings_cache=embeddings_cache,
                 embedding_options=embedding_options,
+                new_slugs=new_slugs,
             )
         except Exception as exc:
             logger.warning("Semantic dedup failed (continuing without): %s", exc)
@@ -387,9 +406,14 @@ async def run_pipeline(
                 enabled=config.embeddings_enabled,
                 model=config.embedding_model,
                 host=config.embedding_host,
+                embeddings_cache=embeddings_cache,
             )
         except Exception as exc:
             logger.warning("Cross-lingual linking failed (continuing without): %s", exc)
+
+        # Persist embeddings for reuse on the next run.
+        if config.embeddings_enabled and embeddings_cache:
+            save_embeddings_cache(embeddings_cache_path, embeddings_cache)
 
         metrics.record_embedding(
             model=config.embedding_model if config.embeddings_enabled else "",

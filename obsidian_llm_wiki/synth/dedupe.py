@@ -277,6 +277,7 @@ def semantic_dedupe_concepts(
     *,
     embeddings_cache: dict[str, list[float]] | None = None,
     embedding_options: dict[str, object] | None = None,
+    new_slugs: set[str] | None = None,
 ) -> None:
     """Merge same-language concepts with high embedding cosine similarity.
 
@@ -291,6 +292,12 @@ def semantic_dedupe_concepts(
 
     Gated behind ``EMBEDDINGS_ENABLED`` — no-ops if embeddings are unavailable
     (the Ollama embedding service is down or the env var is not set).
+
+    When ``new_slugs`` is provided, only compares concepts in ``new_slugs``
+    against all concepts (new + existing).  Existing-vs-existing pairs are
+    skipped — they were already compared in a previous run and won't produce
+    new merges (same embeddings, same threshold).  This reduces the comparison
+    count from O(N²) to O(new × total) for incremental runs.
     """
     from obsidian_llm_wiki.synth.embedding import cosine_similarity
     from obsidian_llm_wiki.synth.language import detect_language
@@ -323,13 +330,19 @@ def semantic_dedupe_concepts(
     merge_map: dict[str, str] = {}  # merged_slug → surviving_slug
     merged_slugs: set[str] = set()
 
-    for i, slug_a in enumerate(slugs):
+    # When new_slugs is provided, only compare new concepts against all.
+    # Existing-vs-existing pairs were compared in a previous run with the same
+    # embeddings and threshold — they won't merge now.
+    comparison_slugs = new_slugs if new_slugs is not None else set(slugs)
+
+    for slug_a in slugs:
+        if slug_a not in comparison_slugs:
+            continue  # not a new concept — only new concepts initiate comparisons
         if slug_a in merged_slugs:
             continue
-        for slug_b in slugs[i + 1:]:
-            # slug_a can become a victim mid-inner-loop; without this check it
-            # would be picked as a *survivor* for a later pair, merging that
-            # pair's content into an already-deleted concept.
+        for slug_b in slugs:
+            if slug_a == slug_b:
+                continue
             if slug_a in merged_slugs:
                 break
             if slug_b in merged_slugs:
@@ -343,7 +356,6 @@ def semantic_dedupe_concepts(
             if sim < threshold:
                 continue
 
-            # Determine survivor: higher confidence, tie-break by slug order.
             ca = concept_map[slug_a]
             cb = concept_map[slug_b]
             if cb.confidence > ca.confidence or (

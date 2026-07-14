@@ -6,7 +6,10 @@ have high cosine similarity (>0.85), they are automatically linked as
 cross-lingual aliases in the MoC and concept pages.
 
 Architecture:
-  - embed_text(text) → list[float] | None — call Ollama /api/embeddings
+  - embed_text(text) → list[float] | None — call Ollama /api/embed
+  - embed_batch(texts) → list[list[float] | None] — batched embedding (8 per call)
+  - load_embeddings_cache(path) → dict[str, list[float]] — load persisted embeddings
+  - save_embeddings_cache(path, cache) → None — persist embeddings to disk
   - cosine_similarity(a, b) → float — cosine similarity
   - find_cross_lingual_links(concepts) → dict[slug, list[(target_slug, score, display)]]
   - The results are injected into concept.related and MoC concept_slugs
@@ -15,9 +18,11 @@ Architecture:
 
 from __future__ import annotations
 
+import json
 import logging
 import math
 import os
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -27,11 +32,16 @@ logger = logging.getLogger("obswiki.synth.embedding")
 __all__ = [
     "find_cross_lingual_links",
     "embed_text",
+    "embed_batch",
+    "load_embeddings_cache",
+    "save_embeddings_cache",
     "cosine_similarity",
 ]
 
 _SIMILARITY_THRESHOLD = 0.60
 _EMBED_TIMEOUT = 30  # seconds — allow for cold model loading
+_BATCH_SIZE = 8  # texts per Ollama /api/embed call — keeps RAM under ~2GB
+_ROUND_DECIMALS = 6  # round floats in persisted cache to keep file size manageable
 
 
 def _embedding_model() -> str:
@@ -107,6 +117,115 @@ def embed_text(
         return None
 
 
+def embed_batch(
+    texts: list[str],
+    *,
+    enabled: bool | None = None,
+    model: str | None = None,
+    host: str | None = None,
+    batch_size: int = _BATCH_SIZE,
+) -> list[list[float] | None]:
+    """Embed multiple texts efficiently using Ollama's batched /api/embed.
+
+    Sends ``batch_size`` texts per API call.  Returns one embedding per input
+    text (``None`` for texts that failed or when embeddings are disabled).
+    """
+    if enabled is None:
+        enabled = os.environ.get("EMBEDDINGS_ENABLED", "false").strip().lower() in (
+            "true", "1", "yes",
+        )
+    if not enabled or not texts:
+        return [None] * len(texts)
+
+    model = model or _embedding_model()
+    host = (host or _ollama_host()).rstrip("/")
+
+    results: list[list[float] | None] = [None] * len(texts)
+
+    for start in range(0, len(texts), batch_size):
+        batch = texts[start:start + batch_size]
+        truncated = [t[:2000] for t in batch]
+        try:
+            with httpx.Client(timeout=_EMBED_TIMEOUT) as client:
+                resp = client.post(
+                    f"{host}/api/embed",
+                    json={"model": model, "input": truncated},
+                )
+                if resp.status_code != 200:
+                    for i, text in enumerate(batch):
+                        idx = start + i
+                        results[idx] = embed_text(
+                            text, enabled=enabled, model=model, host=host,
+                        )
+                    continue
+                data = resp.json()
+                embeddings = data.get("embeddings", [])
+                for i, emb in enumerate(embeddings):
+                    idx = start + i
+                    if idx < len(results) and emb:
+                        results[idx] = emb
+        except Exception as exc:
+            logger.debug("Batch embedding failed at offset %d: %s", start, exc)
+            for i, text in enumerate(batch):
+                idx = start + i
+                if results[idx] is None:
+                    results[idx] = embed_text(
+                        text, enabled=enabled, model=model, host=host,
+                    )
+
+    return results
+
+
+def load_embeddings_cache(cache_path: Path) -> dict[str, list[float]]:
+    """Load persisted embeddings from ``embeddings.json``.
+
+    Returns an empty dict if the file is missing, corrupt, or was produced by
+    a different embedding model.
+    """
+    if not cache_path.exists():
+        return {}
+    try:
+        data = json.loads(cache_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        logger.debug("Embeddings cache at %s is corrupt — ignoring", cache_path)
+        return {}
+
+    cached_model = data.get("_model", "")
+    current_model = _embedding_model()
+    if cached_model != current_model:
+        logger.info(
+            "Embeddings cache model mismatch (cached=%s, current=%s) — rebuilding",
+            cached_model, current_model,
+        )
+        return {}
+
+    embeddings: dict[str, list[float]] = {}
+    for slug, vec in data.get("embeddings", {}).items():
+        if isinstance(vec, list):
+            embeddings[slug] = vec
+    logger.info("Loaded %d cached embeddings from %s", len(embeddings), cache_path)
+    return embeddings
+
+
+def save_embeddings_cache(cache_path: Path, embeddings: dict[str, list[float]]) -> None:
+    """Persist embeddings to ``embeddings.json`` with 6-decimal rounding."""
+    if not embeddings:
+        return
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    rounded = {
+        slug: [round(v, _ROUND_DECIMALS) for v in vec]
+        for slug, vec in embeddings.items()
+    }
+    data = {
+        "_model": _embedding_model(),
+        "embeddings": rounded,
+    }
+    tmp = cache_path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(cache_path)
+    logger.info("Saved %d embeddings to %s", len(rounded), cache_path)
+
+
 def cosine_similarity(a: list[float], b: list[float]) -> float:
     """Compute cosine similarity between two embedding vectors.
 
@@ -129,24 +248,30 @@ def find_cross_lingual_links(
     enabled: bool | None = None,
     model: str | None = None,
     host: str | None = None,
+    embeddings_cache: dict[str, list[float]] | None = None,
 ) -> dict[str, list[tuple[str, float, str]]]:
     """Find cross-lingual concept pairs with high semantic similarity.
 
     Returns empty dict if embeddings are disabled or unavailable.
+
+    When ``embeddings_cache`` is provided, uses and updates it instead of
+    recomputing embeddings from scratch.
     """
     from obsidian_llm_wiki.synth.language import detect_language
 
-    # Build embeddings for all concepts
-    embeddings: dict[str, list[float]] = {}
+    # Build embeddings for all concepts, reusing the shared cache
+    embeddings: dict[str, list[float]] = embeddings_cache or {}
     concept_langs: dict[str, str] = {}
 
     for concept in concepts:
-        # Embed title + summary (best semantic representation)
+        if concept.slug in embeddings:
+            lang = detect_language(f"{concept.title}. {concept.summary or ''}")
+            concept_langs[concept.slug] = lang
+            continue
         text = f"{concept.title}. {concept.summary or ''}"
         emb = embed_text(text, enabled=enabled, model=model, host=host)
         if emb:
             embeddings[concept.slug] = emb
-            # Detect language from title + summary
             lang = detect_language(text)
             concept_langs[concept.slug] = lang
 
