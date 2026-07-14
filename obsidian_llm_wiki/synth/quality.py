@@ -316,12 +316,13 @@ def merge_entry_syntheses(
             if tag not in merged_tags:
                 merged_tags.append(tag)
 
-        # Union claims (dedup by text).
+        # Union claims without conflating evidence from distinct sources.
         merged_claims = list(existing.claims)
-        seen_claim_texts: set[str] = {c.text for c in existing.claims}
+        seen_claim_keys = {_claim_key(claim) for claim in existing.claims}
         for claim in concept.claims:
-            if claim.text not in seen_claim_texts:
-                seen_claim_texts.add(claim.text)
+            key = _claim_key(claim)
+            if key not in seen_claim_keys:
+                seen_claim_keys.add(key)
                 merged_claims.append(claim)
 
         # Union related (dedup by slug).
@@ -379,6 +380,21 @@ def merge_entry_syntheses(
     merged.maps = list(moc_by_slug.values())
 
     return merged
+
+
+def _claim_key(claim: Claim) -> tuple[str, ...]:
+    """Deduplicate exact claims while retaining independently verified spans."""
+    if claim.evidence is None:
+        return (claim.text, claim.source_ref)
+    evidence = claim.evidence
+    return (
+        claim.text,
+        evidence.quote,
+        evidence.source_file,
+        evidence.source_hash,
+        str(evidence.start_offset),
+        str(evidence.end_offset),
+    )
 
 
 def _section_body_chars(section: BodySection) -> int:
@@ -519,6 +535,7 @@ _EXPAND_SCHEMA: dict[str, Any] = {
     "claims": [
         {
             "text": "string — factual claim from the source",
+            "quote": "string — exact verbatim quote supporting this claim",
             "source_ref": "string — where in the source",
         }
     ],
@@ -1255,6 +1272,7 @@ def _build_concept_from_expand(data: dict[str, Any], fallback_slug: str) -> Conc
             text=c.get("text", ""),
             concept_slug=fallback_slug,
             source_ref=c.get("source_ref", ""),
+            evidence=c.get("evidence") or ({"quote": c["quote"]} if c.get("quote") else None),
         )
         for c in data.get("claims", [])
         if isinstance(c, dict)
@@ -1352,7 +1370,11 @@ Return JSON:
         {{"heading": "Section Name", "points": ["point1", "point2"], "prose": ""}}
     ],
     "claims": [
-        {{"text": "factual claim", "source_ref": "from new source"}}
+        {{
+            "text": "factual claim",
+            "quote": "exact verbatim source quote",
+            "source_ref": "from new source"
+        }}
     ]
 }}
 ```
@@ -1404,6 +1426,7 @@ Return JSON:
                 text=c.get("text", ""),
                 concept_slug=concept.slug,
                 source_ref=c.get("source_ref", ""),
+                evidence=c.get("evidence") or ({"quote": c["quote"]} if c.get("quote") else None),
             ))
 
     from obsidian_llm_wiki.synth.dedupe import normalise_tags

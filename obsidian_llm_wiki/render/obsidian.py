@@ -17,6 +17,7 @@ import os
 import shutil
 import tempfile
 from contextlib import suppress
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
@@ -317,9 +318,37 @@ def render_concept_page(
 
     if concept.claims:
         parts.extend(["## Claims", ""])
+        evidence_entries: list[tuple[int, str, str]] = []
         for claim in concept.claims:
-            parts.append(f"- {claim.text}")
+            evidence = claim.evidence
+            verified = (
+                evidence is not None
+                and str(evidence.verification) == "verified"
+                and bool(evidence.quote)
+                and bool(evidence.source_file)
+            )
+            marker = ""
+            if verified:
+                marker_number = len(evidence_entries) + 1
+                marker = f" [{marker_number}]"
+                evidence_entries.append(
+                    (marker_number, evidence.quote, evidence.source_file)
+                )
+            parts.append(f"- {claim.text}{marker}")
         parts.append("")
+        if evidence_entries:
+            from obsidian_llm_wiki.core.source_files import validate_source_filename
+
+            parts.extend(["## Evidence", ""])
+            for number, quote, source_file in evidence_entries:
+                try:
+                    safe_source_file = validate_source_filename(source_file)
+                    source_stem = Path(safe_source_file).stem
+                    source_link = make_wikilink(f"sources/{source_stem}", source_stem)
+                except ValueError:
+                    source_link = source_file
+                parts.extend([f"{number}. “{quote}”", f"   — {source_link}"])
+            parts.append("")
 
     # ── 关联图谱 / Cross-References ──────────────────────────────────
     # The ASCII flow diagram goes inside a ```text code block for monospace
@@ -548,11 +577,11 @@ def render_bundle_index(
 
 
 class _RenderTransaction:
-    """Restore non-human vault files if a render cannot finish.
+    """Restore every pre-existing vault file if a render cannot finish.
 
     The renderer has several independent output steps, so a per-page atomic
     write alone cannot prevent a later failure from leaving a mixed vault.
-    Snapshotting the existing generated tree also lets rollback remove backups
+    Snapshotting the entire pre-existing tree also lets rollback remove backups
     created by an aborted render while retaining the pre-existing backup set.
     """
 
@@ -563,7 +592,6 @@ class _RenderTransaction:
         self._root_existed = bundle_dir.exists()
         self._original_files: set[Path] = set()
         self._original_dirs: set[Path] = set()
-        self._protected_files: set[Path] = set()
         self._snapshot()
 
     def _snapshot(self) -> None:
@@ -577,31 +605,16 @@ class _RenderTransaction:
                 continue
             if not path.is_file():
                 continue
-            if self._is_human_page(path):
-                self._protected_files.add(relative)
-                continue
             destination = self._staging_dir / relative
             destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(path, destination)
             self._original_files.add(relative)
 
-    @staticmethod
-    def _is_human_page(path: Path) -> bool:
-        if path.suffix != ".md":
-            return False
-        from obsidian_llm_wiki.core.review import is_reviewed_page
-
-        content = safe_read_file(path)
-        if is_reviewed_page(content):
-            return True
-        metadata, _ = parse_frontmatter(content)
-        return metadata.get("orphaned") is True
-
     def commit(self) -> None:
         self._staging.cleanup()
 
     def rollback(self) -> None:
-        """Restore the snapshot without overwriting reviewed/orphaned pages."""
+        """Restore the exact pre-render snapshot, including reviewed metadata."""
         if self.bundle_dir.exists():
             for path in sorted(
                 (p for p in self.bundle_dir.rglob("*") if p.is_file()),
@@ -609,7 +622,7 @@ class _RenderTransaction:
                 reverse=True,
             ):
                 relative = path.relative_to(self.bundle_dir)
-                if relative not in self._original_files and relative not in self._protected_files:
+                if relative not in self._original_files:
                     path.unlink()
 
         for relative in self._original_files:
@@ -919,17 +932,18 @@ def render_vault(
 ) -> list[str]:
     """Render a vault atomically with respect to generated output.
 
-    Reviewed and orphaned pages are deliberately left outside the rollback
-    boundary: they contain user-maintained content.  All other pre-existing
-    vault files (including indexes and backup history) are restored if any
-    render step raises, and stale pages are removed only after every output has
-    been written successfully.
+    Every pre-existing vault file (including reviewed metadata, indexes, and
+    backup history) is restored if any render step raises. Rendering operates
+    on a defensive bundle copy because normalization and MoC augmentation are
+    renderer-local output preparation, not caller-visible state changes. Stale
+    pages are removed only after every output has been written successfully.
     """
     transaction = _RenderTransaction(bundle_dir)
+    render_bundle = deepcopy(bundle)
     try:
         written = _render_vault(
             bundle_dir,
-            bundle,
+            render_bundle,
             sources,
             config,
             cross_lingual_links=cross_lingual_links,

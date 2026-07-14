@@ -220,7 +220,9 @@ def test_render_vault_remaps_embedding_links_after_bilingual_slug_normalization(
 
     normalized_chinese_slug = "da-yuyan-moxing-大语言模型"
     page = (tmp_path / "mocs" / "language-ai.md").read_text(encoding="utf-8")
-    assert normalized_chinese_slug in moc.concept_slugs
+    # Rendering works on a defensive bundle copy: the page receives the
+    # normalized/augmented member but a caller can retry with its original data.
+    assert normalized_chinese_slug not in moc.concept_slugs
     assert page.index(f"[[{normalized_chinese_slug}]]") < page.index(
         "## Cross-References / 关联图谱"
     )

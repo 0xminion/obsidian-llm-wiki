@@ -557,90 +557,81 @@ def extract(raw_url: str) -> SourceDoc:
     if is_direct_document_url(raw_url):
         return _stamp_extracted_source(dispatch_document(raw_url), raw_url, "document_dispatch")
 
-    # Parse as URL.
-    parsed = urlparse(raw_url)
+    # Route every ordinary remote URL through the connector contract. Existing
+    # specialists remain first and retain their fail-closed behavior; the
+    # generic web extractor is the dispatcher fallback rather than a side path.
+    result = _dispatch_remote_connectors(raw_url)
+    if result.succeeded:
+        assert result.source is not None
+        stamped = _stamp_extracted_source(result.source, raw_url, result.connector_name)
+        if result.connector_name != "generic_web":
+            return stamped
 
-    # Try registered extractors first (YouTube, PDF, JATS, etc.).
-    # If a specialized extractor MATCHES the URL but fails, we fail closed —
-    # do NOT fall through to extract_web, which would produce garbage from
-    # cookie-walled pages (YouTube footer chrome, CF challenge HTML, etc.).
-    # JATS does its own XML→HTML fallback internally; PDF downloads directly.
-    matched_errors: list[tuple[str, Exception]] = []
-    for match_fn, extractor_fn in _EXTRACTORS:
-        if match_fn(parsed, raw_url):
-            logger.debug("Routing '%s' to %s", raw_url, extractor_fn.__name__)
-            try:
-                return _stamp_extracted_source(
-                    extractor_fn(raw_url), raw_url, extractor_fn.__name__
-                )
-            except ExtractorNotApplicableError as exc:
-                # The extractor disclaimed the URL after inspecting the content.
-                # This is not a failure, so it must not fail closed — keep the
-                # ordinary fallback chain (other extractors, then extract_web).
-                logger.debug(
-                    "Extractor %s disclaimed %s: %s",
-                    extractor_fn.__name__,
-                    raw_url,
-                    exc,
-                )
-                continue
-            except Exception as exc:
-                logger.warning(
-                    "Extractor %s failed for %s: %s; trying fallback",
-                    extractor_fn.__name__,
-                    raw_url,
-                    exc,
-                )
-                matched_errors.append((extractor_fn.__name__, exc))
-                continue
-
-    if matched_errors:
-        # Last-resort: deep search across accessible scholarly sources.
-        # Only fires when DEEP_SEARCH_FALLBACK is enabled — keeps CI offline.
+        # Last-resort: if generic web extraction produced a stub, try deep
+        # search for the same title across accessible scholarly sources and use
+        # the best alternative. Gated to keep CI deterministic.
         if _deep_search_enabled():
-            try:
-                ds = _deep_search_fallback("", raw_url)
-                logger.info(
-                    "Deep search fallback recovered content for %s after all "
-                    "specialized extractors failed.", raw_url,
-                )
-                return _stamp_extracted_source(ds, raw_url, "deep_search_fallback")
-            except Exception as ds_exc:
-                logger.warning(
-                    "Deep search fallback also failed for %s: %s", raw_url, ds_exc,
-                )
+            passed, _reason = _check_extraction_quality(stamped)
+            if not passed:
+                try:
+                    ds = _deep_search_fallback(stamped.title or "", raw_url)
+                    if len(ds.content or "") > len(stamped.content or ""):
+                        logger.info(
+                            "Deep search fallback replacing stub for %s "
+                            "(stub=%d chars → deep_search=%d chars).",
+                            raw_url, len(stamped.content or ""), len(ds.content or ""),
+                        )
+                        return _stamp_extracted_source(ds, raw_url, "deep_search_fallback")
+                except Exception as ds_exc:
+                    logger.warning("Deep search fallback failed for stub %s: %s", raw_url, ds_exc)
+        return stamped
+
+    assert result.failure is not None
+    if result.connector_name == "specialist_dispatch" and _deep_search_enabled():
+        try:
+            ds = _deep_search_fallback("", raw_url)
+            return _stamp_extracted_source(ds, raw_url, "deep_search_fallback")
+        except Exception as ds_exc:
+            logger.warning("Deep search fallback also failed for %s: %s", raw_url, ds_exc)
+    if result.connector_name == "specialist_dispatch":
         raise RuntimeError(
-            f"All specialized extractors failed for {raw_url}: "
-            + "; ".join(f"{n}: {e}" for n, e in matched_errors)
+            f"All specialized extractors failed for {raw_url}: {result.failure.message}"
         )
+    raise RuntimeError(result.failure.message)
 
-    # Fallback: web extraction.
-    web_source = extract_web(raw_url)
-    stamped = _stamp_extracted_source(web_source, raw_url, "web_fallback")
 
-    # Last-resort: if web extraction produced a stub, try deep search for the
-    # same title across accessible scholarly sources and use the best
-    # alternative.  Gated by DEEP_SEARCH_FALLBACK to keep CI deterministic.
-    if _deep_search_enabled():
-        passed, _reason = _check_extraction_quality(stamped)
-        if not passed:
-            try:
-                ds = _deep_search_fallback(stamped.title or "", raw_url)
-                # Only replace when the deep search result is strictly better
-                # (longer content) than the stub it's replacing.
-                if len(ds.content or "") > len(stamped.content or ""):
-                    logger.info(
-                        "Deep search fallback replacing stub for %s "
-                        "(stub=%d chars → deep_search=%d chars).",
-                        raw_url, len(stamped.content or ""), len(ds.content or ""),
-                    )
-                    return _stamp_extracted_source(ds, raw_url, "deep_search_fallback")
-            except Exception as ds_exc:
-                logger.warning(
-                    "Deep search fallback failed for stub %s: %s", raw_url, ds_exc,
-                )
+def _dispatch_remote_connectors(raw_url: str):
+    """Adapt the registered specialist functions to the connector contract."""
+    from obsidian_llm_wiki.ingest.connectors import (
+        CallableSourceConnector,
+        GenericWebConnector,
+        SourceConnectorDispatcher,
+    )
 
-    return stamped
+    # These extractors currently create HTTPX clients with automatic redirects.
+    # Keep their specialized path disabled for untrusted URLs until each uses
+    # the common hop-validating transport; the generic connector remains safe.
+    unvalidated_modules = {
+        "obsidian_llm_wiki.ingest.extractors.jats",
+        "obsidian_llm_wiki.ingest.extractors.youtube",
+        "obsidian_llm_wiki.ingest.extractors.twitter",
+        "obsidian_llm_wiki.ingest.extractors.scientific",
+        "obsidian_llm_wiki.ingest.extractors.podcast",
+    }
+    specialists = [
+        CallableSourceConnector(
+            extractor_fn.__name__,
+            match_fn,
+            extractor_fn,
+            is_not_applicable=lambda exc: isinstance(exc, ExtractorNotApplicableError),
+            validated_redirects=extractor_fn.__module__ not in unvalidated_modules,
+        )
+        for match_fn, extractor_fn in _EXTRACTORS
+    ]
+    return SourceConnectorDispatcher(
+        specialists,
+        GenericWebConnector(extractor=extract_web),
+    ).dispatch(raw_url)
 
 
 def _stamp_extracted_source(source: SourceDoc, raw_url: str, extractor: str) -> SourceDoc:

@@ -44,6 +44,7 @@ from obsidian_llm_wiki.core.contradictions import (
     ContradictionStore,
     SourceRevision,
 )
+from obsidian_llm_wiki.core.evidence import resolve_synthesis_evidence
 from obsidian_llm_wiki.core.lock import acquire_lock, release_lock
 from obsidian_llm_wiki.core.metrics import MetricsCollector
 from obsidian_llm_wiki.core.models import (
@@ -507,8 +508,13 @@ async def _synthesize_source(
             schema_policy=schema_policy,
             granularity=granularity,
         )
-        if synth is not None and source_lang and not synth.language:
-            synth.language = source_lang
+        if synth is not None:
+            if not synth.source_title:
+                synth.source_title = source.title
+            synth.source_file = filename
+            if source_lang and not synth.language:
+                synth.language = source_lang
+            resolve_synthesis_evidence(synth, source, filename)
         return synth
 
     from obsidian_llm_wiki.providers.llm import acall_llm
@@ -545,6 +551,8 @@ async def _synthesize_source(
 
     if source_lang and not synthesis.language:
         synthesis.language = source_lang
+
+    resolve_synthesis_evidence(synthesis, source, filename)
 
     return synthesis
 
@@ -620,6 +628,9 @@ async def _synthesize_with_retry(
 
         if synth is not None:
             if level_idx > 0:
+                # Evidence must describe the source revision persisted and
+                # rendered, never the temporary retry prefix.
+                resolve_synthesis_evidence(synth, source, filename)
                 # Success on truncated content is a degraded result, not a
                 # clean one — the wiki was built from a fraction of the source.
                 logger.warning(
