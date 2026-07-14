@@ -313,6 +313,16 @@ class CompileResult:
 # ── JSON ↔ dataclass conversion ─────────────────────────────────────────
 
 
+def _string(value: object) -> str:
+    """Accept only strings from untrusted LLM JSON scalar fields."""
+    return value if isinstance(value, str) else ""
+
+
+def _strings(value: object) -> list[str]:
+    """Accept a list of strings without coercing dicts or null into content."""
+    return [item for item in value if isinstance(item, str)] if isinstance(value, list) else []
+
+
 def source_synthesis_from_dict(data: dict[str, Any]) -> SourceSynthesis:
     """Build a SourceSynthesis from a raw dict (LLM JSON output).
 
@@ -329,15 +339,15 @@ def source_synthesis_from_dict(data: dict[str, Any]) -> SourceSynthesis:
         if isinstance(m, dict)
     ]
     return SourceSynthesis(
-        source_title=data.get("source_title", data.get("title", "")),
-        source_summary=data.get("source_summary", data.get("summary", "")),
-        source_tags=list(data.get("source_tags", data.get("tags", [])) or []),
-        key_points=list(data.get("key_points", []) or []),
-        open_questions=list(data.get("open_questions", []) or []),
-        language=data.get("language", ""),
+        source_title=_string(data.get("source_title", data.get("title", ""))),
+        source_summary=_string(data.get("source_summary", data.get("summary", ""))),
+        source_tags=_strings(data.get("source_tags", data.get("tags", []))),
+        key_points=_strings(data.get("key_points", [])),
+        open_questions=_strings(data.get("open_questions", [])),
+        language=_string(data.get("language", "")),
         concepts=concepts,
         maps=maps,
-        source_file=data.get("source_file", ""),
+        source_file=_string(data.get("source_file", "")),
     )
 
 
@@ -345,9 +355,9 @@ def _concept_from_dict(data: dict[str, Any]) -> ConceptNote:
     """Build a ConceptNote from a raw dict."""
     sections = [
         BodySection(
-            heading=s.get("heading", ""),
-            points=list(s.get("points", []) or []),
-            prose=s.get("prose", ""),
+            heading=_string(s.get("heading", "")),
+            points=_strings(s.get("points", [])),
+            prose=_string(s.get("prose", "")),
         )
         for s in data.get("sections", [])
         if isinstance(s, dict)
@@ -359,9 +369,9 @@ def _concept_from_dict(data: dict[str, Any]) -> ConceptNote:
     ]
     claims = [
         Claim(
-            text=c.get("text", ""),
-            concept_slug=c.get("concept_slug", ""),
-            source_ref=c.get("source_ref", ""),
+            text=_string(c.get("text", "")),
+            concept_slug=_string(c.get("concept_slug", "")),
+            source_ref=_string(c.get("source_ref", "")),
         )
         for c in data.get("claims", [])
         if isinstance(c, dict)
@@ -370,7 +380,7 @@ def _concept_from_dict(data: dict[str, Any]) -> ConceptNote:
         ConceptLink(
             slug=normalize_slug(r.get("slug", "")),
             relation=normalize_relation(r.get("relation", "related_to")),
-            display=r.get("display", ""),
+            display=_string(r.get("display", "")),
         )
         for r in data.get("related", [])
         if isinstance(r, dict)
@@ -382,16 +392,16 @@ def _concept_from_dict(data: dict[str, Any]) -> ConceptNote:
     except (TypeError, ValueError):
         confidence = 1.0
     return ConceptNote(
-        title=data.get("title", ""),
+        title=_string(data.get("title", "")),
         slug=normalize_slug(data.get("slug", ""), data.get("title", "")),
-        summary=data.get("summary", ""),
-        tags=list(data.get("tags", []) or []),
-        aliases=list(data.get("aliases", []) or []),
+        summary=_string(data.get("summary", "")),
+        tags=_strings(data.get("tags", [])),
+        aliases=_strings(data.get("aliases", [])),
         sections=sections,
         claims=claims,
         related=related,
         confidence=confidence,
-        provenance=data.get("provenance", data.get("provenance_state", "extracted")),
+        provenance=_string(data.get("provenance", data.get("provenance_state", "extracted"))),
         is_new=data.get("is_new", True),
     )
 
@@ -399,11 +409,11 @@ def _concept_from_dict(data: dict[str, Any]) -> ConceptNote:
 def _moc_from_dict(data: dict[str, Any]) -> MapOfContent:
     """Build a MapOfContent from a raw dict."""
     return MapOfContent(
-        title=data.get("title", ""),
+        title=_string(data.get("title", "")),
         slug=normalize_slug(data.get("slug", ""), data.get("title", "")),
-        summary=data.get("summary", ""),
-        tags=list(data.get("tags", []) or []),
-        concept_slugs=[normalize_slug(slug) for slug in data.get("concept_slugs", []) or []],
+        summary=_string(data.get("summary", "")),
+        tags=_strings(data.get("tags", [])),
+        concept_slugs=[normalize_slug(slug) for slug in _strings(data.get("concept_slugs", []))],
     )
 
 

@@ -216,6 +216,10 @@ olw metrics ~/MyVault
 | `olw validate` | Check vault for conformance (frontmatter, wikilinks, strict mode) |
 | `olw health` | Vault health report (broken links, orphans, stubs, low confidence) |
 | `olw metrics` | Print pipeline run metrics summary |
+| `olw recompile` | Retry one source with bounded truncation recovery |
+| `olw fix` | Preview or explicitly apply conservative backed-up maintenance fixes |
+| `olw providers check` | Inspect endpoint, authentication state, and task-model routing |
+| `olw providers models` | List models exposed by the configured LLM provider |
 
 ---
 
@@ -255,20 +259,17 @@ confidence: 0.95
 provenance: extracted
 timestamp: 2026-07-13T10:00:00Z
 relations:
-  - target: sgd
-    type: variant_of
-    display: SGD
-  - target: learning-rate
-    type: depends_on
-    display: Learning Rate
+  - sgd|variant_of|SGD
+  - learning-rate|depends_on|Learning Rate
 ---
 ```
 
 Cross-links use Obsidian wikilinks with typed edge annotations:
 `[[sgd|SGD]] — \`variant_of\``
 
-The `relations[]` frontmatter array is machine-readable for Obsidian Dataview
-queries and graph visualisation plugins.
+The `relations[]` frontmatter array stores `slug|relation|display` strings.
+It is machine-readable for Obsidian Dataview queries and graph visualisation
+plugins without triggering nested-object Properties warnings.
 
 ### MOC pages
 
@@ -276,6 +277,21 @@ Maps of Content group related concepts with:
 - Bilingual headings when the MoC contains both English and Chinese concepts
 - Cross-reference diagrams showing typed relationships between concepts
 - Cross-lingual embedding links merged into the Concepts list
+
+A single MoC can deliberately contain English and Chinese concepts from the
+same umbrella. With embeddings enabled, a high-confidence cross-language
+semantic sibling of any existing MoC member is added to that MoC during the
+render pass, so the page, graph export, and health checks agree on membership.
+Use a multilingual embedding model for this; a monolingual model makes this
+feature decorative rather than useful.
+
+### Source provenance and Obsidian Properties
+
+Source pages retain requested, resolved, and extracted URLs, extraction stages,
+content type, retrieval time, hash, and diagnostics in the `provenance`
+property. It is serialized as a flat list of readable strings rather than a
+nested YAML object, because Obsidian's Properties pane warns on nested objects.
+Existing source pages with the legacy nested representation remain readable.
 
 ---
 
@@ -312,7 +328,7 @@ OUTPUT_LANGUAGE=
 SYNTHESIS_MODE=single        # single | two_pass
 
 # Quality gates
-CONCEPT_MIN_BODY_CHARS=800
+CONCEPT_MIN_BODY_CHARS=1200
 ENTRY_MIN_BODY_CHARS=500
 
 # Semantic features
@@ -346,6 +362,33 @@ For OpenAI, OpenRouter, LM Studio, vLLM, etc., set `LLM_PROVIDER=openai`,
 The Ollama client passes `context_window` as `num_ctx` to the Ollama API
 automatically — required for cloud models like `gemma4:31b-cloud` that
 support 256K token context.
+
+### Embeddings: what they do and what they do not do
+
+Embeddings are opt-in and fail closed: if the local embedding endpoint is
+unavailable or returns an invalid vector, normal synthesis and rendering still
+complete without semantic deduplication, automatic MoC assignment, or
+cross-lingual expansion. When healthy, the pipeline uses embeddings for:
+
+1. same-language near-duplicate concept merging;
+2. assigning otherwise orphaned concepts to the most similar MoC; and
+3. connecting cross-language semantic siblings under the same MoC.
+
+Set `EMBEDDING_MODEL` to a model that supports every language in the vault.
+For English+Chinese vaults, use a multilingual embedding model such as the
+locally installed `qwen3-embedding:0.6b` rather than assuming a default model
+is bilingual. The model and `LLM_HOST` are resolved at call time after the
+vault `.env` is loaded, so per-vault settings actually take effect.
+
+### Extraction fallbacks and access-controlled sources
+
+Set `DEEP_SEARCH_FALLBACK=true` to let a failed or stub web extraction search
+Semantic Scholar, OpenAlex, arXiv, and Crossref for an accessible equivalent.
+It is deliberately off by default because it adds external network calls and
+may recover metadata/abstracts rather than the publisher's full text. For
+YouTube age/consent walls, set `YOUTUBE_COOKIES_FILE` to a local Netscape
+cookies file. Proxy routing is opt-in through `RESIDENTIAL_PROXY_URL`; do not
+set a global `HTTPS_PROXY` unless that broad routing is actually intended.
 
 ---
 
@@ -413,7 +456,7 @@ obsidian_llm_wiki/
 
 ```bash
 pip install -e ".[dev]"
-pytest                     # 431 tests
+pytest
 ruff check obsidian_llm_wiki tests
 ```
 
@@ -453,6 +496,24 @@ The test suite follows standard test automation patterns
 | Equivalence class tests | `test_url_classification` (journal XML, SSRN, YouTube) |
 | Regression tests | `test_backlink_propagation_golden`, `test_multi_source_merge_golden` |
 | State transition tests | `test_golden_pipeline_incremental_skip` |
+
+---
+
+## Obsidian desktop bridge (optional)
+
+`obsidian-plugin/` is a thin desktop-only bridge around the installed `olw`
+CLI; it does not duplicate compiler logic. Build it with `npm ci && npm run
+build`, then copy `manifest.json` and `main.js` into your vault's
+`.obsidian/plugins/obsidian-llm-wiki-bridge/` directory and enable it in
+Obsidian. It provides commands for URL ingest/preview, query, health checks,
+maintenance-fix previews, result history, and cancellation. Configure the
+`olw` executable in the plugin settings if it is not on Obsidian's PATH.
+
+---
+
+## License
+
+This project is licensed under the [MIT License](LICENSE).
 
 ---
 

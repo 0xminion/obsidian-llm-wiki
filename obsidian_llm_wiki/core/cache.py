@@ -24,6 +24,7 @@ from obsidian_llm_wiki.core.models import (
     source_synthesis_from_dict,
     source_synthesis_to_dict,
 )
+from obsidian_llm_wiki.core.source_files import validate_source_filename
 from obsidian_llm_wiki.render.obsidian import atomic_write, safe_read_file
 
 logger = logging.getLogger("obswiki.core.cache")
@@ -50,7 +51,7 @@ def synthesis_cache_dir(cache_root: Path) -> Path:
 
 def synthesis_cache_path(cache_root: Path, source_file: str) -> Path:
     """Return the cache JSON path for a given source filename."""
-    return synthesis_cache_dir(cache_root) / f"{source_file}.json"
+    return synthesis_cache_dir(cache_root) / f"{validate_source_filename(source_file)}.json"
 
 
 def save_synthesis(

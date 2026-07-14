@@ -139,8 +139,8 @@ def english_side(title: str) -> str:
     return ""
 
 
-def normalize_bilingual_titles_and_slugs(bundle: SynthesisBundle) -> None:
-    """Normalize Chinese-derived titles/slugs across a bundle in-place."""
+def normalize_bilingual_titles_and_slugs(bundle: SynthesisBundle) -> dict[str, str]:
+    """Normalize Chinese-derived titles/slugs and return old-to-new slug mappings."""
     slug_map: dict[str, str] = {}
 
     # Concepts: normalize title and slug, then remap all relationship targets.
@@ -210,6 +210,8 @@ def normalize_bilingual_titles_and_slugs(bundle: SynthesisBundle) -> None:
         ]
         english = " and ".join(concept_titles) if concept_titles else "Chinese Source"
         synthesis.source_title = f"{english} ({synthesis.source_title})"
+
+    return slug_map
 
 
 def moc_needs_bilingual_headings(

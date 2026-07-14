@@ -102,3 +102,13 @@ def test_cjk_aliases_are_tokenized_for_lexical_retrieval():
 
     assert "自注意力" in tokenize("自注意力机制")
     assert result.candidates[0].path == "concepts/attention.md"
+
+
+def test_cjk_tokenization_uses_bounded_ngram_sizes():
+    from obsidian_llm_wiki.query.retrieval import tokenize
+
+    tokens = tokenize("知" * 1000)
+
+    # Whole-token + unigrams + each 2/3/4-gram: linear, not every substring.
+    assert len(tokens) <= 4_000
+    assert "知知" in tokens and "知知知知" in tokens

@@ -545,6 +545,13 @@ def extract(raw_url: str) -> SourceDoc:
             return _stamp_extracted_source(dispatch_document(raw_url), raw_url, "document_dispatch")
         return _stamp_extracted_source(_extract_file(raw_url), raw_url, "local_file")
 
+    # Inbox URLs can originate outside the local trust boundary. Reject direct
+    # local/private targets before a generic extractor or document downloader
+    # can turn the CLI into an SSRF primitive.
+    from obsidian_llm_wiki.ingest.url_safety import validate_remote_url
+
+    validate_remote_url(raw_url)
+
     from obsidian_llm_wiki.ingest.documents import dispatch_document, is_direct_document_url
 
     if is_direct_document_url(raw_url):

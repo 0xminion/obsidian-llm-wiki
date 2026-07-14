@@ -304,11 +304,9 @@ def test_merge_victim_is_never_reused_as_survivor(monkeypatch):
     dedupe.semantic_dedupe_concepts(bundle, threshold=0.85)
 
     surviving = {c.slug for c in bundle.concepts}
-    # X merged into Y; W must survive untouched (its only similar pair was
-    # with the deleted X).
-    assert "x-concept" not in surviving
-    assert "y-concept" in surviving
-    assert "w-concept" in surviving
+    # Deterministic traversal merges W into X, then X into Y. The flattened
+    # merge map must leave one live survivor with no dangling MoC references.
+    assert surviving == {"y-concept"}
     # Every MoC slug must reference a live concept.
     for moc in bundle.maps:
         for slug in moc.concept_slugs:
@@ -524,6 +522,61 @@ def test_pipeline_does_not_double_record_synthesis_failures(tmp_path, monkeypatc
     assert len(failures) == 1, (
         f"expected exactly the helper's 1 per-attempt record, got {len(failures)}"
     )
+
+
+def test_pipeline_records_and_reuses_cross_lingual_embedding_links(tmp_path, monkeypatch):
+    """One embedding pass must drive both rendering and truthful metrics."""
+    from obsidian_llm_wiki.config import Config
+    from obsidian_llm_wiki.core import pipeline as pl
+    from obsidian_llm_wiki.core.metrics import load_metrics
+
+    english = _concept("language-model")
+    english.title = "Language model"
+    chinese = _concept("da-yuyan-moxing")
+    chinese.title = "大语言模型"
+    moc = MapOfContent(
+        title="Language models", slug="language-models", summary="", concept_slugs=[english.slug],
+    )
+
+    async def fake_retry(_config, filename, _source, _existing, *_args, **_kwargs):
+        return SourceSynthesis(
+            source_title="Bilingual source",
+            source_summary="",
+            source_file=filename,
+            concepts=[english, chinese],
+            maps=[moc],
+        )
+
+    captured: dict = {}
+
+    def fake_render(_dir, _bundle, _sources, **kwargs):
+        captured["cross_lingual_links"] = kwargs["cross_lingual_links"]
+        return []
+
+    links = {
+        english.slug: [(chinese.slug, 0.91, chinese.title)],
+        chinese.slug: [(english.slug, 0.91, english.title)],
+    }
+    monkeypatch.setattr(pl, "_synthesize_with_retry", fake_retry)
+    monkeypatch.setattr(pl, "render_vault", fake_render)
+    monkeypatch.setattr(
+        "obsidian_llm_wiki.synth.embedding.find_cross_lingual_links",
+        lambda _concepts, **_kwargs: links,
+    )
+
+    result = asyncio.run(
+        pl.run_pipeline(
+            tmp_path,
+            {"bilingual.md": SourceDoc(title="Bilingual source", content="x " * 100)},
+            Config(vault_path=str(tmp_path)),
+        )
+    )
+
+    assert result.compiled == 1
+    assert captured["cross_lingual_links"] == links
+    metrics_data = load_metrics(tmp_path)
+    assert metrics_data is not None
+    assert metrics_data["rendering"]["cross_lingual_links"] == 1
 
 
 # ── Health report wikilink normalization ──────────────────────────────────

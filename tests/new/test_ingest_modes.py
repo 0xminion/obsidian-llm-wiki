@@ -144,8 +144,9 @@ def test_skip_synthesis_enforces_source_byte_limit_before_writing(tmp_path, monk
     assert len(rendered_content.encode("utf-8")) <= config.max_source_chars
     assert extracted.content == original_content
     assert extracted.provenance.content_sha256 == original_hash
-    assert metadata["provenance"]["content_sha256"] == sha256("éé".encode()).hexdigest()
-    assert "truncated" in metadata["provenance"]["diagnostics"][-1]
+    provenance = metadata["provenance"]
+    assert f"content_sha256: {sha256('éé'.encode()).hexdigest()}" in provenance
+    assert any(entry.startswith("diagnostics: ") and "truncated" in entry for entry in provenance)
 
 
 def test_ingest_cancellation_persists_source_state_and_resume_marker(tmp_path, monkeypatch) -> None:

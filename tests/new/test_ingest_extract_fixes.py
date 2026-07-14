@@ -57,8 +57,8 @@ def test_supported_document_urls_are_directly_dispatched(url):
 
 def test_html_landing_page_reaches_citation_discovery(monkeypatch, tmp_path):
     """HTML landing-page citation links reach the same bounded document dispatcher."""
-    landing = "https://journal.example/articles/42"
-    candidate = "https://journal.example/pdf/42.pdf"
+    landing = "https://example.com/articles/42"
+    candidate = "https://example.com/pdf/42.pdf"
     landing_html = '<meta name="citation_pdf_url" content="/pdf/42.pdf">'
 
     class LandingClient:
@@ -71,7 +71,7 @@ def test_html_landing_page_reaches_citation_discovery(monkeypatch, tmp_path):
         def __exit__(self, *_args):
             return None
 
-        def get(self, url):
+        def get(self, url, **_kwargs):
             assert url == landing
             return httpx.Response(
                 200,
@@ -168,7 +168,7 @@ def test_disclaimed_url_falls_through_to_extract_web(monkeypatch):
         lambda url: SourceDoc(title="Blog", content="web body", url=url),
     )
 
-    source = extractors.extract("https://blog.example/feed")
+    source = extractors.extract("https://example.com/feed")
 
     assert source.content == "web body"
 
@@ -339,3 +339,42 @@ def test_rate_limiter_serializes_concurrent_callers(monkeypatch):
     assert all(gap == 3.0 for gap in gaps), f"calls burst together: {gaps}"
 
     supadata_utils.reset_rate_limiter()
+
+
+# ── Generic HTML responses must be bounded while streaming ───────────────
+
+
+def test_trafilatura_stops_reading_chunked_html_at_configured_byte_limit(monkeypatch):
+    """An unknown-length HTML response must not be fully buffered before rejection."""
+    from obsidian_llm_wiki.ingest import web
+
+    url = "https://example.com/oversized"
+    yielded: list[bytes] = []
+
+    class ChunkedBody(httpx.SyncByteStream):
+        def __iter__(self):
+            for chunk in (b"<html>", b"x" * 5):
+                yielded.append(chunk)
+                yield chunk
+            raise AssertionError("HTML stream was read beyond the configured byte limit")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert str(request.url) == url
+        return httpx.Response(200, stream=ChunkedBody(), request=request)
+
+    real_client = httpx.Client
+    monkeypatch.setenv("MAX_HTML_BYTES", "10")
+    monkeypatch.setattr(
+        web.httpx,
+        "Client",
+        lambda **kwargs: real_client(transport=httpx.MockTransport(handler), **kwargs),
+    )
+    monkeypatch.setattr(
+        "obsidian_llm_wiki.ingest.url_safety.validate_remote_url",
+        lambda _url: None,
+    )
+
+    with pytest.raises(RuntimeError, match="HTML response exceeded 10 bytes"):
+        web._extract_trafilatura(url, timeout=10)
+
+    assert yielded == [b"<html>", b"x" * 5]

@@ -44,6 +44,16 @@ __all__ = [
 
 logger = logging.getLogger("obswiki.synth.dedupe")
 
+_INVERSE_RELATIONS = {
+    "depends_on": "prerequisite_of",
+    "prerequisite_of": "depends_on",
+    "component_of": "part_of",
+    "part_of": "component_of",
+    "variant_of": "variant_of",
+    "contrasts_with": "contrasts_with",
+    "related_to": "related_to",
+}
+
 
 # ── Tag normalisation ───────────────────────────────────────────────────
 
@@ -184,8 +194,8 @@ def propagate_backlinks(bundle: SynthesisBundle) -> None:
     synthesized in different runs (B is cached, A is new).
 
     This pass walks all concepts in the bundle and for every forward
-    edge A→B, ensures B has a reverse edge B→A with the same relation
-    type (or ``related_to`` as a fallback). It also enriches MoC
+    edge A→B, ensures B has a reverse edge B→A with its semantic inverse
+    type (or ``related_to`` when the schema has no inverse). It also enriches MoC
     concept lists: if a concept in a MoC links to a concept in another
     MoC, the target concept's MoCs are checked for reciprocal links.
 
@@ -214,7 +224,7 @@ def propagate_backlinks(bundle: SynthesisBundle) -> None:
 
             # Add reverse link
             from obsidian_llm_wiki.core.models import ConceptLink
-            reverse_relation = link.relation or "related_to"
+            reverse_relation = _INVERSE_RELATIONS.get(link.relation, "related_to")
             if target.related is None:
                 target.related = []
             target.related.append(
@@ -239,6 +249,7 @@ def propagate_backlinks(bundle: SynthesisBundle) -> None:
 def _embed_concept(
     concept: ConceptNote,
     embeddings_cache: dict[str, list[float]] | None,
+    embedding_options: dict[str, object] | None = None,
 ) -> list[float]:
     """Embed a concept's title+summary, consulting the shared cache first.
 
@@ -251,7 +262,10 @@ def _embed_concept(
         return embeddings_cache[concept.slug]
     from obsidian_llm_wiki.synth.embedding import embed_text
 
-    emb = embed_text(f"{concept.title}. {concept.summary or ''}")
+    emb = embed_text(
+        f"{concept.title}. {concept.summary or ''}",
+        **(embedding_options or {}),
+    )
     if emb and embeddings_cache is not None:
         embeddings_cache[concept.slug] = emb
     return emb
@@ -262,6 +276,7 @@ def semantic_dedupe_concepts(
     threshold: float = 0.85,
     *,
     embeddings_cache: dict[str, list[float]] | None = None,
+    embedding_options: dict[str, object] | None = None,
 ) -> None:
     """Merge same-language concepts with high embedding cosine similarity.
 
@@ -288,7 +303,7 @@ def semantic_dedupe_concepts(
     concept_langs: dict[str, str] = {}
 
     for concept in bundle.concepts:
-        emb = _embed_concept(concept, embeddings_cache)
+        emb = _embed_concept(concept, embeddings_cache, embedding_options)
         if emb:
             embeddings[concept.slug] = emb
             concept_langs[concept.slug] = detect_language(
@@ -304,7 +319,7 @@ def semantic_dedupe_concepts(
 
     # Find mergeable pairs (same language, high similarity).
     concept_map: dict[str, ConceptNote] = {c.slug: c for c in bundle.concepts}
-    slugs = list(embeddings.keys())
+    slugs = sorted(embeddings)
     merge_map: dict[str, str] = {}  # merged_slug → surviving_slug
     merged_slugs: set[str] = set()
 
@@ -331,7 +346,9 @@ def semantic_dedupe_concepts(
             # Determine survivor: higher confidence, tie-break by slug order.
             ca = concept_map[slug_a]
             cb = concept_map[slug_b]
-            if cb.confidence > ca.confidence:
+            if cb.confidence > ca.confidence or (
+                cb.confidence == ca.confidence and slug_b < slug_a
+            ):
                 survivor, victim = slug_b, slug_a
             else:
                 survivor, victim = slug_a, slug_b
@@ -427,6 +444,7 @@ def assign_orphans_to_mocs(
     threshold: float = 0.55,
     *,
     embeddings_cache: dict[str, list[float]] | None = None,
+    embedding_options: dict[str, object] | None = None,
 ) -> None:
     """Assign concepts not in any MoC to the most semantically similar MoC.
 
@@ -463,7 +481,7 @@ def assign_orphans_to_mocs(
     # Compute embeddings for orphans.
     orphan_embs: dict[str, list[float]] = {}
     for orphan in orphans:
-        emb = _embed_concept(orphan, embeddings_cache)
+        emb = _embed_concept(orphan, embeddings_cache, embedding_options)
         if emb:
             orphan_embs[orphan.slug] = emb
 
@@ -478,7 +496,7 @@ def assign_orphans_to_mocs(
         for slug in moc.concept_slugs:
             concept = concept_by_slug.get(slug)
             if concept:
-                emb = _embed_concept(concept, embeddings_cache)
+                emb = _embed_concept(concept, embeddings_cache, embedding_options)
                 if emb:
                     moc_embeddings.append(emb)
         if moc_embeddings:

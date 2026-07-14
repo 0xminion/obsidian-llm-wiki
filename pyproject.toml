@@ -7,6 +7,10 @@ name = "obsidian-llm-wiki"
 version = "3.0.0"
 description = "LLM-powered knowledge compiler for Obsidian vaults — links in, interlinked wiki out"
 requires-python = ">=3.11"
+license = {file = "LICENSE"}
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+]
 dependencies = [
     "typer>=0.12",
     "httpx[socks]>=0.27",

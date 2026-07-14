@@ -29,6 +29,7 @@ __all__ = [
 ]
 
 logger = logging.getLogger("obswiki.synth.parser")
+_MAX_RESPONSE_CHARS = 1_000_000
 
 
 def parse_synthesis_response(response: str) -> SynthesisBundle:
@@ -134,10 +135,13 @@ def _sanitize_latex_artifacts(data: Any) -> Any:
 def _extract_json(text: str) -> list[Any] | dict[str, Any] | None:
     """Extract the first valid JSON array or object from ``text``.
 
-    Handles code fences and surrounding prose.  Falls back to progressive
-    trimming if the JSON is malformed.
+    Handles code fences and surrounding prose without repeatedly parsing every
+    shorter suffix of malformed model output.
     """
     text = text.strip()
+    if len(text) > _MAX_RESPONSE_CHARS:
+        logger.warning("Refusing oversized synthesis response (%d chars)", len(text))
+        return None
 
     # Strip markdown code fences.
     text = re.sub(r"^```(?:json)?\s*", "", text)
@@ -157,22 +161,14 @@ def _extract_json(text: str) -> list[Any] | dict[str, Any] | None:
 
     text = text[start:]
 
-    # Try parsing the whole remainder.
+    # Decode one JSON value from the first object/array. ``raw_decode`` accepts
+    # explanatory trailing prose while keeping malformed-input work bounded.
     try:
-        return json.loads(text)
+        value, _end = json.JSONDecoder().raw_decode(text)
+        return value
     except json.JSONDecodeError:
-        pass
-
-    # Try progressively trimming from the end.
-    for end in range(len(text), 1, -1):
-        try:
-            return json.loads(text[:end])
-        except json.JSONDecodeError:
-            continue
-
-    logger.warning("Could not parse JSON from response (first 200 chars): %s",
-                   text[:200])
-    return None
+        logger.warning("Could not parse JSON from response (first 200 chars): %s", text[:200])
+        return None
 
 
 def _find_json_start(text: str) -> int:

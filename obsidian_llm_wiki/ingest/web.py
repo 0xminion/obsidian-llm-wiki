@@ -21,9 +21,11 @@ import subprocess
 
 import httpx
 
+from obsidian_llm_wiki.config import load_config
 from obsidian_llm_wiki.core.models import SourceDoc
 from obsidian_llm_wiki.ingest.http_headers import BROWSER_HEADERS, DEFAULT_TIMEOUT
 from obsidian_llm_wiki.ingest.proxy import make_client_kwargs
+from obsidian_llm_wiki.ingest.url_safety import stream_with_validated_redirects
 
 logger = logging.getLogger("obswiki.ingest.web")
 
@@ -32,12 +34,40 @@ __all__ = ["extract_web"]
 _TIMEOUT = DEFAULT_TIMEOUT
 _MAX_EXTRACTION_ERRORS = 12
 _MAX_EXTRACTION_ERROR_CHARS = 240
+_MAX_HTML_STREAM_CHUNK_BYTES = 64 * 1024
 
 
 def _record_error(errors: list[str], stage: str, exc: Exception) -> None:
     """Keep fallback diagnostics informative without allowing unbounded errors."""
     if len(errors) < _MAX_EXTRACTION_ERRORS:
         errors.append(f"{stage}: {str(exc)[:_MAX_EXTRACTION_ERROR_CHARS]}")
+
+
+def _read_bounded_html(response: httpx.Response, max_bytes: int) -> str:
+    """Read one HTML response incrementally without exceeding ``max_bytes``."""
+    if max_bytes < 1:
+        raise RuntimeError("MAX_HTML_BYTES must be at least 1")
+
+    declared_size = response.headers.get("content-length")
+    if declared_size is not None:
+        try:
+            if int(declared_size) > max_bytes:
+                raise RuntimeError(
+                    f"HTML response Content-Length {declared_size} exceeds {max_bytes} bytes"
+                )
+        except ValueError:
+            pass
+
+    chunks: list[bytes] = []
+    total = 0
+    chunk_size = min(_MAX_HTML_STREAM_CHUNK_BYTES, max_bytes + 1)
+    for chunk in response.iter_bytes(chunk_size=chunk_size):
+        total += len(chunk)
+        if total > max_bytes:
+            raise RuntimeError(f"HTML response exceeded {max_bytes} bytes")
+        chunks.append(chunk)
+
+    return b"".join(chunks).decode(response.encoding or "utf-8", errors="replace")
 
 
 def extract_web(url: str, timeout: int = _TIMEOUT) -> SourceDoc:
@@ -321,19 +351,20 @@ def _extract_defuddle_md(url: str, timeout: int) -> SourceDoc:
     stripped = url.replace("https://", "").replace("http://", "")
     defuddle_url = f"https://defuddle.md/{stripped}"
 
-    with httpx.Client(
-        **make_client_kwargs(timeout=timeout, follow_redirects=True),
-        headers={
-            "User-Agent": BROWSER_HEADERS["User-Agent"],
-            "Accept": "text/html",
-        },
-    ) as client:
-        resp = client.get(defuddle_url)
+    with (
+        httpx.Client(
+            **make_client_kwargs(timeout=timeout, follow_redirects=False),
+            headers={
+                "User-Agent": BROWSER_HEADERS["User-Agent"],
+                "Accept": "text/html",
+            },
+        ) as client,
+        stream_with_validated_redirects(client, defuddle_url) as resp,
+    ):
+        if resp.status_code != 200:
+            raise RuntimeError(f"defuddle.md returned HTTP {resp.status_code}")
+        text = _read_bounded_html(resp, load_config().max_html_bytes).strip()
 
-    if resp.status_code != 200:
-        raise RuntimeError(f"defuddle.md returned HTTP {resp.status_code}")
-
-    text = resp.text.strip()
     if not text or len(text) < 100:
         raise RuntimeError("defuddle.md returned empty content")
 
@@ -382,12 +413,14 @@ def _extract_trafilatura(url: str, timeout: int) -> SourceDoc:
     """Extract via httpx fetch + trafilatura."""
     import trafilatura
 
-    with httpx.Client(
-        **make_client_kwargs(timeout=timeout, follow_redirects=True),
-        headers=BROWSER_HEADERS,
-    ) as client:
-        resp = client.get(url)
-        html = resp.text
+    with (
+        httpx.Client(
+            **make_client_kwargs(timeout=timeout, follow_redirects=False),
+            headers=BROWSER_HEADERS,
+        ) as client,
+        stream_with_validated_redirects(client, url) as resp,
+    ):
+        html = _read_bounded_html(resp, load_config().max_html_bytes)
 
     _check_cloudflare(resp, html)
     resp.raise_for_status()

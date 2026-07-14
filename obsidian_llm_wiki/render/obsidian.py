@@ -13,6 +13,10 @@ single input; the output is a complete vault directory tree.
 from __future__ import annotations
 
 import logging
+import os
+import shutil
+import tempfile
+from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
@@ -70,6 +74,16 @@ from obsidian_llm_wiki.render.frontmatter import (
 
 logger = logging.getLogger("obswiki.render.obsidian")
 
+_PROVENANCE_SCALAR_KEYS = (
+    "requested_url",
+    "resolved_url",
+    "extracted_url",
+    "content_type",
+    "document_format",
+    "retrieved_at",
+    "content_sha256",
+)
+
 __all__ = [
     "render_vault",
     "render_entry_page",
@@ -98,7 +112,7 @@ def render_source_page(source: SourceDoc, timestamp: str | None = None) -> str:
     (as a # heading or plain text), the body heading is skipped.
     """
     ts = timestamp or _timestamp()
-    fm = {
+    fm: dict[str, Any] = {
         "type": ConceptType.SOURCE.value,
         "title": source.title,
         "url": source.url or "",
@@ -110,18 +124,10 @@ def render_source_page(source: SourceDoc, timestamp: str | None = None) -> str:
         fm["tags"] = source.tags
     if source.source_type:
         fm["source_type"] = source.source_type
-    provenance = {
-        "requested_url": source.provenance.requested_url,
-        "resolved_url": source.provenance.resolved_url,
-        "extracted_url": source.provenance.extracted_url,
-        "extractor_chain": list(source.provenance.extractor_chain),
-        "content_type": source.provenance.content_type,
-        "document_format": source.provenance.document_format,
-        "retrieved_at": source.provenance.retrieved_at,
-        "content_sha256": source.provenance.content_sha256,
-        "diagnostics": list(source.provenance.diagnostics),
-    }
-    provenance = {key: value for key, value in provenance.items() if value}
+    # Obsidian Properties accepts scalar and list values but warns for nested
+    # mappings. Preserve complete provenance in a readable, round-trippable
+    # list of strings rather than emitting a YAML object in the property pane.
+    provenance = _render_provenance(source)
     if provenance:
         fm["provenance"] = provenance
     content = source.content.strip()
@@ -140,6 +146,19 @@ def render_source_page(source: SourceDoc, timestamp: str | None = None) -> str:
     else:
         body = f"# {source.title}\n\n{content}"
     return f"{build_frontmatter(fm)}\n{body}"
+
+
+def _render_provenance(source: SourceDoc) -> list[str]:
+    """Return compact source provenance entries compatible with Obsidian Properties."""
+    values = source.provenance
+    entries = [
+        f"{key}: {getattr(values, key)}"
+        for key in _PROVENANCE_SCALAR_KEYS
+        if getattr(values, key)
+    ]
+    entries.extend(f"extractor_chain: {stage}" for stage in values.extractor_chain if stage)
+    entries.extend(f"diagnostics: {message}" for message in values.diagnostics if message)
+    return entries
 
 
 def _write_generated_page(path: Path, page: str, bundle_dir: Path) -> bool:
@@ -359,6 +378,10 @@ def render_moc_page(
     if moc.summary:
         parts.extend([moc.summary, ""])
 
+    _augment_moc_cross_lingual_members(
+        moc, all_concepts, cross_lingual_links,
+    )
+
     if moc.concept_slugs:
         concept_entries = [
             all_concepts.get(slug) if all_concepts else None
@@ -417,37 +440,51 @@ def render_moc_page(
                     "",
                 ])
 
-    # ── Cross-lingual links from embedding ──────────────────────────
-    # Instead of a separate section, merge cross-lingual concepts into the
-    # Concepts list so they appear as part of the same MoC umbrella.
-    if cross_lingual_links and moc.concept_slugs:
-        existing_slugs = set(moc.concept_slugs)
-        added_slugs: list[str] = []
-        for slug in moc.concept_slugs:
-            if slug in cross_lingual_links:
-                for target_slug, _score, display in cross_lingual_links[slug]:
-                    if target_slug in existing_slugs:
-                        continue  # Already in this MoC
-                    existing_slugs.add(target_slug)
-                    added_slugs.append(target_slug)
-                    target_concept = all_concepts.get(target_slug) if all_concepts else None
-                    badge = ""
-                    if target_concept and target_concept.confidence < 0.5:
-                        badge = " *(low confidence)*"
-                    definition = ""
-                    if target_concept:
-                        definition = (
-                            f" — {target_concept.summary}"
-                            if target_concept.summary else ""
-                        )
-                    parts.append(
-                        f"- {make_wikilink(target_slug, display)}"
-                        f"{badge}{definition} *(cross-lingual link)*"
-                    )
-        # Don't add a separate section heading
-
     body = "\n".join(parts)
     return f"{build_frontmatter(fm)}\n{body}"
+
+
+def _augment_moc_cross_lingual_members(
+    moc: MapOfContent,
+    all_concepts: dict[str, ConceptNote] | None,
+    cross_lingual_links: dict[str, list[tuple[str, float, str]]] | None,
+) -> None:
+    """Add validated semantic siblings before rendering the MoC concept list.
+
+    The mutation is deliberate: the graph export and page agree on membership.
+    Rebuilds recalculate it from current embeddings, so this adds no hidden
+    persisted state.
+    """
+    if not all_concepts or not cross_lingual_links:
+        return
+
+    existing = set(moc.concept_slugs)
+    for slug in tuple(moc.concept_slugs):
+        for target_slug, _score, _display in cross_lingual_links.get(slug, []):
+            if target_slug not in all_concepts or target_slug in existing:
+                continue
+            moc.concept_slugs.append(target_slug)
+            existing.add(target_slug)
+
+
+def _remap_cross_lingual_links(
+    links: dict[str, list[tuple[str, float, str]]],
+    slug_map: dict[str, str],
+) -> dict[str, list[tuple[str, float, str]]]:
+    """Keep pre-render embedding links valid after bilingual slug normalization."""
+    if not slug_map:
+        return links
+    remapped: dict[str, list[tuple[str, float, str]]] = {}
+    seen: set[tuple[str, str]] = set()
+    for source_slug, targets in links.items():
+        source = slug_map.get(source_slug, source_slug)
+        for target_slug, score, display in targets:
+            target = slug_map.get(target_slug, target_slug)
+            if source == target or (source, target) in seen:
+                continue
+            seen.add((source, target))
+            remapped.setdefault(source, []).append((target, score, display))
+    return remapped
 
 
 
@@ -510,11 +547,99 @@ def render_bundle_index(
 # ── Full vault renderer ─────────────────────────────────────────────────
 
 
-def render_vault(
+class _RenderTransaction:
+    """Restore non-human vault files if a render cannot finish.
+
+    The renderer has several independent output steps, so a per-page atomic
+    write alone cannot prevent a later failure from leaving a mixed vault.
+    Snapshotting the existing generated tree also lets rollback remove backups
+    created by an aborted render while retaining the pre-existing backup set.
+    """
+
+    def __init__(self, bundle_dir: Path) -> None:
+        self.bundle_dir = bundle_dir
+        self._staging = tempfile.TemporaryDirectory(prefix="obsidian-render-")
+        self._staging_dir = Path(self._staging.name)
+        self._root_existed = bundle_dir.exists()
+        self._original_files: set[Path] = set()
+        self._original_dirs: set[Path] = set()
+        self._protected_files: set[Path] = set()
+        self._snapshot()
+
+    def _snapshot(self) -> None:
+        if not self._root_existed:
+            return
+        self._original_dirs.add(Path("."))
+        for path in self.bundle_dir.rglob("*"):
+            relative = path.relative_to(self.bundle_dir)
+            if path.is_dir():
+                self._original_dirs.add(relative)
+                continue
+            if not path.is_file():
+                continue
+            if self._is_human_page(path):
+                self._protected_files.add(relative)
+                continue
+            destination = self._staging_dir / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(path, destination)
+            self._original_files.add(relative)
+
+    @staticmethod
+    def _is_human_page(path: Path) -> bool:
+        if path.suffix != ".md":
+            return False
+        from obsidian_llm_wiki.core.review import is_reviewed_page
+
+        content = safe_read_file(path)
+        if is_reviewed_page(content):
+            return True
+        metadata, _ = parse_frontmatter(content)
+        return metadata.get("orphaned") is True
+
+    def commit(self) -> None:
+        self._staging.cleanup()
+
+    def rollback(self) -> None:
+        """Restore the snapshot without overwriting reviewed/orphaned pages."""
+        if self.bundle_dir.exists():
+            for path in sorted(
+                (p for p in self.bundle_dir.rglob("*") if p.is_file()),
+                key=lambda p: len(p.parts),
+                reverse=True,
+            ):
+                relative = path.relative_to(self.bundle_dir)
+                if relative not in self._original_files and relative not in self._protected_files:
+                    path.unlink()
+
+        for relative in self._original_files:
+            source = self._staging_dir / relative
+            destination = self.bundle_dir / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(source, destination)
+
+        if self.bundle_dir.exists():
+            for directory in sorted(
+                (p for p in self.bundle_dir.rglob("*") if p.is_dir()),
+                key=lambda p: len(p.parts),
+                reverse=True,
+            ):
+                if directory.relative_to(self.bundle_dir) not in self._original_dirs:
+                    with suppress(OSError):
+                        directory.rmdir()
+            if not self._root_existed:
+                with suppress(OSError):
+                    self.bundle_dir.rmdir()
+        self._staging.cleanup()
+
+
+def _render_vault(
     bundle_dir: Path,
     bundle: SynthesisBundle,
     sources: dict[str, SourceDoc],
     config: Any = None,
+    *,
+    cross_lingual_links: dict[str, list[tuple[str, float, str]]] | None = None,
 ) -> list[str]:
     """Render a complete vault from a SynthesisBundle.
 
@@ -525,11 +650,15 @@ def render_vault(
         config: Optional pipeline config for threshold settings
             (similarity_dedup_threshold, moc_assignment_threshold).
             When None, defaults are used.
+        cross_lingual_links: Optional precomputed embedding links. Passing
+            these keeps pipeline metrics and rendered MoC membership aligned
+            without repeating embedding calls.
 
     Returns:
         List of file paths that were written.
     """
     written: list[str] = []
+    stale_files: list[Path] = []
     ts = _timestamp()
 
     # ── Backlink propagation ─────────────────────────────────────────
@@ -543,8 +672,10 @@ def render_vault(
     # sources to use English-first bilingual titles, but smaller/local models do
     # not always comply. Rendering is the last safe choke point before filenames
     # and wikilinks are written, so normalize here and remap slugs consistently.
-    _normalize_bilingual_titles_and_slugs(bundle)
+    slug_map = _normalize_bilingual_titles_and_slugs(bundle)
     _normalize_bundle_output_slugs(bundle)
+    if cross_lingual_links:
+        cross_lingual_links = _remap_cross_lingual_links(cross_lingual_links, slug_map)
 
     # Ensure directories exist.
     dirs = {
@@ -557,9 +688,11 @@ def render_vault(
         d.mkdir(parents=True, exist_ok=True)
 
     # ── Render source pages ──────────────────────────────────────────
+    from obsidian_llm_wiki.core.source_files import source_file_path
+
     for filename, source in sources.items():
         page = render_source_page(source, ts)
-        path = dirs["sources"] / filename
+        path = source_file_path(dirs["sources"], filename)
         if _write_generated_page(path, page, bundle_dir):
             written.append(str(path))
 
@@ -577,8 +710,7 @@ def render_vault(
             and old_file.name != "index.md"
             and not is_reviewed_page(safe_read_file(old_file))
         ):
-            old_file.unlink()
-            logger.debug("Removed stale entry: %s", old_file.name)
+            stale_files.append(old_file)
 
     # Build a lookup from slugified source_title → actual source filename
     # so the Source wikilink in each entry resolves to the real source note.
@@ -631,17 +763,18 @@ def render_vault(
 
     # ── Cross-lingual embedding links ────────────────────────────────
     # Find semantically similar concepts across languages using embeddings.
-    cross_lingual_links: dict[str, list[tuple[str, float, str]]] = {}
-    try:
-        from obsidian_llm_wiki.synth.embedding import find_cross_lingual_links
-        cross_lingual_links = find_cross_lingual_links(bundle.concepts)
-        if cross_lingual_links:
-            logger.info(
-                "Embedding: found %d cross-lingual concept links",
-                len(cross_lingual_links),
-            )
-    except Exception as exc:
-        logger.debug("Embedding-based linking skipped: %s", exc)
+    if cross_lingual_links is None:
+        try:
+            from obsidian_llm_wiki.synth.embedding import find_cross_lingual_links
+            cross_lingual_links = find_cross_lingual_links(bundle.concepts)
+        except Exception as exc:
+            logger.debug("Embedding-based linking skipped: %s", exc)
+            cross_lingual_links = {}
+    if cross_lingual_links:
+        logger.info(
+            "Embedding: found %d cross-lingual concept links",
+            len(cross_lingual_links),
+        )
 
     # ── Render concept pages ─────────────────────────────────────────
     # First, remove stale concept files from previous runs that are no
@@ -664,8 +797,7 @@ def render_vault(
         old_meta, _ = parse_frontmatter(old_content)
         if old_meta.get("orphaned") is True:
             continue
-        old_file.unlink()
-        logger.debug("Removed stale concept: %s", old_file.name)
+        stale_files.append(old_file)
 
     for concept in bundle.concepts:
         page = render_concept_page(concept, ts, all_concepts=concept_map)
@@ -682,8 +814,7 @@ def render_vault(
             and old_file.name != "index.md"
             and not is_reviewed_page(safe_read_file(old_file))
         ):
-            old_file.unlink()
-            logger.debug("Removed stale MoC: %s", old_file.name)
+            stale_files.append(old_file)
 
     for moc in bundle.maps:
         page = render_moc_page(
@@ -698,7 +829,7 @@ def render_vault(
     # ── Per-directory index.md ───────────────────────────────────────
     for dir_name, dir_path in dirs.items():
         md_files = [f for f in dir_path.glob("*.md")
-                    if f.name not in ("index.md", "log.md")]
+                    if f.name not in ("index.md", "log.md") and f not in stale_files]
         if md_files:
             idx = render_directory_index(dir_name, md_files, bundle_dir)
             idx_path = dir_path / "index.md"
@@ -727,7 +858,7 @@ def render_vault(
         written.append(str(graph_dir / "graph.json"))
         written.append(str(graph_dir / "graph.mmd"))
     except Exception as exc:
-        logger.debug("Graph export skipped: %s", exc)
+        raise RuntimeError("Graph export failed during vault render") from exc
 
     # ── Dataview / Bases views ───────────────────────────────────────
     # Generate live Dataview views (concepts by confidence, MoCs by count,
@@ -738,7 +869,7 @@ def render_vault(
             render_dataview_views(bundle_dir, bundle, sources)
         )
     except Exception as exc:
-        logger.debug("Dataview views skipped: %s", exc)
+        raise RuntimeError("Dataview view render failed") from exc
 
     # ── Source dependency graph ──────────────────────────────────────
     # Export which sources contributed to which concepts (JSON + Mermaid).
@@ -748,7 +879,7 @@ def render_vault(
         dep_graph_paths = export_source_dependency_graph(bundle, dep_graph_dir)
         written.extend(dep_graph_paths)
     except Exception as exc:
-        logger.debug("Source dependency graph skipped: %s", exc)
+        raise RuntimeError("Source dependency graph export failed") from exc
 
     # ── Vault log.md ─────────────────────────────────────────────────
     # Append a chronological entry recording this build/render action.
@@ -769,6 +900,45 @@ def render_vault(
         )
         written.append(str(log_path))
     except Exception as exc:
-        logger.debug("Vault log append skipped: %s", exc)
+        raise RuntimeError("Vault log append failed") from exc
 
+    for old_file in stale_files:
+        old_file.unlink()
+        logger.debug("Removed stale generated page: %s", old_file)
+
+    return written
+
+
+def render_vault(
+    bundle_dir: Path,
+    bundle: SynthesisBundle,
+    sources: dict[str, SourceDoc],
+    config: Any = None,
+    *,
+    cross_lingual_links: dict[str, list[tuple[str, float, str]]] | None = None,
+) -> list[str]:
+    """Render a vault atomically with respect to generated output.
+
+    Reviewed and orphaned pages are deliberately left outside the rollback
+    boundary: they contain user-maintained content.  All other pre-existing
+    vault files (including indexes and backup history) are restored if any
+    render step raises, and stale pages are removed only after every output has
+    been written successfully.
+    """
+    transaction = _RenderTransaction(bundle_dir)
+    try:
+        written = _render_vault(
+            bundle_dir,
+            bundle,
+            sources,
+            config,
+            cross_lingual_links=cross_lingual_links,
+        )
+    except BaseException:
+        try:
+            transaction.rollback()
+        except BaseException:
+            logger.exception("Could not fully roll back failed vault render")
+        raise
+    transaction.commit()
     return written
