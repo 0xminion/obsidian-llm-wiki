@@ -316,12 +316,13 @@ def merge_entry_syntheses(
             if tag not in merged_tags:
                 merged_tags.append(tag)
 
-        # Union claims (dedup by text).
+        # Union claims without conflating evidence from distinct sources.
         merged_claims = list(existing.claims)
-        seen_claim_texts: set[str] = {c.text for c in existing.claims}
+        seen_claim_keys = {_claim_key(claim) for claim in existing.claims}
         for claim in concept.claims:
-            if claim.text not in seen_claim_texts:
-                seen_claim_texts.add(claim.text)
+            key = _claim_key(claim)
+            if key not in seen_claim_keys:
+                seen_claim_keys.add(key)
                 merged_claims.append(claim)
 
         # Union related (dedup by slug).
@@ -377,6 +378,60 @@ def merge_entry_syntheses(
         else:
             moc_by_slug[moc.slug] = moc
     merged.maps = list(moc_by_slug.values())
+
+    return merged
+
+
+def _claim_key(claim: Claim) -> tuple[str, ...]:
+    """Deduplicate exact claims while retaining independently verified spans."""
+    if claim.evidence is None:
+        return (claim.text, claim.source_ref)
+    evidence = claim.evidence
+    return (
+        claim.text,
+        evidence.quote,
+        evidence.source_file,
+        evidence.source_hash,
+        str(evidence.start_offset),
+        str(evidence.end_offset),
+    )
+
+
+def _merge_claims(pass1: list[Claim], pass2: list[Claim]) -> list[Claim]:
+    """Union claims from Pass 1 and Pass 2, preferring evidence-bearing entries.
+
+    Pass 2 replaces the concept body but may omit quotes for claims that Pass 1
+    had evidence for.  This unions both lists, deduplicating by claim text
+    (case-insensitive).  When the same claim text appears in both passes, the
+    version with evidence (quote + source_file) wins; if both have evidence,
+    the Pass 2 (expanded) version wins.
+    """
+    merged: list[Claim] = []
+    seen_text: dict[str, int] = {}  # lowercased text → index in merged
+
+    for claim in pass2 + pass1:
+        key = claim.text.strip().lower()
+        if not key:
+            continue
+        if key in seen_text:
+            idx = seen_text[key]
+            existing = merged[idx]
+            # Prefer the version with evidence if one has it and the other doesn't.
+            existing_has_evidence = (
+                existing.evidence is not None
+                and bool(existing.evidence.quote)
+                and bool(existing.evidence.source_file)
+            )
+            new_has_evidence = (
+                claim.evidence is not None
+                and bool(claim.evidence.quote)
+                and bool(claim.evidence.source_file)
+            )
+            if new_has_evidence and not existing_has_evidence:
+                merged[idx] = claim
+        else:
+            seen_text[key] = len(merged)
+            merged.append(claim)
 
     return merged
 
@@ -519,6 +574,7 @@ _EXPAND_SCHEMA: dict[str, Any] = {
     "claims": [
         {
             "text": "string — factual claim from the source",
+            "quote": "string — exact verbatim quote supporting this claim",
             "source_ref": "string — where in the source",
         }
     ],
@@ -914,12 +970,16 @@ async def quality_synthesize_source(
             )
             continue
 
-        # Replace skeleton concept with expanded version.
+        # Replace skeleton concept with expanded version, preserving Pass 1
+        # claims that Pass 2 didn't reproduce.  Pass 2 may omit quotes for
+        # claims that Pass 1 had evidence for — union them so evidence from
+        # the first pass survives.
         expanded = result
         expanded.tags = original.tags or expanded.tags
         expanded.confidence = original.confidence
         expanded.provenance = original.provenance
         expanded.is_new = original.is_new
+        expanded.claims = _merge_claims(original.claims, expanded.claims)
 
         skeleton.concepts[i] = expanded
 
@@ -1255,6 +1315,7 @@ def _build_concept_from_expand(data: dict[str, Any], fallback_slug: str) -> Conc
             text=c.get("text", ""),
             concept_slug=fallback_slug,
             source_ref=c.get("source_ref", ""),
+            evidence=c.get("evidence") or ({"quote": c["quote"]} if c.get("quote") else None),
         )
         for c in data.get("claims", [])
         if isinstance(c, dict)
@@ -1352,7 +1413,11 @@ Return JSON:
         {{"heading": "Section Name", "points": ["point1", "point2"], "prose": ""}}
     ],
     "claims": [
-        {{"text": "factual claim", "source_ref": "from new source"}}
+        {{
+            "text": "factual claim",
+            "quote": "exact verbatim source quote",
+            "source_ref": "from new source"
+        }}
     ]
 }}
 ```
@@ -1404,6 +1469,7 @@ Return JSON:
                 text=c.get("text", ""),
                 concept_slug=concept.slug,
                 source_ref=c.get("source_ref", ""),
+                evidence=c.get("evidence") or ({"quote": c["quote"]} if c.get("quote") else None),
             ))
 
     from obsidian_llm_wiki.synth.dedupe import normalise_tags

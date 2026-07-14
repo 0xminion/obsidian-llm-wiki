@@ -12,6 +12,9 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
+import obsidian_llm_wiki.render.obsidian as obsidian
 from obsidian_llm_wiki.core.models import (
     ConceptNote,
     MapOfContent,
@@ -59,6 +62,121 @@ def test_stale_concept_cleanup_deletes_non_reviewed(tmp_path: Path):
 
     assert not stale_concept.exists()
     assert (tmp_path / "concepts" / "new-concept.md").exists()
+
+
+def _vault_snapshot(vault: Path) -> dict[str, bytes]:
+    """Return every regular file in the vault keyed by its relative path."""
+    return {
+        path.relative_to(vault).as_posix(): path.read_bytes()
+        for path in vault.rglob("*")
+        if path.is_file()
+    }
+
+
+def test_late_root_index_failure_restores_the_whole_vault(tmp_path: Path, monkeypatch):
+    """A late failure leaves generated files, indexes, and backups unchanged."""
+    old_bundle = SynthesisBundle(
+        concepts=[ConceptNote(title="Old Concept", slug="old-concept", summary="Old")],
+    )
+    render_vault(tmp_path, old_bundle, {})
+    _write_md(tmp_path / "concepts" / "reviewed.md", reviewed=True)
+    _write_md(tmp_path / "concepts" / "orphaned.md", orphaned=True)
+    before = _vault_snapshot(tmp_path)
+
+    new_bundle = SynthesisBundle(
+        concepts=[ConceptNote(title="New Concept", slug="new-concept", summary="New")],
+    )
+    original_write = obsidian._write_generated_page
+
+    def fail_root_index(path: Path, page: str, bundle_dir: Path) -> bool:
+        if path == tmp_path / "index.md":
+            raise OSError("simulated root index write failure")
+        return original_write(path, page, bundle_dir)
+
+    monkeypatch.setattr(obsidian, "_write_generated_page", fail_root_index)
+
+    with pytest.raises(OSError, match="simulated root index write failure"):
+        render_vault(tmp_path, new_bundle, {})
+
+    assert _vault_snapshot(tmp_path) == before
+
+
+def test_late_failure_restores_reviewed_page_generated_frontmatter(tmp_path: Path, monkeypatch):
+    """A failed render restores both the curated body and prior generated metadata."""
+    concept_path = tmp_path / "concepts" / "concept.md"
+    concept_path.parent.mkdir(parents=True)
+    concept_path.write_text(
+        "---\n"
+        "type: Concept\n"
+        "title: Former generated title\n"
+        "tags:\n"
+        "  - former-tag\n"
+        "reviewed: true\n"
+        "---\n"
+        "# Curated Concept\n\nHuman-authored body.\n",
+        encoding="utf-8",
+    )
+    before = concept_path.read_bytes()
+    bundle = SynthesisBundle(
+        concepts=[
+            ConceptNote(
+                title="Fresh generated title",
+                slug="concept",
+                summary="Fresh generated summary",
+                tags=["fresh-tag"],
+            )
+        ]
+    )
+    original_write = obsidian._write_generated_page
+
+    def fail_root_index(path: Path, page: str, bundle_dir: Path) -> bool:
+        if path == tmp_path / "index.md":
+            raise OSError("simulated root index write failure")
+        return original_write(path, page, bundle_dir)
+
+    monkeypatch.setattr(obsidian, "_write_generated_page", fail_root_index)
+
+    with pytest.raises(OSError, match="simulated root index write failure"):
+        render_vault(tmp_path, bundle, {})
+
+    assert concept_path.read_bytes() == before
+
+
+def test_late_failure_does_not_augment_callers_moc_members(tmp_path: Path, monkeypatch):
+    """Cross-lingual MoC expansion during a failed render stays in renderer-local state."""
+    bundle = SynthesisBundle(
+        concepts=[
+            ConceptNote(title="Signal", slug="signal", summary="English concept"),
+            ConceptNote(title="信号", slug="xin-hao", summary="Chinese concept"),
+        ],
+        maps=[
+            MapOfContent(
+                title="Signals",
+                slug="signals",
+                summary="A shared MoC",
+                concept_slugs=["signal"],
+            )
+        ],
+    )
+    original_members = list(bundle.maps[0].concept_slugs)
+    original_write = obsidian._write_generated_page
+
+    def fail_root_index(path: Path, page: str, bundle_dir: Path) -> bool:
+        if path == tmp_path / "index.md":
+            raise OSError("simulated root index write failure")
+        return original_write(path, page, bundle_dir)
+
+    monkeypatch.setattr(obsidian, "_write_generated_page", fail_root_index)
+
+    with pytest.raises(OSError, match="simulated root index write failure"):
+        render_vault(
+            tmp_path,
+            bundle,
+            {},
+            cross_lingual_links={"signal": [("xin-hao", 0.99, "信号")]},
+        )
+
+    assert bundle.maps[0].concept_slugs == original_members
 
 
 def test_stale_concept_cleanup_preserves_reviewed(tmp_path: Path):

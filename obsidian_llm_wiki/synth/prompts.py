@@ -66,6 +66,7 @@ SYNTHESIS_SCHEMA: dict[str, Any] = {
             "claims": [
                 {
                     "text": "string — a factual claim derived from the source",
+                    "quote": "string — exact verbatim quote supporting this claim",
                     "source_ref": "string — where in the source this claim appears"
                 }
             ],
@@ -169,7 +170,7 @@ the key tension, how the concepts interact, and why this grouping matters.
 * Review the existing concept index below to avoid duplicates.  Set \
 "is_new" to false for concepts that already exist.
 * Surface ALL available insights — do not produce stubs or shallow summaries.
-* Claims should be specific, evidence-backed statements from the source.
+* Claims should be specific, evidence-backed statements from the source. Include an exact verbatim supporting quote for every claim; do not paraphrase the quote.
 {findings_instruction}{lang_instruction}
 {schema_guidance}
 {RELATIONSHIP_FEWSHOT}

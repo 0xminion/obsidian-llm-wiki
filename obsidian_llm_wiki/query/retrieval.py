@@ -21,6 +21,7 @@ __all__ = [
 ]
 
 _TOKEN_RE = re.compile(r"[a-z0-9]+|[\u3400-\u9fff]+", re.IGNORECASE)
+_CJK_NGRAM_LENGTHS = (2, 3, 4)
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,13 +62,15 @@ class RetrievalResult:
 
 
 def tokenize(text: str) -> tuple[str, ...]:
-    """Tokenize Latin text plus CJK words and characters without a segmenter."""
+    """Tokenize Latin text plus bounded CJK n-grams without a segmenter."""
     tokens: list[str] = []
     for match in _TOKEN_RE.finditer(text.casefold()):
         token = match.group(0)
         tokens.append(token)
         if _contains_cjk(token):
-            for length in range(2, len(token)):
+            for length in _CJK_NGRAM_LENGTHS:
+                if length > len(token):
+                    continue
                 chunks = (
                     token[index : index + length]
                     for index in range(len(token) - length + 1)

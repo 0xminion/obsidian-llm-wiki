@@ -183,11 +183,49 @@ def test_render_moc_page_with_cross_lingual_links():
         moc, all_concepts={"concept-a": a, "concept-b": _make_concept("concept-b", "概念B")},
         cross_lingual_links=xling,
     )
-    # Cross-lingual links should NOT be a separate section
+    # Cross-lingual links should NOT be a separate section. They must appear
+    # before cross-references, otherwise Markdown nests them under the wrong
+    # heading even though the page happens to contain both strings.
     assert "Cross-Lingual Links" not in page
-    # But the cross-lingual concept should appear in the Concepts section
-    assert "concept-b" in page
-    assert "cross-lingual link" in page
+    concept_b_index = page.index("concept-b")
+    cross_ref_index = page.index("## Cross-References / 关联图谱")
+    assert concept_b_index < cross_ref_index
+    assert moc.concept_slugs == ["concept-a", "concept-b"]
+
+
+def test_render_vault_remaps_embedding_links_after_bilingual_slug_normalization(tmp_path):
+    """Pre-render links must survive the final English-first filename policy."""
+    from obsidian_llm_wiki.core.models import MapOfContent, SourceSynthesis, SynthesisBundle
+    from obsidian_llm_wiki.render.obsidian import render_vault
+
+    english = _make_concept("language-model", "Language model")
+    chinese = _make_concept("da-yuyan-moxing", "大语言模型")
+    moc = MapOfContent(
+        title="Language AI", slug="language-ai", summary="", concept_slugs=[english.slug],
+    )
+    source = SourceSynthesis(
+        source_title="Source", source_summary="", concepts=[english, chinese], maps=[moc],
+    )
+    bundle = SynthesisBundle(
+        sources=[source],
+        concepts=[english, chinese],
+        maps=[moc],
+    )
+    links = {
+        english.slug: [(chinese.slug, 0.84, chinese.title)],
+        chinese.slug: [(english.slug, 0.84, english.title)],
+    }
+
+    render_vault(tmp_path, bundle, {}, cross_lingual_links=links)
+
+    normalized_chinese_slug = "da-yuyan-moxing-大语言模型"
+    page = (tmp_path / "mocs" / "language-ai.md").read_text(encoding="utf-8")
+    # Rendering works on a defensive bundle copy: the page receives the
+    # normalized/augmented member but a caller can retry with its original data.
+    assert normalized_chinese_slug not in moc.concept_slugs
+    assert page.index(f"[[{normalized_chinese_slug}]]") < page.index(
+        "## Cross-References / 关联图谱"
+    )
 
 
 # ── render/obsidian.py: render_source_page deduplication ───────────────────
@@ -450,7 +488,7 @@ def test_propagate_backlinks_adds_reverse_edges():
 
     # B should now have a link back to A
     assert any(r.slug == "a" for r in b.related)
-    assert b.related[0].relation == "depends_on"
+    assert b.related[0].relation == "prerequisite_of"
 
 
 def test_propagate_backlinks_skips_existing_reverse():

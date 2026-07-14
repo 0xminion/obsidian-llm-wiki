@@ -50,6 +50,15 @@ class SourceStatus(StrEnum):
     DELETED = "deleted"
 
 
+class EvidenceVerification(StrEnum):
+    """Whether an evidence quote resolved uniquely in its source."""
+
+    UNVERIFIED = "unverified"
+    VERIFIED = "verified"
+    AMBIGUOUS = "ambiguous"
+    UNMATCHED = "unmatched"
+
+
 class RelationType(StrEnum):
     """Typed relationships between concepts (for graph construction)."""
 
@@ -175,12 +184,60 @@ class SourceDoc:
 
 
 @dataclass
+class EvidenceSpan:
+    """A quote and its deterministic location in one source revision.
+
+    Offsets are Python/Unicode character offsets into the UTF-8-decoded source
+    text.  They are populated only when ``verification`` is ``verified``.
+    """
+
+    quote: str
+    source_file: str = ""
+    source_hash: str = ""
+    start_offset: int | None = None
+    end_offset: int | None = None
+    verification: EvidenceVerification | str = EvidenceVerification.UNVERIFIED
+
+    def __post_init__(self) -> None:
+        self.quote = _string(self.quote)
+        self.source_file = _string(self.source_file)
+        self.source_hash = _string(self.source_hash)
+        try:
+            self.verification = EvidenceVerification(self.verification)
+        except ValueError:
+            self.verification = EvidenceVerification.UNVERIFIED
+        offsets_valid = (
+            not isinstance(self.start_offset, bool)
+            and isinstance(self.start_offset, int)
+            and self.start_offset >= 0
+            and not isinstance(self.end_offset, bool)
+            and isinstance(self.end_offset, int)
+            and self.end_offset >= self.start_offset
+        )
+        if not offsets_valid:
+            self.start_offset = None
+            self.end_offset = None
+            if self.verification is EvidenceVerification.VERIFIED:
+                self.verification = EvidenceVerification.UNVERIFIED
+        if self.verification is not EvidenceVerification.VERIFIED:
+            self.start_offset = None
+            self.end_offset = None
+
+
+@dataclass
 class Claim:
     """A single factual claim extracted from the source, tied to a concept."""
 
     text: str
     concept_slug: str = ""
     source_ref: str = ""  # e.g. "source#para3" or source filename
+    evidence: EvidenceSpan | dict[str, Any] | None = None
+
+    def __post_init__(self) -> None:
+        if isinstance(self.evidence, dict):
+            self.evidence = _evidence_from_dict(self.evidence)
+        elif not isinstance(self.evidence, EvidenceSpan):
+            self.evidence = None
 
 
 @dataclass
@@ -313,6 +370,50 @@ class CompileResult:
 # ── JSON ↔ dataclass conversion ─────────────────────────────────────────
 
 
+def _string(value: object) -> str:
+    """Accept only strings from untrusted LLM JSON scalar fields."""
+    return value if isinstance(value, str) else ""
+
+
+def _strings(value: object) -> list[str]:
+    """Accept a list of strings without coercing dicts or null into content."""
+    return [item for item in value if isinstance(item, str)] if isinstance(value, list) else []
+
+
+def _evidence_from_dict(data: object) -> EvidenceSpan | None:
+    """Build an EvidenceSpan without coercing malformed cache/LLM values."""
+    if not isinstance(data, dict):
+        return None
+    quote = _string(data.get("quote", ""))
+    if not quote:
+        return None
+    start = data.get("start_offset")
+    end = data.get("end_offset")
+    return EvidenceSpan(
+        quote=quote,
+        source_file=_string(data.get("source_file", "")),
+        source_hash=_string(data.get("source_hash", "")),
+        start_offset=start if isinstance(start, int) and not isinstance(start, bool) else None,
+        end_offset=end if isinstance(end, int) and not isinstance(end, bool) else None,
+        verification=_string(data.get("verification", EvidenceVerification.UNVERIFIED)),
+    )
+
+
+def _claim_from_dict(data: dict[str, Any]) -> Claim:
+    """Build a Claim from legacy or structured evidence JSON."""
+    evidence = _evidence_from_dict(data.get("evidence"))
+    # The LLM emits a lightweight quote. The pipeline later resolves it against
+    # source content; legacy source_ref-only claims intentionally remain valid.
+    if evidence is None and _string(data.get("quote", "")):
+        evidence = EvidenceSpan(quote=_string(data["quote"]))
+    return Claim(
+        text=_string(data.get("text", "")),
+        concept_slug=_string(data.get("concept_slug", "")),
+        source_ref=_string(data.get("source_ref", "")),
+        evidence=evidence,
+    )
+
+
 def source_synthesis_from_dict(data: dict[str, Any]) -> SourceSynthesis:
     """Build a SourceSynthesis from a raw dict (LLM JSON output).
 
@@ -329,15 +430,15 @@ def source_synthesis_from_dict(data: dict[str, Any]) -> SourceSynthesis:
         if isinstance(m, dict)
     ]
     return SourceSynthesis(
-        source_title=data.get("source_title", data.get("title", "")),
-        source_summary=data.get("source_summary", data.get("summary", "")),
-        source_tags=list(data.get("source_tags", data.get("tags", [])) or []),
-        key_points=list(data.get("key_points", []) or []),
-        open_questions=list(data.get("open_questions", []) or []),
-        language=data.get("language", ""),
+        source_title=_string(data.get("source_title", data.get("title", ""))),
+        source_summary=_string(data.get("source_summary", data.get("summary", ""))),
+        source_tags=_strings(data.get("source_tags", data.get("tags", []))),
+        key_points=_strings(data.get("key_points", [])),
+        open_questions=_strings(data.get("open_questions", [])),
+        language=_string(data.get("language", "")),
         concepts=concepts,
         maps=maps,
-        source_file=data.get("source_file", ""),
+        source_file=_string(data.get("source_file", "")),
     )
 
 
@@ -345,9 +446,9 @@ def _concept_from_dict(data: dict[str, Any]) -> ConceptNote:
     """Build a ConceptNote from a raw dict."""
     sections = [
         BodySection(
-            heading=s.get("heading", ""),
-            points=list(s.get("points", []) or []),
-            prose=s.get("prose", ""),
+            heading=_string(s.get("heading", "")),
+            points=_strings(s.get("points", [])),
+            prose=_string(s.get("prose", "")),
         )
         for s in data.get("sections", [])
         if isinstance(s, dict)
@@ -357,20 +458,12 @@ def _concept_from_dict(data: dict[str, Any]) -> ConceptNote:
         section for section in sections
         if section.points or section.prose.strip()
     ]
-    claims = [
-        Claim(
-            text=c.get("text", ""),
-            concept_slug=c.get("concept_slug", ""),
-            source_ref=c.get("source_ref", ""),
-        )
-        for c in data.get("claims", [])
-        if isinstance(c, dict)
-    ]
+    claims = [_claim_from_dict(c) for c in data.get("claims", []) if isinstance(c, dict)]
     related = [
         ConceptLink(
             slug=normalize_slug(r.get("slug", "")),
             relation=normalize_relation(r.get("relation", "related_to")),
-            display=r.get("display", ""),
+            display=_string(r.get("display", "")),
         )
         for r in data.get("related", [])
         if isinstance(r, dict)
@@ -382,16 +475,16 @@ def _concept_from_dict(data: dict[str, Any]) -> ConceptNote:
     except (TypeError, ValueError):
         confidence = 1.0
     return ConceptNote(
-        title=data.get("title", ""),
+        title=_string(data.get("title", "")),
         slug=normalize_slug(data.get("slug", ""), data.get("title", "")),
-        summary=data.get("summary", ""),
-        tags=list(data.get("tags", []) or []),
-        aliases=list(data.get("aliases", []) or []),
+        summary=_string(data.get("summary", "")),
+        tags=_strings(data.get("tags", [])),
+        aliases=_strings(data.get("aliases", [])),
         sections=sections,
         claims=claims,
         related=related,
         confidence=confidence,
-        provenance=data.get("provenance", data.get("provenance_state", "extracted")),
+        provenance=_string(data.get("provenance", data.get("provenance_state", "extracted"))),
         is_new=data.get("is_new", True),
     )
 
@@ -399,11 +492,11 @@ def _concept_from_dict(data: dict[str, Any]) -> ConceptNote:
 def _moc_from_dict(data: dict[str, Any]) -> MapOfContent:
     """Build a MapOfContent from a raw dict."""
     return MapOfContent(
-        title=data.get("title", ""),
+        title=_string(data.get("title", "")),
         slug=normalize_slug(data.get("slug", ""), data.get("title", "")),
-        summary=data.get("summary", ""),
-        tags=list(data.get("tags", []) or []),
-        concept_slugs=[normalize_slug(slug) for slug in data.get("concept_slugs", []) or []],
+        summary=_string(data.get("summary", "")),
+        tags=_strings(data.get("tags", [])),
+        concept_slugs=[normalize_slug(slug) for slug in _strings(data.get("concept_slugs", []))],
     )
 
 
@@ -427,6 +520,20 @@ def concept_note_to_dict(c: ConceptNote) -> dict[str, Any]:
                 "text": claim.text,
                 "concept_slug": claim.concept_slug,
                 "source_ref": claim.source_ref,
+                **(
+                    {
+                        "evidence": {
+                            "quote": claim.evidence.quote,
+                            "source_file": claim.evidence.source_file,
+                            "source_hash": claim.evidence.source_hash,
+                            "start_offset": claim.evidence.start_offset,
+                            "end_offset": claim.evidence.end_offset,
+                            "verification": claim.evidence.verification.value,
+                        }
+                    }
+                    if claim.evidence is not None
+                    else {}
+                ),
             }
             for claim in c.claims
         ],

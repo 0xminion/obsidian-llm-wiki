@@ -12,7 +12,6 @@ import threading
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
-from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -79,30 +78,10 @@ def _run_id() -> str:
 
 
 def _bounded_source(source: SourceDoc, maximum_bytes: int) -> tuple[SourceDoc, bool]:
-    """Limit extracted UTF-8 content before any renderer or synthesis can use it."""
-    if maximum_bytes <= 0:
-        truncated = bool(source.content)
-        bounded_content = ""
-    else:
-        encoded = source.content.encode("utf-8")
-        if len(encoded) <= maximum_bytes:
-            return source, False
-        # Decode only complete UTF-8 characters, enforcing the byte boundary rather
-        # than merely counting Python characters (important for non-ASCII sources).
-        bounded_content = encoded[:maximum_bytes].decode("utf-8", errors="ignore")
-        truncated = True
-    if not truncated:
-        return source, False
-    provenance = replace(
-        source.provenance,
-        content_sha256=hashlib.sha256(bounded_content.encode("utf-8")).hexdigest(),
-        diagnostics=(
-            *source.provenance.diagnostics,
-            f"content truncated to {len(bounded_content.encode('utf-8'))} UTF-8 bytes "
-            f"(limit {maximum_bytes})",
-        ),
-    )
-    return replace(source, content=bounded_content, provenance=provenance), True
+    """Backward-compatible CLI wrapper for canonical source normalization."""
+    from obsidian_llm_wiki.core.source_content import bound_source_content
+
+    return bound_source_content(source, maximum_bytes)
 
 
 def _source_event(
@@ -133,6 +112,27 @@ def _emit(json_output: bool, event: dict[str, Any], text: str = "") -> None:
         typer.echo(json.dumps(event, ensure_ascii=False, sort_keys=True))
     elif text:
         typer.echo(text)
+
+
+def _reserve_collision_safe_path(
+    sources_dir: Path,
+    source: SourceDoc,
+    *,
+    preferred_stem: str | None = None,
+) -> Path:
+    """Atomically reserve a source filename for a concurrent ingestion writer."""
+    stem = slugify(preferred_stem) if preferred_stem else slugify(source.title)
+    for index in range(0, 101):
+        suffix = "" if index == 0 else f"-{index}"
+        candidate = sources_dir / f"{stem}{suffix}.md"
+        try:
+            fd = os.open(candidate, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError:
+            continue
+        else:
+            os.close(fd)
+            return candidate
+    raise RuntimeError(f"Too many source filename collisions for {source.title!r}")
 
 
 def _collision_safe_path(sources_dir: Path, source: SourceDoc) -> Path:
@@ -446,12 +446,16 @@ def ingest(
                                     processed_clipping_paths.append(archive_dest)
                         continue
 
-                    filepath = (
-                        config.sources_dir / Path(identifier).name
-                        if source_kind == "clipping"
-                        else _collision_safe_path(config.sources_dir, source)
+                    filepath = _reserve_collision_safe_path(
+                        config.sources_dir,
+                        source,
+                        preferred_stem=Path(identifier).stem if source_kind == "clipping" else None,
                     )
-                    atomic_write(filepath, render_source_page(source))
+                    try:
+                        atomic_write(filepath, render_source_page(source))
+                    except BaseException:
+                        filepath.unlink(missing_ok=True)
+                        raise
                     output_file = filepath.name
                     assert record is not None
                     store.transition(

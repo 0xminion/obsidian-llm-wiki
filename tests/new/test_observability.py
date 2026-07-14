@@ -193,6 +193,43 @@ class TestRetryWithTruncation:
         assert result is not None
         assert result.source_title == "Test"
 
+    def test_retry_preserves_source_metadata_when_truncating(self):
+        """Retry copies metadata needed for language and granularity policy."""
+        from obsidian_llm_wiki.config import Config
+        from obsidian_llm_wiki.core.models import SourceDoc, SourceProvenance, SourceSynthesis
+        from obsidian_llm_wiki.core.pipeline import _synthesize_with_retry
+
+        source = SourceDoc(
+            title="Research paper",
+            content="x" * 60_000,
+            source_file="paper.md",
+            aliases=["Paper"],
+            tags=["research"],
+            source_type="scientific-paper",
+            provenance=SourceProvenance(requested_url="https://example.com/paper"),
+        )
+        seen: list[SourceDoc] = []
+
+        async def mock_synth(_config, filename, src, _existing_concepts, **_kwargs):
+            seen.append(src)
+            return None if len(seen) == 1 else SourceSynthesis(
+                source_title=src.title, source_summary="Summary", source_file=filename,
+            )
+
+        with mock.patch(
+            "obsidian_llm_wiki.core.pipeline._synthesize_source", side_effect=mock_synth,
+        ):
+            result = asyncio.run(_synthesize_with_retry(Config(), "paper.md", source, []))
+
+        assert result is not None
+        assert len(seen) == 2
+        truncated = seen[1]
+        assert len(truncated.content) == 50_000
+        assert truncated.source_type == "scientific-paper"
+        assert truncated.aliases == ["Paper"]
+        assert truncated.tags == ["research"]
+        assert truncated.provenance == source.provenance
+
     def test_all_levels_fail_returns_none(self):
         """When all truncation levels fail, return None."""
         from obsidian_llm_wiki.config import Config

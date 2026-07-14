@@ -10,7 +10,7 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from dotenv import load_dotenv
+from dotenv import dotenv_values
 
 
 @dataclass
@@ -94,6 +94,17 @@ class Config:
     parser_timeout_seconds: int = 120
     max_parser_stdout_bytes: int = 1_000_000
     max_parser_stderr_bytes: int = 16_384
+
+    # Generic HTML is read incrementally before article extraction. This cap
+    # prevents an untrusted page from being fully buffered in memory.
+    max_html_bytes: int = 10_000_000
+
+    # ── Embeddings ───────────────────────────────────────────────────
+    # These must travel in Config rather than relying on process-global env,
+    # so a vault-local .env controls its own semantic-indexing behavior.
+    embeddings_enabled: bool = False
+    embedding_model: str = "embeddinggemma:300m"
+    embedding_host: str = ""
 
     # ── Extraction fallbacks ─────────────────────────────────────
     # Residential proxy URL (socks5h:// or http://) for blocked sites.
@@ -195,78 +206,110 @@ class Config:
         return self.llmwiki_dir / "candidates"
 
 
-def load_config(env_file: str | None = None, **overrides: str) -> Config:
-    """Load configuration from environment and optional .env file."""
-    if env_file:
-        load_dotenv(env_file, override=True)
-    else:
-        vault_raw = os.getenv("VAULT_PATH", "")
-        vault_dir = os.path.expandvars(vault_raw)
-        if vault_dir:
-            vault_env = os.path.join(vault_dir, ".env")
-            if os.path.isfile(vault_env):
-                load_dotenv(vault_env, override=True)
-        load_dotenv(override=False)
+def _dotenv_mapping(path: Path) -> dict[str, str]:
+    """Read a dotenv file without leaking its values into ``os.environ``."""
+    return {
+        key: value
+        for key, value in dotenv_values(path).items()
+        if value is not None
+    }
 
-    for key, val in overrides.items():
-        os.environ[key.upper()] = val
+
+def _config_environment(env_file: str | None, overrides: dict[str, str]) -> dict[str, str]:
+    """Merge process, base, vault, and explicit config without global mutation."""
+    environment = dict(os.environ)
+    base_file = Path(env_file) if env_file else Path.cwd() / ".env"
+    if base_file.is_file():
+        environment.update(_dotenv_mapping(base_file))
+
+    # Resolve the vault selector before loading vault-specific settings. For
+    # implicit discovery, the caller's process VAULT_PATH outranks CWD .env.
+    vault_raw = overrides.get("VAULT_PATH")
+    if vault_raw is None:
+        vault_raw = (
+            os.environ.get("VAULT_PATH", "")
+            if env_file is None
+            else environment.get("VAULT_PATH", "")
+        )
+    vault_dir = os.path.expandvars(vault_raw)
+    if vault_dir:
+        vault_file = Path(vault_dir).expanduser() / ".env"
+        if vault_file.is_file() and vault_file != base_file:
+            environment.update(_dotenv_mapping(vault_file))
+
+    # Implicit discovery must respect explicit process configuration. An
+    # explicitly supplied env_file keeps its established file-wins semantics.
+    if env_file is None:
+        environment.update(os.environ)
+    environment.update(overrides)
+    return environment
+
+
+def load_config(env_file: str | None = None, **overrides: str) -> Config:
+    """Load deterministic configuration without mutating process environment."""
+    env = _config_environment(env_file, overrides)
+    get = env.get
 
     llm_config = LLMProviderConfig(
-        provider=os.getenv("LLM_PROVIDER", "ollama"),
-        host=os.getenv("LLM_HOST", "http://localhost:11434"),
-        model=os.getenv("LLM_MODEL", "gemma3:27b"),
-        ingest_model=_optional_model_env("INGEST_MODEL"),
-        maintenance_model=_optional_model_env("MAINTENANCE_MODEL"),
-        query_model=_optional_model_env("QUERY_MODEL"),
-        expand_model=_optional_model_env("PASS2_MODEL"),
-        api_key=os.getenv("LLM_API_KEY"),
-        timeout_ms=_int_env("LLM_TIMEOUT_MS", 1_800_000),
-        context_window=_int_env("LLM_CONTEXT_WINDOW", 256_000),
+        provider=get("LLM_PROVIDER", "ollama"),
+        host=get("LLM_HOST", "http://localhost:11434"),
+        model=get("LLM_MODEL", "gemma3:27b"),
+        ingest_model=_optional_model_env("INGEST_MODEL", env),
+        maintenance_model=_optional_model_env("MAINTENANCE_MODEL", env),
+        query_model=_optional_model_env("QUERY_MODEL", env),
+        expand_model=_optional_model_env("PASS2_MODEL", env),
+        api_key=get("LLM_API_KEY"),
+        timeout_ms=_int_env("LLM_TIMEOUT_MS", 1_800_000, env),
+        context_window=_int_env("LLM_CONTEXT_WINDOW", 256_000, env),
     )
 
     return Config(
         llm=llm_config,
-        vault_path=os.getenv("VAULT_PATH", str(Path.home() / "MyVault")),
-        max_source_chars=_int_env("MAX_SOURCE_CHARS", 1_000_000),
-        min_source_chars=_int_env("MIN_SOURCE_CHARS", 50),
-        chunk_size=_int_env("CHUNK_SIZE", 30_000),
-        compile_concurrency=_int_env("COMPILE_CONCURRENCY", 3),
-        output_language=os.getenv("OUTPUT_LANGUAGE", ""),
-        synthesis_mode=os.getenv("SYNTHESIS_MODE", "single"),
-        concept_min_body_chars=_int_env("CONCEPT_MIN_BODY_CHARS", 1200),
-        entry_min_body_chars=_int_env("ENTRY_MIN_BODY_CHARS", 500),
-        clipping_min_body_chars=_int_env("CLIPPING_MIN_BODY_CHARS", 500),
-        similarity_dedup_threshold=_float_env("SIMILARITY_DEDUP_THRESHOLD", 0.85),
-        moc_assignment_threshold=_float_env("MOC_ASSIGNMENT_THRESHOLD", 0.55),
-        retry_count=_int_env("RETRY_COUNT", 3),
-        retry_base_ms=_int_env("RETRY_BASE_MS", 1_000),
-        retry_multiplier=_int_env("RETRY_MULTIPLIER", 4),
-        max_document_bytes=_int_env("MAX_DOCUMENT_BYTES", 50_000_000),
-        max_document_candidates=_int_env("MAX_DOCUMENT_CANDIDATES", 10),
-        parser_timeout_seconds=_int_env("PARSER_TIMEOUT_SECONDS", 120),
-        max_parser_stdout_bytes=_int_env("MAX_PARSER_STDOUT_BYTES", 1_000_000),
-        max_parser_stderr_bytes=_int_env("MAX_PARSER_STDERR_BYTES", 16_384),
-        residential_proxy_url=os.getenv("RESIDENTIAL_PROXY_URL", ""),
-        youtube_cookies_file=os.getenv("YOUTUBE_COOKIES_FILE", ""),
-        transcript_api_key=os.getenv("TRANSCRIPT_API_KEY", ""),
-        supadata_api_key=os.getenv("SUPADATA_API_KEY", ""),
-        assemblyai_api_key=os.getenv("ASSEMBLYAI_API_KEY", ""),
-        podcast_index_api_key=os.getenv("PODCAST_INDEX_API_KEY", ""),
-        podcast_index_api_secret=os.getenv("PODCAST_INDEX_API_SECRET", ""),
+        vault_path=get("VAULT_PATH", str(Path.home() / "MyVault")),
+        max_source_chars=_int_env("MAX_SOURCE_CHARS", 1_000_000, env),
+        min_source_chars=_int_env("MIN_SOURCE_CHARS", 50, env),
+        chunk_size=_int_env("CHUNK_SIZE", 30_000, env),
+        compile_concurrency=_int_env("COMPILE_CONCURRENCY", 3, env),
+        output_language=get("OUTPUT_LANGUAGE", ""),
+        synthesis_mode=get("SYNTHESIS_MODE", "single"),
+        concept_min_body_chars=_int_env("CONCEPT_MIN_BODY_CHARS", 1200, env),
+        entry_min_body_chars=_int_env("ENTRY_MIN_BODY_CHARS", 500, env),
+        clipping_min_body_chars=_int_env("CLIPPING_MIN_BODY_CHARS", 500, env),
+        similarity_dedup_threshold=_float_env("SIMILARITY_DEDUP_THRESHOLD", 0.85, env),
+        moc_assignment_threshold=_float_env("MOC_ASSIGNMENT_THRESHOLD", 0.55, env),
+        retry_count=_int_env("RETRY_COUNT", 3, env),
+        retry_base_ms=_int_env("RETRY_BASE_MS", 1_000, env),
+        retry_multiplier=_int_env("RETRY_MULTIPLIER", 4, env),
+        max_document_bytes=_int_env("MAX_DOCUMENT_BYTES", 50_000_000, env),
+        max_document_candidates=_int_env("MAX_DOCUMENT_CANDIDATES", 10, env),
+        parser_timeout_seconds=_int_env("PARSER_TIMEOUT_SECONDS", 120, env),
+        max_parser_stdout_bytes=_int_env("MAX_PARSER_STDOUT_BYTES", 1_000_000, env),
+        max_parser_stderr_bytes=_int_env("MAX_PARSER_STDERR_BYTES", 16_384, env),
+        max_html_bytes=_int_env("MAX_HTML_BYTES", 10_000_000, env),
+        embeddings_enabled=_bool_env("EMBEDDINGS_ENABLED", False, env),
+        embedding_model=get("EMBEDDING_MODEL", "embeddinggemma:300m").strip(),
+        embedding_host=get("EMBEDDING_HOST", get("LLM_HOST", "http://localhost:11434")).rstrip("/"),
+        residential_proxy_url=get("RESIDENTIAL_PROXY_URL", ""),
+        youtube_cookies_file=get("YOUTUBE_COOKIES_FILE", ""),
+        transcript_api_key=get("TRANSCRIPT_API_KEY", ""),
+        supadata_api_key=get("SUPADATA_API_KEY", ""),
+        assemblyai_api_key=get("ASSEMBLYAI_API_KEY", ""),
+        podcast_index_api_key=get("PODCAST_INDEX_API_KEY", ""),
+        podcast_index_api_secret=get("PODCAST_INDEX_API_SECRET", ""),
     )
 
 
-def _optional_model_env(key: str) -> str | None:
+def _optional_model_env(key: str, env: dict[str, str]) -> str | None:
     """Return a configured task model, treating empty values as no override."""
-    value = os.getenv(key)
+    value = env.get(key)
     if value is None or not value.strip():
         return None
     return value.strip()
 
 
-def _int_env(key: str, default: int) -> int:
-    """Parse an integer from environment with fallback."""
-    val = os.getenv(key)
+def _int_env(key: str, default: int, env: dict[str, str]) -> int:
+    """Parse an integer from the resolved config environment with fallback."""
+    val = env.get(key)
     if val is None:
         return default
     try:
@@ -275,9 +318,17 @@ def _int_env(key: str, default: int) -> int:
         return default
 
 
-def _float_env(key: str, default: float) -> float:
-    """Parse a float from environment with fallback."""
-    val = os.getenv(key)
+def _bool_env(key: str, default: bool, env: dict[str, str]) -> bool:
+    """Parse a boolean from the resolved config environment with fallback."""
+    value = env.get(key)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _float_env(key: str, default: float, env: dict[str, str]) -> float:
+    """Parse a float from the resolved config environment with fallback."""
+    val = env.get(key)
     if val is None:
         return default
     try:

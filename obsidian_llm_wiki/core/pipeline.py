@@ -27,6 +27,7 @@ import asyncio
 import hashlib
 import logging
 import time
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -43,6 +44,7 @@ from obsidian_llm_wiki.core.contradictions import (
     ContradictionStore,
     SourceRevision,
 )
+from obsidian_llm_wiki.core.evidence import resolve_synthesis_evidence
 from obsidian_llm_wiki.core.lock import acquire_lock, release_lock
 from obsidian_llm_wiki.core.metrics import MetricsCollector
 from obsidian_llm_wiki.core.models import (
@@ -60,6 +62,8 @@ from obsidian_llm_wiki.core.schema import (
     load_schema_policy,
     select_synthesis_granularity,
 )
+from obsidian_llm_wiki.core.source_content import bound_source_content
+from obsidian_llm_wiki.core.source_files import source_file_path, validate_source_filename
 from obsidian_llm_wiki.core.state import (
     hash_content,
     read_state,
@@ -121,6 +125,9 @@ async def run_pipeline(
         CompileResult with counts and any errors.
     """
     vault = Path(vault_path).resolve()
+    # Keep the bounded representation used for hashing, synthesis, cache, and
+    # rendering local to this run without mutating the caller's source mapping.
+    sources = dict(sources)
     result = CompileResult()
 
     # ── Load config ────────────────────────────────────────────────────
@@ -168,6 +175,12 @@ async def run_pipeline(
 
         # ── Load cached syntheses for unchanged sources ────────────────
         cached_syntheses = load_all_cached_syntheses(config.llmwiki_dir)
+        # Render-time bilingual normalization used to leave cache/state with
+        # the old identity while pages used the new slug. Migrate cached items
+        # before they participate in dedup, prompts, or state updates.
+        for filename, synthesis in cached_syntheses.items():
+            if _normalize_synthesis_identity(synthesis):
+                save_synthesis(synthesis, config.llmwiki_dir, filename)
 
         # ── Classify sources: compile vs reuse cache ───────────────────
         to_compile: dict[str, SourceDoc] = {}
@@ -176,27 +189,23 @@ async def run_pipeline(
 
         for filename, source in sources.items():
             # Source length gate (B3 fix).
-            content_len = len(source.content)
+            content_len = len(source.content.encode("utf-8"))
             if content_len < config.min_source_chars:
                 result.errors.append(
                     f"source:{filename}: too short ({content_len} < "
-                    f"{config.min_source_chars} chars)"
+                    f"{config.min_source_chars} bytes)"
                 )
                 continue
-            if content_len > config.max_source_chars:
+            source, truncated = bound_source_content(source, config.max_source_chars)
+            if truncated:
                 logger.warning(
-                    "Source '%s' is %d chars — exceeds max_source_chars (%d), "
+                    "Source '%s' is %d UTF-8 bytes — exceeds max_source_chars (%d), "
                     "truncating to safety cap. Sources above chunk_size (%d) "
                     "will be chunked during two-pass synthesis.",
                     filename, content_len, config.max_source_chars,
                     config.chunk_size,
                 )
-                source = SourceDoc(
-                    title=source.title,
-                    content=source.content[:config.max_source_chars],
-                    url=source.url,
-                    source_file=filename,
-                )
+                sources[filename] = source
 
             current_hash = hash_content(source.content)
             prev = state.sources.get(filename)
@@ -264,6 +273,8 @@ async def run_pipeline(
                     )
                     result.errors.append(f"synth:{filename}: no output (permanent failure)")
                     continue
+                assert isinstance(res, SourceSynthesis)
+                _normalize_synthesis_identity(res)
                 all_syntheses_by_file[filename] = res
                 save_synthesis(res, config.llmwiki_dir, filename)
                 filenames_done.append(filename)
@@ -342,11 +353,18 @@ async def run_pipeline(
             semantic_dedupe_concepts,
         )
         embeddings_cache: dict[str, list[float]] = {}
+        embedding_started = time.monotonic()
+        embedding_options: dict[str, object] = {
+            "enabled": config.embeddings_enabled,
+            "model": config.embedding_model,
+            "host": config.embedding_host,
+        }
         try:
             semantic_dedupe_concepts(
                 bundle,
                 threshold=config.similarity_dedup_threshold,
                 embeddings_cache=embeddings_cache,
+                embedding_options=embedding_options,
             )
         except Exception as exc:
             logger.warning("Semantic dedup failed (continuing without): %s", exc)
@@ -355,9 +373,35 @@ async def run_pipeline(
                 bundle,
                 threshold=config.moc_assignment_threshold,
                 embeddings_cache=embeddings_cache,
+                embedding_options=embedding_options,
             )
         except Exception as exc:
             logger.warning("MoC orphan assignment failed (continuing without): %s", exc)
+
+        cross_lingual_links: dict[str, list[tuple[str, float, str]]] = {}
+        try:
+            from obsidian_llm_wiki.synth.embedding import find_cross_lingual_links
+
+            cross_lingual_links = find_cross_lingual_links(
+                bundle.concepts,
+                enabled=config.embeddings_enabled,
+                model=config.embedding_model,
+                host=config.embedding_host,
+            )
+        except Exception as exc:
+            logger.warning("Cross-lingual linking failed (continuing without): %s", exc)
+
+        metrics.record_embedding(
+            model=config.embedding_model if config.embeddings_enabled else "",
+            concepts_embedded=len(embeddings_cache),
+            cross_lingual_matches=len({
+                tuple(sorted((source_slug, target_slug)))
+                for source_slug, targets in cross_lingual_links.items()
+                for target_slug, _score, _display in targets
+                if source_slug != target_slug
+            }),
+            time_seconds=time.monotonic() - embedding_started,
+        )
 
         # ── Render: full corpus deterministic markdown ─────────────────
         logger.info(
@@ -370,7 +414,13 @@ async def run_pipeline(
             for f in all_syntheses_by_file
         }
         render_start = time.monotonic()
-        written = render_vault(bundle_dir, bundle, all_sources_for_render, config=config)
+        written = render_vault(
+            bundle_dir,
+            bundle,
+            all_sources_for_render,
+            config=config,
+            cross_lingual_links=cross_lingual_links,
+        )
         result.pages.extend(written)
         result.concepts = bundle.concepts
 
@@ -379,7 +429,12 @@ async def run_pipeline(
         metrics.record_rendering(
             concepts_rendered=len(bundle.concepts),
             mocs_rendered=len(bundle.maps),
-            cross_lingual_links=0,  # populated by embedding pass if enabled
+            cross_lingual_links=len({
+                tuple(sorted((source_slug, target_slug)))
+                for source_slug, targets in cross_lingual_links.items()
+                for target_slug, _score, _display in targets
+                if source_slug != target_slug
+            }),
             backlinks_added=0,  # approximate: not separately tracked yet
             time_seconds=render_time,
         )
@@ -453,8 +508,13 @@ async def _synthesize_source(
             schema_policy=schema_policy,
             granularity=granularity,
         )
-        if synth is not None and source_lang and not synth.language:
-            synth.language = source_lang
+        if synth is not None:
+            if not synth.source_title:
+                synth.source_title = source.title
+            synth.source_file = filename
+            if source_lang and not synth.language:
+                synth.language = source_lang
+            resolve_synthesis_evidence(synth, source, filename)
         return synth
 
     from obsidian_llm_wiki.providers.llm import acall_llm
@@ -492,6 +552,8 @@ async def _synthesize_source(
     if source_lang and not synthesis.language:
         synthesis.language = source_lang
 
+    resolve_synthesis_evidence(synthesis, source, filename)
+
     return synthesis
 
 
@@ -516,12 +578,7 @@ async def _synthesize_with_retry(
     """
     for level_idx, truncation_chars in enumerate(_TRUNCATION_LEVELS):
         if truncation_chars is not None and len(source.content) > truncation_chars:
-            truncated_source = SourceDoc(
-                title=source.title,
-                content=source.content[:truncation_chars],
-                url=source.url,
-                source_file=filename,
-            )
+            truncated_source = replace(source, content=source.content[:truncation_chars])
             level_label = f"{truncation_chars // 1000}K"
         else:
             truncated_source = source
@@ -571,6 +628,9 @@ async def _synthesize_with_retry(
 
         if synth is not None:
             if level_idx > 0:
+                # Evidence must describe the source revision persisted and
+                # rendered, never the temporary retry prefix.
+                resolve_synthesis_evidence(synth, source, filename)
                 # Success on truncated content is a degraded result, not a
                 # clean one — the wiki was built from a fraction of the source.
                 logger.warning(
@@ -649,7 +709,12 @@ async def recompile_single_source(
     # the next build would immediately re-synthesize and discard this result.
     from obsidian_llm_wiki.ingest.sources import load_source_file
 
-    source_path = config.sources_dir / source_file
+    try:
+        source_file = validate_source_filename(source_file)
+        source_path = source_file_path(config.sources_dir, source_file)
+    except ValueError as exc:
+        result.errors.append(f"Invalid source filename: {exc}")
+        return result
     if not source_path.exists():
         result.errors.append(f"Source file not found: {source_path}")
         return result
@@ -658,6 +723,14 @@ async def recompile_single_source(
     if source is None:
         result.errors.append(f"source:{source_file}: empty or unreadable")
         return result
+
+    source, truncated = bound_source_content(source, config.max_source_chars)
+    if truncated:
+        logger.warning(
+            "Source '%s' exceeds max_source_chars (%d); truncating before recompile.",
+            source_file,
+            config.max_source_chars,
+        )
 
     if len(source.content) < config.min_source_chars:
         result.errors.append(
@@ -691,6 +764,7 @@ async def recompile_single_source(
             result.errors.append(f"synth:{source_file}: permanent failure (all truncation levels)")
             return result
 
+        _normalize_synthesis_identity(synth)
         save_synthesis(synth, config.llmwiki_dir, source_file)
         result.compiled += 1
         result.concepts = synth.concepts
@@ -725,6 +799,27 @@ def _detect_source_language(content: str, filename: str) -> str:
         return lang
     except Exception:
         return ""
+
+
+def _normalize_synthesis_identity(synthesis: SourceSynthesis) -> bool:
+    """Persist English-first bilingual slugs before cache/state/render diverge."""
+    from obsidian_llm_wiki.render.bilingual import normalize_bilingual_titles_and_slugs
+
+    before = (
+        synthesis.source_title,
+        tuple((concept.title, concept.slug) for concept in synthesis.concepts),
+        tuple((moc.title, moc.slug, tuple(moc.concept_slugs)) for moc in synthesis.maps),
+    )
+    bundle = SynthesisBundle(
+        sources=[synthesis], concepts=synthesis.concepts, maps=synthesis.maps,
+    )
+    normalize_bilingual_titles_and_slugs(bundle)
+    after = (
+        synthesis.source_title,
+        tuple((concept.title, concept.slug) for concept in synthesis.concepts),
+        tuple((moc.title, moc.slug, tuple(moc.concept_slugs)) for moc in synthesis.maps),
+    )
+    return before != after
 
 
 def _existing_concept_slugs(

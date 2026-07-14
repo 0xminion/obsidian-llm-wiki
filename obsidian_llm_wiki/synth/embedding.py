@@ -1,6 +1,6 @@
 """Embedding-based cross-lingual concept linking.
 
-Uses nomic-embed-text via Ollama to compute semantic similarity between
+Uses a configured Ollama embedding model to compute semantic similarity between
 concepts across languages. When a Chinese concept and an English concept
 have high cosine similarity (>0.85), they are automatically linked as
 cross-lingual aliases in the MoC and concept pages.
@@ -30,22 +30,42 @@ __all__ = [
     "cosine_similarity",
 ]
 
-_EMBEDDING_MODEL = os.environ.get(
-    "EMBEDDING_MODEL", "nomic-embed-text:v1.5"
-)
-_OLLAMA_HOST = os.environ.get("LLM_HOST", "http://localhost:11435")
 _SIMILARITY_THRESHOLD = 0.60
 _EMBED_TIMEOUT = 30  # seconds — allow for cold model loading
 
 
-def embed_text(text: str) -> list[float] | None:
+def _embedding_model() -> str:
+    """Resolve the model after the vault ``.env`` has been loaded."""
+    return os.environ.get("EMBEDDING_MODEL", "embeddinggemma:300m").strip()
+
+
+def _ollama_host() -> str:
+    """Resolve the host at call time instead of freezing import-time settings."""
+    return os.environ.get("LLM_HOST", "http://localhost:11434").rstrip("/")
+
+
+def embed_text(
+    text: str,
+    *,
+    enabled: bool | None = None,
+    model: str | None = None,
+    host: str | None = None,
+) -> list[float] | None:
     """Generate embedding for a text string via Ollama.
 
     Returns None if embeddings are disabled or the service is unavailable.
     """
-    # Check at call time so env changes (e.g. loading .env) take effect.
-    if os.environ.get("EMBEDDINGS_ENABLED", "false").strip().lower() not in ("true", "1", "yes"):
+    # Explicit config wins; environment remains a backwards-compatible fallback
+    # for direct library callers.
+    if enabled is None:
+        enabled = os.environ.get("EMBEDDINGS_ENABLED", "false").strip().lower() in (
+            "true", "1", "yes"
+        )
+    if not enabled:
         return None
+
+    model = model or _embedding_model()
+    host = (host or _ollama_host()).rstrip("/")
 
     if not text.strip():
         return None
@@ -54,18 +74,18 @@ def embed_text(text: str) -> list[float] | None:
         with httpx.Client(timeout=_EMBED_TIMEOUT) as client:
             # Use /api/embed (Ollama 0.4+) with fallback to /api/embeddings (older)
             resp = client.post(
-                f"{_OLLAMA_HOST}/api/embed",
+                f"{host}/api/embed",
                 json={
-                    "model": _EMBEDDING_MODEL,
+                    "model": model,
                     "input": text[:2000],  # Truncate to avoid timeout
                 },
             )
             if resp.status_code != 200:
                 # Fallback to old API
                 resp = client.post(
-                    f"{_OLLAMA_HOST}/api/embeddings",
+                    f"{_ollama_host()}/api/embeddings",
                     json={
-                        "model": _EMBEDDING_MODEL,
+                        "model": _embedding_model(),
                         "prompt": text[:2000],
                     },
                 )
@@ -105,6 +125,10 @@ def cosine_similarity(a: list[float], b: list[float]) -> float:
 def find_cross_lingual_links(
     concepts: list[Any],
     threshold: float = _SIMILARITY_THRESHOLD,
+    *,
+    enabled: bool | None = None,
+    model: str | None = None,
+    host: str | None = None,
 ) -> dict[str, list[tuple[str, float, str]]]:
     """Find cross-lingual concept pairs with high semantic similarity.
 
@@ -119,7 +143,7 @@ def find_cross_lingual_links(
     for concept in concepts:
         # Embed title + summary (best semantic representation)
         text = f"{concept.title}. {concept.summary or ''}"
-        emb = embed_text(text)
+        emb = embed_text(text, enabled=enabled, model=model, host=host)
         if emb:
             embeddings[concept.slug] = emb
             # Detect language from title + summary

@@ -48,6 +48,7 @@ from obsidian_llm_wiki.ingest.transcript_resolver import (
     save_transcript_cache,
     validate_assemblyai_key,
 )
+from obsidian_llm_wiki.ingest.url_safety import get_with_validated_redirects
 
 logger = logging.getLogger("obswiki.ingest.extractors.podcast")
 
@@ -55,6 +56,7 @@ __all__ = [
     "extract_spotify",
     "extract_apple_podcast",
     "extract_generic_podcast",
+    "extract_catch_all_podcast",
     "validate_supadata_key",
     "validate_assemblyai_key",
 ]
@@ -115,6 +117,72 @@ def _is_rss_feed(url: str) -> bool:
     return bool(segments) and segments[-1] in _RSS_PATH_SEGMENTS
 
 
+# ── Catch-all pre-check ────────────────────────────────────────────────
+
+_PODCAST_HTML_SIGNALS = (
+    "<audio",          # HTML5 audio element
+    'type="audio/',    # audio enclosure link
+    "og:audio",         # Open Graph audio tag
+    "itunes:podcast",   # iTunes podcast meta
+    "podcast:transcript",  # Podcasting 2.0 transcript tag
+    'rel="alternate" type="application/rss+xml"',  # RSS auto-discovery link
+)
+
+_PODCAST_KEYWORDS = (
+    "podcast", "episode", "transcript", "show notes",
+    "listen", "audio player", "subscribe", "rss feed",
+)
+
+
+def _looks_like_podcast_page(raw_url: str) -> bool:
+    """Cheap HTML pre-check to decide if a URL might be a podcast episode.
+
+    Fetches the page HTML (bounded to the first 200K chars) and checks for
+    podcast-indicative signals: ``<audio>`` elements, RSS auto-discovery
+    links, OG audio tags, or podcast-related keywords in meta tags and the
+    page title.  Returns ``False`` on any fetch error or timeout so the
+    catch-all disclaims quickly without adding latency for non-podcast URLs.
+    """
+    try:
+        with httpx.Client(
+            **make_client_kwargs(timeout=15, follow_redirects=False),
+            headers=BROWSER_HEADERS,
+        ) as client:
+            from obsidian_llm_wiki.ingest.url_safety import get_with_validated_redirects
+            response = get_with_validated_redirects(client, raw_url)
+        if response.status_code != 200:
+            return False
+        html_text = response.text[:200_000].lower()
+    except Exception:
+        return False
+
+    # Fast structural signals — HTML elements and meta tags
+    for signal in _PODCAST_HTML_SIGNALS:
+        if signal.lower() in html_text:
+            return True
+
+    # Keyword signals — check meta description/keywords and title only
+    # to avoid false positives from article body text mentioning "podcast"
+    meta_match = re.search(
+        r'<meta\s+(?:name|property)=["\'](?:description|keywords|og:description)["\']\s+content=["\']([^"\']*)["\']',
+        html_text,
+    )
+    if meta_match:
+        meta_content = meta_match.group(1)
+        for keyword in _PODCAST_KEYWORDS:
+            if keyword in meta_content:
+                return True
+
+    title_match = re.search(r"<title>([^<]*)</title>", html_text)
+    if title_match:
+        title = title_match.group(1)
+        for keyword in _PODCAST_KEYWORDS:
+            if keyword in title:
+                return True
+
+    return False
+
+
 def _looks_like_podcast_feed(rss_text: str) -> bool:
     """Whether feed XML is a *podcast* feed rather than a plain blog/news feed.
 
@@ -160,6 +228,47 @@ def extract_apple_podcast(raw_url: str) -> SourceDoc:
 def extract_generic_podcast(raw_url: str) -> SourceDoc:
     """Extract a generic podcast episode via RSS."""
     return _extract_podcast(raw_url, platform="generic")
+
+
+@register_extractor(
+    lambda parsed, raw: (
+        parsed.scheme.lower() in ("http", "https")
+        and bool(parsed.hostname)
+        # Don't shadow known specialist domains that are tried after us.
+        and parsed.hostname.lower() not in (
+            "x.com", "twitter.com", "www.x.com", "www.twitter.com",
+        )
+    )
+)
+def extract_catch_all_podcast(raw_url: str) -> SourceDoc:
+    """Catch-all podcast extractor for URLs not on a known platform.
+
+    Tries to discover a podcast RSS feed from the episode page metadata via
+    Podcast Index / iTunes Search.  If the page doesn't look like a podcast
+    or no audio enclosure is found, the extractor disclaims the URL (raises
+    ``ExtractorNotApplicableError``) so the dispatcher falls through to
+    generic web extraction rather than failing closed.
+
+    This extractor is registered last among specialists so that every known
+    platform (Spotify, Apple, anchor.fm, direct RSS feeds, etc.) gets a chance
+    first.  It only fires for URLs that no other specialist claimed.
+
+    To avoid a redundant defuddle.md fetch for every non-podcast URL, the
+    catch-all first does a cheap HTML head request and checks for podcast-
+    indicative signals (``<audio>`` tags, ``podcast`` in ``<meta>``
+    keywords/description, iTunes/OG audio tags) before committing to the full
+    metadata + RSS resolution path.
+    """
+    if not _looks_like_podcast_page(raw_url):
+        raise ExtractorNotApplicableError(
+            f"catch-all podcast: no podcast signals found in page head for {raw_url}"
+        )
+    try:
+        return _extract_podcast(raw_url, platform="generic")
+    except RuntimeError as exc:
+        raise ExtractorNotApplicableError(
+            f"catch-all podcast: no audio enclosure or episode description found for {raw_url}"
+        ) from exc
 
 
 @register_extractor(lambda _parsed, raw: _is_rss_feed(raw))
@@ -341,13 +450,13 @@ def _fetch_defuddle_md_metadata(url: str) -> dict[str, str]:
 
     try:
         with httpx.Client(
-            **make_client_kwargs(timeout=DEFAULT_TIMEOUT, follow_redirects=True),
+            **make_client_kwargs(timeout=DEFAULT_TIMEOUT, follow_redirects=False),
             headers={
                 "User-Agent": BROWSER_HEADERS["User-Agent"],
                 "Accept": "text/html",
             },
         ) as client:
-            resp = client.get(defuddle_url)
+            resp = get_with_validated_redirects(client, defuddle_url)
         if resp.status_code != 200:
             return {}
 
@@ -441,10 +550,10 @@ def _fetch_rss_text(feed_url: str) -> str:
         return ""
     try:
         with httpx.Client(
-            **make_client_kwargs(timeout=DEFAULT_TIMEOUT, follow_redirects=True),
+            **make_client_kwargs(timeout=DEFAULT_TIMEOUT, follow_redirects=False),
             headers={"User-Agent": BROWSER_HEADERS["User-Agent"]},
         ) as client:
-            response = client.get(feed_url)
+            response = get_with_validated_redirects(client, feed_url)
         if response.status_code == 200:
             return response.text
     except httpx.HTTPError as exc:
@@ -602,10 +711,11 @@ def _find_apple_episode_asset(
 
     try:
         with httpx.Client(
-            **make_client_kwargs(timeout=DEFAULT_TIMEOUT, follow_redirects=True),
+            **make_client_kwargs(timeout=DEFAULT_TIMEOUT, follow_redirects=False),
             headers={"User-Agent": BROWSER_HEADERS["User-Agent"]},
         ) as client:
-            response = client.get(
+            response = get_with_validated_redirects(
+                client,
                 f"https://itunes.apple.com/lookup?id={podcast_id_match.group(1)}",
             )
         if response.status_code == 200:
@@ -636,10 +746,11 @@ def _find_asset_via_itunes(title: str, author: str = "") -> EpisodeAsset:
     search_term = author.strip() or title.strip()
     try:
         with httpx.Client(
-            **make_client_kwargs(timeout=DEFAULT_TIMEOUT, follow_redirects=True),
+            **make_client_kwargs(timeout=DEFAULT_TIMEOUT, follow_redirects=False),
             headers={"User-Agent": BROWSER_HEADERS["User-Agent"]},
         ) as client:
-            response = client.get(
+            response = get_with_validated_redirects(
+                client,
                 "https://itunes.apple.com/search",
                 params={"term": search_term, "media": "podcast", "limit": 5},
             )
@@ -814,10 +925,10 @@ def _whisper_fallback_transcribe(audio_url: str) -> str:
             # media enclosure from the pipeline host, which is exactly the fetch
             # RESIDENTIAL_PROXY_URL exists to unblock.
             with httpx.Client(
-                **make_client_kwargs(timeout=120, follow_redirects=True),
+                **make_client_kwargs(timeout=120, follow_redirects=False),
                 headers={"User-Agent": BROWSER_HEADERS["User-Agent"]},
             ) as client:
-                resp = client.get(audio_url)
+                resp = get_with_validated_redirects(client, audio_url)
                 resp.raise_for_status()
                 tmp.write(resp.content)
             tmp_path = tmp.name

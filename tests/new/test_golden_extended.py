@@ -407,7 +407,7 @@ def test_backlink_propagation_golden():
     b = next(c for c in bundle.concepts if c.slug == "concept-b")
     assert len(b.related) == 1
     assert b.related[0].slug == "concept-a"
-    assert b.related[0].relation == "depends_on"
+    assert b.related[0].relation == "prerequisite_of"
 
 
 # ── Gradient confidence golden test ─────────────────────────────────────

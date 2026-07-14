@@ -51,17 +51,18 @@ def test_source_provenance_round_trips_through_source_frontmatter(tmp_path: Path
     page = render_source_page(source, "2026-07-13T12:30:00Z")
     meta, _ = parse_frontmatter(page)
     assert meta["url"] == "https://example.com/legacy-url"
-    assert meta["provenance"] == {
-        "requested_url": "https://example.com/requested",
-        "resolved_url": "https://example.com/resolved",
-        "extracted_url": "https://cdn.example.com/full-text.pdf",
-        "extractor_chain": ["scientific-candidate", "pdf"],
-        "content_type": "application/pdf",
-        "document_format": "pdf",
-        "retrieved_at": "2026-07-13T12:00:00Z",
-        "content_sha256": "a" * 64,
-        "diagnostics": ["candidate selected"],
-    }
+    assert meta["provenance"] == [
+        "requested_url: https://example.com/requested",
+        "resolved_url: https://example.com/resolved",
+        "extracted_url: https://cdn.example.com/full-text.pdf",
+        "content_type: application/pdf",
+        "document_format: pdf",
+        "retrieved_at: 2026-07-13T12:00:00Z",
+        f"content_sha256: {'a' * 64}",
+        "extractor_chain: scientific-candidate",
+        "extractor_chain: pdf",
+        "diagnostics: candidate selected",
+    ]
 
     source_path = tmp_path / "article.md"
     source_path.write_text(page, encoding="utf-8")
@@ -75,6 +76,27 @@ def test_source_provenance_round_trips_through_source_frontmatter(tmp_path: Path
         render_source_page(SourceDoc(title="Legacy", content="Body"), "2026-07-13T12:30:00Z"),
     )
     assert "provenance" not in empty_meta
+
+
+def test_source_loader_keeps_legacy_nested_provenance_frontmatter(tmp_path: Path):
+    """Existing vault pages remain readable after the Obsidian-safe migration."""
+    legacy = (
+        "---\n"
+        "title: Legacy\n"
+        "provenance:\n"
+        "  requested_url: https://example.com/requested\n"
+        "  extractor_chain: [web, trafilatura]\n"
+        "---\n"
+        "Body\n"
+    )
+    path = tmp_path / "legacy.md"
+    path.write_text(legacy, encoding="utf-8")
+
+    source = load_source_file(path)
+
+    assert source is not None
+    assert source.provenance.requested_url == "https://example.com/requested"
+    assert source.provenance.extractor_chain == ("web", "trafilatura")
 
 
 def test_source_metadata_round_trips_through_source_frontmatter(tmp_path: Path):

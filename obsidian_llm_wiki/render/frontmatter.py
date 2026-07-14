@@ -157,7 +157,17 @@ def atomic_write(path: str | Path, content: str) -> None:
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(content)
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(tmp, p)
+        # Persist the directory entry too: rename is atomic, but not durable
+        # across a power loss until the containing directory is flushed.
+        if hasattr(os, "O_DIRECTORY"):
+            dir_fd = os.open(p.parent, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
     except BaseException:
         # BaseException so the temp file is cleaned up even on
         # KeyboardInterrupt/SystemExit.

@@ -23,6 +23,11 @@ from obsidian_llm_wiki.ingest.http_headers import BROWSER_HEADERS
 from obsidian_llm_wiki.ingest.liteparse import parse_document
 from obsidian_llm_wiki.ingest.provenance import stamp_source
 from obsidian_llm_wiki.ingest.proxy import make_client_kwargs
+from obsidian_llm_wiki.ingest.url_safety import (
+    get_with_validated_redirects,
+    stream_with_validated_redirects,
+    validate_remote_url,
+)
 
 DOCUMENT_SUFFIXES = frozenset((".pdf", ".doc", ".docx", ".epub", ".ppt", ".pptx", ".xls", ".xlsx"))
 TEXT_SUFFIXES = frozenset((".txt", ".md", ".markdown", ".rst"))
@@ -117,10 +122,10 @@ def extract_discovered_document(
     """Discover and parse bounded same-site document candidates from a landing page."""
     cfg = config or load_config()
     with httpx.Client(
-        **make_client_kwargs(timeout=timeout, follow_redirects=True), headers=BROWSER_HEADERS
+        **make_client_kwargs(timeout=timeout, follow_redirects=False), headers=BROWSER_HEADERS
     ) as client:
         try:
-            response = client.get(page_url)
+            response = get_with_validated_redirects(client, page_url)
             response.raise_for_status()
         except Exception as exc:
             raise DocumentError(f"Could not retrieve document landing page {page_url}") from exc
@@ -173,15 +178,16 @@ def download_document(
     re-raised through a document-specific exception.
     """
     cfg = config or load_config()
+    validate_remote_url(url)
     expected_suffix = _suffix_from_url(url)
     temp_path: Path | None = None
     try:
         with (
             httpx.Client(
-                **make_client_kwargs(timeout=timeout, follow_redirects=True),
+                **make_client_kwargs(timeout=timeout, follow_redirects=False),
                 headers=BROWSER_HEADERS,
             ) as client,
-            client.stream("GET", url) as response,
+            stream_with_validated_redirects(client, url) as response,
         ):
             response.raise_for_status()
             resolved_url = str(response.url)

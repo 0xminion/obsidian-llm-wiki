@@ -31,7 +31,24 @@ def detect_language(text: str) -> str:
     For short texts (< 200 chars), confidence is lower — the caller should
     default to 'en' for ambiguous cases.
     """
-    if not text or len(text.strip()) < 20:
+    if not text or not text.strip():
+        return "en"
+
+    # Script is decisive even for short labels such as ``比特币``. The old
+    # length-first English fallback suppressed cross-lingual matching exactly
+    # where concept titles and summaries are most terse.
+    short_text = text.strip()
+    if len(short_text) < 20:
+        if re.search(r"[\u3040-\u309f\u30a0-\u30ff]", short_text):
+            return "ja"
+        if re.search(r"[\u4e00-\u9fff]", short_text):
+            return "zh"
+        if re.search(r"[\uac00-\ud7af]", short_text):
+            return "ko"
+        if re.search(r"[\u0600-\u06ff]", short_text):
+            return "ar"
+        if re.search(r"[\u0400-\u04ff]", short_text):
+            return "ru"
         return "en"
 
     text = text[:5000]  # Sample first 5k chars

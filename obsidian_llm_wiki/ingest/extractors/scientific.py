@@ -99,11 +99,12 @@ def _fetch_public_html(url: str, timeout: int) -> str:
     """Fetch a public document without cookies, credentials, or browser bypasses."""
     with httpx.Client(
         timeout=timeout,
-        follow_redirects=True,
+        follow_redirects=False,
         trust_env=False,
         headers=BROWSER_HEADERS,
     ) as client:
-        response = client.get(url)
+        from obsidian_llm_wiki.ingest.url_safety import get_with_validated_redirects
+        response = get_with_validated_redirects(client, url)
     response.raise_for_status()
     resolved_url = str(getattr(response, "url", ""))
     if resolved_url.startswith(("http://", "https://")) and not _same_official_site(

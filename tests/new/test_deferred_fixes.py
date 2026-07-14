@@ -81,11 +81,11 @@ def test_pipeline_runs_dedup_before_state_write(tmp_path, monkeypatch):
 
     monkeypatch.setattr(
         dedupe, "semantic_dedupe_concepts",
-        lambda bundle, threshold, embeddings_cache=None: order.append("dedup"),
+        lambda bundle, threshold, embeddings_cache=None, **_kwargs: order.append("dedup"),
     )
     monkeypatch.setattr(
         dedupe, "assign_orphans_to_mocs",
-        lambda bundle, threshold, embeddings_cache=None: order.append("orphans"),
+        lambda bundle, threshold, embeddings_cache=None, **_kwargs: order.append("orphans"),
     )
     monkeypatch.setattr(
         "obsidian_llm_wiki.render.obsidian.render_vault",

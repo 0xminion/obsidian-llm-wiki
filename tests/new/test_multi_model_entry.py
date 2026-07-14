@@ -190,6 +190,43 @@ def test_merge_unions_claims_dedup():
     assert claim_texts == ["claim A", "claim B"]
 
 
+def test_merge_preserves_same_claim_text_with_distinct_verified_evidence():
+    """Two sources may independently support identical claim wording."""
+    primary = _make_synth(concepts=[
+        _make_concept("alpha", claims=[Claim(
+            text="claim A",
+            evidence={
+                "quote": "first source quote",
+                "source_file": "first.md",
+                "source_hash": "one",
+                "start_offset": 0,
+                "end_offset": 18,
+                "verification": "verified",
+            },
+        )]),
+    ])
+    secondary = _make_synth(concepts=[
+        _make_concept("alpha", claims=[Claim(
+            text="claim A",
+            evidence={
+                "quote": "second source quote",
+                "source_file": "second.md",
+                "source_hash": "two",
+                "start_offset": 0,
+                "end_offset": 19,
+                "verification": "verified",
+            },
+        )]),
+    ])
+
+    merged = merge_entry_syntheses(primary, secondary)
+
+    assert [claim.evidence.source_file for claim in merged.concepts[0].claims] == [
+        "first.md",
+        "second.md",
+    ]
+
+
 def test_merge_unions_related_dedup():
     """Related links are unioned, deduplicated by slug."""
     primary = _make_synth(concepts=[

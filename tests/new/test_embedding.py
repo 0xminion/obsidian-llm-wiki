@@ -51,3 +51,30 @@ class TestEmbeddingGating:
             mock_client_cls.return_value.post = mock.Mock(return_value=err_resp)
             result = embed_text("test")
         assert result is None
+
+    def test_embed_text_uses_vault_environment_loaded_after_import(self):
+        """Configured model and host must not be frozen at module import."""
+        response = mock.Mock(status_code=200)
+        response.json.return_value = {"embeddings": [[0.1, 0.2]]}
+        client = mock.Mock()
+        client.post.return_value = response
+        client.__enter__ = mock.Mock(return_value=client)
+        client.__exit__ = mock.Mock(return_value=False)
+        with (
+            mock.patch.dict(
+                "os.environ",
+                {
+                    "EMBEDDINGS_ENABLED": "true",
+                    "EMBEDDING_MODEL": "qwen3-embedding:0.6b",
+                    "LLM_HOST": "http://localhost:11435/",
+                },
+                clear=False,
+            ),
+            mock.patch("obsidian_llm_wiki.synth.embedding.httpx.Client", return_value=client),
+        ):
+            assert embed_text("bilingual concept") == [0.1, 0.2]
+
+        client.post.assert_called_once_with(
+            "http://localhost:11435/api/embed",
+            json={"model": "qwen3-embedding:0.6b", "input": "bilingual concept"},
+        )

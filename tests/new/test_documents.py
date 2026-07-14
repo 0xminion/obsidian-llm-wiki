@@ -210,8 +210,8 @@ def test_discovered_document_keeps_landing_candidate_redirect_and_download_prove
     from obsidian_llm_wiki.ingest import documents
     from obsidian_llm_wiki.ingest.documents import DownloadedDocument
 
-    landing_url = "https://journal.example/articles/42"
-    candidate_url = "https://journal.example/files/42.pdf"
+    landing_url = "https://example.com/articles/42"
+    candidate_url = "https://example.com/files/42.pdf"
     resolved_url = "https://journal.example/downloads/42-final.pdf"
     landing_response = httpx.Response(
         200,
@@ -235,7 +235,7 @@ def test_discovered_document_keeps_landing_candidate_redirect_and_download_prove
         def __exit__(self, *_args) -> None:
             return None
 
-        def get(self, url: str) -> httpx.Response:
+        def get(self, url: str, **_kwargs: object) -> httpx.Response:
             assert url == landing_url
             return landing_response
 
@@ -244,6 +244,7 @@ def test_discovered_document_keeps_landing_candidate_redirect_and_download_prove
         assert source_url == landing_url
         return SourceDoc(title="Paper", content="Extracted document text", url=source_url)
 
+    config = Config()
     with (
         patch(
             "obsidian_llm_wiki.ingest.documents.httpx.Client",
@@ -255,13 +256,13 @@ def test_discovered_document_keeps_landing_candidate_redirect_and_download_prove
         ) as download,
         patch("obsidian_llm_wiki.ingest.documents._parse_local_document", side_effect=parse),
     ):
-        result = documents.extract_discovered_document(landing_url, timeout=9)
+        result = documents.extract_discovered_document(landing_url, timeout=9, config=config)
 
     download.assert_called_once_with(
         candidate_url,
-        config=load_config(),
+        config=config,
         timeout=9,
-        required_host="journal.example",
+        required_host="example.com",
     )
     assert result.provenance.requested_url == landing_url
     assert result.provenance.extracted_url == candidate_url

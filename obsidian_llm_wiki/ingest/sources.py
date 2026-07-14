@@ -73,6 +73,47 @@ def _provenance_strings(value: object) -> tuple[str, ...]:
     return tuple(_metadata_strings(value, max_chars=512))
 
 
+def _source_provenance(value: object) -> SourceProvenance:
+    """Load current flat provenance plus legacy nested frontmatter safely."""
+    if isinstance(value, dict):
+        return SourceProvenance(
+            requested_url=_safe_string(value.get("requested_url")),
+            resolved_url=_safe_string(value.get("resolved_url")),
+            extracted_url=_safe_string(value.get("extracted_url")),
+            extractor_chain=_provenance_strings(value.get("extractor_chain")),
+            content_type=_safe_string(value.get("content_type")),
+            document_format=_safe_string(value.get("document_format")),
+            retrieved_at=_safe_string(value.get("retrieved_at")),
+            content_sha256=_safe_string(value.get("content_sha256")),
+            diagnostics=_provenance_strings(value.get("diagnostics")),
+        )
+
+    scalar: dict[str, str] = {}
+    repeated: dict[str, list[str]] = {"extractor_chain": [], "diagnostics": []}
+    for entry in _metadata_strings(value, max_chars=512):
+        key, separator, raw = entry.partition(": ")
+        if not separator:
+            continue
+        if key in repeated:
+            repeated[key].append(raw)
+        elif key in {
+            "requested_url", "resolved_url", "extracted_url", "content_type",
+            "document_format", "retrieved_at", "content_sha256",
+        }:
+            scalar[key] = raw
+    return SourceProvenance(
+        requested_url=scalar.get("requested_url", ""),
+        resolved_url=scalar.get("resolved_url", ""),
+        extracted_url=scalar.get("extracted_url", ""),
+        extractor_chain=tuple(repeated["extractor_chain"]),
+        content_type=scalar.get("content_type", ""),
+        document_format=scalar.get("document_format", ""),
+        retrieved_at=scalar.get("retrieved_at", ""),
+        content_sha256=scalar.get("content_sha256", ""),
+        diagnostics=tuple(repeated["diagnostics"]),
+    )
+
+
 def load_source_file(path: Path) -> SourceDoc | None:
     """Load a single source markdown file into a SourceDoc.
 
@@ -94,20 +135,7 @@ def load_source_file(path: Path) -> SourceDoc | None:
     source_type = _source_type(
         meta.get("source_type", meta.get("document_type", meta.get("content_type", "")))
     )
-    provenance_data = meta.get("provenance")
-    if not isinstance(provenance_data, dict):
-        provenance_data = {}
-    provenance = SourceProvenance(
-        requested_url=_safe_string(provenance_data.get("requested_url")),
-        resolved_url=_safe_string(provenance_data.get("resolved_url")),
-        extracted_url=_safe_string(provenance_data.get("extracted_url")),
-        extractor_chain=_provenance_strings(provenance_data.get("extractor_chain")),
-        content_type=_safe_string(provenance_data.get("content_type")),
-        document_format=_safe_string(provenance_data.get("document_format")),
-        retrieved_at=_safe_string(provenance_data.get("retrieved_at")),
-        content_sha256=_safe_string(provenance_data.get("content_sha256")),
-        diagnostics=_provenance_strings(provenance_data.get("diagnostics")),
-    )
+    provenance = _source_provenance(meta.get("provenance"))
     return SourceDoc(
         title=title,
         content=body,
