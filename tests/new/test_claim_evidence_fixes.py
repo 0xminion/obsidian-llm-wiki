@@ -6,10 +6,6 @@ Fix 2: Unverified claims with quotes render in the evidence section.
 
 from __future__ import annotations
 
-from unittest import mock
-
-import pytest
-
 from obsidian_llm_wiki.core.models import (
     Claim,
     ConceptNote,
@@ -18,7 +14,6 @@ from obsidian_llm_wiki.core.models import (
 )
 from obsidian_llm_wiki.render.obsidian import render_concept_page
 from obsidian_llm_wiki.synth.quality import _merge_claims
-
 
 # ── Fix 1: _merge_claims ────────────────────────────────────────────────
 
@@ -261,5 +256,5 @@ def test_mixed_verified_and_unverified_claims_both_render():
     assert "*(unverified)*" in page
     # Bare claim should have no marker
     lines = page.split("## Claims")[1].split("## Evidence")[0]
-    bare_line = [l for l in lines.split("\n") if "Bare claim" in l]
+    bare_line = [line for line in lines.split("\n") if "Bare claim" in line]
     assert bare_line and "[" not in bare_line[0]

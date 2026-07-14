@@ -6,9 +6,7 @@ from unittest import mock
 
 import pytest
 
-from obsidian_llm_wiki.ingest.extractors import ExtractorNotApplicableError
-from obsidian_llm_wiki.ingest.extractors import podcast
-
+from obsidian_llm_wiki.ingest.extractors import ExtractorNotApplicableError, podcast
 
 # ── _looks_like_podcast_page ────────────────────────────────────────────
 
