@@ -66,7 +66,7 @@ def setup():
 
     # ── Scaffold vault directories ────────────────────────────────────
     # Karpathy-style vault layout: raw sources → LLM-compiled wiki →
-    # saved queries → templates/schema.
+    # saved queries.
     vault_dirs = {
         "00-Inbox": "URL queue and incoming files",
         "01-Raw": "Immutable raw source documents",
@@ -74,7 +74,6 @@ def setup():
         "03-Raw-Annotations": "Manual notes, highlights, and commentary on sources",
         "04-Wiki": "LLM-compiled wiki (sources, entries, concepts, mocs)",
         "05-Queries": "Saved query results and analyses filed back into the vault",
-        "07-Templates": "Wiki schema, page templates, MoC templates",
     }
     for dirname, _desc in vault_dirs.items():
         (vault / dirname).mkdir(parents=True, exist_ok=True)
@@ -91,20 +90,20 @@ def setup():
     (vault / "02-Clippings" / "processed").mkdir(parents=True, exist_ok=True)
     print(f"✅ Clippings archive ready: {vault / '02-Clippings' / 'processed'}")
 
-    # ── Default schema template ──────────────────────────────────────
-    schema_path = vault / "07-Templates" / "schema.yaml"
+    # ── Default schema policy ────────────────────────────────────────
+    schema_path = wiki_dir / ".llmwiki" / "schema.yaml"
     if not schema_path.exists():
         schema_path.write_text(
             "# Vault-local schema policy for synthesis guidance.\n"
-            "# This file is optional. When present, its guidance is\n"
-            "# injected into the LLM synthesis prompt.\n\n"
-            "# granularity: detailed  # auto, brief, detailed\n"
-            "# concept_name_convention: english-first\n"
-            "# max_concepts_per_source: 15\n"
-            "# require_rationale: true\n",
+            "# This file is loaded by core/schema.py and injected into\n"
+            "# the LLM synthesis prompt as a user-guidance block.\n\n"
+            "granularity: detailed\n"
+            "concept_name_convention: english-first\n"
+            "max_concepts_per_source: 15\n"
+            "require_rationale: true\n",
             encoding="utf-8",
         )
-        print(f"✅ Default schema template: {schema_path}")
+        print(f"✅ Default schema policy: {schema_path}")
 
     print("\nNext steps:")
     print(f"  olw ingest {vault} --url https://example.com/article")

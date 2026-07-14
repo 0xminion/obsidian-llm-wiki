@@ -178,11 +178,6 @@ class Config:
         return self.vault / "05-Queries"
 
     @property
-    def templates_dir(self) -> Path:
-        """Wiki schema, page templates, and configuration directory."""
-        return self.vault / "07-Templates"
-
-    @property
     def llmwiki_dir(self) -> Path:
         """Internal pipeline state directory."""
         return self.wiki_dir / ".llmwiki"

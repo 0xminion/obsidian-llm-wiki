@@ -14,6 +14,7 @@ from obsidian_llm_wiki.cli import app
 from obsidian_llm_wiki.cli._helpers import resolve_vault
 from obsidian_llm_wiki.cli.health import (
     _normalize_wikilink_target,
+    _parse_relation_target,
     _scan_maintenance_findings,
 )
 from obsidian_llm_wiki.core.backups import backup_file, list_backups
@@ -199,11 +200,10 @@ def _fixed_page_content(raw: str, page_fixes: list[PlannedFix]) -> tuple[str, in
         retained_relations = [
             relation
             for relation in original_relations
-            if not (
-                isinstance(relation, dict)
-                and _normalize_wikilink_target(str(relation.get("target", "")))
-                in broken_targets
+            if _normalize_wikilink_target(
+                _parse_relation_target(relation) or ""
             )
+            not in broken_targets
         ]
         removed = len(original_relations) - len(retained_relations)
         if removed:

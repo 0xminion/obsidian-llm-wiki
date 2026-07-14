@@ -488,7 +488,7 @@ def _download_and_upload_audio(url: str, api_key: str) -> str | None:
         upload_result = data.get("upload_url", "")
         if upload_result:
             logger.info("Uploaded audio to AssemblyAI: %s", upload_result)
-            return upload_url
+            return upload_result
 
     except Exception as exc:
         logger.warning("Audio download+upload failed: %s", exc)

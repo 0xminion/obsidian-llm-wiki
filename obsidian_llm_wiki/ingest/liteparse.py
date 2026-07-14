@@ -133,20 +133,6 @@ def extract_document_fallback(url: str, timeout: int) -> SourceDoc:
     return extract_discovered_document(url, timeout)
 
 
-def _is_document_response(url: str, response) -> bool:
-    """Compatibility predicate for callers that classify HTTP responses.
-
-    Classification alone does not validate a document: the unified dispatcher
-    subsequently verifies content type, bounded size, and file signature before
-    invoking a parser. HTML is intentionally excluded unless a document suffix
-    explicitly identifies the URL.
-    """
-    from obsidian_llm_wiki.ingest.documents import _CONTENT_TYPE_SUFFIXES, is_document_path
-
-    content_type = response.headers.get("content-type", "").split(";", 1)[0].lower()
-    return is_document_path(url) or content_type in _CONTENT_TYPE_SUFFIXES
-
-
 def _document_candidates(html: str, page_url: str) -> list[str]:
     """Compatibility wrapper for existing callers of candidate discovery."""
     return document_candidates(html, page_url, max_candidates=load_config().max_document_candidates)
