@@ -1,23 +1,42 @@
-"""Twitter/X post and article extractor via VxTwitter API + defuddle.
+"""Twitter/X post and article extractor via defuddle.
 
-Handles both regular tweets and X Articles (long-form posts).
-Uses VxTwitter API (api.vxtwitter.com) for metadata + tweet text,
-and defuddle CLI for full article body extraction when available.
+Extraction strategy — X Articles and tweets MUST go through defuddle:
 
-For X Articles:
-  - Title comes from article.title (the article headline)
-  - Content comes from article.preview_text + defuddle extraction of the tweet page
-  - Full article body requires JS rendering (not available without a headless browser)
+  1. **defuddle.md** (hosted service at https://defuddle.md/<url>) — primary.
+     Renders JS-heavy X pages server-side and returns clean markdown with
+     YAML frontmatter (title, author, word_count, published date).
 
-For regular tweets:
-  - Title comes from user_name + tweet text (first 80 chars)
-  - Content is the full tweet text from VxTwitter API
+  2. **defuddle CLI** (local, ``npx defuddle parse <url> --md``) — fallback.
+     Same engine as defuddle.md but runs locally.  Requires ``npx defuddle``
+     or a global ``defuddle`` install.
+
+  3. **trafilatura** via ``extract_web`` — last resort for non-JS pages.
+
+**DO NOT route X URLs through VxTwitter, direct HTTP, or browser_navigate.**
+These do NOT work for X Articles:
+
+  - VxTwitter (api.vxtwitter.com) only handles ``/status/`` tweet IDs, not
+    ``/article/`` URLs — returns 404.
+  - Direct HTTP fetch of x.com returns a JS-rendered React shell with no
+    article content (the page requires client-side rendering + authentication).
+  - Browser navigation hits X's login wall — articles are gated behind an
+    authenticated session.
+  - Wayback Machine archives the JS shell, not the rendered article content.
+
+**X Article auth wall (July 2026):** X started requiring authentication to
+view ``/article/`` URLs.  defuddle.md's server-side renderer gets a
+``"JavaScript is not available"`` stub from X instead of the article body.
+When this happens, the extractor detects the stub and falls through to the
+defuddle CLI, then to ``extract_web``.  If all three fail, the URL is logged
+to the failed URLs ledger.
+
+For ``/status/`` URLs (regular tweets), defuddle.md still works — X serves
+tweet content server-side for unauthenticated requests.
 """
 
 from __future__ import annotations
 
 import logging
-import re
 
 import httpx
 
@@ -30,6 +49,15 @@ logger = logging.getLogger("obswiki.ingest.twitter")
 
 __all__ = ["extract_twitter"]
 
+# X/Twitter pages that carry no article content — detect and reject these
+# so the extractor falls through to the next strategy instead of returning
+# a content-free stub to the pipeline.
+_STUB_MARKERS = (
+    "JavaScript is not available",
+    "Something went wrong",
+    "cookie wall",
+)
+
 
 def _is_twitter_url(parsed, raw: str) -> bool:
     """Match Twitter/X URLs."""
@@ -37,33 +65,22 @@ def _is_twitter_url(parsed, raw: str) -> bool:
     return host in ("x.com", "twitter.com", "www.x.com", "www.twitter.com")
 
 
-def _extract_tweet_id(url: str) -> str | None:
-    """Extract the numeric tweet ID from a Twitter/X URL."""
-    m = re.search(r"/status/(\d+)", url)
-    return m.group(1) if m else None
-
-
-def _extract_handle(url: str) -> str | None:
-    """Extract the @handle from a Twitter/X URL."""
-    m = re.search(r"/([^/]+)/status/\d+", url)
-    return m.group(1) if m else None
-
-
 @register_extractor(_is_twitter_url)
 def extract_twitter(raw_url: str) -> SourceDoc:
     """Extract content from a Twitter/X post or article.
 
-    Strategy:
-      1. VxTwitter API for tweet metadata (title, text, article info)
-      2. Defuddle CLI for full article body extraction
-      3. Fallback to trafilatura via extract_web
+    Strategy (see module docstring for rationale):
+      1. defuddle.md hosted service — renders JS-heavy X pages
+      2. defuddle CLI (local) — same engine, local fallback
+      3. trafilatura via extract_web — last resort
+
+    DO NOT add VxTwitter, direct HTTP, or browser_navigate fallbacks —
+    they do not work for X Articles (see module docstring).
 
     Raises:
         RuntimeError: If all extraction strategies fail.
     """
     errors: list[str] = []
-    tweet_id = _extract_tweet_id(raw_url)
-    handle = _extract_handle(raw_url)
 
     # ── Primary: Defuddle.md web service ──────────────────────────────
     try:
@@ -77,19 +94,7 @@ def extract_twitter(raw_url: str) -> SourceDoc:
     except Exception as exc:
         errors.append(f"defuddle_md: {exc}")
 
-    # ── Fallback: VxTwitter API ────────────────────────────────────────
-    try:
-        source = _extract_via_vxtwitter(raw_url, tweet_id, handle)
-        if source:
-            logger.info(
-                "VxTwitter: extracted %d chars for %s",
-                len(source.content), raw_url,
-            )
-            return source
-    except Exception as exc:
-        errors.append(f"vxtwitter: {exc}")
-
-    # ── Fallback: defuddle CLI ────────────────────────────────────────
+    # ── Fallback: Defuddle CLI ────────────────────────────────────────
     try:
         source = _extract_via_defuddle(raw_url)
         if source:
@@ -140,6 +145,19 @@ def _extract_via_defuddle_md(url: str) -> SourceDoc | None:
     if not text or len(text) < 100:
         return None
 
+    # Detect X/Twitter JavaScript-disabled stubs and error pages —
+    # defuddle.md renders the page shell but X requires JS for article
+    # content, returning a stub like:
+    #   ---
+    #   title: "JavaScript is not available."
+    #   site: "X (formerly Twitter)"
+    #   ---
+    # This passes the 100-char gate but carries no article content.
+    # The module-level _STUB_MARKERS tuple is used for detection.
+    if any(marker.lower() in text.lower() for marker in _STUB_MARKERS):
+        logger.debug("defuddle.md returned JS stub/error for %s — skipping", url)
+        return None
+
     # Parse frontmatter (defuddle.md returns YAML frontmatter + markdown body)
     title = ""
     content = text
@@ -176,161 +194,6 @@ def _extract_via_defuddle_md(url: str) -> SourceDoc | None:
         return None
 
     return SourceDoc(title=title, content=content.strip(), url=url)
-
-
-def _extract_via_vxtwitter(
-    url: str, tweet_id: str | None, handle: str | None,
-) -> SourceDoc | None:
-    """Fetch tweet data via VxTwitter API (api.vxtwitter.com).
-
-    Returns None if the API is unavailable. Raises RuntimeError on auth errors.
-    """
-    if not tweet_id or not handle:
-        return None
-
-    api_url = f"https://api.vxtwitter.com/{handle}/status/{tweet_id}"
-
-    with httpx.Client(
-        **make_client_kwargs(timeout=DEFAULT_TIMEOUT, follow_redirects=False),
-        headers={
-            "User-Agent": BROWSER_HEADERS["User-Agent"],
-            "Accept": "application/json",
-        },
-    ) as client:
-        from obsidian_llm_wiki.ingest.url_safety import get_with_validated_redirects
-        resp = get_with_validated_redirects(client, api_url)
-
-    if resp.status_code != 200:
-        logger.debug("VxTwitter returned %d for %s", resp.status_code, url)
-        return None
-
-    data = resp.json()
-
-    # Extract tweet metadata
-    author_name = data.get("user_name", "") or ""
-    author_handle = data.get("user_screen_name", "") or handle or ""
-    tweet_text = data.get("text", "") or ""
-    article = data.get("article", {}) or {}
-    article_title = article.get("title", "") or ""
-    article_preview = article.get("preview_text", "") or ""
-    likes = data.get("likes", 0) or 0
-    retweets = data.get("retweets", 0) or 0
-    date = data.get("date", "") or ""
-
-    # Determine if this is an X Article
-    is_article = bool(article) and bool(article_title)
-
-    if is_article:
-        # X Article: use article title as the source title
-        title = article_title
-
-        # Try to get full article body via defuddle
-        body = _extract_article_body_via_defuddle(url)
-
-        if not body or len(body) < 100:
-            # Fall back to preview text + tweet text
-            body = article_preview
-            if tweet_text and tweet_text != f"http://x.com/i/article/{tweet_id}":
-                body = f"{body}\n\n{tweet_text}"
-
-        if not body or len(body.strip()) < 50:
-            return None
-
-        # Add metadata
-        content_parts = [
-            f"Author: @{author_handle} ({author_name})",
-            f"Date: {date}",
-            f"Engagement: {likes:,} likes, {retweets:,} retweets",
-            "",
-            body.strip(),
-        ]
-        content = "\n".join(content_parts)
-    else:
-        # Regular tweet: use tweet text as both title and content
-        if not tweet_text or "http://x.com/i/article/" in tweet_text:
-            # Tweet text is just a link to an article — use preview
-            if article_preview:
-                tweet_text = article_preview
-            else:
-                return None
-
-        # Title: first ~80 chars of tweet text, or author name
-        title = tweet_text[:80].replace("\n", " ").strip()
-        if not title:
-            title = f"@{author_handle} ({author_name})"
-
-        content_parts = [
-            f"Author: @{author_handle} ({author_name})",
-            f"Date: {date}",
-            f"Engagement: {likes:,} likes, {retweets:,} retweets",
-            "",
-            tweet_text.strip(),
-        ]
-        content = "\n".join(content_parts)
-
-    if not content or len(content.strip()) < 50:
-        return None
-
-    return SourceDoc(title=title, content=content.strip(), url=url)
-
-
-def _extract_article_body_via_defuddle(tweet_url: str) -> str:
-    """Try to extract full article body using defuddle CLI on the tweet URL.
-
-    Defuddle can extract article preview text from the tweet page,
-    even though it can't render the full JS article body.
-    """
-    import os
-    import shutil
-    import subprocess
-
-    defuddle_path = shutil.which("defuddle") or shutil.which("npx")
-    if not defuddle_path:
-        return ""
-
-    if "defuddle" in defuddle_path:
-        cmd = [defuddle_path, "parse", tweet_url, "--md"]
-    else:
-        cmd = [defuddle_path, "defuddle", "parse", tweet_url, "--md"]
-
-    env = os.environ.copy()
-    env["NODE_EXTRA_CA_CERTS"] = ""
-
-    try:
-        proc = subprocess.run(
-            cmd, capture_output=True, text=True,
-            timeout=30, env=env,
-        )
-        if proc.returncode != 0:
-            return ""
-
-        output = proc.stdout.strip()
-        if not output or len(output) < 50:
-            return ""
-
-        # Extract the article body from defuddle output
-        # Defuddle returns markdown starting with image + title + preview text
-        lines = output.split("\n")
-        body_lines: list[str] = []
-        in_body = False
-        for line in lines:
-            # Skip image markdown
-            if line.startswith("!["):
-                continue
-            # Skip empty lines at the start
-            if not in_body and not line.strip():
-                continue
-            in_body = True
-            body_lines.append(line)
-
-        body = "\n".join(body_lines).strip()
-        # Remove the article URL link if present
-        body = re.sub(r"\[https?://x\.com/i/article/\d+\]\(.*?\)", "", body).strip()
-
-        return body if len(body) > 50 else ""
-
-    except Exception:
-        return ""
 
 
 def _extract_via_defuddle(url: str) -> SourceDoc | None:
