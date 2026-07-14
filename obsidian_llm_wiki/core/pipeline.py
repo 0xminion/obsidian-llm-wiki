@@ -413,7 +413,14 @@ async def run_pipeline(
 
         # Persist embeddings for reuse on the next run.
         if config.embeddings_enabled and embeddings_cache:
-            save_embeddings_cache(embeddings_cache_path, embeddings_cache)
+            # Prune stale entries: only keep embeddings for concepts that
+            # survived dedup (are in the final bundle).
+            live_slugs = {c.slug for c in bundle.concepts}
+            pruned_cache = {
+                slug: vec for slug, vec in embeddings_cache.items()
+                if slug in live_slugs
+            }
+            save_embeddings_cache(embeddings_cache_path, pruned_cache)
 
         metrics.record_embedding(
             model=config.embedding_model if config.embeddings_enabled else "",

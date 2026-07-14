@@ -271,6 +271,32 @@ def _embed_concept(
     return emb
 
 
+def _embed_concepts_batch(
+    concepts: list[ConceptNote],
+    embeddings_cache: dict[str, list[float]],
+    embedding_options: dict[str, object] | None = None,
+) -> None:
+    """Batch-embed concepts that are missing from the cache.
+
+    Uses :func:`embed_batch` to send up to 8 texts per Ollama /api/embed
+    call, falling back to individual calls on API error.  Concepts already
+    in the cache are skipped.  Results are written directly into
+    ``embeddings_cache``.
+    """
+    from obsidian_llm_wiki.synth.embedding import embed_batch
+
+    missing = [c for c in concepts if c.slug not in embeddings_cache]
+    if not missing:
+        return
+
+    texts = [f"{c.title}. {c.summary or ''}" for c in missing]
+    results = embed_batch(texts, **(embedding_options or {}))
+
+    for concept, emb in zip(missing, results, strict=False):
+        if emb:
+            embeddings_cache[concept.slug] = emb
+
+
 def semantic_dedupe_concepts(
     bundle: SynthesisBundle,
     threshold: float = 0.85,
@@ -305,6 +331,12 @@ def semantic_dedupe_concepts(
     if not bundle.concepts or len(bundle.concepts) < 2:
         return
 
+    # Batch-embed concepts missing from the cache before pairwise comparison.
+    if embeddings_cache is not None:
+        _embed_concepts_batch(
+            bundle.concepts, embeddings_cache, embedding_options,
+        )
+
     # Build embeddings for all concepts.
     embeddings: dict[str, list[float]] = {}
     concept_langs: dict[str, str] = {}
@@ -330,9 +362,16 @@ def semantic_dedupe_concepts(
     merge_map: dict[str, str] = {}  # merged_slug → surviving_slug
     merged_slugs: set[str] = set()
 
-    # When new_slugs is provided, only compare new concepts against all.
-    # Existing-vs-existing pairs were compared in a previous run with the same
-    # embeddings and threshold — they won't merge now.
+    # When new_slugs is provided and non-empty, only compare new concepts
+    # against all.  Existing-vs-existing pairs were compared in a previous
+    # run with the same embeddings and threshold — they won't merge now.
+    # An empty set means "no new concepts this run" — skip dedup entirely
+    # (equivalent to new_slugs=None for comparison purposes, but we short-
+    # circuit to avoid the full O(N²) loop).
+    if new_slugs is not None and not new_slugs:
+        logger.info("Semantic dedup: no new concepts this run — skipping")
+        return
+
     comparison_slugs = new_slugs if new_slugs is not None else set(slugs)
 
     for slug_a in slugs:

@@ -11,12 +11,10 @@ import pytest
 from obsidian_llm_wiki.synth.embedding import (
     cosine_similarity,
     embed_batch,
-    embed_text,
     find_cross_lingual_links,
     load_embeddings_cache,
     save_embeddings_cache,
 )
-
 
 # ── Fix 1: Embedding persistence ──────────────────────────────────────
 
@@ -104,7 +102,7 @@ def test_find_cross_lingual_links_reuses_existing_embeddings():
     with mock.patch(
         "obsidian_llm_wiki.synth.embedding.embed_text",
     ) as mock_embed:
-        links = find_cross_lingual_links(
+        find_cross_lingual_links(
             [concept_a, concept_b],
             enabled=True,
             embeddings_cache=pre_cache,
@@ -133,7 +131,7 @@ def test_find_cross_lingual_links_computes_missing_embeddings():
         "obsidian_llm_wiki.synth.embedding.embed_text",
         side_effect=fake_embed,
     ) as mock_embed:
-        links = find_cross_lingual_links(
+        find_cross_lingual_links(
             [concept_a, concept_b],
             enabled=True,
             embeddings_cache=pre_cache,
@@ -148,8 +146,8 @@ def test_find_cross_lingual_links_computes_missing_embeddings():
 
 def test_dedup_only_compares_new_concepts_against_all():
     """When new_slugs is provided, existing-vs-existing pairs are NOT compared."""
-    from obsidian_llm_wiki.synth.dedupe import semantic_dedupe_concepts
     from obsidian_llm_wiki.core.models import ConceptNote, SynthesisBundle
+    from obsidian_llm_wiki.synth.dedupe import semantic_dedupe_concepts
 
     # Create 3 concepts with known embeddings
     # a and b are similar (should merge), c is different
@@ -200,9 +198,9 @@ def test_dedup_only_compares_new_concepts_against_all():
         )
 
     # Extract comparisons involving b
-    b_comparisons = [p for p in compared_pairs if "b" in p]
+    [p for p in compared_pairs if "b" in p]
     # Extract comparisons involving a (should NOT happen since a is existing)
-    a_initiated = [p for p in compared_pairs if p[0] == "a" or p[1] == "a"]
+    [p for p in compared_pairs if p[0] == "a" or p[1] == "a"]
     # a-initiated comparisons should only include a-vs-b (where b initiated)
     # NOT a-vs-c (both existing, should be skipped)
     a_vs_c = any(
@@ -214,8 +212,8 @@ def test_dedup_only_compares_new_concepts_against_all():
 
 def test_dedup_compares_all_when_new_slugs_none():
     """When new_slugs is None (default), all pairs are compared (backward compat)."""
-    from obsidian_llm_wiki.synth.dedupe import semantic_dedupe_concepts
     from obsidian_llm_wiki.core.models import ConceptNote, SynthesisBundle
+    from obsidian_llm_wiki.synth.dedupe import semantic_dedupe_concepts
 
     concepts = [
         ConceptNote(title="A", slug="a", summary="alpha", confidence=0.9),
@@ -253,8 +251,8 @@ def test_dedup_compares_all_when_new_slugs_none():
 
 def test_dedup_new_concept_merges_with_existing():
     """A new concept that's very similar to an existing one should merge."""
-    from obsidian_llm_wiki.synth.dedupe import semantic_dedupe_concepts
     from obsidian_llm_wiki.core.models import ConceptNote, SynthesisBundle
+    from obsidian_llm_wiki.synth.dedupe import semantic_dedupe_concepts
 
     concepts = [
         ConceptNote(title="Existing", slug="existing", summary="prediction market", confidence=1.0),
@@ -355,3 +353,137 @@ def test_embed_batch_fallback_on_api_error():
     # Should have fallen back to individual calls
     assert mock_embed_text.call_count == 2
     assert result == [[0.5, 0.5], [0.5, 0.5]]
+
+
+# ── Review fixes: empty new_slugs, stale cache pruning ─────────────────
+
+
+def test_dedup_empty_new_slugs_skips_dedup():
+    """When new_slugs is an empty set (not None), dedup is skipped entirely."""
+    from obsidian_llm_wiki.core.models import ConceptNote, SynthesisBundle
+    from obsidian_llm_wiki.synth.dedupe import semantic_dedupe_concepts
+
+    concepts = [
+        ConceptNote(title="A", slug="a", summary="alpha", confidence=0.9),
+        ConceptNote(title="B", slug="b", summary="alpha variant", confidence=0.8),
+    ]
+    bundle = SynthesisBundle(sources=[], concepts=concepts, maps=[], errors=[])
+
+    with mock.patch(
+        "obsidian_llm_wiki.synth.dedupe._embed_concept",
+        return_value=[1.0, 0.0],
+    ):
+        semantic_dedupe_concepts(bundle, threshold=0.85, new_slugs=set())
+
+    # No concepts should be merged (empty new_slugs = skip)
+    assert len(bundle.concepts) == 2
+
+
+def test_stale_embeddings_pruned_on_save(tmp_path):
+    """save_embeddings_cache only persists embeddings for live concept slugs."""
+    from obsidian_llm_wiki.synth.embedding import load_embeddings_cache, save_embeddings_cache
+
+    cache_path = tmp_path / "embeddings.json"
+    cache = {
+        "live-concept": [0.1, 0.2],
+        "stale-concept": [0.3, 0.4],
+        "another-stale": [0.5, 0.6],
+    }
+    save_embeddings_cache(cache_path, cache)
+    loaded = load_embeddings_cache(cache_path)
+    assert "live-concept" in loaded
+    assert "stale-concept" in loaded
+    assert "another-stale" in loaded
+
+    # Now save only the live ones (simulating pruning in pipeline.py)
+    pruned = {"live-concept": loaded["live-concept"]}
+    save_embeddings_cache(cache_path, pruned)
+    loaded2 = load_embeddings_cache(cache_path)
+    assert "live-concept" in loaded2
+    assert "stale-concept" not in loaded2
+    assert "another-stale" not in loaded2
+
+
+def test_batch_embedding_wired_into_dedupe():
+    """_embed_concepts_batch is called before pairwise comparison in dedup."""
+    from obsidian_llm_wiki.core.models import ConceptNote, SynthesisBundle
+    from obsidian_llm_wiki.synth.dedupe import semantic_dedupe_concepts
+
+    concepts = [
+        ConceptNote(title="A", slug="a", summary="alpha", confidence=0.9),
+        ConceptNote(title="B", slug="b", summary="beta", confidence=0.8),
+    ]
+    bundle = SynthesisBundle(sources=[], concepts=concepts, maps=[], errors=[])
+    cache: dict[str, list[float]] = {}
+
+    with mock.patch(
+        "obsidian_llm_wiki.synth.dedupe._embed_concepts_batch",
+    ) as mock_batch:
+        semantic_dedupe_concepts(
+            bundle, threshold=0.85,
+            embeddings_cache=cache,
+        )
+        mock_batch.assert_called_once()
+
+
+def test_embed_batch_exception_fallback():
+    """When the batch API raises an exception, falls back to embed_text."""
+    texts = ["text1", "text2"]
+
+    client = mock.Mock()
+    client.__enter__ = mock.Mock(return_value=client)
+    client.__exit__ = mock.Mock(return_value=False)
+    client.post.side_effect = Exception("Connection refused")
+
+    with mock.patch(
+        "obsidian_llm_wiki.synth.embedding.httpx.Client",
+        return_value=client,
+    ), mock.patch(
+        "obsidian_llm_wiki.synth.embedding._embedding_model",
+        return_value="test-model",
+    ), mock.patch(
+        "obsidian_llm_wiki.synth.embedding._ollama_host",
+        return_value="http://test:11434",
+    ), mock.patch(
+        "obsidian_llm_wiki.synth.embedding.embed_text",
+        return_value=[0.5, 0.5],
+    ) as mock_embed_text:
+        result = embed_batch(texts, enabled=True, batch_size=8)
+
+    assert mock_embed_text.call_count == 2
+    assert result == [[0.5, 0.5], [0.5, 0.5]]
+
+
+def test_embed_batch_partial_response():
+    """When the batch API returns fewer embeddings than sent, missing slots stay None."""
+    texts = [f"text{i}" for i in range(5)]
+
+    # API returns only 3 embeddings for 5 texts
+    mock_response = mock.Mock(status_code=200)
+    mock_response.json.return_value = {
+        "embeddings": [[0.1, 0.2], [0.3, 0.4], [0.5, 0.6]],
+    }
+
+    client = mock.Mock()
+    client.__enter__ = mock.Mock(return_value=client)
+    client.__exit__ = mock.Mock(return_value=False)
+    client.post.return_value = mock_response
+
+    with mock.patch(
+        "obsidian_llm_wiki.synth.embedding.httpx.Client",
+        return_value=client,
+    ), mock.patch(
+        "obsidian_llm_wiki.synth.embedding._embedding_model",
+        return_value="test-model",
+    ), mock.patch(
+        "obsidian_llm_wiki.synth.embedding._ollama_host",
+        return_value="http://test:11434",
+    ):
+        result = embed_batch(texts, enabled=True, batch_size=8)
+
+    # First 3 should have embeddings, last 2 should be None
+    assert result[0] is not None
+    assert result[1] is not None
+    assert result[2] is not None
+    assert result[3] is None
+    assert result[4] is None
