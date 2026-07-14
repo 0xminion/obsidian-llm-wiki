@@ -168,11 +168,6 @@ class SourceConnectorDispatcher:
         for connector in self._specialists:
             if not connector.matches(parsed, raw_url):
                 continue
-            if not getattr(connector, "validated_redirects", False):
-                # A connector may only receive untrusted URLs after it proves
-                # that every redirect hop is checked. Fall through to the
-                # generic bounded/validated path until it is migrated.
-                continue
             result = connector.extract(raw_url)
             if result.succeeded:
                 return result

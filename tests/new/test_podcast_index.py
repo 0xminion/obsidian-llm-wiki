@@ -30,6 +30,7 @@ def test_config_loads_podcast_index_credentials(tmp_path):
 
 
 def _client_with_response(response):
+    response.is_redirect = False
     client = mock.Mock()
     client.__enter__ = mock.Mock(return_value=client)
     client.__exit__ = mock.Mock(return_value=False)

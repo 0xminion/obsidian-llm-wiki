@@ -20,7 +20,7 @@ _LONG_TEXT = " ".join(["A usable transcript sentence."] * 20)
 
 
 def _response(status_code: int, payload: dict | None = None, text: str = "") -> mock.Mock:
-    response = mock.Mock(status_code=status_code, text=text)
+    response = mock.Mock(status_code=status_code, text=text, is_redirect=False)
     response.json.return_value = payload or {}
     response.raise_for_status.side_effect = None
     return response

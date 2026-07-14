@@ -400,8 +400,9 @@ def _fetch_youtube_title(url: str) -> str:
         f"?url={quote(url, safe='')}&format=json"
     )
     try:
-        with httpx.Client(timeout=10, follow_redirects=True) as client:
-            resp = client.get(oembed_url)
+        with httpx.Client(timeout=10, follow_redirects=False) as client:
+            from obsidian_llm_wiki.ingest.url_safety import get_with_validated_redirects
+            resp = get_with_validated_redirects(client, oembed_url)
             if resp.status_code == 200:
                 data = resp.json()
                 return data.get("title", "") or ""
@@ -503,8 +504,9 @@ def _download_and_upload_audio(url: str, api_key: str) -> str | None:
 def _extract_oembed(youtube_url: str) -> SourceDoc | None:
     """Fetch video metadata via YouTube oEmbed API (no auth required)."""
     oembed_url = f"https://www.youtube.com/oembed?url={quote(youtube_url, safe='')}&format=json"
-    with httpx.Client(timeout=15, follow_redirects=True) as client:
-        resp = client.get(oembed_url)
+    with httpx.Client(timeout=15, follow_redirects=False) as client:
+        from obsidian_llm_wiki.ingest.url_safety import get_with_validated_redirects
+        resp = get_with_validated_redirects(client, oembed_url)
         if resp.status_code != 200:
             return None
         data = resp.json()

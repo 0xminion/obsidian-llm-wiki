@@ -608,23 +608,13 @@ def _dispatch_remote_connectors(raw_url: str):
         SourceConnectorDispatcher,
     )
 
-    # These extractors currently create HTTPX clients with automatic redirects.
-    # Keep their specialized path disabled for untrusted URLs until each uses
-    # the common hop-validating transport; the generic connector remains safe.
-    unvalidated_modules = {
-        "obsidian_llm_wiki.ingest.extractors.jats",
-        "obsidian_llm_wiki.ingest.extractors.youtube",
-        "obsidian_llm_wiki.ingest.extractors.twitter",
-        "obsidian_llm_wiki.ingest.extractors.scientific",
-        "obsidian_llm_wiki.ingest.extractors.podcast",
-    }
     specialists = [
         CallableSourceConnector(
             extractor_fn.__name__,
             match_fn,
             extractor_fn,
             is_not_applicable=lambda exc: isinstance(exc, ExtractorNotApplicableError),
-            validated_redirects=extractor_fn.__module__ not in unvalidated_modules,
+            validated_redirects=True,
         )
         for match_fn, extractor_fn in _EXTRACTORS
     ]

@@ -100,6 +100,7 @@ def test_public_scientific_fetch_sends_no_cookie_or_auth_headers() -> None:
 
     response = MagicMock()
     response.text = "<html><body>" + ("public article text " * 10) + "</body></html>"
+    response.is_redirect = False
     client = MagicMock()
     client.get.return_value = response
     client.__enter__.return_value = client
@@ -113,7 +114,9 @@ def test_public_scientific_fetch_sends_no_cookie_or_auth_headers() -> None:
 
     headers = http_client.call_args.kwargs["headers"]
     assert not {"authorization", "cookie", "referer"} & {name.lower() for name in headers}
-    client.get.assert_called_once_with("https://papers.ssrn.com/article")
+    client.get.assert_called_once_with(
+        "https://papers.ssrn.com/article", follow_redirects=False
+    )
     response.raise_for_status.assert_called_once()
 
 

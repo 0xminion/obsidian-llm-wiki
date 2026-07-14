@@ -123,13 +123,14 @@ def _extract_via_defuddle_md(url: str) -> SourceDoc | None:
     defuddle_url = f"https://defuddle.md/{stripped}"
 
     with httpx.Client(
-        **make_client_kwargs(timeout=DEFAULT_TIMEOUT, follow_redirects=True),
+        **make_client_kwargs(timeout=DEFAULT_TIMEOUT, follow_redirects=False),
         headers={
             "User-Agent": BROWSER_HEADERS["User-Agent"],
             "Accept": "text/html",
         },
     ) as client:
-        resp = client.get(defuddle_url)
+        from obsidian_llm_wiki.ingest.url_safety import get_with_validated_redirects
+        resp = get_with_validated_redirects(client, defuddle_url)
 
     if resp.status_code != 200:
         logger.debug("defuddle.md returned %d for %s", resp.status_code, url)
@@ -190,13 +191,14 @@ def _extract_via_vxtwitter(
     api_url = f"https://api.vxtwitter.com/{handle}/status/{tweet_id}"
 
     with httpx.Client(
-        **make_client_kwargs(timeout=DEFAULT_TIMEOUT, follow_redirects=True),
+        **make_client_kwargs(timeout=DEFAULT_TIMEOUT, follow_redirects=False),
         headers={
             "User-Agent": BROWSER_HEADERS["User-Agent"],
             "Accept": "application/json",
         },
     ) as client:
-        resp = client.get(api_url)
+        from obsidian_llm_wiki.ingest.url_safety import get_with_validated_redirects
+        resp = get_with_validated_redirects(client, api_url)
 
     if resp.status_code != 200:
         logger.debug("VxTwitter returned %d for %s", resp.status_code, url)

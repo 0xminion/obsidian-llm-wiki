@@ -48,6 +48,7 @@ from obsidian_llm_wiki.ingest.transcript_resolver import (
     save_transcript_cache,
     validate_assemblyai_key,
 )
+from obsidian_llm_wiki.ingest.url_safety import get_with_validated_redirects
 
 logger = logging.getLogger("obswiki.ingest.extractors.podcast")
 
@@ -341,13 +342,13 @@ def _fetch_defuddle_md_metadata(url: str) -> dict[str, str]:
 
     try:
         with httpx.Client(
-            **make_client_kwargs(timeout=DEFAULT_TIMEOUT, follow_redirects=True),
+            **make_client_kwargs(timeout=DEFAULT_TIMEOUT, follow_redirects=False),
             headers={
                 "User-Agent": BROWSER_HEADERS["User-Agent"],
                 "Accept": "text/html",
             },
         ) as client:
-            resp = client.get(defuddle_url)
+            resp = get_with_validated_redirects(client, defuddle_url)
         if resp.status_code != 200:
             return {}
 
@@ -441,10 +442,10 @@ def _fetch_rss_text(feed_url: str) -> str:
         return ""
     try:
         with httpx.Client(
-            **make_client_kwargs(timeout=DEFAULT_TIMEOUT, follow_redirects=True),
+            **make_client_kwargs(timeout=DEFAULT_TIMEOUT, follow_redirects=False),
             headers={"User-Agent": BROWSER_HEADERS["User-Agent"]},
         ) as client:
-            response = client.get(feed_url)
+            response = get_with_validated_redirects(client, feed_url)
         if response.status_code == 200:
             return response.text
     except httpx.HTTPError as exc:
@@ -602,10 +603,11 @@ def _find_apple_episode_asset(
 
     try:
         with httpx.Client(
-            **make_client_kwargs(timeout=DEFAULT_TIMEOUT, follow_redirects=True),
+            **make_client_kwargs(timeout=DEFAULT_TIMEOUT, follow_redirects=False),
             headers={"User-Agent": BROWSER_HEADERS["User-Agent"]},
         ) as client:
-            response = client.get(
+            response = get_with_validated_redirects(
+                client,
                 f"https://itunes.apple.com/lookup?id={podcast_id_match.group(1)}",
             )
         if response.status_code == 200:
@@ -636,10 +638,11 @@ def _find_asset_via_itunes(title: str, author: str = "") -> EpisodeAsset:
     search_term = author.strip() or title.strip()
     try:
         with httpx.Client(
-            **make_client_kwargs(timeout=DEFAULT_TIMEOUT, follow_redirects=True),
+            **make_client_kwargs(timeout=DEFAULT_TIMEOUT, follow_redirects=False),
             headers={"User-Agent": BROWSER_HEADERS["User-Agent"]},
         ) as client:
-            response = client.get(
+            response = get_with_validated_redirects(
+                client,
                 "https://itunes.apple.com/search",
                 params={"term": search_term, "media": "podcast", "limit": 5},
             )
@@ -814,10 +817,10 @@ def _whisper_fallback_transcribe(audio_url: str) -> str:
             # media enclosure from the pipeline host, which is exactly the fetch
             # RESIDENTIAL_PROXY_URL exists to unblock.
             with httpx.Client(
-                **make_client_kwargs(timeout=120, follow_redirects=True),
+                **make_client_kwargs(timeout=120, follow_redirects=False),
                 headers={"User-Agent": BROWSER_HEADERS["User-Agent"]},
             ) as client:
-                resp = client.get(audio_url)
+                resp = get_with_validated_redirects(client, audio_url)
                 resp.raise_for_status()
                 tmp.write(resp.content)
             tmp_path = tmp.name

@@ -256,7 +256,7 @@ def test_item_title_is_not_shadowed_by_a_nested_image_title():
 def test_published_date_survives_a_missing_space(frontmatter, expected, monkeypatch):
     """`line[11:]` for the 10-character 'published:' ate the first character."""
     body = f"---\ntitle: Ep\n{frontmatter}\n---\nbody text here, long enough to keep."
-    response = mock.Mock(status_code=200, text=body)
+    response = mock.Mock(status_code=200, text=body, is_redirect=False)
     client = mock.Mock()
     client.__enter__ = mock.Mock(return_value=client)
     client.__exit__ = mock.Mock(return_value=False)

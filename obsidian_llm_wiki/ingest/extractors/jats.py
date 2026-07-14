@@ -109,10 +109,11 @@ def extract_jats(raw_url: str) -> SourceDoc:
     """
     try:
         with httpx.Client(
-            **make_client_kwargs(follow_redirects=True, timeout=45),
+            **make_client_kwargs(follow_redirects=False, timeout=45),
             headers=BROWSER_HEADERS,
         ) as client:
-            resp = client.get(raw_url)
+            from obsidian_llm_wiki.ingest.url_safety import get_with_validated_redirects
+            resp = get_with_validated_redirects(client, raw_url)
             resp.raise_for_status()
             xml_text = resp.text
     except httpx.HTTPStatusError as exc:
