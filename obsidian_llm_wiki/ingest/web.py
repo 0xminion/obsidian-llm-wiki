@@ -200,7 +200,11 @@ def _extract_defuddle(url: str, timeout: int) -> SourceDoc:
 
     # Run with browser UA to reduce 403s
     env = os.environ.copy()
-    env["NODE_EXTRA_CA_CERTS"] = ""  # Clear problematic CA certs
+    env["NODE_EXTRA_CA_CERTS"] = ""
+    # Strip SOCKS proxy env vars — Node.js fetch() does not support SOCKS
+    for key in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy",
+                "ALL_PROXY", "all_proxy"):
+        env.pop(key, None)
 
     proc = subprocess.run(
         cmd,
@@ -270,6 +274,10 @@ def _defuddle_metadata_title(url: str, timeout: int) -> str:
 
     env = os.environ.copy()
     env["NODE_EXTRA_CA_CERTS"] = ""
+    # Strip SOCKS proxy env vars — Node.js fetch() does not support SOCKS
+    for key in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy",
+                "ALL_PROXY", "all_proxy"):
+        env.pop(key, None)
 
     try:
         proc = subprocess.run(

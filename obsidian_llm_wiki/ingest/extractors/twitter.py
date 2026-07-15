@@ -213,6 +213,12 @@ def _extract_via_defuddle(url: str) -> SourceDoc | None:
 
     env = os.environ.copy()
     env["NODE_EXTRA_CA_CERTS"] = ""
+    # Strip SOCKS proxy env vars — Node.js fetch() does not support SOCKS
+    # proxies natively and will throw "socket hang up" if HTTPS_PROXY is set
+    # to a socks5h:// URL.  defuddle CLI needs direct or HTTP proxy access.
+    for key in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy",
+                "ALL_PROXY", "all_proxy"):
+        env.pop(key, None)
 
     try:
         proc = subprocess.run(
@@ -271,6 +277,12 @@ def _defuddle_metadata_title(url: str) -> str:
 
     env = os.environ.copy()
     env["NODE_EXTRA_CA_CERTS"] = ""
+    # Strip SOCKS proxy env vars — Node.js fetch() does not support SOCKS
+    # proxies natively and will throw "socket hang up" if HTTPS_PROXY is set
+    # to a socks5h:// URL.  defuddle CLI needs direct or HTTP proxy access.
+    for key in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy",
+                "ALL_PROXY", "all_proxy"):
+        env.pop(key, None)
 
     try:
         proc = subprocess.run(
