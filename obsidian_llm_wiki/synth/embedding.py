@@ -154,9 +154,10 @@ def embed_batch(
                 if resp.status_code != 200:
                     for i, text in enumerate(batch):
                         idx = start + i
-                        results[idx] = embed_text(
-                            text, enabled=enabled, model=model, host=host,
-                        )
+                        if results[idx] is None:
+                            results[idx] = embed_text(
+                                text, enabled=enabled, model=model, host=host,
+                            )
                     continue
                 data = resp.json()
                 embeddings = data.get("embeddings", [])

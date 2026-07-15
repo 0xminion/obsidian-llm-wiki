@@ -70,8 +70,8 @@ def extract_twitter(raw_url: str) -> SourceDoc:
     """Extract content from a Twitter/X post or article.
 
     Strategy (see module docstring for rationale):
-      1. defuddle.md hosted service — renders JS-heavy X pages
-      2. defuddle CLI (local) — same engine, local fallback
+      1. defuddle CLI (local) — primary, renders JS-heavy X pages
+      2. defuddle.md (hosted) — fallback, may return JS stubs for auth-walled URLs
       3. trafilatura via extract_web — last resort
 
     DO NOT add VxTwitter, direct HTTP, or browser_navigate fallbacks —
@@ -236,6 +236,11 @@ def _extract_via_defuddle(url: str) -> SourceDoc | None:
 
         output = proc.stdout.strip()
         if len(output) < 50:
+            return None
+
+        # Detect JS stubs/error pages (same as defuddle.md path)
+        if any(marker.lower() in output.lower() for marker in _STUB_MARKERS):
+            logger.debug("defuddle CLI returned JS stub/error for %s — skipping", url)
             return None
 
         # Extract title from first # heading

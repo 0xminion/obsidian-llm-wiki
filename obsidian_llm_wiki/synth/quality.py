@@ -402,9 +402,11 @@ def _merge_claims(pass1: list[Claim], pass2: list[Claim]) -> list[Claim]:
 
     Pass 2 replaces the concept body but may omit quotes for claims that Pass 1
     had evidence for.  This unions both lists, deduplicating by claim text
-    (case-insensitive).  When the same claim text appears in both passes, the
-    version with evidence (quote + source_file) wins; if both have evidence,
-    the Pass 2 (expanded) version wins.
+    (case-insensitive).  When the same claim text appears in both passes:
+
+      - If one has evidence and the other doesn't, the evidence version wins.
+      - If both have evidence, the **verified** version wins.  If both are
+        verified (or both unverified), Pass 2 (expanded) wins.
     """
     merged: list[Claim] = []
     seen_text: dict[str, int] = {}  # lowercased text → index in merged
@@ -416,7 +418,6 @@ def _merge_claims(pass1: list[Claim], pass2: list[Claim]) -> list[Claim]:
         if key in seen_text:
             idx = seen_text[key]
             existing = merged[idx]
-            # Prefer the version with evidence if one has it and the other doesn't.
             existing_has_evidence = (
                 existing.evidence is not None
                 and bool(existing.evidence.quote)
@@ -429,6 +430,12 @@ def _merge_claims(pass1: list[Claim], pass2: list[Claim]) -> list[Claim]:
             )
             if new_has_evidence and not existing_has_evidence:
                 merged[idx] = claim
+            elif new_has_evidence and existing_has_evidence:
+                # Both have evidence — prefer verified over unverified
+                existing_verified = str(existing.evidence.verification) == "verified"
+                new_verified = str(claim.evidence.verification) == "verified"
+                if new_verified and not existing_verified:
+                    merged[idx] = claim
         else:
             seen_text[key] = len(merged)
             merged.append(claim)

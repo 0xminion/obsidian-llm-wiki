@@ -372,14 +372,18 @@ def semantic_dedupe_concepts(
         logger.info("Semantic dedup: no new concepts this run — skipping")
         return
 
-    comparison_slugs = new_slugs if new_slugs is not None else set(slugs)
+    comparison_slugs = new_slugs if new_slugs is not None else None
 
-    for slug_a in slugs:
-        if slug_a not in comparison_slugs:
+    for i, slug_a in enumerate(slugs):
+        if comparison_slugs is not None and slug_a not in comparison_slugs:
             continue  # not a new concept — only new concepts initiate comparisons
         if slug_a in merged_slugs:
             continue
-        for slug_b in slugs:
+        # Default path (new_slugs=None): use slugs[i+1:] to avoid 2× comparisons.
+        # Incremental path (new_slugs=set): compare against ALL slugs (including
+        # existing ones) so new concepts can merge with existing concepts.
+        inner_slugs = slugs[i + 1:] if comparison_slugs is None else slugs
+        for slug_b in inner_slugs:
             if slug_a == slug_b:
                 continue
             if slug_a in merged_slugs:

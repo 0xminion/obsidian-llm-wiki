@@ -115,6 +115,38 @@ def test_merge_deduplicates_case_insensitively():
     assert len(merged) == 1
 
 
+def test_merge_prefers_verified_over_unverified():
+    """When both passes have evidence, verified evidence wins over unverified."""
+    pass1 = [
+        Claim(
+            text="Important claim",
+            evidence=EvidenceSpan(
+                quote="verified quote",
+                source_file="source.md",
+                verification=EvidenceVerification.VERIFIED,
+                start_offset=0,
+                end_offset=13,
+            ),
+        ),
+    ]
+    pass2 = [
+        Claim(
+            text="Important claim",
+            evidence=EvidenceSpan(
+                quote="unverified quote",
+                source_file="source2.md",
+                verification=EvidenceVerification.UNVERIFIED,
+            ),
+        ),
+    ]
+
+    merged = _merge_claims(pass1, pass2)
+    assert len(merged) == 1
+    # Pass 1 has verified evidence, Pass 2 has unverified — verified wins
+    assert merged[0].evidence.quote == "verified quote"
+    assert str(merged[0].evidence.verification) == "verified"
+
+
 def test_merge_empty_claims():
     """Empty claim lists produce empty merged list."""
     assert _merge_claims([], []) == []
