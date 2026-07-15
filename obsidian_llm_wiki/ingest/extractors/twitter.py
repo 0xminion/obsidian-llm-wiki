@@ -202,6 +202,40 @@ def _extract_via_defuddle_md(url: str) -> SourceDoc | None:
     return SourceDoc(title=title, content=content.strip(), url=url)
 
 
+def _extract_article_title_from_content(markdown: str) -> str:
+    """Extract the article title from defuddle CLI markdown output.
+
+    X Articles don't have a ``#`` heading in defuddle's markdown output.
+    The title appears as a plain text line after image markdown and an
+    "Article" label.  This function scans the first ~20 lines, skipping
+    images, links, empty lines, and the "Article" label, and returns the
+    first substantial text line (>=10 chars, not a URL, not image markdown).
+    """
+    lines = markdown.split("\n")
+    for line in lines[:20]:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        # Skip image markdown
+        if stripped.startswith("!["):
+            continue
+        # Skip link markdown (lines that are just links)
+        if stripped.startswith("[!") or stripped.startswith("["):
+            continue
+        # Skip the "Article" label
+        if stripped.lower() == "article":
+            continue
+        # Skip URLs
+        if stripped.startswith("http"):
+            continue
+        # Skip very short lines (likely metadata, not the title)
+        if len(stripped) < 10:
+            continue
+        # This is the article title
+        return stripped
+    return ""
+
+
 def _extract_via_defuddle(url: str) -> SourceDoc | None:
     """Fallback: extract via defuddle CLI directly."""
     import os
@@ -252,6 +286,16 @@ def _extract_via_defuddle(url: str) -> SourceDoc | None:
         # If no heading, try defuddle --json for metadata
         if not title:
             title = _defuddle_metadata_title(url)
+
+        # Generic X page titles like "danny (@agintender) on X" are the
+        # browser tab title, not the article title.  Extract the real
+        # article title from the content — it appears as the first
+        # substantial text line after image/link markdown, often after
+        # an "Article" label.
+        if not title or title.endswith(" on X") or title.endswith(" on Twitter"):
+            extracted_title = _extract_article_title_from_content(output)
+            if extracted_title:
+                title = extracted_title
 
         if not title:
             title = url
