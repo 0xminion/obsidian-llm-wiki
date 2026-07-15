@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import os
 import shutil
 import signal
@@ -27,6 +28,7 @@ from obsidian_llm_wiki.render.frontmatter import parse_frontmatter
 from obsidian_llm_wiki.render.obsidian import atomic_write, slugify
 
 _PlannedSource = tuple[str, str, SourceDoc | None, bool]
+logger = logging.getLogger("obswiki.cli.ingest")
 
 LEDGER_TEMPLATE = """\
 ---
@@ -393,8 +395,18 @@ def ingest(
                     from obsidian_llm_wiki.config import extraction_environment
                     from obsidian_llm_wiki.ingest.extractors import extract
 
-                    with extraction_environment(config):
-                        source = extract(identifier)
+                    try:
+                        # Direct egress is the normal path. A configured
+                        # residential proxy is a bounded fallback for sites
+                        # that reject the VPS/datacenter address.
+                        with extraction_environment(config, use_residential_proxy=False):
+                            source = extract(identifier)
+                    except Exception:
+                        if not config.residential_proxy_url:
+                            raise
+                        logger.info("Retrying extraction through residential proxy: %s", identifier)
+                        with extraction_environment(config):
+                            source = extract(identifier)
                 source, truncated = _bounded_source(source, config.max_source_chars)
                 size = len(source.content.encode("utf-8"))
                 output_file = ""

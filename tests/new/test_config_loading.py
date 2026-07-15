@@ -74,6 +74,10 @@ def test_extraction_environment_scopes_vault_credentials_and_restores_process_st
     assert os.environ["RESIDENTIAL_PROXY_URL"] == "http://process-proxy:8080"
     assert os.environ["ASSEMBLYAI_API_KEY"] == "process-key"
 
+    with extraction_environment(config, use_residential_proxy=False):
+        assert "RESIDENTIAL_PROXY_URL" not in os.environ
+        assert os.environ["ASSEMBLYAI_API_KEY"] == "vault-key"
+
 
 def test_resolve_vault_does_not_leak_a_cli_vault_into_process_environment(tmp_path, monkeypatch):
     from obsidian_llm_wiki.cli._helpers import resolve_vault

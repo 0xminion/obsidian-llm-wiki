@@ -302,7 +302,9 @@ def load_config(env_file: str | None = None, **overrides: str) -> Config:
 
 
 @contextmanager
-def extraction_environment(config: Config) -> Iterator[None]:
+def extraction_environment(
+    config: Config, *, use_residential_proxy: bool = True
+) -> Iterator[None]:
     """Expose vault-scoped extraction settings only while an extractor runs.
 
     ``load_config`` intentionally does not mutate ``os.environ``. A few
@@ -312,7 +314,7 @@ def extraction_environment(config: Config) -> Iterator[None]:
     """
     values = {
         "VAULT_PATH": str(config.vault),
-        "RESIDENTIAL_PROXY_URL": config.residential_proxy_url,
+        "RESIDENTIAL_PROXY_URL": config.residential_proxy_url if use_residential_proxy else "",
         "YOUTUBE_COOKIES_FILE": config.youtube_cookies_file,
         "TRANSCRIPT_API_KEY": config.transcript_api_key,
         "SUPADATA_API_KEY": config.supadata_api_key,
