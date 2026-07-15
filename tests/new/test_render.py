@@ -13,6 +13,9 @@ from obsidian_llm_wiki.core.models import (
     SourceSynthesis,
 )
 from obsidian_llm_wiki.render.obsidian import (
+    _ACTIVE_RENDER_TRANSACTION,
+    _RenderTransaction,
+    _write_generated_page,
     atomic_write,
     build_frontmatter,
     make_wikilink,
@@ -58,6 +61,23 @@ def test_atomic_write(tmp_path: Path):
     assert f.read_text() == "content"
     atomic_write(f, "overwritten")
     assert f.read_text() == "overwritten"
+
+
+def test_render_rollback_preserves_concurrent_manual_edit(tmp_path: Path):
+    """A failed renderer must not overwrite an Obsidian edit after its write."""
+    page = tmp_path / "concepts" / "topic.md"
+    page.parent.mkdir()
+    page.write_text("before-render", encoding="utf-8")
+    transaction = _RenderTransaction(tmp_path)
+    token = _ACTIVE_RENDER_TRANSACTION.set(transaction)
+    try:
+        assert _write_generated_page(page, "renderer-output", tmp_path)
+        page.write_text("manual-obsidian-edit", encoding="utf-8")
+        transaction.rollback()
+    finally:
+        _ACTIVE_RENDER_TRANSACTION.reset(token)
+
+    assert page.read_text(encoding="utf-8") == "manual-obsidian-edit"
 
 
 # ── Page renderers ───────────────────────────────────────────────────────
