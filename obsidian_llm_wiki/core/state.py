@@ -81,8 +81,13 @@ def read_state(state_file: str | Path) -> WikiState:
     except json.JSONDecodeError:
         return WikiState()
 
+    if not isinstance(data, dict):
+        return WikiState()
+    raw_sources = data.get("sources", {})
+    if not isinstance(raw_sources, dict):
+        return WikiState()
     sources: dict[str, SourceState] = {}
-    for filename, entry in data.get("sources", {}).items():
+    for filename, entry in raw_sources.items():
         if not isinstance(entry, dict):
             continue
         sources[filename] = SourceState(

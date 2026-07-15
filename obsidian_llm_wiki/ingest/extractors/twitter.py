@@ -43,7 +43,7 @@ import httpx
 from obsidian_llm_wiki.core.models import SourceDoc
 from obsidian_llm_wiki.ingest.extractors import register_extractor
 from obsidian_llm_wiki.ingest.http_headers import BROWSER_HEADERS, DEFAULT_TIMEOUT
-from obsidian_llm_wiki.ingest.proxy import make_client_kwargs
+from obsidian_llm_wiki.ingest.proxy import make_client_kwargs, node_subprocess_env
 
 logger = logging.getLogger("obswiki.ingest.twitter")
 
@@ -238,7 +238,6 @@ def _extract_article_title_from_content(markdown: str) -> str:
 
 def _extract_via_defuddle(url: str) -> SourceDoc | None:
     """Fallback: extract via defuddle CLI directly."""
-    import os
     import shutil
     import subprocess
 
@@ -251,14 +250,7 @@ def _extract_via_defuddle(url: str) -> SourceDoc | None:
     else:
         cmd = [defuddle_path, "defuddle", "parse", url, "--md"]
 
-    env = os.environ.copy()
-    env["NODE_EXTRA_CA_CERTS"] = ""
-    # Strip SOCKS proxy env vars — Node.js fetch() does not support SOCKS
-    # proxies natively and will throw "socket hang up" if HTTPS_PROXY is set
-    # to a socks5h:// URL.  defuddle CLI needs direct or HTTP proxy access.
-    for key in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy",
-                "ALL_PROXY", "all_proxy"):
-        env.pop(key, None)
+    env = node_subprocess_env()
 
     try:
         proc = subprocess.run(
@@ -317,7 +309,6 @@ def _extract_via_defuddle(url: str) -> SourceDoc | None:
 def _defuddle_metadata_title(url: str) -> str:
     """Fetch page title via defuddle --json."""
     import json
-    import os
     import shutil
     import subprocess
 
@@ -330,14 +321,7 @@ def _defuddle_metadata_title(url: str) -> str:
     else:
         cmd = [defuddle_path, "defuddle", "parse", url, "--json"]
 
-    env = os.environ.copy()
-    env["NODE_EXTRA_CA_CERTS"] = ""
-    # Strip SOCKS proxy env vars — Node.js fetch() does not support SOCKS
-    # proxies natively and will throw "socket hang up" if HTTPS_PROXY is set
-    # to a socks5h:// URL.  defuddle CLI needs direct or HTTP proxy access.
-    for key in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy",
-                "ALL_PROXY", "all_proxy"):
-        env.pop(key, None)
+    env = node_subprocess_env()
 
     try:
         proc = subprocess.run(

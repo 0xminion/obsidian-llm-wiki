@@ -20,6 +20,7 @@ import httpx
 from obsidian_llm_wiki.core.models import SourceDoc
 from obsidian_llm_wiki.ingest.http_headers import BROWSER_HEADERS, DEFAULT_TIMEOUT
 from obsidian_llm_wiki.ingest.proxy import make_client_kwargs
+from obsidian_llm_wiki.ingest.url_safety import get_with_validated_redirects
 
 logger = logging.getLogger("obswiki.ingest.alt_source")
 
@@ -239,9 +240,9 @@ def extract_via_journal_page(url: str, timeout: int = DEFAULT_TIMEOUT) -> Source
     html = ""
     try:
         with httpx.Client(
-            **make_client_kwargs(timeout=timeout, follow_redirects=True),
+            **make_client_kwargs(timeout=timeout, follow_redirects=False),
         ) as client:
-            resp = client.get(direct_url, headers=BROWSER_HEADERS)
+            resp = get_with_validated_redirects(client, direct_url, headers=BROWSER_HEADERS)
             if resp.status_code == 404:
                 raise RuntimeError(f"Direct page returned 404: {direct_url}")
             resp.raise_for_status()

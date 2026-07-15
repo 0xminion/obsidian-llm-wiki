@@ -20,7 +20,7 @@ from obsidian_llm_wiki.synth.embedding import (
 
 
 def test_save_and_load_embeddings_round_trip(tmp_path):
-    """Saved embeddings can be loaded back with the same values (6-decimal rounded)."""
+    """Saved embeddings reload at the same canonical comparison precision."""
     cache_path = tmp_path / "embeddings.json"
     cache = {
         "concept-a": [0.123456789, 0.987654321, -0.5],
@@ -32,9 +32,8 @@ def test_save_and_load_embeddings_round_trip(tmp_path):
     loaded = load_embeddings_cache(cache_path)
     assert "concept-a" in loaded
     assert "concept-b" in loaded
-    # Values should be rounded to 6 decimals
-    assert loaded["concept-a"][0] == pytest.approx(0.123457, abs=1e-6)
-    assert loaded["concept-a"][1] == pytest.approx(0.987654, abs=1e-6)
+    assert loaded["concept-a"][0] == pytest.approx(0.12345679, abs=1e-8)
+    assert loaded["concept-a"][1] == pytest.approx(0.98765432, abs=1e-8)
     assert loaded["concept-a"][2] == pytest.approx(-0.5, abs=1e-6)
 
 
@@ -139,6 +138,21 @@ def test_find_cross_lingual_links_computes_missing_embeddings():
         # embed_text should be called once for concept_b (missing from cache)
         assert mock_embed.call_count == 1
     assert "b" in pre_cache
+
+
+def test_cross_lingual_links_ignore_stale_cache_slugs():
+    """A dedup victim retained until persistence cannot become a dead wikilink."""
+    from obsidian_llm_wiki.core.models import ConceptNote
+
+    concept = ConceptNote(title="English concept", slug="live", summary="alpha")
+    cache = {
+        "live": [1.0, 0.0],
+        "deleted-concept": [1.0, 0.0],
+    }
+
+    links = find_cross_lingual_links([concept], enabled=True, embeddings_cache=cache)
+
+    assert links == {}
 
 
 # ── Fix 3: Incremental (new-vs-existing) dedup ─────────────────────────
@@ -277,6 +291,27 @@ def test_dedup_new_concept_merges_with_existing():
     assert "new" not in remaining
 
 
+def test_orphan_assignment_ignores_malformed_or_mismatched_cached_vectors():
+    """One stale cache vector cannot crash MoC averaging for the whole vault."""
+    from obsidian_llm_wiki.core.models import ConceptNote, MapOfContent, SynthesisBundle
+    from obsidian_llm_wiki.synth.dedupe import assign_orphans_to_mocs
+
+    good = ConceptNote(title="Good", slug="good", summary="alpha")
+    malformed = ConceptNote(title="Bad", slug="bad", summary="alpha")
+    orphan = ConceptNote(title="Orphan", slug="orphan", summary="alpha")
+    moc = MapOfContent(title="Topic", slug="topic", summary="", concept_slugs=["good", "bad"])
+    bundle = SynthesisBundle(concepts=[good, malformed, orphan], maps=[moc])
+    cache = {
+        "good": [1.0, 0.0],
+        "bad": [1.0, 0.0, 0.0],
+        "orphan": [1.0, 0.0],
+    }
+
+    assign_orphans_to_mocs(bundle, threshold=0.5, embeddings_cache=cache)
+
+    assert "orphan" in moc.concept_slugs
+
+
 # ── Fix 4: Batch embedding ─────────────────────────────────────────────
 
 
@@ -353,6 +388,30 @@ def test_embed_batch_fallback_on_api_error():
     # Should have fallen back to individual calls
     assert mock_embed_text.call_count == 2
     assert result == [[0.5, 0.5], [0.5, 0.5]]
+
+
+def test_embed_text_fallback_honors_explicit_host_and_model():
+    """A configured vault endpoint survives the legacy Ollama API fallback."""
+    from obsidian_llm_wiki.synth.embedding import embed_text
+
+    primary = mock.Mock(status_code=404)
+    fallback = mock.Mock(status_code=200)
+    fallback.json.return_value = {"embedding": [0.123456789, 0.0]}
+    client = mock.Mock()
+    client.__enter__ = mock.Mock(return_value=client)
+    client.__exit__ = mock.Mock(return_value=False)
+    client.post.side_effect = [primary, fallback]
+
+    with mock.patch(
+        "obsidian_llm_wiki.synth.embedding.httpx.Client", return_value=client
+    ):
+        embedding = embed_text(
+            "test text", enabled=True, model="vault-model", host="http://vault-host:11435"
+        )
+
+    assert embedding == [0.12345679, 0.0]
+    assert client.post.call_args_list[1].args[0] == "http://vault-host:11435/api/embeddings"
+    assert client.post.call_args_list[1].kwargs["json"]["model"] == "vault-model"
 
 
 # ── Review fixes: empty new_slugs, stale cache pruning ─────────────────

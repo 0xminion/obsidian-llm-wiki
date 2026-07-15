@@ -64,6 +64,20 @@ wheels = [
 ]
 
 [[package]]
+name = "build"
+version = "1.5.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "colorama", marker = "os_name == 'nt'" },
+    { name = "packaging" },
+    { name = "pyproject-hooks" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/2d/21/6ec54248b4d0d51f12f3ca4aa77a128077d747a5db86cb5a2fcd9aedecbd/build-1.5.1.tar.gz", hash = "sha256:94e17f1db803ab22f46049376c44c8437c52090f0dfdf1adc43df56542d644fb", size = 112439, upload-time = "2026-07-09T06:21:59.632Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/c7/f7/2c3f99ff9282f1c1ec9f6298f2c03034658a0901eeacb3b3501cb488574c/build-1.5.1-py3-none-any.whl", hash = "sha256:f1a58fe2e5af5b0238a07b9e70207492c79ddebbdb1ad954fc86d62a56be3e0d", size = 31195, upload-time = "2026-07-09T06:21:58.551Z" },
+]
+
+[[package]]
 name = "certifi"
 version = "2026.6.17"
 source = { registry = "https://pypi.org/simple" }
@@ -853,6 +867,7 @@ all = [
     { name = "yt-dlp" },
 ]
 dev = [
+    { name = "build" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
     { name = "pytest-cov" },
@@ -877,24 +892,25 @@ youtube = [
 
 [package.metadata]
 requires-dist = [
+    { name = "build", marker = "extra == 'dev'", specifier = ">=1.2,<2" },
     { name = "defusedxml", specifier = ">=0.7,<1" },
     { name = "faster-whisper", marker = "extra == 'all'", specifier = ">=1.0,<2" },
     { name = "faster-whisper", marker = "extra == 'podcast'", specifier = ">=1.0,<2" },
-    { name = "httpx", extras = ["socks"], specifier = ">=0.27" },
+    { name = "httpx", extras = ["socks"], specifier = ">=0.27,<1" },
     { name = "liteparse", marker = "extra == 'all'", specifier = ">=2.5.1,<3" },
     { name = "liteparse", marker = "extra == 'liteparse'", specifier = ">=2.5.1,<3" },
     { name = "pymupdf", marker = "extra == 'all'", specifier = ">=1.24,<2" },
     { name = "pymupdf", marker = "extra == 'pdf'", specifier = ">=1.24,<2" },
-    { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
-    { name = "pytest-asyncio", marker = "extra == 'dev'" },
-    { name = "pytest-cov", marker = "extra == 'dev'" },
+    { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0,<10" },
+    { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.23,<2" },
+    { name = "pytest-cov", marker = "extra == 'dev'", specifier = ">=5,<8" },
     { name = "python-docx", marker = "extra == 'all'", specifier = ">=1.1,<2" },
     { name = "python-docx", marker = "extra == 'docx'", specifier = ">=1.1,<2" },
-    { name = "python-dotenv", specifier = ">=1.0" },
-    { name = "pyyaml", specifier = ">=6.0" },
-    { name = "ruff", marker = "extra == 'dev'" },
-    { name = "trafilatura", specifier = ">=1.12" },
-    { name = "typer", specifier = ">=0.12" },
+    { name = "python-dotenv", specifier = ">=1.0,<2" },
+    { name = "pyyaml", specifier = ">=6.0,<7" },
+    { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.5,<1" },
+    { name = "trafilatura", specifier = ">=1.12,<3" },
+    { name = "typer", specifier = ">=0.12,<1" },
     { name = "youtube-transcript-api", marker = "extra == 'all'", specifier = ">=0.6,<1" },
     { name = "youtube-transcript-api", marker = "extra == 'youtube'", specifier = ">=0.6,<1" },
     { name = "yt-dlp", marker = "extra == 'all'", specifier = ">=2025.3,<2026" },
@@ -1000,6 +1016,15 @@ wheels = [
 ]
 
 [[package]]
+name = "pyproject-hooks"
+version = "1.2.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/e7/82/28175b2414effca1cdac8dc99f76d660e7a4fb0ceefa4b4ab8f5f6742925/pyproject_hooks-1.2.0.tar.gz", hash = "sha256:1e859bd5c40fae9448642dd871adf459e5e2084186e8d2c2a79a824c970da1f8", size = 19228, upload-time = "2024-09-29T09:24:13.293Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/bd/24/12818598c362d7f300f18e74db45963dbcb85150324092410c8b49405e42/pyproject_hooks-1.2.0-py3-none-any.whl", hash = "sha256:9e5c6bfa8dcc30091c74b0cf803c81fdd29d94f01992a7707bc97babb1141913", size = 10216, upload-time = "2024-09-29T09:24:11.978Z" },
+]
+
+[[package]]
 name = "pytest"
 version = "9.1.1"
 source = { registry = "https://pypi.org/simple" }
@@ -1030,16 +1055,16 @@ wheels = [
 
 [[package]]
 name = "pytest-cov"
-version = "7.1.0"
+version = "6.3.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "coverage", extra = ["toml"] },
     { name = "pluggy" },
     { name = "pytest" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/b1/51/a849f96e117386044471c8ec2bd6cfebacda285da9525c9106aeb28da671/pytest_cov-7.1.0.tar.gz", hash = "sha256:30674f2b5f6351aa09702a9c8c364f6a01c27aae0c1366ae8016160d1efc56b2", size = 55592, upload-time = "2026-03-21T20:11:16.284Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/30/4c/f883ab8f0daad69f47efdf95f55a66b51a8b939c430dadce0611508d9e99/pytest_cov-6.3.0.tar.gz", hash = "sha256:35c580e7800f87ce892e687461166e1ac2bcb8fb9e13aea79032518d6e503ff2", size = 70398, upload-time = "2025-09-06T15:40:14.361Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/9d/7a/d968e294073affff457b041c2be9868a40c1c71f4a35fcc1e45e5493067b/pytest_cov-7.1.0-py3-none-any.whl", hash = "sha256:a0461110b7865f9a271aa1b51e516c9a95de9d696734a2f71e3e78f46e1d4678", size = 22876, upload-time = "2026-03-21T20:11:14.438Z" },
+    { url = "https://files.pythonhosted.org/packages/80/b4/bb7263e12aade3842b938bc5c6958cae79c5ee18992f9b9349019579da0f/pytest_cov-6.3.0-py3-none-any.whl", hash = "sha256:440db28156d2468cafc0415b4f8e50856a0d11faefa38f30906048fe490f1749", size = 25115, upload-time = "2025-09-06T15:40:12.44Z" },
 ]
 
 [[package]]
@@ -1437,7 +1462,7 @@ wheels = [
 
 [[package]]
 name = "trafilatura"
-version = "2.1.0"
+version = "1.12.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "certifi" },
@@ -1448,9 +1473,9 @@ dependencies = [
     { name = "lxml" },
     { name = "urllib3" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/e8/19/24833e905df2d80e3bb67424f95febcc17709a1f61a522120bc438afca70/trafilatura-2.1.0.tar.gz", hash = "sha256:f689e2116fc89c7bc0b9a296d01dcfe2eb0b5455f8c371a77dc0db1f06a05643", size = 263876, upload-time = "2026-06-07T17:43:31.829Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/d0/cd/77e4403b61d5da59063bb65ee894cf951c6f1137658499947adc040102f5/trafilatura-1.12.2.tar.gz", hash = "sha256:4c9cb1434f7e13ef0b16cb44ee1d44e84523ec7268940b9559c374e7effc9a96", size = 2987179, upload-time = "2024-09-10T12:42:48.459Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/0e/78/4ad99d79aee2784f49f20fd0a29058ce4c032fe4439047924c43521cd211/trafilatura-2.1.0-py3-none-any.whl", hash = "sha256:0eded5207a806445ddebbe36eae30b9035fe6a2f233c36f6fe82663fca8b9d30", size = 134600, upload-time = "2026-06-07T17:43:28.404Z" },
+    { url = "https://files.pythonhosted.org/packages/79/14/d69c627444a7e93bee0425cd05e11a30dfb7a1b471e990ad0aafbb234307/trafilatura-1.12.2-py3-none-any.whl", hash = "sha256:6df5b666f625c9579a50d7cc715005f450fa75606696aceab73eeda0a76dbe96", size = 132246, upload-time = "2024-09-10T12:42:30.696Z" },
 ]
 
 [[package]]

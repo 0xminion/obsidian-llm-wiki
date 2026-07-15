@@ -47,3 +47,43 @@ def test_implicit_config_uses_process_vault_for_vault_specific_settings(tmp_path
 
     assert config.vault == vault_a
     assert config.llm.model == "from-vault-a"
+
+
+def test_extraction_environment_scopes_vault_credentials_and_restores_process_state(
+    tmp_path, monkeypatch
+):
+    from obsidian_llm_wiki.config import extraction_environment, load_config
+
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    (vault / ".env").write_text(
+        "RESIDENTIAL_PROXY_URL=http://vault-proxy:8080\n"
+        "ASSEMBLYAI_API_KEY=vault-key\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("RESIDENTIAL_PROXY_URL", "http://process-proxy:8080")
+    monkeypatch.setenv("ASSEMBLYAI_API_KEY", "process-key")
+    config = load_config(env_file=str(vault / ".env"), VAULT_PATH=str(vault))
+
+    with extraction_environment(config):
+        assert os.environ["VAULT_PATH"] == str(vault.resolve())
+        assert os.environ["RESIDENTIAL_PROXY_URL"] == "http://vault-proxy:8080"
+        assert os.environ["ASSEMBLYAI_API_KEY"] == "vault-key"
+
+    assert "VAULT_PATH" not in os.environ
+    assert os.environ["RESIDENTIAL_PROXY_URL"] == "http://process-proxy:8080"
+    assert os.environ["ASSEMBLYAI_API_KEY"] == "process-key"
+
+
+def test_resolve_vault_does_not_leak_a_cli_vault_into_process_environment(tmp_path, monkeypatch):
+    from obsidian_llm_wiki.cli._helpers import resolve_vault
+
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    monkeypatch.delenv("VAULT_PATH", raising=False)
+
+    resolved, config = resolve_vault(str(vault))
+
+    assert resolved == vault.resolve()
+    assert config.vault == vault.resolve()
+    assert "VAULT_PATH" not in os.environ

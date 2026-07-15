@@ -80,7 +80,14 @@ def load_synthesis(cache_root: Path, source_file: str) -> SourceSynthesis | None
     except json.JSONDecodeError:
         logger.warning("Corrupt synthesis cache for '%s' — will recompile.", source_file)
         return None
-    synth = source_synthesis_from_dict(data)
+    if not isinstance(data, dict):
+        logger.warning("Invalid synthesis cache for '%s' — will recompile.", source_file)
+        return None
+    try:
+        synth = source_synthesis_from_dict(data)
+    except (AttributeError, KeyError, TypeError, ValueError):
+        logger.warning("Invalid synthesis cache for '%s' — will recompile.", source_file)
+        return None
     synth.source_file = source_file
     return synth
 
@@ -106,7 +113,14 @@ def load_all_cached_syntheses(cache_root: Path) -> dict[str, SourceSynthesis]:
         except json.JSONDecodeError:
             logger.warning("Corrupt synthesis cache for '%s' — skipping.", source_file)
             continue
-        synth = source_synthesis_from_dict(data)
+        if not isinstance(data, dict):
+            logger.warning("Invalid synthesis cache for '%s' — skipping.", source_file)
+            continue
+        try:
+            synth = source_synthesis_from_dict(data)
+        except (AttributeError, KeyError, TypeError, ValueError):
+            logger.warning("Invalid synthesis cache for '%s' — skipping.", source_file)
+            continue
         synth.source_file = source_file
         result[source_file] = synth
     return result

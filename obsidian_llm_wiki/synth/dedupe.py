@@ -23,6 +23,7 @@ Concept merging (same slug):
 from __future__ import annotations
 
 import logging
+import math
 import re
 
 from obsidian_llm_wiki.core.models import (
@@ -556,11 +557,24 @@ def assign_orphans_to_mocs(
                     moc_embeddings.append(emb)
         if moc_embeddings:
             dim = len(moc_embeddings[0])
+            compatible_embeddings = [
+                embedding
+                for embedding in moc_embeddings
+                if len(embedding) == dim
+                and all(
+                    isinstance(value, (int, float))
+                    and not isinstance(value, bool)
+                    and math.isfinite(float(value))
+                    for value in embedding
+                )
+            ]
+            if not compatible_embeddings:
+                continue
             avg = [0.0] * dim
-            for emb in moc_embeddings:
+            for emb in compatible_embeddings:
                 for j, val in enumerate(emb):
                     avg[j] += val
-            n = len(moc_embeddings)
+            n = len(compatible_embeddings)
             moc_avg_embs[moc.slug] = [v / n for v in avg]
 
     if not moc_avg_embs:

@@ -107,10 +107,19 @@ def test_fetch_public_vtt_transcript_normalizes_timestamps(monkeypatch):
     """VTT publisher artifacts become clean source markdown text."""
     vtt = "WEBVTT\n\n00:00.000 --> 00:02.000\n" + _LONG_TEXT
     response = _response(200, text=vtt)
-    client = mock.Mock()
+    response.headers = {}
+    response.encoding = "utf-8"
+    response.iter_bytes.return_value = [vtt.encode("utf-8")]
+    client = mock.MagicMock()
     client.__enter__ = mock.Mock(return_value=client)
     client.__exit__ = mock.Mock(return_value=False)
-    client.get.return_value = response
+    stream = mock.MagicMock()
+    stream.__enter__.return_value = response
+    stream.__exit__.return_value = False
+    client.stream.return_value = stream
+    monkeypatch.setattr(
+        "obsidian_llm_wiki.ingest.url_safety.validate_remote_url", lambda _url: None,
+    )
 
     with mock.patch(
         "obsidian_llm_wiki.ingest.transcript_resolver.httpx.Client",

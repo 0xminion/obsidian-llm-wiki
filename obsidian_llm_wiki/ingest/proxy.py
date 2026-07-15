@@ -20,7 +20,12 @@ from __future__ import annotations
 import os
 from typing import Any
 
-__all__ = ["make_client_kwargs"]
+__all__ = ["make_client_kwargs", "node_subprocess_env"]
+
+_PROXY_ENV_KEYS = (
+    "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy",
+)
+_SOCKS_SCHEMES = ("socks4://", "socks4a://", "socks5://", "socks5h://")
 
 
 def make_client_kwargs(**kwargs: Any) -> dict[str, Any]:
@@ -47,3 +52,19 @@ def make_client_kwargs(**kwargs: Any) -> dict[str, Any]:
             opts["proxy"] = proxy_url  # httpx 0.28 accepts string URL directly
 
     return opts
+
+
+def node_subprocess_env(base: dict[str, str] | None = None) -> dict[str, str]:
+    """Return a Node-compatible subprocess environment.
+
+    Node's built-in ``fetch`` cannot speak SOCKS proxies, but it can use HTTP
+    proxy settings. Remove only SOCKS-valued variables rather than severing a
+    valid HTTP proxy configured by the user.
+    """
+    env = dict(os.environ if base is None else base)
+    env["NODE_EXTRA_CA_CERTS"] = ""
+    for key in _PROXY_ENV_KEYS:
+        value = env.get(key, "").strip().lower()
+        if value.startswith(_SOCKS_SCHEMES):
+            env.pop(key, None)
+    return env

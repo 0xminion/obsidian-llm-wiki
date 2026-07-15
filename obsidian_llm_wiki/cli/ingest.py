@@ -390,9 +390,11 @@ def ingest(
                     assert clipped_source is not None
                     source = clipped_source
                 else:
+                    from obsidian_llm_wiki.config import extraction_environment
                     from obsidian_llm_wiki.ingest.extractors import extract
 
-                    source = extract(identifier)
+                    with extraction_environment(config):
+                        source = extract(identifier)
                 source, truncated = _bounded_source(source, config.max_source_chars)
                 size = len(source.content.encode("utf-8"))
                 output_file = ""

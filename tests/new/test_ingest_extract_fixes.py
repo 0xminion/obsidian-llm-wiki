@@ -14,7 +14,7 @@ import httpx
 import pytest
 
 from obsidian_llm_wiki.core.models import SourceDoc
-from obsidian_llm_wiki.ingest import documents, supadata_utils
+from obsidian_llm_wiki.ingest import alt_source, documents, proxy, supadata_utils
 from obsidian_llm_wiki.ingest.extractors import ExtractorNotApplicableError, podcast
 
 _LONG_TEXT = " ".join(["A usable transcript sentence."] * 20)
@@ -32,6 +32,42 @@ _BLOG_ATOM_FEED = """<?xml version='1.0'?>
   <title>A Blog</title>
   <entry><title>A post</title><link href='https://blog.example/post'/></entry>
 </feed>"""
+
+
+def test_node_subprocess_environment_removes_only_socks_proxy_variables():
+    """Defuddle retains valid HTTP proxy routing while avoiding Node SOCKS failures."""
+    env = proxy.node_subprocess_env(
+        {
+            "HTTPS_PROXY": "socks5h://127.0.0.1:1080",
+            "HTTP_PROXY": "http://residential.example:8080",
+            "ALL_PROXY": "SOCKS5://127.0.0.1:1080",
+        }
+    )
+
+    assert "HTTPS_PROXY" not in env
+    assert "ALL_PROXY" not in env
+    assert env["HTTP_PROXY"] == "http://residential.example:8080"
+    assert env["NODE_EXTRA_CA_CERTS"] == ""
+
+
+def test_journal_direct_page_uses_validated_redirects_for_user_urls(monkeypatch):
+    """A journal fallback cannot silently follow a redirect to private space."""
+    client = mock.Mock()
+    client.__enter__ = mock.Mock(return_value=client)
+    client.__exit__ = mock.Mock(return_value=False)
+    monkeypatch.setattr(
+        alt_source,
+        "get_with_validated_redirects",
+        mock.Mock(side_effect=ValueError("Refusing non-public IP address")),
+    )
+
+    with (
+        mock.patch.object(alt_source.httpx, "Client", return_value=client),
+        pytest.raises(RuntimeError, match="Journal direct page failed"),
+    ):
+        alt_source.extract_via_journal_page("https://journal.example/article-123")
+
+    client.get.assert_not_called()
 
 
 # ── LiteParse must not treat every HTML page as a document ────────────────

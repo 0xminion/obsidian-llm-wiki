@@ -7,6 +7,8 @@ Clean port of the legacy ``pipeline.config`` module.  Env vars use the
 from __future__ import annotations
 
 import os
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -297,6 +299,41 @@ def load_config(env_file: str | None = None, **overrides: str) -> Config:
         podcast_index_api_key=get("PODCAST_INDEX_API_KEY", ""),
         podcast_index_api_secret=get("PODCAST_INDEX_API_SECRET", ""),
     )
+
+
+@contextmanager
+def extraction_environment(config: Config) -> Iterator[None]:
+    """Expose vault-scoped extraction settings only while an extractor runs.
+
+    ``load_config`` intentionally does not mutate ``os.environ``. A few
+    established extractor integrations still read credentials and proxy values
+    from the environment, so the CLI needs a narrow compatibility bridge. The
+    previous process values are restored even when extraction fails.
+    """
+    values = {
+        "VAULT_PATH": str(config.vault),
+        "RESIDENTIAL_PROXY_URL": config.residential_proxy_url,
+        "YOUTUBE_COOKIES_FILE": config.youtube_cookies_file,
+        "TRANSCRIPT_API_KEY": config.transcript_api_key,
+        "SUPADATA_API_KEY": config.supadata_api_key,
+        "ASSEMBLYAI_API_KEY": config.assemblyai_api_key,
+        "PODCAST_INDEX_API_KEY": config.podcast_index_api_key,
+        "PODCAST_INDEX_API_SECRET": config.podcast_index_api_secret,
+    }
+    previous = {key: os.environ.get(key) for key in values}
+    try:
+        for key, value in values.items():
+            if value:
+                os.environ[key] = value
+            else:
+                os.environ.pop(key, None)
+        yield
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
 
 def _optional_model_env(key: str, env: dict[str, str]) -> str | None:
