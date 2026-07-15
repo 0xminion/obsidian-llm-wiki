@@ -13,6 +13,7 @@ from unittest import mock
 import httpx
 import pytest
 
+from obsidian_llm_wiki.cli.ingest import _can_retry_with_residential_proxy
 from obsidian_llm_wiki.core.models import SourceDoc
 from obsidian_llm_wiki.ingest import alt_source, documents, proxy, supadata_utils
 from obsidian_llm_wiki.ingest.extractors import ExtractorNotApplicableError, podcast
@@ -32,6 +33,13 @@ _BLOG_ATOM_FEED = """<?xml version='1.0'?>
   <title>A Blog</title>
   <entry><title>A post</title><link href='https://blog.example/post'/></entry>
 </feed>"""
+
+
+def test_residential_proxy_fallback_excludes_ssrn():
+    assert _can_retry_with_residential_proxy(
+        "https://papers.ssrn.com/sol3/papers.cfm?abstract_id=1"
+    ) is False
+    assert _can_retry_with_residential_proxy("https://example.com/article") is True
 
 
 def test_node_subprocess_environment_removes_only_socks_proxy_variables():

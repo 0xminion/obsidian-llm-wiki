@@ -16,6 +16,7 @@ from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import typer
 
@@ -114,6 +115,14 @@ def _emit(json_output: bool, event: dict[str, Any], text: str = "") -> None:
         typer.echo(json.dumps(event, ensure_ascii=False, sort_keys=True))
     elif text:
         typer.echo(text)
+
+
+def _can_retry_with_residential_proxy(url: str) -> bool:
+    """Return whether proxy fallback is permitted for this public source."""
+    hostname = (urlparse(url).hostname or "").casefold()
+    # SSRN is deliberately public-only: use its public metadata fallback, not
+    # a proxy or other access-control bypass.
+    return not (hostname == "ssrn.com" or hostname.endswith(".ssrn.com"))
 
 
 def _reserve_collision_safe_path(
@@ -402,7 +411,8 @@ def ingest(
                         with extraction_environment(config, use_residential_proxy=False):
                             source = extract(identifier)
                     except Exception:
-                        if not config.residential_proxy_url:
+                        proxy_allowed = _can_retry_with_residential_proxy(identifier)
+                        if not config.residential_proxy_url or not proxy_allowed:
                             raise
                         logger.info("Retrying extraction through residential proxy: %s", identifier)
                         with extraction_environment(config):
