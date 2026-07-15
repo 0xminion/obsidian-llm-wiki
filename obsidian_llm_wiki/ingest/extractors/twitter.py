@@ -2,13 +2,13 @@
 
 Extraction strategy — X Articles and tweets MUST go through defuddle:
 
-  1. **defuddle.md** (hosted service at https://defuddle.md/<url>) — primary.
-     Renders JS-heavy X pages server-side and returns clean markdown with
-     YAML frontmatter (title, author, word_count, published date).
+  1. **defuddle CLI** (local, ``npx defuddle parse <url> --md``) — primary.
+     Same engine as defuddle.md but runs locally.  Proxy env vars are
+     stripped because Node.js fetch() does not support SOCKS proxies.
 
-  2. **defuddle CLI** (local, ``npx defuddle parse <url> --md``) — fallback.
-     Same engine as defuddle.md but runs locally.  Requires ``npx defuddle``
-     or a global ``defuddle`` install.
+  2. **defuddle.md** (hosted service at https://defuddle.md/<url>) — fallback.
+     Renders JS-heavy X pages server-side.  May return JS stubs for
+     auth-walled /article/ URLs.
 
   3. **trafilatura** via ``extract_web`` — last resort for non-JS pages.
 
@@ -82,26 +82,32 @@ def extract_twitter(raw_url: str) -> SourceDoc:
     """
     errors: list[str] = []
 
-    # ── Primary: Defuddle.md web service ──────────────────────────────
+    # ── Primary: Defuddle CLI (local) ─────────────────────────────────
+    # The local defuddle CLI is the most reliable path — it renders JS-
+    # heavy X pages with full article content.  Proxy env vars are
+    # stripped (Node.js can't handle SOCKS proxies natively).
+    try:
+        source = _extract_via_defuddle(raw_url)
+        if source:
+            logger.info(
+                "Defuddle CLI: extracted %d chars for %s",
+                len(source.content), raw_url,
+            )
+            return source
+    except Exception as exc:
+        errors.append(f"defuddle_cli: {exc}")
+
+    # ── Fallback: Defuddle.md (hosted service) ────────────────────────
     try:
         source = _extract_via_defuddle_md(raw_url)
         if source:
             logger.info(
-                "Defuddle.md: extracted %d chars for %s",
+                "Defuddle.md fallback: extracted %d chars for %s",
                 len(source.content), raw_url,
             )
             return source
     except Exception as exc:
         errors.append(f"defuddle_md: {exc}")
-
-    # ── Fallback: Defuddle CLI ────────────────────────────────────────
-    try:
-        source = _extract_via_defuddle(raw_url)
-        if source:
-            logger.info("Defuddle CLI fallback: %d chars for %s", len(source.content), raw_url)
-            return source
-    except Exception as exc:
-        errors.append(f"defuddle: {exc}")
 
     # ── Last resort: web extraction (trafilatura) ─────────────────────
     try:
