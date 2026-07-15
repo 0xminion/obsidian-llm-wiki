@@ -34,6 +34,7 @@ from obsidian_llm_wiki.render.obsidian import (
 def test_slugify():
     assert slugify("Gradient Descent") == "gradient-descent"
     assert slugify("") == "untitled"
+    assert len(slugify("word " * 100)) <= 120
 
 
 def test_make_wikilink_plain():

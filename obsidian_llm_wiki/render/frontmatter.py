@@ -38,7 +38,7 @@ def slugify(text: str) -> str:
     cleaned = re.sub(r"\s+", "-", cleaned)
     cleaned = re.sub(r"-+", "-", cleaned)
     slug = cleaned.strip("-").lower()
-    return slug if slug else "untitled"
+    return slug[:120].rstrip("-") or "untitled"
 
 
 def make_wikilink(slug: str, alias: str | None = None) -> str:
