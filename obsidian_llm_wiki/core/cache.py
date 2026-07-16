@@ -117,6 +117,8 @@ def load_all_cached_syntheses(cache_root: Path) -> dict[str, SourceSynthesis]:
 
     result: dict[str, SourceSynthesis] = {}
     for f in sorted(cache_dir.glob("*.json")):
+        if f.name == "_resynthesis_overlay.json":
+            continue
         fallback_source_file = f.stem  # e.g. "article.md.json" → "article.md"
         raw = safe_read_file(f)
         if not raw.strip():

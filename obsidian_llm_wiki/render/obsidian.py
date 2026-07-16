@@ -291,6 +291,13 @@ def render_concept_page(
             against the other direction (bidirectional edges inferred).
     """
     ts = timestamp or _timestamp()
+    related = [
+        relation
+        for relation in concept.related
+        if all_concepts is None or relation.slug in all_concepts
+    ]
+    rendered_concept = deepcopy(concept)
+    rendered_concept.related = related
     fm: dict[str, Any] = {
         "type": ConceptType.CONCEPT.value,
         "title": concept.title,
@@ -301,12 +308,12 @@ def render_concept_page(
     }
     if concept.aliases:
         fm["aliases"] = concept.aliases
-    if concept.related:
+    if related:
         # Serialize as pipe-separated strings so Obsidian's Properties panel
         # treats ``relations`` as a simple list of strings (no nested-object
         # warning). Format: "slug|relation_type|display_label".
         fm["relations"] = [
-            f"{r.slug}|{r.relation}|{r.display or r.slug}" for r in concept.related
+            f"{r.slug}|{r.relation}|{r.display or r.slug}" for r in related
         ]
 
     parts: list[str] = [f"# {concept.title}", ""]
@@ -370,8 +377,8 @@ def render_concept_page(
     # display. The cross-link wikilinks are rendered as regular markdown
     # outside the code block so Obsidian treats them as live, clickable
     # links — wikilinks inside code blocks are literal text.
-    if all_concepts and concept.related:
-        cross_ref_lines = _build_cross_ref_diagram(concept, all_concepts)
+    if all_concepts and related:
+        cross_ref_lines = _build_cross_ref_diagram(rendered_concept, all_concepts)
         if cross_ref_lines:
             parts.extend(["## Cross-References / 关联图谱", ""])
             parts.append("```text")
@@ -379,7 +386,7 @@ def render_concept_page(
             parts.append("```")
             parts.append("")
             # Clickable cross-links outside the code block
-            cross_links = _build_cross_links(concept, all_concepts)
+            cross_links = _build_cross_links(rendered_concept, all_concepts)
             if cross_links:
                 parts.extend(cross_links)
                 parts.append("")
@@ -425,16 +432,23 @@ def render_moc_page(
     _augment_moc_cross_lingual_members(
         moc, all_concepts, cross_lingual_links,
     )
+    # A source-local MoC can retain slugs removed or renamed during canonical
+    # concept merge. Never emit a wikilink for a page that will not be rendered.
+    concept_slugs = [
+        slug
+        for slug in moc.concept_slugs
+        if all_concepts is None or slug in all_concepts
+    ]
 
-    if moc.concept_slugs:
+    if concept_slugs:
         concept_entries = [
             all_concepts.get(slug) if all_concepts else None
-            for slug in moc.concept_slugs
+            for slug in concept_slugs
         ]
         bilingual_headings = _moc_needs_bilingual_headings(moc, concept_entries)
         concepts_heading = "## Concepts / 概念" if bilingual_headings else "## Concepts"
         parts.extend([concepts_heading, ""])
-        for slug in moc.concept_slugs:
+        for slug in concept_slugs:
             entry = all_concepts.get(slug) if all_concepts else None
             badge = ""
             definition = ""
@@ -458,9 +472,9 @@ def render_moc_page(
     # structural consistency — even when no inter-concept relations exist
     # yet, a placeholder message is shown instead of silently omitting
     # the section.
-    if all_concepts and moc.concept_slugs:
+    if all_concepts and concept_slugs:
         moc_concepts = [
-            all_concepts[s] for s in moc.concept_slugs
+            all_concepts[s] for s in concept_slugs
             if s in all_concepts
         ]
         if len(moc_concepts) >= 2:
