@@ -11,6 +11,7 @@ from obsidian_llm_wiki.core.models import (
     MapOfContent,
     SourceDoc,
     SourceSynthesis,
+    SynthesisBundle,
 )
 from obsidian_llm_wiki.render.obsidian import (
     _ACTIVE_RENDER_TRANSACTION,
@@ -265,3 +266,26 @@ def test_render_vault_full(tmp_path: Path):
     log_entries = [ln for ln in log_content.splitlines() if ln.startswith("## [")]
     assert len(log_entries) >= 1
     assert any("BUILD" in ln for ln in log_entries)
+
+
+def test_render_vault_omits_entry_links_to_cached_concepts(tmp_path: Path):
+    """Entry links only target concepts the current bundle materializes."""
+    active_concept = ConceptNote(
+        title="Active Concept", slug="active-concept", summary="Current concept",
+    )
+    cached_concept = ConceptNote(
+        title="Cached Concept", slug="cached-concept", summary="Stale cached concept",
+    )
+    synthesis = SourceSynthesis(
+        source_title="Active Source",
+        source_summary="Source summary",
+        concepts=[active_concept, cached_concept],
+    )
+    bundle = SynthesisBundle(sources=[synthesis], concepts=[active_concept])
+    sources = {"active-source.md": SourceDoc(title="Active Source", content="Source body")}
+
+    render_vault(tmp_path, bundle, sources)
+
+    entry = (tmp_path / "entries" / "active-source.md").read_text(encoding="utf-8")
+    assert "[[active-concept]]" in entry
+    assert "[[cached-concept]]" not in entry

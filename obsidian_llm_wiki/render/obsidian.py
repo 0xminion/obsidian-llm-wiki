@@ -741,6 +741,11 @@ def _render_vault(
     for d in dirs.values():
         d.mkdir(parents=True, exist_ok=True)
 
+    # Source-local synthesis data can retain cached concepts that semantic
+    # deduplication removed from the bundle. Entry pages must only link to
+    # concepts this render will materialize.
+    current_concept_slugs = {concept.slug for concept in bundle.concepts}
+
     # ── Render source pages ──────────────────────────────────────────
     from obsidian_llm_wiki.core.source_files import source_file_path
 
@@ -804,7 +809,11 @@ def _render_vault(
     for synthesis in bundle.sources:
         entry_slug = normalize_slug(slugify(synthesis.source_title), synthesis.source_title)
         actual_source_stem = source_filename_lookup.get(entry_slug, entry_slug)
-        concept_slugs = [c.slug for c in synthesis.concepts]
+        concept_slugs = [
+            concept.slug
+            for concept in synthesis.concepts
+            if concept.slug in current_concept_slugs
+        ]
         page = render_entry_page(synthesis, actual_source_stem, concept_slugs, ts)
         path = _safe_page_path(dirs["entries"], entry_slug, synthesis.source_title)
         if _write_generated_page(path, page, bundle_dir):
@@ -837,7 +846,6 @@ def _render_vault(
     # old files remain on disk and pollute the vault.
     from obsidian_llm_wiki.core.review import is_reviewed_page
 
-    current_concept_slugs = {c.slug for c in bundle.concepts}
     for old_file in dirs["concepts"].glob("*.md"):
         if old_file.name == "index.md":
             continue

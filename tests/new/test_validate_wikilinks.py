@@ -44,3 +44,49 @@ def test_strict_validate_accepts_aliased_anchor_and_path_wikilinks(tmp_path, mon
     result = CliRunner().invoke(app, ["validate", str(tmp_path), "--strict"])
 
     assert result.exit_code == 0, result.output
+
+
+def test_strict_validate_ignores_llmwiki_cache_files(tmp_path, monkeypatch):
+    """Internal renderer state is not part of the live Obsidian vault scan."""
+    from obsidian_llm_wiki.config import Config
+
+    config = Config(vault_path=str(tmp_path))
+    bundle = config.wiki_dir
+    bundle.mkdir(parents=True)
+    (bundle / "note.md").write_text(
+        "---\ntype: Concept\n---\nLive note.", encoding="utf-8",
+    )
+    cache_file = bundle / ".llmwiki" / "cached-render.md"
+    cache_file.parent.mkdir()
+    cache_file.write_text("[[missing-concept]]", encoding="utf-8")
+    monkeypatch.setattr(
+        "obsidian_llm_wiki.cli.validate.resolve_vault", lambda _vault: (tmp_path, config),
+    )
+
+    result = CliRunner().invoke(app, ["validate", str(tmp_path), "--strict"])
+
+    assert result.exit_code == 0, result.output
+    assert ".llmwiki" not in result.output
+
+
+def test_strict_validate_does_not_resolve_links_to_llmwiki_cache_files(tmp_path, monkeypatch):
+    """Internal cache pages cannot satisfy a live vault wikilink target."""
+    from obsidian_llm_wiki.config import Config
+
+    config = Config(vault_path=str(tmp_path))
+    bundle = config.wiki_dir
+    bundle.mkdir(parents=True)
+    (bundle / "note.md").write_text(
+        "---\ntype: Concept\n---\nSee [[cached-render]].", encoding="utf-8",
+    )
+    cache_file = bundle / ".llmwiki" / "cached-render.md"
+    cache_file.parent.mkdir()
+    cache_file.write_text("---\ntype: Internal\n---\n", encoding="utf-8")
+    monkeypatch.setattr(
+        "obsidian_llm_wiki.cli.validate.resolve_vault", lambda _vault: (tmp_path, config),
+    )
+
+    result = CliRunner().invoke(app, ["validate", str(tmp_path), "--strict"])
+
+    assert result.exit_code == 1
+    assert "note.md: broken link → cached-render" in result.output
