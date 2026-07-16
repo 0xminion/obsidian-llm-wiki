@@ -17,6 +17,7 @@ import os
 import shutil
 import tempfile
 from contextlib import suppress
+from contextvars import ContextVar
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
@@ -74,6 +75,9 @@ from obsidian_llm_wiki.render.frontmatter import (
 )
 
 logger = logging.getLogger("obswiki.render.obsidian")
+_ACTIVE_RENDER_TRANSACTION: ContextVar[Any] = ContextVar(
+    "active_render_transaction", default=None
+)
 
 _PROVENANCE_SCALAR_KEYS = (
     "requested_url",
@@ -189,6 +193,9 @@ def _write_generated_page(path: Path, page: str, bundle_dir: Path) -> bool:
             raise RuntimeError(f"Could not safely replace generated page {path}: {exc}") from exc
 
     atomic_write(path, page)
+    transaction = _ACTIVE_RENDER_TRANSACTION.get()
+    if transaction is not None:
+        transaction.record_write(path, page)
     return True
 
 
@@ -600,7 +607,14 @@ class _RenderTransaction:
         self._root_existed = bundle_dir.exists()
         self._original_files: set[Path] = set()
         self._original_dirs: set[Path] = set()
+        self._expected_outputs: dict[Path, str | None] = {}
         self._snapshot()
+
+    def record_write(self, path: Path, content: str) -> None:
+        self._expected_outputs[path.relative_to(self.bundle_dir)] = content
+
+    def record_delete(self, path: Path) -> None:
+        self._expected_outputs[path.relative_to(self.bundle_dir)] = None
 
     def _snapshot(self) -> None:
         if not self._root_existed:
@@ -631,11 +645,30 @@ class _RenderTransaction:
             ):
                 relative = path.relative_to(self.bundle_dir)
                 if relative not in self._original_files:
-                    path.unlink()
+                    expected = self._expected_outputs.get(relative)
+                    is_renderer_backup = relative.parts[:2] == (".llmwiki", "backups")
+                    if is_renderer_backup or (
+                        expected is not None and safe_read_file(path) == expected
+                    ):
+                        path.unlink()
+                    elif relative in self._expected_outputs:
+                        logger.warning("Preserving concurrent edit during rollback: %s", path)
 
         for relative in self._original_files:
             source = self._staging_dir / relative
             destination = self.bundle_dir / relative
+            if relative in self._expected_outputs:
+                expected = self._expected_outputs[relative]
+                if expected is None and destination.exists():
+                    logger.warning(
+                        "Preserving concurrent recreated page during rollback: %s", destination
+                    )
+                    continue
+                if expected is not None and (
+                    not destination.exists() or safe_read_file(destination) != expected
+                ):
+                    logger.warning("Preserving concurrent edit during rollback: %s", destination)
+                    continue
             destination.parent.mkdir(parents=True, exist_ok=True)
             os.replace(source, destination)
 
@@ -708,6 +741,11 @@ def _render_vault(
     for d in dirs.values():
         d.mkdir(parents=True, exist_ok=True)
 
+    # Source-local synthesis data can retain cached concepts that semantic
+    # deduplication removed from the bundle. Entry pages must only link to
+    # concepts this render will materialize.
+    current_concept_slugs = {concept.slug for concept in bundle.concepts}
+
     # ── Render source pages ──────────────────────────────────────────
     from obsidian_llm_wiki.core.source_files import source_file_path
 
@@ -771,7 +809,11 @@ def _render_vault(
     for synthesis in bundle.sources:
         entry_slug = normalize_slug(slugify(synthesis.source_title), synthesis.source_title)
         actual_source_stem = source_filename_lookup.get(entry_slug, entry_slug)
-        concept_slugs = [c.slug for c in synthesis.concepts]
+        concept_slugs = [
+            concept.slug
+            for concept in synthesis.concepts
+            if concept.slug in current_concept_slugs
+        ]
         page = render_entry_page(synthesis, actual_source_stem, concept_slugs, ts)
         path = _safe_page_path(dirs["entries"], entry_slug, synthesis.source_title)
         if _write_generated_page(path, page, bundle_dir):
@@ -804,7 +846,6 @@ def _render_vault(
     # old files remain on disk and pollute the vault.
     from obsidian_llm_wiki.core.review import is_reviewed_page
 
-    current_concept_slugs = {c.slug for c in bundle.concepts}
     for old_file in dirs["concepts"].glob("*.md"):
         if old_file.name == "index.md":
             continue
@@ -924,6 +965,9 @@ def _render_vault(
         raise RuntimeError("Vault log append failed") from exc
 
     for old_file in stale_files:
+        transaction = _ACTIVE_RENDER_TRANSACTION.get()
+        if transaction is not None:
+            transaction.record_delete(old_file)
         old_file.unlink()
         logger.debug("Removed stale generated page: %s", old_file)
 
@@ -948,6 +992,7 @@ def render_vault(
     """
     transaction = _RenderTransaction(bundle_dir)
     render_bundle = deepcopy(bundle)
+    token = _ACTIVE_RENDER_TRANSACTION.set(transaction)
     try:
         written = _render_vault(
             bundle_dir,
@@ -962,5 +1007,7 @@ def render_vault(
         except BaseException:
             logger.exception("Could not fully roll back failed vault render")
         raise
+    finally:
+        _ACTIVE_RENDER_TRANSACTION.reset(token)
     transaction.commit()
     return written

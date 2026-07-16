@@ -46,7 +46,11 @@ def validate(
         print(f"❌ Bundle directory not found: {bundle_dir}")
         raise typer.Exit(code=1)
 
-    all_md_files = sorted(bundle_dir.rglob("*.md"))
+    all_md_files = sorted(
+        path
+        for path in bundle_dir.rglob("*.md")
+        if ".llmwiki" not in path.relative_to(bundle_dir).parts
+    )
     note_stems = {f.stem for f in all_md_files}
 
     for md_file in all_md_files:

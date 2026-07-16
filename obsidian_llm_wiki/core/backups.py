@@ -59,7 +59,11 @@ def backup_file(
     directory = _source_directory(source, Path(backups_root))
     directory.mkdir(parents=True, exist_ok=True)
     name = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
-    destination = directory / f"{name}-{uuid.uuid4().hex}-{source.name}.bak"
+    prefix = f"{name}-{uuid.uuid4().hex}-"
+    suffix = ".bak"
+    max_source_name_bytes = 255 - len(os.fsencode(prefix + suffix))
+    source_name = os.fsdecode(os.fsencode(source.name)[:max_source_name_bytes])
+    destination = directory / f"{prefix}{source_name}{suffix}"
 
     fd, temporary_name = tempfile.mkstemp(dir=directory, prefix=".backup-", suffix=".tmp")
     temporary = Path(temporary_name)

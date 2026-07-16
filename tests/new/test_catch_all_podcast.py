@@ -6,16 +6,15 @@ from unittest import mock
 
 import pytest
 
-from obsidian_llm_wiki.ingest.extractors import ExtractorNotApplicableError
-from obsidian_llm_wiki.ingest.extractors import podcast
-
+from obsidian_llm_wiki.ingest.extractors import ExtractorNotApplicableError, podcast
 
 # ── _looks_like_podcast_page ────────────────────────────────────────────
 
 
 def _html_response(body: str) -> mock.Mock:
     """Build a mock httpx response with the given HTML body."""
-    resp = mock.Mock(status_code=200, text=body, is_redirect=False)
+    resp = mock.Mock(status_code=200, is_redirect=False, encoding="utf-8")
+    resp.iter_bytes.return_value = [body.encode("utf-8")]
     return resp
 
 
@@ -23,7 +22,10 @@ def _client_with_response(response: mock.Mock) -> mock.Mock:
     client = mock.Mock()
     client.__enter__ = mock.Mock(return_value=client)
     client.__exit__ = mock.Mock(return_value=False)
-    client.get.return_value = response
+    stream = mock.MagicMock()
+    stream.__enter__.return_value = response
+    stream.__exit__.return_value = False
+    client.stream.return_value = stream
     return client
 
 
@@ -94,7 +96,7 @@ def test_podcast_page_fetch_error_returns_false():
     client = mock.Mock()
     client.__enter__ = mock.Mock(return_value=client)
     client.__exit__ = mock.Mock(return_value=False)
-    client.get.side_effect = Exception("Connection refused")
+    client.stream.side_effect = Exception("Connection refused")
 
     with mock.patch.object(podcast.httpx, "Client", return_value=client):
         assert podcast._looks_like_podcast_page("https://example.com/ep") is False
@@ -121,6 +123,24 @@ def test_body_text_mentioning_podcast_does_not_trigger():
 
     with mock.patch.object(podcast.httpx, "Client", return_value=client):
         assert podcast._looks_like_podcast_page("https://example.com/article") is False
+
+
+def test_podcast_precheck_stops_at_its_byte_boundary():
+    """A large unknown-length page never buffers its full body for a heuristic."""
+    yielded: list[bytes] = []
+
+    def chunks():
+        for chunk in (b"<audio", b"x" * podcast._PODCAST_PRECHECK_MAX_BYTES):
+            yielded.append(chunk)
+            yield chunk
+        raise AssertionError("precheck read beyond its byte boundary")
+
+    response = mock.Mock(encoding="utf-8")
+    response.iter_bytes.side_effect = chunks
+    text = podcast._read_podcast_precheck(response)
+
+    assert len(text.encode("utf-8")) == podcast._PODCAST_PRECHECK_MAX_BYTES
+    assert yielded == [b"<audio", b"x" * podcast._PODCAST_PRECHECK_MAX_BYTES]
 
 
 # ── extract_catch_all_podcast ───────────────────────────────────────────

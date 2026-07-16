@@ -22,7 +22,7 @@ class _StreamingClient:
     def __exit__(self, *_args) -> None:
         return None
 
-    def stream(self, _method: str, _url: str):
+    def stream(self, _method: str, _url: str, **_kwargs):
         response = self.response
 
         class _Stream:

@@ -108,7 +108,7 @@ def test_public_extract_stamps_generic_connector_provenance(monkeypatch):
     monkeypatch.setattr(
         extractors,
         "extract_web",
-        lambda url: SourceDoc(title="Article", content="body", url=f"{url}/final"),
+        lambda url: SourceDoc(title="Article", content="body " * 150, url=f"{url}/final"),
     )
 
     source = extractors.extract("https://example.com/article")

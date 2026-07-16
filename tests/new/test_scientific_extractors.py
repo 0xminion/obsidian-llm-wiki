@@ -171,7 +171,7 @@ def test_registry_forwards_original_arxiv_abstract_url_to_specialized_route() ->
     from obsidian_llm_wiki.ingest import extractors as registry
 
     received: list[str] = []
-    source = SourceDoc(title="HTML paper", content="Accessible report text.", url="unused")
+    source = SourceDoc(title="HTML paper", content="Accessible report text. " * 30, url="unused")
 
     def match_arxiv(parsed, raw: str) -> bool:
         return parsed.hostname == "arxiv.org"

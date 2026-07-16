@@ -6,10 +6,6 @@ Fix 2: Unverified claims with quotes render in the evidence section.
 
 from __future__ import annotations
 
-from unittest import mock
-
-import pytest
-
 from obsidian_llm_wiki.core.models import (
     Claim,
     ConceptNote,
@@ -18,7 +14,6 @@ from obsidian_llm_wiki.core.models import (
 )
 from obsidian_llm_wiki.render.obsidian import render_concept_page
 from obsidian_llm_wiki.synth.quality import _merge_claims
-
 
 # ── Fix 1: _merge_claims ────────────────────────────────────────────────
 
@@ -118,6 +113,38 @@ def test_merge_deduplicates_case_insensitively():
 
     merged = _merge_claims(pass1, pass2)
     assert len(merged) == 1
+
+
+def test_merge_prefers_verified_over_unverified():
+    """When both passes have evidence, verified evidence wins over unverified."""
+    pass1 = [
+        Claim(
+            text="Important claim",
+            evidence=EvidenceSpan(
+                quote="verified quote",
+                source_file="source.md",
+                verification=EvidenceVerification.VERIFIED,
+                start_offset=0,
+                end_offset=13,
+            ),
+        ),
+    ]
+    pass2 = [
+        Claim(
+            text="Important claim",
+            evidence=EvidenceSpan(
+                quote="unverified quote",
+                source_file="source2.md",
+                verification=EvidenceVerification.UNVERIFIED,
+            ),
+        ),
+    ]
+
+    merged = _merge_claims(pass1, pass2)
+    assert len(merged) == 1
+    # Pass 1 has verified evidence, Pass 2 has unverified — verified wins
+    assert merged[0].evidence.quote == "verified quote"
+    assert str(merged[0].evidence.verification) == "verified"
 
 
 def test_merge_empty_claims():
@@ -261,5 +288,5 @@ def test_mixed_verified_and_unverified_claims_both_render():
     assert "*(unverified)*" in page
     # Bare claim should have no marker
     lines = page.split("## Claims")[1].split("## Evidence")[0]
-    bare_line = [l for l in lines.split("\n") if "Bare claim" in l]
+    bare_line = [line for line in lines.split("\n") if "Bare claim" in line]
     assert bare_line and "[" not in bare_line[0]

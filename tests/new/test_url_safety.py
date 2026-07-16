@@ -7,6 +7,7 @@ import pytest
 
 from obsidian_llm_wiki.ingest.url_safety import (
     get_with_validated_redirects,
+    stream_with_validated_redirects,
     validate_remote_url,
 )
 
@@ -72,5 +73,27 @@ def test_validated_redirect_helper_rejects_private_redirect_before_request(monke
         pytest.raises(ValueError, match="non-public IP"),
     ):
         get_with_validated_redirects(client, "https://example.com/start")
+
+    assert requests == ["https://example.com/start"]
+
+
+def test_streaming_redirect_helper_overrides_an_unsafe_client_default(monkeypatch):
+    """A caller's follow_redirects=True cannot bypass stream redirect validation."""
+    requests: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(str(request.url))
+        return httpx.Response(302, headers={"location": "http://127.0.0.1/admin"})
+
+    monkeypatch.setattr(
+        "obsidian_llm_wiki.ingest.url_safety.socket.getaddrinfo",
+        lambda *_args, **_kwargs: [(None, None, None, None, ("93.184.216.34", 0))],
+    )
+    with (
+        httpx.Client(transport=httpx.MockTransport(handler), follow_redirects=True) as client,
+        pytest.raises(ValueError, match="non-public IP"),
+        stream_with_validated_redirects(client, "https://example.com/start"),
+    ):
+        pass
 
     assert requests == ["https://example.com/start"]

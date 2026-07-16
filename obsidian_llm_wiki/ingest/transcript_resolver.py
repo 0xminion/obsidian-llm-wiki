@@ -24,11 +24,13 @@ import httpx
 
 from obsidian_llm_wiki.ingest.http_headers import BROWSER_HEADERS, DEFAULT_TIMEOUT
 from obsidian_llm_wiki.ingest.proxy import make_client_kwargs
+from obsidian_llm_wiki.ingest.url_safety import stream_with_validated_redirects
 
 logger = logging.getLogger("obswiki.ingest.transcript_resolver")
 
 _ASSEMBLYAI_BASE_URL = "https://api.assemblyai.com/v2/transcript"
 _MIN_TRANSCRIPT_CHARS = 200
+_MAX_PUBLIC_TRANSCRIPT_BYTES = 10_000_000
 
 __all__ = [
     "TranscriptResult",
@@ -168,20 +170,28 @@ def fetch_public_transcript(
 
     try:
         with httpx.Client(
-            **make_client_kwargs(timeout=DEFAULT_TIMEOUT, follow_redirects=True),
+            **make_client_kwargs(timeout=DEFAULT_TIMEOUT, follow_redirects=False),
             headers={"User-Agent": BROWSER_HEADERS["User-Agent"], "Accept": "*/*"},
-        ) as client:
-            response = client.get(transcript_url)
-        response.raise_for_status()
-    except httpx.HTTPError as exc:
+        ) as client, stream_with_validated_redirects(client, transcript_url) as response:
+            response.raise_for_status()
+            declared = response.headers.get("content-length")
+            if declared and int(declared) > _MAX_PUBLIC_TRANSCRIPT_BYTES:
+                return None
+            effective_type = (mime_type or response.headers.get("content-type", "")).lower()
+            body = bytearray()
+            for chunk in response.iter_bytes():
+                if len(body) + len(chunk) > _MAX_PUBLIC_TRANSCRIPT_BYTES:
+                    return None
+                body.extend(chunk)
+            raw_text = bytes(body).decode(response.encoding or "utf-8", errors="replace")
+            json_payload = json.loads(raw_text) if "json" in effective_type else None
+    except (httpx.HTTPError, ValueError, json.JSONDecodeError) as exc:
         logger.debug("Publisher transcript fetch failed for %s: %s", transcript_url, exc)
         return None
 
-    effective_type = (mime_type or response.headers.get("content-type", "")).lower()
-    raw_text = response.text
     if "json" in effective_type:
         try:
-            raw_text = _extract_json_transcript(response.json())
+            raw_text = _extract_json_transcript(json_payload)
         except (json.JSONDecodeError, ValueError):
             return None
 

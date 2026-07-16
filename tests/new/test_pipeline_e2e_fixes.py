@@ -579,6 +579,64 @@ def test_pipeline_records_and_reuses_cross_lingual_embedding_links(tmp_path, mon
     assert metrics_data["rendering"]["cross_lingual_links"] == 1
 
 
+def test_pipeline_embedding_metric_uses_pruned_cache_count(tmp_path, monkeypatch):
+    """A dedup victim must not inflate the final embedding metric."""
+    from obsidian_llm_wiki.config import Config
+    from obsidian_llm_wiki.core import pipeline as pl
+    from obsidian_llm_wiki.core.metrics import MetricsCollector
+
+    survivor = _concept("survivor")
+    victim = _concept("victim")
+
+    async def fake_retry(_config, filename, _source, _existing, *_args, **_kwargs):
+        return SourceSynthesis(
+            source_title="Source",
+            source_summary="",
+            source_file=filename,
+            concepts=[survivor, victim],
+        )
+
+    def fake_dedup(bundle, **_kwargs):
+        bundle.concepts = [survivor]
+
+    persisted: dict[str, list[float]] = {}
+    metrics: dict[str, int] = {}
+    monkeypatch.setattr(pl, "_synthesize_with_retry", fake_retry)
+    monkeypatch.setattr(pl, "render_vault", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(
+        "obsidian_llm_wiki.synth.dedupe.semantic_dedupe_concepts", fake_dedup,
+    )
+    monkeypatch.setattr(
+        "obsidian_llm_wiki.synth.embedding.load_embeddings_cache",
+        lambda _path, **_kwargs: {"survivor": [1.0, 0.0], "victim": [0.0, 1.0]},
+    )
+    monkeypatch.setattr(
+        "obsidian_llm_wiki.synth.embedding.save_embeddings_cache",
+        lambda _path, cache, **_kwargs: persisted.update(cache),
+    )
+    monkeypatch.setattr(
+        "obsidian_llm_wiki.synth.embedding.find_cross_lingual_links",
+        lambda *_args, **_kwargs: {},
+    )
+    monkeypatch.setattr(
+        MetricsCollector,
+        "record_embedding",
+        lambda _self, **kwargs: metrics.update(kwargs),
+    )
+
+    result = asyncio.run(
+        pl.run_pipeline(
+            tmp_path,
+            {"source.md": SourceDoc(title="Source", content="x " * 100)},
+            Config(vault_path=str(tmp_path), embeddings_enabled=True),
+        )
+    )
+
+    assert result.compiled == 1
+    assert persisted == {"survivor": [1.0, 0.0]}
+    assert metrics["concepts_embedded"] == 1
+
+
 # ── Health report wikilink normalization ──────────────────────────────────
 
 

@@ -48,10 +48,6 @@ def build(
     # ── Load the FULL corpus from sources/ ──────────────────────────────
     sources = load_sources_from_dir(config.sources_dir)
 
-    if not sources:
-        print("⚠ No source files found. Run 'olw ingest' first.")
-        return
-
     print(f"\n📦 Found {len(sources)} source file(s)")
 
     if dry_run:

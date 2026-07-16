@@ -39,6 +39,7 @@ __all__ = [
     "extract",
     "register_extractor",
     "_check_extraction_quality",
+    "_require_usable_source",
     "_deep_search_fallback",
     "_deep_search_enabled",
 ]
@@ -435,6 +436,40 @@ def _check_extraction_quality(source: SourceDoc) -> tuple[bool, str]:
       4. Content is mostly metadata (Title:/Channel:/Published:) → "metadata only"
     """
     content = source.content or ""
+    title = (source.title or "").strip()
+
+    # A title is source identity. Broken Markdown/link fragments and raw URLs
+    # become meaningless filenames and infect every downstream artifact.
+    if (
+        len(title) < 3
+        or title.startswith(("](", "[", "http://", "https://"))
+        or "://" in title
+        or title.endswith((" on X", " on Twitter"))
+        or bool(re.match(r"https?(?:www)?(?:x|twitter|[a-z0-9-]+(?:com|org|net))", title, re.I))
+    ):
+        return (False, "invalid source title")
+
+    # X status pages frequently contain an article card plus a 1-2 sentence
+    # preview. That is not the linked article; fail it instead of synthesizing
+    # a plausible-looking graph from the login shell.
+    lowered = content.casefold()
+    if (
+        "https://x.com/i/article/" in lowered
+        or "https://twitter.com/i/article/" in lowered
+    ) and ("article\n" in lowered or "article\r\n" in lowered):
+        return (False, "X article preview stub")
+
+    # Generic extractors can return a large navigation shell. Length is not
+    # quality: Congress.gov's shell is tens of thousands of characters.
+    chrome_markers = (
+        "skip to main content",
+        "navigation",
+        "advanced searches",
+        "back to top",
+        "loading...",
+    )
+    if sum(marker in lowered for marker in chrome_markers) >= 4:
+        return (False, "navigation chrome")
 
     # 1. Too short to be real content.
     if len(content) < 500:
@@ -472,6 +507,14 @@ def _check_extraction_quality(source: SourceDoc) -> tuple[bool, str]:
             return (False, "metadata only")
 
     return (True, "")
+
+
+def _require_usable_source(source: SourceDoc) -> SourceDoc:
+    """Return a source only when it clears the corpus-wide quality contract."""
+    passed, reason = _check_extraction_quality(source)
+    if not passed:
+        raise RuntimeError(f"Extraction quality rejected source: {reason}")
+    return source
 
 
 class ExtractorNotApplicableError(RuntimeError):
@@ -565,7 +608,7 @@ def extract(raw_url: str) -> SourceDoc:
         assert result.source is not None
         stamped = _stamp_extracted_source(result.source, raw_url, result.connector_name)
         if result.connector_name != "generic_web":
-            return stamped
+            return _require_usable_source(stamped)
 
         # Last-resort: if generic web extraction produced a stub, try deep
         # search for the same title across accessible scholarly sources and use
@@ -581,16 +624,20 @@ def extract(raw_url: str) -> SourceDoc:
                             "(stub=%d chars → deep_search=%d chars).",
                             raw_url, len(stamped.content or ""), len(ds.content or ""),
                         )
-                        return _stamp_extracted_source(ds, raw_url, "deep_search_fallback")
+                        return _require_usable_source(
+                            _stamp_extracted_source(ds, raw_url, "deep_search_fallback")
+                        )
                 except Exception as ds_exc:
                     logger.warning("Deep search fallback failed for stub %s: %s", raw_url, ds_exc)
-        return stamped
+        return _require_usable_source(stamped)
 
     assert result.failure is not None
     if result.connector_name == "specialist_dispatch" and _deep_search_enabled():
         try:
             ds = _deep_search_fallback("", raw_url)
-            return _stamp_extracted_source(ds, raw_url, "deep_search_fallback")
+            return _require_usable_source(
+                _stamp_extracted_source(ds, raw_url, "deep_search_fallback")
+            )
         except Exception as ds_exc:
             logger.warning("Deep search fallback also failed for %s: %s", raw_url, ds_exc)
     if result.connector_name == "specialist_dispatch":

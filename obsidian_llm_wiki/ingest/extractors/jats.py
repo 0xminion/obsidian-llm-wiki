@@ -17,6 +17,7 @@ from obsidian_llm_wiki.core.models import SourceDoc
 from obsidian_llm_wiki.ingest.extractors import register_extractor
 from obsidian_llm_wiki.ingest.http_headers import BROWSER_HEADERS
 from obsidian_llm_wiki.ingest.proxy import make_client_kwargs
+from obsidian_llm_wiki.ingest.url_safety import stream_with_validated_redirects
 
 logger = logging.getLogger("obswiki.ingest.extractors.jats")
 
@@ -29,6 +30,7 @@ _JATS_HOSTS = frozenset((
     "akjournals.com",
     "www.akjournals.com",
 ))
+_MAX_JATS_XML_BYTES = 50 * 1024 * 1024
 
 
 def _try_publisher_pdf(raw_url: str) -> SourceDoc | None:
@@ -111,11 +113,17 @@ def extract_jats(raw_url: str) -> SourceDoc:
         with httpx.Client(
             **make_client_kwargs(follow_redirects=False, timeout=45),
             headers=BROWSER_HEADERS,
-        ) as client:
-            from obsidian_llm_wiki.ingest.url_safety import get_with_validated_redirects
-            resp = get_with_validated_redirects(client, raw_url)
+        ) as client, stream_with_validated_redirects(client, raw_url) as resp:
             resp.raise_for_status()
-            xml_text = resp.text
+            declared = resp.headers.get("content-length")
+            if declared and int(declared) > _MAX_JATS_XML_BYTES:
+                raise RuntimeError(f"XML response exceeds {_MAX_JATS_XML_BYTES} bytes")
+            body = bytearray()
+            for chunk in resp.iter_bytes():
+                if len(body) + len(chunk) > _MAX_JATS_XML_BYTES:
+                    raise RuntimeError(f"XML response exceeds {_MAX_JATS_XML_BYTES} bytes")
+                body.extend(chunk)
+            xml_text = bytes(body).decode(resp.encoding or "utf-8", errors="replace")
     except httpx.HTTPStatusError as exc:
         # 405/403/404 — server doesn't serve XML to bots.
         # Strip .xml suffix and try the HTML article page via extract_web.

@@ -48,9 +48,13 @@ from obsidian_llm_wiki.ingest.transcript_resolver import (
     save_transcript_cache,
     validate_assemblyai_key,
 )
-from obsidian_llm_wiki.ingest.url_safety import get_with_validated_redirects
+from obsidian_llm_wiki.ingest.url_safety import (
+    get_with_validated_redirects,
+    stream_with_validated_redirects,
+)
 
 logger = logging.getLogger("obswiki.ingest.extractors.podcast")
+_MAX_RSS_BYTES = 50 * 1024 * 1024
 
 __all__ = [
     "extract_spotify",
@@ -134,25 +138,46 @@ _PODCAST_KEYWORDS = (
 )
 
 
+_PODCAST_PRECHECK_TIMEOUT_SECONDS = 5
+_PODCAST_PRECHECK_MAX_BYTES = 200_000
+
+
+def _read_podcast_precheck(response: httpx.Response) -> str:
+    """Read only the bounded page prefix needed for podcast discovery."""
+    body = bytearray()
+    for chunk in response.iter_bytes():
+        remaining = _PODCAST_PRECHECK_MAX_BYTES - len(body)
+        if remaining <= 0:
+            break
+        body.extend(chunk[:remaining])
+        if len(body) >= _PODCAST_PRECHECK_MAX_BYTES:
+            break
+    return bytes(body).decode(response.encoding or "utf-8", errors="replace")
+
+
 def _looks_like_podcast_page(raw_url: str) -> bool:
     """Cheap HTML pre-check to decide if a URL might be a podcast episode.
 
-    Fetches the page HTML (bounded to the first 200K chars) and checks for
+    Streams only a bounded page prefix and checks for
     podcast-indicative signals: ``<audio>`` elements, RSS auto-discovery
     links, OG audio tags, or podcast-related keywords in meta tags and the
     page title.  Returns ``False`` on any fetch error or timeout so the
     catch-all disclaims quickly without adding latency for non-podcast URLs.
     """
     try:
-        with httpx.Client(
-            **make_client_kwargs(timeout=15, follow_redirects=False),
-            headers=BROWSER_HEADERS,
-        ) as client:
-            from obsidian_llm_wiki.ingest.url_safety import get_with_validated_redirects
-            response = get_with_validated_redirects(client, raw_url)
-        if response.status_code != 200:
-            return False
-        html_text = response.text[:200_000].lower()
+        with (
+            httpx.Client(
+                **make_client_kwargs(
+                    timeout=_PODCAST_PRECHECK_TIMEOUT_SECONDS,
+                    follow_redirects=False,
+                ),
+                headers=BROWSER_HEADERS,
+            ) as client,
+            stream_with_validated_redirects(client, raw_url) as response,
+        ):
+            if response.status_code != 200:
+                return False
+            html_text = _read_podcast_precheck(response).lower()
     except Exception:
         return False
 
@@ -552,11 +577,25 @@ def _fetch_rss_text(feed_url: str) -> str:
         with httpx.Client(
             **make_client_kwargs(timeout=DEFAULT_TIMEOUT, follow_redirects=False),
             headers={"User-Agent": BROWSER_HEADERS["User-Agent"]},
-        ) as client:
-            response = get_with_validated_redirects(client, feed_url)
-        if response.status_code == 200:
-            return response.text
-    except httpx.HTTPError as exc:
+        ) as client, stream_with_validated_redirects(client, feed_url) as response:
+            if response.status_code != 200:
+                return ""
+            declared = response.headers.get("content-length")
+            if declared and int(declared) > _MAX_RSS_BYTES:
+                logger.warning(
+                    "RSS feed exceeds %d-byte safety limit: %s", _MAX_RSS_BYTES, feed_url
+                )
+                return ""
+            body = bytearray()
+            for chunk in response.iter_bytes():
+                if len(body) + len(chunk) > _MAX_RSS_BYTES:
+                    logger.warning(
+                        "RSS feed exceeded %d-byte safety limit: %s", _MAX_RSS_BYTES, feed_url
+                    )
+                    return ""
+                body.extend(chunk)
+            return bytes(body).decode(response.encoding or "utf-8", errors="replace")
+    except (httpx.HTTPError, ValueError) as exc:
         logger.debug("RSS fetch failed for %s: %s", feed_url, exc)
     return ""
 

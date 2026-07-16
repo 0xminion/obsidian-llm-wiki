@@ -36,6 +36,11 @@ __all__ = [
 VIEWS_DIR = "views"
 
 
+def _view_document(title: str, body: str) -> str:
+    """Wrap a generated view in ordinary Obsidian frontmatter."""
+    return f"---\ntype: View\ntitle: {title}\n---\n\n{body}"
+
+
 # ── Individual view renderers ──────────────────────────────────────────
 
 
@@ -262,7 +267,8 @@ def render_dataview_views(
 
     for filename, content in views:
         path = views_dir / filename
-        path.write_text(content, encoding="utf-8")
+        title = content.splitlines()[0].removeprefix("# ")
+        path.write_text(_view_document(title, content), encoding="utf-8")
         written.append(str(path))
 
     # Write a views index.
@@ -278,7 +284,9 @@ def render_dataview_views(
         "- [[sources-by-freshness|Sources by Freshness]]",
         "",
     ]
-    idx.write_text("\n".join(idx_lines), encoding="utf-8")
+    idx.write_text(
+        _view_document("Dataview Views", "\n".join(idx_lines)), encoding="utf-8"
+    )
     written.append(str(idx))
 
     logger.info("Dataview views generated: %d files → %s", len(written), views_dir)

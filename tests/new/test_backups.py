@@ -36,6 +36,16 @@ def test_backup_file_rotates_oldest_backups_without_touching_newest(tmp_path: Pa
     assert not list(backups_root.rglob("*.tmp"))
 
 
+def test_backup_file_bounds_utf8_backup_component_length(tmp_path: Path) -> None:
+    source = tmp_path / f"{'你' * 70}.md"
+    source.write_text("content", encoding="utf-8")
+
+    backup = backup_file(source, tmp_path / "backups")
+
+    assert len(backup.name.encode()) <= 255
+    assert backup.read_text(encoding="utf-8") == "content"
+
+
 def test_backup_file_rejects_non_positive_retention(tmp_path: Path) -> None:
     source = tmp_path / "concept.md"
     source.write_text("content", encoding="utf-8")

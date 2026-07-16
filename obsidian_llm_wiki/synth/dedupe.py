@@ -23,6 +23,7 @@ Concept merging (same slug):
 from __future__ import annotations
 
 import logging
+import math
 import re
 
 from obsidian_llm_wiki.core.models import (
@@ -100,7 +101,7 @@ def slugify(text: str) -> str:
     cleaned = re.sub(r"\s+", "-", cleaned)
     cleaned = re.sub(r"-+", "-", cleaned)
     slug = cleaned.strip("-").lower()
-    return slug if slug else "untitled"
+    return slug[:120].rstrip("-") or "untitled"
 
 
 # ── Concept merging ─────────────────────────────────────────────────────
@@ -271,12 +272,39 @@ def _embed_concept(
     return emb
 
 
+def _embed_concepts_batch(
+    concepts: list[ConceptNote],
+    embeddings_cache: dict[str, list[float]],
+    embedding_options: dict[str, object] | None = None,
+) -> None:
+    """Batch-embed concepts that are missing from the cache.
+
+    Uses :func:`embed_batch` to send up to 8 texts per Ollama /api/embed
+    call, falling back to individual calls on API error.  Concepts already
+    in the cache are skipped.  Results are written directly into
+    ``embeddings_cache``.
+    """
+    from obsidian_llm_wiki.synth.embedding import embed_batch
+
+    missing = [c for c in concepts if c.slug not in embeddings_cache]
+    if not missing:
+        return
+
+    texts = [f"{c.title}. {c.summary or ''}" for c in missing]
+    results = embed_batch(texts, **(embedding_options or {}))
+
+    for concept, emb in zip(missing, results, strict=False):
+        if emb:
+            embeddings_cache[concept.slug] = emb
+
+
 def semantic_dedupe_concepts(
     bundle: SynthesisBundle,
     threshold: float = 0.85,
     *,
     embeddings_cache: dict[str, list[float]] | None = None,
     embedding_options: dict[str, object] | None = None,
+    new_slugs: set[str] | None = None,
 ) -> None:
     """Merge same-language concepts with high embedding cosine similarity.
 
@@ -291,12 +319,24 @@ def semantic_dedupe_concepts(
 
     Gated behind ``EMBEDDINGS_ENABLED`` — no-ops if embeddings are unavailable
     (the Ollama embedding service is down or the env var is not set).
+
+    When ``new_slugs`` is provided, only compares concepts in ``new_slugs``
+    against all concepts (new + existing).  Existing-vs-existing pairs are
+    skipped — they were already compared in a previous run and won't produce
+    new merges (same embeddings, same threshold).  This reduces the comparison
+    count from O(N²) to O(new × total) for incremental runs.
     """
     from obsidian_llm_wiki.synth.embedding import cosine_similarity
     from obsidian_llm_wiki.synth.language import detect_language
 
     if not bundle.concepts or len(bundle.concepts) < 2:
         return
+
+    # Batch-embed concepts missing from the cache before pairwise comparison.
+    if embeddings_cache is not None:
+        _embed_concepts_batch(
+            bundle.concepts, embeddings_cache, embedding_options,
+        )
 
     # Build embeddings for all concepts.
     embeddings: dict[str, list[float]] = {}
@@ -323,13 +363,30 @@ def semantic_dedupe_concepts(
     merge_map: dict[str, str] = {}  # merged_slug → surviving_slug
     merged_slugs: set[str] = set()
 
+    # When new_slugs is provided and non-empty, only compare new concepts
+    # against all.  Existing-vs-existing pairs were compared in a previous
+    # run with the same embeddings and threshold — they won't merge now.
+    # An empty set means "no new concepts this run" — skip dedup entirely
+    # (equivalent to new_slugs=None for comparison purposes, but we short-
+    # circuit to avoid the full O(N²) loop).
+    if new_slugs is not None and not new_slugs:
+        logger.info("Semantic dedup: no new concepts this run — skipping")
+        return
+
+    comparison_slugs = new_slugs if new_slugs is not None else None
+
     for i, slug_a in enumerate(slugs):
+        if comparison_slugs is not None and slug_a not in comparison_slugs:
+            continue  # not a new concept — only new concepts initiate comparisons
         if slug_a in merged_slugs:
             continue
-        for slug_b in slugs[i + 1:]:
-            # slug_a can become a victim mid-inner-loop; without this check it
-            # would be picked as a *survivor* for a later pair, merging that
-            # pair's content into an already-deleted concept.
+        # Default path (new_slugs=None): use slugs[i+1:] to avoid 2× comparisons.
+        # Incremental path (new_slugs=set): compare against ALL slugs (including
+        # existing ones) so new concepts can merge with existing concepts.
+        inner_slugs = slugs[i + 1:] if comparison_slugs is None else slugs
+        for slug_b in inner_slugs:
+            if slug_a == slug_b:
+                continue
             if slug_a in merged_slugs:
                 break
             if slug_b in merged_slugs:
@@ -343,7 +400,6 @@ def semantic_dedupe_concepts(
             if sim < threshold:
                 continue
 
-            # Determine survivor: higher confidence, tie-break by slug order.
             ca = concept_map[slug_a]
             cb = concept_map[slug_b]
             if cb.confidence > ca.confidence or (
@@ -501,11 +557,24 @@ def assign_orphans_to_mocs(
                     moc_embeddings.append(emb)
         if moc_embeddings:
             dim = len(moc_embeddings[0])
+            compatible_embeddings = [
+                embedding
+                for embedding in moc_embeddings
+                if len(embedding) == dim
+                and all(
+                    isinstance(value, (int, float))
+                    and not isinstance(value, bool)
+                    and math.isfinite(float(value))
+                    for value in embedding
+                )
+            ]
+            if not compatible_embeddings:
+                continue
             avg = [0.0] * dim
-            for emb in moc_embeddings:
+            for emb in compatible_embeddings:
                 for j, val in enumerate(emb):
                     avg[j] += val
-            n = len(moc_embeddings)
+            n = len(compatible_embeddings)
             moc_avg_embs[moc.slug] = [v / n for v in avg]
 
     if not moc_avg_embs:

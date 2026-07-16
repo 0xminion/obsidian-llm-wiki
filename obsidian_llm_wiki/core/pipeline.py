@@ -265,6 +265,12 @@ async def run_pipeline(
                 if isinstance(res, BaseException):
                     logger.error("Synthesis failed for '%s': %s", filename, res)
                     result.errors.append(f"synth:{filename}:{res}")
+                    # A transient failure must not erase a changed source's
+                    # last successful knowledge from this render. Its state
+                    # remains unchanged, so the source retries next run.
+                    previous = changed_sources.get(filename, ("", None))[1]
+                    if previous is not None:
+                        all_syntheses_by_file[filename] = previous
                     continue
                 if res is None:
                     logger.warning(
@@ -272,6 +278,9 @@ async def run_pipeline(
                         "(tried all truncation levels)", filename,
                     )
                     result.errors.append(f"synth:{filename}: no output (permanent failure)")
+                    previous = changed_sources.get(filename, ("", None))[1]
+                    if previous is not None:
+                        all_syntheses_by_file[filename] = previous
                     continue
                 assert isinstance(res, SourceSynthesis)
                 _normalize_synthesis_identity(res)
@@ -285,6 +294,10 @@ async def run_pipeline(
         if not all_syntheses_by_file:
             if result.errors:
                 logger.error("No syntheses available (%d errors).", len(result.errors))
+            # Run the renderer with an empty bundle so obsolete generated pages
+            # are pruned after the final source is removed.
+            written = render_vault(bundle_dir, SynthesisBundle(), {}, config=config)
+            result.pages.extend(written)
             # Persist state even when no syntheses (e.g. all sources deleted).
             write_state(config.state_file, state)
             return result
@@ -326,6 +339,7 @@ async def run_pipeline(
         # When new sources reference existing concepts (from cached syntheses),
         # re-synthesize those concepts to integrate new information coherently
         # rather than just appending sections.
+        resynthesized: dict[str, ConceptNote] = {}
         if filenames_done and config.synthesis_mode == "two_pass":
             try:
                 resynthesized = await _resynthesize_referenced_concepts(
@@ -359,12 +373,37 @@ async def run_pipeline(
             "model": config.embedding_model,
             "host": config.embedding_host,
         }
+        # Load persisted embeddings to avoid recomputing for unchanged concepts.
+        # The cache is model-keyed — switching embedding models invalidates it.
+        embeddings_cache_path = config.llmwiki_dir / "embeddings.json"
+        if config.embeddings_enabled:
+            from obsidian_llm_wiki.synth.embedding import (
+                load_embeddings_cache,
+                save_embeddings_cache,
+            )
+            embeddings_cache = load_embeddings_cache(
+                embeddings_cache_path, model=config.embedding_model
+            )
         try:
+            # Build the set of new/changed concept slugs for incremental dedup.
+            new_slugs: set[str] | None = None
+            if filenames_done:
+                new_slugs = set()
+                for f in filenames_done:
+                    synth = all_syntheses_by_file.get(f)
+                    if synth:
+                        new_slugs.update(c.slug for c in synth.concepts)
+                # Re-synthesis changes a concept's semantic payload without
+                # changing its source filename. It must re-enter incremental
+                # comparison or an updated vector can bypass dedup entirely.
+                new_slugs.update(resynthesized)
+
             semantic_dedupe_concepts(
                 bundle,
                 threshold=config.similarity_dedup_threshold,
                 embeddings_cache=embeddings_cache,
                 embedding_options=embedding_options,
+                new_slugs=new_slugs,
             )
         except Exception as exc:
             logger.warning("Semantic dedup failed (continuing without): %s", exc)
@@ -378,6 +417,12 @@ async def run_pipeline(
         except Exception as exc:
             logger.warning("MoC orphan assignment failed (continuing without): %s", exc)
 
+        # Semantic dedup remaps source-local concept slugs in memory. Persist
+        # those canonical source syntheses before a later no-embedding run can
+        # resurrect a dedup victim from a pre-dedup cache.
+        for synthesis in bundle.sources:
+            save_synthesis(synthesis, config.llmwiki_dir, synthesis.source_file)
+
         cross_lingual_links: dict[str, list[tuple[str, float, str]]] = {}
         try:
             from obsidian_llm_wiki.synth.embedding import find_cross_lingual_links
@@ -387,13 +432,29 @@ async def run_pipeline(
                 enabled=config.embeddings_enabled,
                 model=config.embedding_model,
                 host=config.embedding_host,
+                embeddings_cache=embeddings_cache,
             )
         except Exception as exc:
             logger.warning("Cross-lingual linking failed (continuing without): %s", exc)
 
+        # Persist embeddings for reuse on the next run.
+        persisted_embedding_count = 0
+        if config.embeddings_enabled and embeddings_cache:
+            # Prune stale entries: only keep embeddings for concepts that
+            # survived dedup (are in the final bundle).
+            live_slugs = {c.slug for c in bundle.concepts}
+            pruned_cache = {
+                slug: vec for slug, vec in embeddings_cache.items()
+                if slug in live_slugs
+            }
+            save_embeddings_cache(
+                embeddings_cache_path, pruned_cache, model=config.embedding_model
+            )
+            persisted_embedding_count = len(pruned_cache)
+
         metrics.record_embedding(
             model=config.embedding_model if config.embeddings_enabled else "",
-            concepts_embedded=len(embeddings_cache),
+            concepts_embedded=persisted_embedding_count,
             cross_lingual_matches=len({
                 tuple(sorted((source_slug, target_slug)))
                 for source_slug, targets in cross_lingual_links.items()

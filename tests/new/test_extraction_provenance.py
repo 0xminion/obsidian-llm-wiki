@@ -57,7 +57,7 @@ def test_registry_stamps_specialized_extraction(monkeypatch):
     from obsidian_llm_wiki.ingest import extractors
 
     def _specialized(_url: str) -> SourceDoc:
-        return SourceDoc(title="Source", content="body", url="https://example.com/final")
+        return SourceDoc(title="Source", content="body " * 150, url="https://example.com/final")
 
     monkeypatch.setattr(extractors, "_EXTRACTORS", [(lambda _parsed, _raw: True, _specialized)])
 

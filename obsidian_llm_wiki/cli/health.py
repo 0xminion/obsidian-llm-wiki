@@ -69,7 +69,7 @@ def health(
 
     if json_output:
         payload = _health_json_payload(bundle_dir)
-        typer.echo(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+        typer.echo(json.dumps(payload, ensure_ascii=False, sort_keys=True))
         return
 
     report = _generate_health_report(bundle_dir)

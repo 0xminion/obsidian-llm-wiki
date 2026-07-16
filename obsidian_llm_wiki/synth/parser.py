@@ -154,6 +154,16 @@ def _extract_json(text: str) -> list[Any] | dict[str, Any] | None:
     except json.JSONDecodeError:
         pass
 
+    # Local models commonly emit LaTeX commands such as ``\epsilon`` without
+    # JSON-escaping the backslash, or stop while closing the final object.
+    # Repair only these mechanical serialization failures before extracting.
+    repaired = _repair_json_response(text)
+    if repaired != text:
+        try:
+            return json.loads(repaired)
+        except json.JSONDecodeError:
+            pass
+
     # Find the first '[' or '{' that begins a JSON block.
     start = _find_json_start(text)
     if start == -1:
@@ -169,6 +179,37 @@ def _extract_json(text: str) -> list[Any] | dict[str, Any] | None:
     except json.JSONDecodeError:
         logger.warning("Could not parse JSON from response (first 200 chars): %s", text[:200])
         return None
+
+
+def _repair_json_response(text: str) -> str:
+    """Repair invalid escapes and missing final JSON delimiters conservatively."""
+    # JSON allows only these escapes. Preserve valid sequences and double every
+    # other backslash so LaTex-like ``\epsilon`` remains literal text.
+    repaired = re.sub(r"\\(?![\"\\/bfnrtu])", r"\\\\", text)
+    stack: list[str] = []
+    in_string = False
+    escaped = False
+    for char in repaired:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            stack.append("}")
+        elif char == "[":
+            stack.append("]")
+        elif char in "}]" and stack and char == stack[-1]:
+            stack.pop()
+
+    if in_string:
+        repaired += '"'
+    return repaired + "".join(reversed(stack))
 
 
 def _find_json_start(text: str) -> int:

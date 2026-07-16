@@ -124,10 +124,14 @@ def stream_with_validated_redirects(
     **kwargs: Any,
 ) -> Iterator[httpx.Response]:
     """Stream a response after validating each redirect target before opening it."""
+    # A caller may have constructed a client with follow_redirects=True.  The
+    # helper itself is the security boundary, so never let that client setting
+    # follow a redirect before this loop validates its Location target.
+    kwargs.pop("follow_redirects", None)
     current_url = url
     for _ in range(max_redirects + 1):
         validate_remote_url(current_url)
-        with client.stream("GET", current_url, **kwargs) as response:
+        with client.stream("GET", current_url, follow_redirects=False, **kwargs) as response:
             if not response.is_redirect:
                 yield response
                 return

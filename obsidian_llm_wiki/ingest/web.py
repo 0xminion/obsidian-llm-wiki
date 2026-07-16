@@ -14,18 +14,22 @@ the full content — never truncated.
 from __future__ import annotations
 
 import logging
-import os
 import re
 import shutil
 import subprocess
+import tempfile
+from pathlib import Path
 
 import httpx
 
 from obsidian_llm_wiki.config import load_config
 from obsidian_llm_wiki.core.models import SourceDoc
 from obsidian_llm_wiki.ingest.http_headers import BROWSER_HEADERS, DEFAULT_TIMEOUT
-from obsidian_llm_wiki.ingest.proxy import make_client_kwargs
-from obsidian_llm_wiki.ingest.url_safety import stream_with_validated_redirects
+from obsidian_llm_wiki.ingest.proxy import make_client_kwargs, node_subprocess_env
+from obsidian_llm_wiki.ingest.url_safety import (
+    get_with_validated_redirects,
+    stream_with_validated_redirects,
+)
 
 logger = logging.getLogger("obswiki.ingest.web")
 
@@ -35,6 +39,23 @@ _TIMEOUT = DEFAULT_TIMEOUT
 _MAX_EXTRACTION_ERRORS = 12
 _MAX_EXTRACTION_ERROR_CHARS = 240
 _MAX_HTML_STREAM_CHUNK_BYTES = 64 * 1024
+_MAX_DEFUDDLE_OUTPUT_BYTES = 50 * 1024 * 1024
+
+
+def _run_defuddle(cmd: list[str], timeout: int, env: dict[str, str]) -> tuple[int, str, str]:
+    """Run Defuddle without retaining unbounded child output in RAM."""
+    with tempfile.TemporaryDirectory(prefix="olw-defuddle-") as tmpdir:
+        stdout_path = Path(tmpdir) / "stdout"
+        stderr_path = Path(tmpdir) / "stderr"
+        with stdout_path.open("wb") as stdout, stderr_path.open("wb") as stderr:
+            proc = subprocess.run(
+                cmd, stdout=stdout, stderr=stderr, timeout=min(timeout, 60), env=env
+            )
+        if stdout_path.stat().st_size > _MAX_DEFUDDLE_OUTPUT_BYTES:
+            raise RuntimeError(f"defuddle output exceeded {_MAX_DEFUDDLE_OUTPUT_BYTES} bytes")
+        stdout_text = stdout_path.read_text(encoding="utf-8", errors="replace")
+        stderr_text = stderr_path.read_text(encoding="utf-8", errors="replace")
+    return proc.returncode, stdout_text, stderr_text
 
 
 def _record_error(errors: list[str], stage: str, exc: Exception) -> None:
@@ -198,25 +219,18 @@ def _extract_defuddle(url: str, timeout: int) -> SourceDoc:
         # npx defuddle parse ...
         cmd = [defuddle_path, "defuddle", "parse", url, "--md"]
 
-    # Run with browser UA to reduce 403s
-    env = os.environ.copy()
-    env["NODE_EXTRA_CA_CERTS"] = ""  # Clear problematic CA certs
+    # Node cannot use SOCKS proxy variables, but valid HTTP proxy settings
+    # remain available to the subprocess.
+    env = node_subprocess_env()
 
-    proc = subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-        timeout=min(timeout, 60),
-        env=env,
-    )
+    returncode, output, stderr = _run_defuddle(cmd, timeout, env)
 
-    if proc.returncode != 0:
-        stderr = proc.stderr.strip()
+    if returncode != 0:
+        stderr = stderr.strip()
         if stderr:
-            raise RuntimeError(f"defuddle exited {proc.returncode}: {stderr[:200]}")
-        raise RuntimeError(f"defuddle exited {proc.returncode} (no stderr)")
+            raise RuntimeError(f"defuddle exited {returncode}: {stderr[:200]}")
+        raise RuntimeError(f"defuddle exited {returncode} (no stderr)")
 
-    output = proc.stdout
     if not output.strip():
         raise RuntimeError("defuddle returned empty output")
 
@@ -268,20 +282,13 @@ def _defuddle_metadata_title(url: str, timeout: int) -> str:
     else:
         cmd = [defuddle_path, "defuddle", "parse", url, "--json"]
 
-    env = os.environ.copy()
-    env["NODE_EXTRA_CA_CERTS"] = ""
+    env = node_subprocess_env()
 
     try:
-        proc = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=min(timeout, 60),
-            env=env,
-        )
-        if proc.returncode != 0:
+        returncode, output, _stderr = _run_defuddle(cmd, timeout, env)
+        if returncode != 0:
             return ""
-        data = json.loads(proc.stdout)
+        data = json.loads(output)
         return (data.get("title") or "").strip()
     except Exception:
         return ""
@@ -316,8 +323,8 @@ def _is_journal_xml_url(url: str) -> bool:
     # akjournals.com uses /article-p294.xml pattern — only match on known journal domains
     try:
         from urllib.parse import urlparse
-        host = urlparse(url).hostname or ""
-        if "akjournals" in host and "/article-" in url:
+        host = (urlparse(url).hostname or "").lower()
+        if host in {"akjournals.com", "www.akjournals.com"} and "/article-" in url:
             return True
     except Exception:
         pass
@@ -449,8 +456,8 @@ def _extract_wayback(url: str, timeout: int) -> SourceDoc:
     """Extract via archive.org Wayback Machine."""
     wayback_url = f"https://web.archive.org/web/2/{url}"
 
-    with httpx.Client(**make_client_kwargs(timeout=timeout + 20, follow_redirects=True)) as client:
-        resp = client.get(wayback_url)
+    with httpx.Client(**make_client_kwargs(timeout=timeout + 20, follow_redirects=False)) as client:
+        resp = get_with_validated_redirects(client, wayback_url)
         resp.raise_for_status()
         html = resp.text
 

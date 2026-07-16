@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
 from obsidian_llm_wiki.config import Config, load_config
@@ -14,8 +13,6 @@ def resolve_vault(vault: str) -> tuple[Path, Config]:
     """Resolve vault path and load config.  Returns (vault_path, config)."""
     vault_path = Path(vault).expanduser().resolve()
     env_file = str(vault_path / ".env") if (vault_path / ".env").exists() else None
-    if not os.environ.get("VAULT_PATH"):
-        os.environ["VAULT_PATH"] = str(vault_path)
     config = load_config(env_file=env_file, VAULT_PATH=str(vault_path))
     return vault_path, config
 

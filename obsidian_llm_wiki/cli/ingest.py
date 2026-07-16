@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import os
 import shutil
 import signal
@@ -15,6 +16,7 @@ from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import typer
 
@@ -27,6 +29,7 @@ from obsidian_llm_wiki.render.frontmatter import parse_frontmatter
 from obsidian_llm_wiki.render.obsidian import atomic_write, slugify
 
 _PlannedSource = tuple[str, str, SourceDoc | None, bool]
+logger = logging.getLogger("obswiki.cli.ingest")
 
 LEDGER_TEMPLATE = """\
 ---
@@ -112,6 +115,14 @@ def _emit(json_output: bool, event: dict[str, Any], text: str = "") -> None:
         typer.echo(json.dumps(event, ensure_ascii=False, sort_keys=True))
     elif text:
         typer.echo(text)
+
+
+def _can_retry_with_residential_proxy(url: str) -> bool:
+    """Return whether proxy fallback is permitted for this public source."""
+    hostname = (urlparse(url).hostname or "").casefold()
+    # SSRN is deliberately public-only: use its public metadata fallback, not
+    # a proxy or other access-control bypass.
+    return not (hostname == "ssrn.com" or hostname.endswith(".ssrn.com"))
 
 
 def _reserve_collision_safe_path(
@@ -390,9 +401,22 @@ def ingest(
                     assert clipped_source is not None
                     source = clipped_source
                 else:
+                    from obsidian_llm_wiki.config import extraction_environment
                     from obsidian_llm_wiki.ingest.extractors import extract
 
-                    source = extract(identifier)
+                    try:
+                        # Direct egress is the normal path. A configured
+                        # residential proxy is a bounded fallback for sites
+                        # that reject the VPS/datacenter address.
+                        with extraction_environment(config, use_residential_proxy=False):
+                            source = extract(identifier)
+                    except Exception:
+                        proxy_allowed = _can_retry_with_residential_proxy(identifier)
+                        if not config.residential_proxy_url or not proxy_allowed:
+                            raise
+                        logger.info("Retrying extraction through residential proxy: %s", identifier)
+                        with extraction_environment(config):
+                            source = extract(identifier)
                 source, truncated = _bounded_source(source, config.max_source_chars)
                 size = len(source.content.encode("utf-8"))
                 output_file = ""

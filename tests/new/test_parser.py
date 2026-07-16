@@ -52,6 +52,30 @@ def test_parse_single_array_takes_first():
     assert synth.source_title == "First"
 
 
+def test_parse_single_repairs_invalid_latex_escape():
+    response = (
+        '{"source_title":"Paper","source_summary":"Uses \\epsilon notation",'
+        '"concepts":[]}'
+    )
+
+    synth = parse_single_source_synthesis(response)
+
+    assert synth is not None
+    assert "epsilon" in synth.source_summary
+
+
+def test_parse_single_repairs_truncated_nested_json():
+    response = (
+        '{"source_title":"Paper","source_summary":"Summary",'
+        '"concepts":[{"title":"Concept","slug":"concept","summary":"Body"}'
+    )
+
+    synth = parse_single_source_synthesis(response)
+
+    assert synth is not None
+    assert synth.concepts[0].slug == "concept"
+
+
 # ── parse_synthesis_response ─────────────────────────────────────────────
 
 

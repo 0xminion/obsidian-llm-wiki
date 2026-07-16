@@ -79,7 +79,7 @@ def test_extract_unknown_url_falls_back_to_web():
     """Unknown URLs fall back to extract_web."""
     fake_source = SourceDoc(
         title="Web Page",
-        content="Web content here that is long enough.",
+        content="Web content here that is long enough. " * 20,
         url="https://example.com/article",
     )
     with patch(
@@ -95,7 +95,7 @@ def test_extract_youtube_url_routes_to_youtube_extractor():
     """YouTube URLs route to the YouTube extractor when TRANSCRIPT_API_KEY is set."""
     fake_source = SourceDoc(
         title="Test Video",
-        content="Transcript content here that is long enough for quality gates.",
+        content="Transcript content here that is long enough for quality gates. " * 20,
         url="https://www.youtube.com/watch?v=dQw4w9WgXcQ",
     )
     from obsidian_llm_wiki.ingest import extractors as reg
