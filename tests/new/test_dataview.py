@@ -198,6 +198,8 @@ def test_render_dataview_views_creates_all_files(tmp_path: Path):
     assert (views_dir / "contradictions-by-status.md").exists()
     assert (views_dir / "sources-by-freshness.md").exists()
     assert (views_dir / "index.md").exists()
+    for path in views_dir.glob("*.md"):
+        assert path.read_text(encoding="utf-8").startswith("---\n")
 
 
 def test_render_dataview_views_uses_default_contradiction_path(tmp_path: Path):
