@@ -81,6 +81,18 @@ def extract_twitter(raw_url: str) -> SourceDoc:
         RuntimeError: If all extraction strategies fail.
     """
     errors: list[str] = []
+    candidates: list[SourceDoc] = []
+
+    def collect(source: SourceDoc | None, extractor: str) -> None:
+        if source is None:
+            return
+        from obsidian_llm_wiki.ingest.extractors import _check_extraction_quality
+
+        passed, reason = _check_extraction_quality(source)
+        if not passed:
+            errors.append(f"{extractor}: rejected {reason}")
+            return
+        candidates.append(source)
 
     # ── Primary: Defuddle CLI (local) ─────────────────────────────────
     # The local defuddle CLI is the most reliable path — it renders JS-
@@ -88,33 +100,23 @@ def extract_twitter(raw_url: str) -> SourceDoc:
     # stripped (Node.js can't handle SOCKS proxies natively).
     try:
         source = _extract_via_defuddle(raw_url)
-        if source:
-            logger.info(
-                "Defuddle CLI: extracted %d chars for %s",
-                len(source.content), raw_url,
-            )
-            return source
+        collect(source, "defuddle_cli")
     except Exception as exc:
         errors.append(f"defuddle_cli: {exc}")
 
     # ── Fallback: Defuddle.md (hosted service) ────────────────────────
     try:
         source = _extract_via_defuddle_md(raw_url)
-        if source:
-            logger.info(
-                "Defuddle.md fallback: extracted %d chars for %s",
-                len(source.content), raw_url,
-            )
-            return source
+        collect(source, "defuddle_md")
     except Exception as exc:
         errors.append(f"defuddle_md: {exc}")
 
-    # ── Last resort: web extraction (trafilatura) ─────────────────────
-    try:
-        from obsidian_llm_wiki.ingest.web import extract_web
-        return extract_web(raw_url)
-    except Exception as exc:
-        errors.append(f"web: {exc}")
+    if candidates:
+        # Defuddle CLI can return a status-page preview while hosted Defuddle
+        # has the complete article. Prefer the strongest verified candidate.
+        source = max(candidates, key=lambda candidate: len(candidate.content))
+        logger.info("X extraction accepted %d chars for %s", len(source.content), raw_url)
+        return source
 
     raise RuntimeError(
         f"Twitter extraction failed for {raw_url}: " + "; ".join(errors)

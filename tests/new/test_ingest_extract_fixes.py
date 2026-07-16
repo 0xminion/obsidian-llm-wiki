@@ -209,12 +209,12 @@ def test_disclaimed_url_falls_through_to_extract_web(monkeypatch):
     monkeypatch.setattr(
         extractors,
         "extract_web",
-        lambda url: SourceDoc(title="Blog", content="web body", url=url),
+        lambda url: SourceDoc(title="Blog", content="web body " * 100, url=url),
     )
 
     source = extractors.extract("https://example.com/feed")
 
-    assert source.content == "web body"
+    assert source.content == "web body " * 100
 
 
 def test_podcast_without_transcript_or_description_raises(monkeypatch):

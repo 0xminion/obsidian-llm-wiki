@@ -294,6 +294,10 @@ async def run_pipeline(
         if not all_syntheses_by_file:
             if result.errors:
                 logger.error("No syntheses available (%d errors).", len(result.errors))
+            # Run the renderer with an empty bundle so obsolete generated pages
+            # are pruned after the final source is removed.
+            written = render_vault(bundle_dir, SynthesisBundle(), {}, config=config)
+            result.pages.extend(written)
             # Persist state even when no syntheses (e.g. all sources deleted).
             write_state(config.state_file, state)
             return result

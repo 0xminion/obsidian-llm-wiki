@@ -409,14 +409,15 @@ def test_deep_search_fallback_provenance_tagged():
 # ── extract() integration ────────────────────────────────────────────────
 
 
-def test_extract_no_deep_search_when_disabled(monkeypatch):
-    """With DEEP_SEARCH_FALLBACK unset, stubs are returned as-is (no network)."""
+def test_extract_rejects_stub_when_deep_search_disabled(monkeypatch):
+    """A stub is never accepted merely because deep search is disabled."""
     monkeypatch.delenv("DEEP_SEARCH_FALLBACK", raising=False)
     stub = SourceDoc(title="Stub", content="Too short.", url="https://example.com/x")
-    with patch("obsidian_llm_wiki.ingest.extractors.extract_web", return_value=stub):
-        result = extract("https://example.com/x")
-    # The stub is returned unchanged — no deep search attempted.
-    assert result.content == "Too short."
+    with (
+        patch("obsidian_llm_wiki.ingest.extractors.extract_web", return_value=stub),
+        pytest.raises(RuntimeError, match="too short"),
+    ):
+        extract("https://example.com/x")
 
 
 def test_extract_deep_search_replaces_stub_when_enabled(monkeypatch):
@@ -454,18 +455,19 @@ def test_extract_deep_search_not_called_when_content_is_good(monkeypatch):
     assert result.content == good_content
 
 
-def test_extract_deep_search_handles_fallback_failure(monkeypatch):
-    """When deep search itself fails, the original stub is returned."""
+def test_extract_rejects_stub_when_deep_search_fails(monkeypatch):
+    """A failed fallback cannot turn a stub into an accepted source."""
     monkeypatch.setenv("DEEP_SEARCH_FALLBACK", "1")
     stub = SourceDoc(title="Stub", content="Too short.", url="https://example.com/x")
-    with patch("obsidian_llm_wiki.ingest.extractors.extract_web", return_value=stub), \
-         patch(
+    with (
+        patch("obsidian_llm_wiki.ingest.extractors.extract_web", return_value=stub),
+        patch(
              "obsidian_llm_wiki.ingest.extractors._deep_search_fallback",
              side_effect=RuntimeError("all providers failed"),
-         ):
-        result = extract("https://example.com/x")
-    # The stub is returned unchanged because deep search failed.
-    assert result.content == "Too short."
+        ),
+        pytest.raises(RuntimeError, match="too short"),
+    ):
+        extract("https://example.com/x")
 
 
 def test_extract_deep_search_recovers_after_specialized_failure(monkeypatch):
@@ -501,18 +503,19 @@ def test_extract_deep_search_recovers_after_specialized_failure(monkeypatch):
         reg._EXTRACTORS[:] = original
 
 
-def test_extract_deep_search_does_not_replace_when_shorter(monkeypatch):
-    """Deep search result shorter than the stub is not used."""
+def test_extract_rejects_stub_when_deep_search_result_is_shorter(monkeypatch):
+    """A shorter fallback cannot make a stub acceptable."""
     monkeypatch.setenv("DEEP_SEARCH_FALLBACK", "1")
     # A stub that's just barely under 500 chars.
     stub_content = "A" * 450
     stub = SourceDoc(title="Stub", content=stub_content, url="https://example.com/x")
     shorter = SourceDoc(title="Shorter", content="B" * 100, url="https://example.com/x")
-    with patch("obsidian_llm_wiki.ingest.extractors.extract_web", return_value=stub), \
-         patch(
+    with (
+        patch("obsidian_llm_wiki.ingest.extractors.extract_web", return_value=stub),
+        patch(
              "obsidian_llm_wiki.ingest.extractors._deep_search_fallback",
              return_value=shorter,
-         ):
-        result = extract("https://example.com/x")
-    # The original stub is kept because the deep search result was shorter.
-    assert result.content == stub_content
+        ),
+        pytest.raises(RuntimeError, match="too short"),
+    ):
+        extract("https://example.com/x")

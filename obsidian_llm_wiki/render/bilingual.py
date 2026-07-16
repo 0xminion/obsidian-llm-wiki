@@ -197,11 +197,10 @@ def normalize_bilingual_titles_and_slugs(bundle: SynthesisBundle) -> dict[str, s
     for synthesis in bundle.sources:
         if not is_chinese(synthesis.source_title):
             continue
-        if has_latin(synthesis.source_title):
-            synthesis.source_title = ensure_english_first_bilingual(
-                synthesis.source_title,
-                slug=slugify(synthesis.source_title),
-            )
+        existing = split_bilingual_title(synthesis.source_title)
+        if existing:
+            english, chinese = existing
+            synthesis.source_title = f"{english} ({chinese})"
             continue
         concept_titles = [
             english_side(concept.title) or title_from_slug(concept.slug)
