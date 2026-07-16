@@ -575,27 +575,17 @@ class TestExtractedModulesAreCanonical:
         assert body == "Body text"
 
 
-# ── 11. _synthesize_with_retry truncation logic ──────────────────────────
+# ── 11. _synthesize_with_retry lossless policy ───────────────────────────
 
 
-class TestSynthesizeWithRetryTruncation:
-    """Test that _synthesize_with_retry correctly truncates content."""
+class TestSynthesizeWithRetryPolicy:
+    """Large source handling must preserve source content."""
 
-    def test_truncation_levels_constant(self):
-        """Verify the truncation levels are [None, 50K, 20K]."""
-        from obsidian_llm_wiki.core.pipeline import _TRUNCATION_LEVELS
-        assert _TRUNCATION_LEVELS == [None, 50_000, 20_000]
+    def test_bounded_structured_output_policy(self):
+        """The synthesis request has a practical output cap, not 128K."""
+        from obsidian_llm_wiki.core.pipeline import _SYNTHESIS_NUM_PREDICT
 
-    def test_short_content_no_truncation(self):
-        """Short content should not be truncated at any level."""
-        from obsidian_llm_wiki.core.pipeline import _TRUNCATION_LEVELS
-
-        content_len = 1000
-        for level in _TRUNCATION_LEVELS:
-            if level is None:
-                assert content_len <= level if level else True
-            else:
-                assert content_len < level  # No truncation needed
+        assert _SYNTHESIS_NUM_PREDICT == 16_384
 
 
 # ── 12. extract_links consistency note ──────────────────────────────────

@@ -140,11 +140,12 @@ def build_synthesis_prompt(
     # User policy is deliberately isolated from fixed rules and source content.
     schema_guidance = format_schema_guidance(schema_policy, granularity)
 
-    # Key findings instruction — surface ALL, no cap
+    # Ask for coverage without allowing a source to explode into a massive,
+    # repetitive JSON payload. Concepts, claims, and quotes carry the detail.
     findings_instruction = (
-        "\n* Surface ALL key findings — do not limit to 5. Include every "
-        "substantive claim, data point, and insight in the source. "
-        "It is better to surface more than fewer."
+        "\n* Capture the substantive findings comprehensively but concisely. "
+        "Use 4-12 non-redundant key points; represent additional detail in "
+        "the concept sections and evidence-backed claims."
     )
 
     return f"""You are a knowledge synthesis engine.  Analyse the source document \
@@ -171,6 +172,7 @@ the key tension, how the concepts interact, and why this grouping matters.
 "is_new" to false for concepts that already exist.
 * Surface ALL available insights — do not produce stubs or shallow summaries.
 * Claims should be specific, evidence-backed statements from the source. Include an exact verbatim supporting quote for every claim; do not paraphrase the quote.
+* Keep each concept to its 1-3 strongest claims and quote only the minimum exact span needed to support each claim.
 {findings_instruction}{lang_instruction}
 {schema_guidance}
 {RELATIONSHIP_FEWSHOT}

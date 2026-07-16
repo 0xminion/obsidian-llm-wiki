@@ -415,7 +415,7 @@ def test_extract_rejects_stub_when_deep_search_disabled(monkeypatch):
     stub = SourceDoc(title="Stub", content="Too short.", url="https://example.com/x")
     with (
         patch("obsidian_llm_wiki.ingest.extractors.extract_web", return_value=stub),
-        pytest.raises(RuntimeError, match="too short"),
+        pytest.raises(RuntimeError, match="too short, likely stub"),
     ):
         extract("https://example.com/x")
 
@@ -462,10 +462,10 @@ def test_extract_rejects_stub_when_deep_search_fails(monkeypatch):
     with (
         patch("obsidian_llm_wiki.ingest.extractors.extract_web", return_value=stub),
         patch(
-             "obsidian_llm_wiki.ingest.extractors._deep_search_fallback",
-             side_effect=RuntimeError("all providers failed"),
+            "obsidian_llm_wiki.ingest.extractors._deep_search_fallback",
+            side_effect=RuntimeError("all providers failed"),
         ),
-        pytest.raises(RuntimeError, match="too short"),
+        pytest.raises(RuntimeError, match="too short, likely stub"),
     ):
         extract("https://example.com/x")
 
@@ -513,9 +513,9 @@ def test_extract_rejects_stub_when_deep_search_result_is_shorter(monkeypatch):
     with (
         patch("obsidian_llm_wiki.ingest.extractors.extract_web", return_value=stub),
         patch(
-             "obsidian_llm_wiki.ingest.extractors._deep_search_fallback",
-             return_value=shorter,
+            "obsidian_llm_wiki.ingest.extractors._deep_search_fallback",
+            return_value=shorter,
         ),
-        pytest.raises(RuntimeError, match="too short"),
+        pytest.raises(RuntimeError, match="too short, likely stub"),
     ):
         extract("https://example.com/x")

@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import logging
 from contextlib import suppress
+from hashlib import sha256
 from pathlib import Path
 
 from obsidian_llm_wiki.core.models import (
@@ -28,6 +29,7 @@ from obsidian_llm_wiki.core.source_files import validate_source_filename
 from obsidian_llm_wiki.render.obsidian import atomic_write, safe_read_file
 
 logger = logging.getLogger("obswiki.core.cache")
+_MAX_CACHE_FILENAME_BYTES = 200
 
 __all__ = [
     "synthesis_cache_dir",
@@ -50,8 +52,19 @@ def synthesis_cache_dir(cache_root: Path) -> Path:
 
 
 def synthesis_cache_path(cache_root: Path, source_file: str) -> Path:
-    """Return the cache JSON path for a given source filename."""
-    return synthesis_cache_dir(cache_root) / f"{validate_source_filename(source_file)}.json"
+    """Return a filesystem-safe cache path for a source filename.
+
+    Source filenames are user-visible and may legitimately approach ext4's
+    255-byte component limit. Atomic writes append a temporary suffix, so
+    using the source filename verbatim can fail only at cache persistence.
+    Long names use a stable digest; the original filename remains in the
+    serialized ``source_file`` field for reverse lookup.
+    """
+    filename = validate_source_filename(source_file)
+    candidate = f"{filename}.json"
+    if len(candidate.encode("utf-8")) > _MAX_CACHE_FILENAME_BYTES:
+        candidate = f"sha256-{sha256(filename.encode('utf-8')).hexdigest()}.json"
+    return synthesis_cache_dir(cache_root) / candidate
 
 
 def save_synthesis(
@@ -104,23 +117,24 @@ def load_all_cached_syntheses(cache_root: Path) -> dict[str, SourceSynthesis]:
 
     result: dict[str, SourceSynthesis] = {}
     for f in sorted(cache_dir.glob("*.json")):
-        source_file = f.stem  # e.g. "article.md.json" → "article.md"
+        fallback_source_file = f.stem  # e.g. "article.md.json" → "article.md"
         raw = safe_read_file(f)
         if not raw.strip():
             continue
         try:
             data = json.loads(raw)
         except json.JSONDecodeError:
-            logger.warning("Corrupt synthesis cache for '%s' — skipping.", source_file)
+            logger.warning("Corrupt synthesis cache for '%s' — skipping.", fallback_source_file)
             continue
         if not isinstance(data, dict):
-            logger.warning("Invalid synthesis cache for '%s' — skipping.", source_file)
+            logger.warning("Invalid synthesis cache for '%s' — skipping.", fallback_source_file)
             continue
         try:
             synth = source_synthesis_from_dict(data)
         except (AttributeError, KeyError, TypeError, ValueError):
-            logger.warning("Invalid synthesis cache for '%s' — skipping.", source_file)
+            logger.warning("Invalid synthesis cache for '%s' — skipping.", fallback_source_file)
             continue
+        source_file = synth.source_file or fallback_source_file
         synth.source_file = source_file
         result[source_file] = synth
     return result

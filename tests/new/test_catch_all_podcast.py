@@ -175,7 +175,7 @@ def test_catch_all_extracts_when_podcast_found(monkeypatch):
 
     fake_doc = SourceDoc(
         title="Unknown Podcast Episode",
-        content="Transcript content here",
+        content="Transcript content here. " * 30,
         url="https://example.com/unknown-podcast/episode-1",
     )
     monkeypatch.setattr(podcast, "_extract_podcast", lambda *_a, **_kw: fake_doc)
@@ -183,6 +183,21 @@ def test_catch_all_extracts_when_podcast_found(monkeypatch):
     result = podcast.extract_catch_all_podcast("https://example.com/unknown-podcast/episode-1")
     assert result.title == "Unknown Podcast Episode"
     assert "Transcript content" in result.content
+
+
+def test_catch_all_disclaims_metadata_only_stub(monkeypatch):
+    """A short description must fall through to generic article extraction."""
+    from obsidian_llm_wiki.core.models import SourceDoc
+
+    monkeypatch.setattr(podcast, "_looks_like_podcast_page", lambda _url: True)
+    monkeypatch.setattr(
+        podcast,
+        "_extract_podcast",
+        lambda *_args, **_kwargs: SourceDoc(title="Stub", content="Brief description."),
+    )
+
+    with pytest.raises(ExtractorNotApplicableError, match="too short"):
+        podcast.extract_catch_all_podcast("https://example.com/apparently-a-podcast")
 
 
 def test_catch_all_does_not_match_twitter_domains():

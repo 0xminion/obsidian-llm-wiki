@@ -58,6 +58,35 @@ _STUB_MARKERS = (
     "cookie wall",
 )
 
+_LOGIN_SHELL_MARKERS = (
+    "[log in](https://x.com/i/jf/onboarding",
+    "[sign up](https://x.com/i/jf/onboarding",
+    "onboarding/web?mode=login",
+)
+
+
+def _is_bad_twitter_title(title: str) -> bool:
+    """Whether a title is URL/page chrome rather than source metadata."""
+    cleaned = (title or "").strip().lower()
+    return (
+        not cleaned
+        or cleaned.startswith("](")
+        or cleaned.startswith("# ](")
+        or cleaned.startswith("https://x.com/")
+        or cleaned.startswith("https://twitter.com/")
+        or cleaned in {"post", "x", "twitter"}
+    )
+
+
+def _is_usable_twitter_source(source: SourceDoc | None) -> bool:
+    """Reject X login chrome and URL-derived titles before persistence."""
+    if source is None or _is_bad_twitter_title(source.title):
+        return False
+    content = (source.content or "").lower()
+    if any(marker.lower() in content for marker in _STUB_MARKERS):
+        return False
+    return not any(marker in content for marker in _LOGIN_SHELL_MARKERS)
+
 
 def _is_twitter_url(parsed, raw: str) -> bool:
     """Match Twitter/X URLs."""
@@ -86,11 +115,8 @@ def extract_twitter(raw_url: str) -> SourceDoc:
     def collect(source: SourceDoc | None, extractor: str) -> None:
         if source is None:
             return
-        from obsidian_llm_wiki.ingest.extractors import _check_extraction_quality
-
-        passed, reason = _check_extraction_quality(source)
-        if not passed:
-            errors.append(f"{extractor}: rejected {reason}")
+        if not _is_usable_twitter_source(source):
+            errors.append(f"{extractor}: rejected too short, likely stub")
             return
         candidates.append(source)
 
@@ -117,7 +143,6 @@ def extract_twitter(raw_url: str) -> SourceDoc:
         source = max(candidates, key=lambda candidate: len(candidate.content))
         logger.info("X extraction accepted %d chars for %s", len(source.content), raw_url)
         return source
-
     raise RuntimeError(
         f"Twitter extraction failed for {raw_url}: " + "; ".join(errors)
     )
@@ -191,8 +216,8 @@ def _extract_via_defuddle_md(url: str) -> SourceDoc | None:
             if line.startswith("# "):
                 title = line[2:].strip()
                 break
-    if not title:
-        title = url
+    if _is_bad_twitter_title(title):
+        return None
 
     # Strip cover image markdown from content start
     if content.startswith("!["):
@@ -201,7 +226,8 @@ def _extract_via_defuddle_md(url: str) -> SourceDoc | None:
     if not content or len(content.strip()) < 50:
         return None
 
-    return SourceDoc(title=title, content=content.strip(), url=url)
+    source = SourceDoc(title=title, content=content.strip(), url=url)
+    return source if _is_usable_twitter_source(source) else None
 
 
 def _extract_article_title_from_content(markdown: str) -> str:
@@ -286,13 +312,20 @@ def _extract_via_defuddle(url: str) -> SourceDoc | None:
         # article title from the content — it appears as the first
         # substantial text line after image/link markdown, often after
         # an "Article" label.
-        if not title or title.endswith(" on X") or title.endswith(" on Twitter"):
+        # Also fix broken markdown fragments like "](https://x.com/handle)"
+        # that defuddle sometimes produces as the # heading for short tweets.
+        _is_bad_title = (
+            _is_bad_twitter_title(title)
+            or title.endswith(" on X")
+            or title.endswith(" on Twitter")
+        )
+        if _is_bad_title:
             extracted_title = _extract_article_title_from_content(output)
             if extracted_title:
                 title = extracted_title
 
-        if not title:
-            title = url
+        if _is_bad_twitter_title(title):
+            return None
 
         # Strip image markdown from content
         content = output
@@ -302,7 +335,8 @@ def _extract_via_defuddle(url: str) -> SourceDoc | None:
         if len(content) < 50:
             return None
 
-        return SourceDoc(title=title, content=content, url=url)
+        source = SourceDoc(title=title, content=content, url=url)
+        return source if _is_usable_twitter_source(source) else None
 
     except Exception:
         return None

@@ -308,6 +308,7 @@ def ingest(
     # one URL on the first line. These are merged with explicit --url
     # args and deduplicated.
     inbox_urls = _scan_inbox_urls(config)
+    inbox_url_paths = _inbox_url_paths(config)
     if inbox_urls and not json_output:
         typer.echo(f"📥 Found {len(inbox_urls)} URL(s) in 00-Inbox/")
     all_urls = list(dict.fromkeys([*requested_urls, *inbox_urls]))
@@ -468,6 +469,8 @@ def ingest(
                                 archive_dest = _archive_clipping(clipping_path, config)
                                 if archive_dest is not None:
                                     processed_clipping_paths.append(archive_dest)
+                        elif source_kind == "url":
+                            _archive_inbox_url_files(inbox_url_paths.pop(identifier, []), config)
                         continue
 
                     filepath = _reserve_collision_safe_path(
@@ -502,6 +505,8 @@ def ingest(
                             archive_dest = _archive_clipping(clipping_path, config)
                             if archive_dest is not None:
                                 processed_clipping_paths.append(archive_dest)
+                    elif source_kind == "url":
+                        _archive_inbox_url_files(inbox_url_paths.pop(identifier, []), config)
                 new_count += 1
                 _emit(
                     json_output,
@@ -768,3 +773,53 @@ def _scan_inbox_urls(config: Any) -> list[str]:
             continue
 
     return urls
+
+
+def _inbox_url_paths(config: Any) -> dict[str, list[Path]]:
+    """Map queued URLs to their source files so only successes are archived."""
+    inbox_dir = config.vault / "00-Inbox"
+    if not inbox_dir.is_dir():
+        return {}
+    paths: dict[str, list[Path]] = {}
+    for path in sorted(inbox_dir.iterdir()):
+        if path.suffix != ".url" or not path.is_file():
+            continue
+        try:
+            url = next(
+                (
+                    line.strip()
+                    for line in path.read_text(encoding="utf-8").splitlines()
+                    if line.strip().startswith(("http://", "https://"))
+                ),
+                "",
+            )
+        except OSError:
+            continue
+        if url:
+            paths.setdefault(url, []).append(path)
+    return paths
+
+
+def _archive_inbox_url_files(paths: list[Path], config: Any) -> list[Path]:
+    """Archive successfully ingested 00-Inbox URL records without reprocessing them."""
+    if not paths:
+        return []
+    archive_dir = config.vault / "00-Inbox" / "processed"
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    archived: list[Path] = []
+    for path in paths:
+        if not path.is_file():
+            continue
+        destination = archive_dir / path.name
+        if destination.exists():
+            for index in range(1, 100):
+                candidate = archive_dir / f"{path.stem}-{index}{path.suffix}"
+                if not candidate.exists():
+                    destination = candidate
+                    break
+        try:
+            shutil.move(str(path), str(destination))
+        except OSError:
+            continue
+        archived.append(destination)
+    return archived

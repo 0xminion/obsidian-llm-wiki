@@ -31,14 +31,23 @@ __all__ = [
 ]
 
 
-def slugify(text: str) -> str:
-    """Convert arbitrary text to a filename-safe slug."""
+def slugify(text: str, max_len: int = 120) -> str:
+    """Convert arbitrary text to a filename-safe slug.
+
+    The slug is capped at *max_len* characters to prevent ENAMETOOLONG
+    errors on filesystems with 255-byte filename limits.  Titles with
+    long acknowledgment or footnote sections (common on arXiv papers)
+    would otherwise produce slugs exceeding 255 bytes.
+    """
     cleaned = text.replace("'", "").replace("\u2018", "").replace("\u2019", "")
     cleaned = re.sub(r"[^\w\s-]", "", cleaned, flags=re.UNICODE)
     cleaned = re.sub(r"\s+", "-", cleaned)
     cleaned = re.sub(r"-+", "-", cleaned)
     slug = cleaned.strip("-").lower()
-    return slug[:120].rstrip("-") or "untitled"
+    # Truncate at a word boundary to avoid dangling hyphens.
+    if len(slug) > max_len:
+        slug = slug[:max_len].rsplit("-", 1)[0]
+    return slug if slug else "untitled"
 
 
 def make_wikilink(slug: str, alias: str | None = None) -> str:

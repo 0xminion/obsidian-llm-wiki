@@ -33,6 +33,15 @@ _PARENTHETICAL_ALIAS_RE = re.compile(r"\(([^()]+)\)")
 _MAX_ALIAS_CANDIDATE_CHARS = 160
 
 
+def _content_markdown_files(bundle_dir: Path) -> list[Path]:
+    """Return live vault notes, never pipeline state or quarantine evidence."""
+    return sorted(
+        path
+        for path in bundle_dir.rglob("*.md")
+        if not ({".llmwiki", "views"} & set(path.relative_to(bundle_dir).parts))
+    )
+
+
 def _normalize_wikilink_target(target: str) -> str:
     """Reduce a raw wikilink target to the bare note stem Obsidian resolves."""
     stem = target.split("#", 1)[0].strip()
@@ -135,7 +144,7 @@ def _finding_payload(finding: MaintenanceFinding) -> dict[str, Any]:
 
 def _scan_maintenance_findings(bundle_dir: Path) -> tuple[int, list[MaintenanceFinding]]:
     """Scan deterministic repair candidates without writing vault content."""
-    all_md_files = sorted(bundle_dir.rglob("*.md"))
+    all_md_files = _content_markdown_files(bundle_dir)
     concept_stems = {file.stem for file in all_md_files if file.parent.name == "concepts"}
     moced_slugs = _moced_concept_slugs(bundle_dir, concept_stems)
     findings: list[MaintenanceFinding] = []
@@ -312,7 +321,7 @@ def _alias_findings(
 def _generate_health_report(bundle_dir: Path) -> str:
     """Generate the original human-oriented health report markdown string."""
     sections: list[str] = []
-    all_md_files = sorted(bundle_dir.rglob("*.md"))
+    all_md_files = _content_markdown_files(bundle_dir)
     all_stems = {file.stem for file in all_md_files}
     concept_stems = {file.stem for file in all_md_files if file.parent.name == "concepts"}
     source_stems = {file.stem for file in all_md_files if file.parent.name == "sources"}

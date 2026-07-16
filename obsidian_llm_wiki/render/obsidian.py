@@ -606,6 +606,7 @@ class _RenderTransaction:
         self._staging_dir = Path(self._staging.name)
         self._root_existed = bundle_dir.exists()
         self._original_files: set[Path] = set()
+        self._passthrough_files: set[Path] = set()
         self._original_dirs: set[Path] = set()
         self._expected_outputs: dict[Path, str | None] = {}
         self._snapshot()
@@ -626,6 +627,16 @@ class _RenderTransaction:
                 self._original_dirs.add(relative)
                 continue
             if not path.is_file():
+                continue
+            # Backup files are append-only during a render: existing snapshots
+            # are never mutated, only new uniquely named files are added. Keep
+            # their names for rollback (which removes new files), but do not
+            # copy thousands of historical backups before every render.
+            # Copying that immutable archive made a no-op 800-note render take
+            # minutes and turns a 50k-note vault into an I/O denial of service.
+            if relative.parts[:2] == (".llmwiki", "backups"):
+                self._original_files.add(relative)
+                self._passthrough_files.add(relative)
                 continue
             destination = self._staging_dir / relative
             destination.parent.mkdir(parents=True, exist_ok=True)
@@ -655,6 +666,8 @@ class _RenderTransaction:
                         logger.warning("Preserving concurrent edit during rollback: %s", path)
 
         for relative in self._original_files:
+            if relative in self._passthrough_files:
+                continue
             source = self._staging_dir / relative
             destination = self.bundle_dir / relative
             if relative in self._expected_outputs:

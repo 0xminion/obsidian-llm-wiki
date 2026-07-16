@@ -94,14 +94,20 @@ def normalise_tags(tags: list[str]) -> list[str]:
 # ── Slugify ─────────────────────────────────────────────────────────────
 
 
-def slugify(text: str) -> str:
-    """Convert arbitrary text to a filename-safe slug."""
+def slugify(text: str, max_len: int = 120) -> str:
+    """Convert arbitrary text to a filename-safe slug.
+
+    Capped at *max_len* characters to prevent ENAMETOOLONG on 255-byte
+    filename limits (arXiv titles with long acknowledgments, etc.).
+    """
     cleaned = text.replace("'", "").replace("\u2018", "").replace("\u2019", "")
     cleaned = re.sub(r"[^\w\s-]", "", cleaned, flags=re.UNICODE)
     cleaned = re.sub(r"\s+", "-", cleaned)
     cleaned = re.sub(r"-+", "-", cleaned)
     slug = cleaned.strip("-").lower()
-    return slug[:120].rstrip("-") or "untitled"
+    if len(slug) > max_len:
+        slug = slug[:max_len].rsplit("-", 1)[0]
+    return slug if slug else "untitled"
 
 
 # ── Concept merging ─────────────────────────────────────────────────────

@@ -234,6 +234,9 @@ def extract_scientific_html(html: str, source_url: str) -> SourceDoc:
     metadata = trafilatura.extract_metadata(html)
     title = (metadata.title or "").strip() if metadata else ""
     title = title or _title_from_html(html) or source_url
+    # Strip arXiv acknowledgment artifacts (††thanks: ...) that trafilatura
+    # sometimes folds into the title metadata.
+    title = re.split(r"\u2020\u2020thanks:|††thanks:", title, flags=re.IGNORECASE)[0].strip()
     return SourceDoc(title=title, content=content.strip(), url=source_url)
 
 
