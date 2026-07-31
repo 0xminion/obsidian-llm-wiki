@@ -28,7 +28,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from typing import Any
 
 from obsidian_llm_wiki.core.models import (
@@ -41,7 +41,9 @@ from obsidian_llm_wiki.core.models import (
     SourceSynthesis,
     normalize_relation,
 )
+from obsidian_llm_wiki.core.request_limiter import AsyncRequestLimiter
 from obsidian_llm_wiki.core.schema import Granularity, SchemaPolicy, format_schema_guidance
+from obsidian_llm_wiki.synth.evidence_windows import build_evidence_window
 from obsidian_llm_wiki.synth.parser import parse_single_source_synthesis
 
 logger = logging.getLogger("obswiki.synth.quality")
@@ -56,6 +58,62 @@ _SYSTEM_SYNTH = (
     "You are a knowledge synthesis engine. "
     "Return ONLY a JSON object, no prose, no code fences."
 )
+
+
+async def _call_llm_limited(
+    prompt: str,
+    messages: list[dict[str, str]],
+    config: Any,
+    *,
+    task: str,
+    request_limiter: AsyncRequestLimiter | None,
+) -> str:
+    """Route every quality-phase request through the run-level limiter."""
+    from obsidian_llm_wiki.providers.llm import acall_llm
+
+    if request_limiter is None:
+        return await acall_llm(prompt, messages, config, task=task)
+    async with request_limiter.slot():
+        return await acall_llm(prompt, messages, config, task=task)
+
+
+def _config_int(config: Any, name: str, default: int, *, minimum: int = 0) -> int:
+    value = getattr(config, name, default)
+    if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+        return default
+    return value
+
+
+async def _bounded_map(
+    items: list[Any],
+    worker: Callable[[Any], Awaitable[Any]],
+    *,
+    max_workers: int,
+) -> list[Any | BaseException]:
+    """Map async work without creating one live coroutine per corpus item."""
+    if not items:
+        return []
+    iterator = iter(enumerate(items))
+    results: list[Any | BaseException] = [RuntimeError("work not started")] * len(items)
+
+    async def _run_worker() -> None:
+        while True:
+            try:
+                index, item = next(iterator)
+            except StopIteration:
+                return
+            try:
+                results[index] = await worker(item)
+            except BaseException as exc:
+                results[index] = exc
+
+    await asyncio.gather(
+        *(
+            _run_worker()
+            for _ in range(min(len(items), max(1, max_workers)))
+        )
+    )
+    return results
 
 __all__ = [
     "quality_synthesize_source",
@@ -754,6 +812,7 @@ async def quality_synthesize_source(
     *,
     schema_policy: SchemaPolicy | Mapping[str, Any] | None = None,
     granularity: Granularity | str | None = None,
+    request_limiter: AsyncRequestLimiter | None = None,
 ) -> SourceSynthesis | None:
     """Run the two-pass quality synthesis for one source.
 
@@ -767,8 +826,6 @@ async def quality_synthesize_source(
 
     Returns a complete SourceSynthesis with expanded concept bodies.
     """
-    from obsidian_llm_wiki.providers.llm import acall_llm
-
     # Detect source language for correct prompt instructions
     source_lang = ""
     try:
@@ -792,32 +849,35 @@ async def quality_synthesize_source(
             filename, content_len, len(chunks), chunk_size,
         )
 
-        # Run Pass 1 on each chunk concurrently
-        sem = asyncio.Semaphore(config.compile_concurrency)
-
         async def _extract_chunk(chunk_content: str) -> str:
-            async with sem:
-                prompt = build_extract_prompt(
-                    source.title,
-                    chunk_content,
-                    existing_concepts=existing_concepts,
-                    language=source_lang or config.output_language,
-                    schema_policy=schema_policy,
-                    granularity=granularity,
-                )
-                msgs = [
-                    {"role": "system", "content": _SYSTEM_EXTRACT},
-                    {"role": "user", "content": prompt},
-                ]
-                return await acall_llm(prompt, msgs, config, task="ingest")
+            prompt = build_extract_prompt(
+                source.title,
+                chunk_content,
+                existing_concepts=existing_concepts,
+                language=source_lang or config.output_language,
+                schema_policy=schema_policy,
+                granularity=granularity,
+            )
+            msgs = [
+                {"role": "system", "content": _SYSTEM_EXTRACT},
+                {"role": "user", "content": prompt},
+            ]
+            return await _call_llm_limited(
+                prompt,
+                msgs,
+                config,
+                task="ingest",
+                request_limiter=request_limiter,
+            )
 
         # Let every chunk finish, then fail loudly if ANY chunk failed. A
         # partial skeleton must never propagate as success: the pipeline would
         # cache it and hash-stamp the source, permanently losing the failed
         # chunks' content with no error recorded and no retry on later runs.
-        chunk_responses = await asyncio.gather(
-            *[_extract_chunk(c) for c in chunks],
-            return_exceptions=True,
+        chunk_responses = await _bounded_map(
+            chunks,
+            _extract_chunk,
+            max_workers=config.compile_concurrency,
         )
 
         # Parse each chunk's response into a skeleton
@@ -876,7 +936,13 @@ async def quality_synthesize_source(
         ]
 
         try:
-            response = await acall_llm(extract_prompt, messages, config, task="ingest")
+            response = await _call_llm_limited(
+                extract_prompt,
+                messages,
+                config,
+                task="ingest",
+                request_limiter=request_limiter,
+            )
         except Exception as exc:
             logger.error("Pass 1 (extract) failed for '%s': %s", filename, exc)
             raise
@@ -918,25 +984,23 @@ async def quality_synthesize_source(
         {"slug": c.slug, "title": c.title} for c in skeleton.concepts
     ]
 
-    sem = asyncio.Semaphore(config.compile_concurrency)
+    async def _expand(concept: ConceptNote) -> ConceptNote | None:
+        return await _expand_one_concept(
+            config,
+            concept,
+            source,
+            all_concept_dicts,
+            source_lang,
+            rationale=rationales.get(concept.slug, ""),
+            schema_policy=schema_policy,
+            granularity=granularity,
+            request_limiter=request_limiter,
+        )
 
-    async def _run_with_sem(task_coro):
-        async with sem:
-            return await task_coro
-
-    expand_results = await asyncio.gather(
-        *[
-            _run_with_sem(
-                _expand_one_concept(
-                    config, concept, source, all_concept_dicts, source_lang,
-                    rationale=rationales.get(concept.slug, ""),
-                    schema_policy=schema_policy,
-                    granularity=granularity,
-                )
-            )
-            for concept in skeleton.concepts
-        ],
-        return_exceptions=True,
+    expand_results = await _bounded_map(
+        skeleton.concepts,
+        _expand,
+        max_workers=config.compile_concurrency,
     )
 
     # ── Merge expanded concepts back into skeleton ─────────────────────
@@ -1058,6 +1122,7 @@ async def multi_model_entry_synthesize_source(
     *,
     schema_policy: SchemaPolicy | Mapping[str, Any] | None = None,
     granularity: Granularity | str | None = None,
+    request_limiter: AsyncRequestLimiter | None = None,
 ) -> SourceSynthesis | None:
     """Run entry synthesis with both the default and PASS2 model, then merge.
 
@@ -1086,6 +1151,7 @@ async def multi_model_entry_synthesize_source(
         return await quality_synthesize_source(
             config, filename, source, existing_concepts,
             schema_policy=schema_policy, granularity=granularity,
+            request_limiter=request_limiter,
         )
 
     logger.info(
@@ -1108,6 +1174,7 @@ async def multi_model_entry_synthesize_source(
     primary = await quality_synthesize_source(
         config_primary, filename, source, existing_concepts,
         schema_policy=schema_policy, granularity=granularity,
+        request_limiter=request_limiter,
     )
 
     # ── Secondary run: PASS2_MODEL for both passes ───────────────────
@@ -1121,6 +1188,7 @@ async def multi_model_entry_synthesize_source(
     secondary = await quality_synthesize_source(
         config_secondary, filename, source, existing_concepts,
         schema_policy=schema_policy, granularity=granularity,
+        request_limiter=request_limiter,
     )
 
     # ── Merge or fall back ──────────────────────────────────────────
@@ -1157,16 +1225,25 @@ async def _expand_one_concept(
     *,
     schema_policy: SchemaPolicy | Mapping[str, Any] | None = None,
     granularity: Granularity | str | None = None,
+    request_limiter: AsyncRequestLimiter | None = None,
 ) -> ConceptNote | None:
     """Expand a single concept via a focused LLM call."""
-    from obsidian_llm_wiki.providers.llm import acall_llm
-
+    evidence = build_evidence_window(
+        source.content,
+        terms=[concept.title, concept.slug, rationale, *concept.aliases],
+        char_budget=_config_int(
+            config, "evidence_window_chars", 15_000, minimum=256
+        ),
+        context_paragraphs=_config_int(
+            config, "evidence_context_paragraphs", 1, minimum=0
+        ),
+    )
     prompt = build_expand_prompt(
         concept_title=concept.title,
         concept_slug=concept.slug,
         concept_rationale=rationale or concept.summary,
         source_title=source.title,
-        source_content=source.content,
+        source_content=evidence.text,
         all_concepts=all_concepts,
         language=source_lang or config.output_language,
         schema_policy=schema_policy,
@@ -1178,7 +1255,13 @@ async def _expand_one_concept(
     ]
 
     try:
-        response = await acall_llm(prompt, messages, config, task="expand")
+        response = await _call_llm_limited(
+            prompt,
+            messages,
+            config,
+            task="expand",
+            request_limiter=request_limiter,
+        )
     except Exception as exc:
         logger.error("Pass 2 LLM call failed for '%s': %s", concept.slug, exc)
         raise
@@ -1359,6 +1442,8 @@ async def resynthesize_concept(
     concept: ConceptNote,
     new_source_content: str,
     new_source_title: str = "",
+    *,
+    request_limiter: AsyncRequestLimiter | None = None,
 ) -> ConceptNote | None:
     """Re-synthesize an existing concept using new source content.
 
@@ -1376,12 +1461,21 @@ async def resynthesize_concept(
     Returns:
         Updated ConceptNote with re-synthesized body, or None if LLM fails.
     """
-    from obsidian_llm_wiki.providers.llm import acall_llm
-
     # Build the re-synthesis prompt
     existing_sections = "\n\n".join(
         f"## {s.heading}\n{s.prose or chr(10).join(f'- {p}' for p in s.points)}"
         for s in concept.sections
+    )
+
+    evidence = build_evidence_window(
+        new_source_content,
+        terms=[concept.title, concept.slug, concept.summary, *concept.aliases],
+        char_budget=_config_int(
+            config, "evidence_window_chars", 15_000, minimum=256
+        ),
+        context_paragraphs=_config_int(
+            config, "evidence_context_paragraphs", 1, minimum=0
+        ),
     )
 
     prompt = f"""You are updating an existing knowledge wiki concept \
@@ -1397,7 +1491,7 @@ with new information from a newly ingested source.
 
 ## New Source: {new_source_title or 'Untitled'}
 
-{new_source_content[:15000]}
+{evidence.text}
 
 ## Task
 
@@ -1436,7 +1530,13 @@ Return JSON:
     ]
 
     try:
-        response = await acall_llm(prompt, messages, config, task="ingest")
+        response = await _call_llm_limited(
+            prompt,
+            messages,
+            config,
+            task="ingest",
+            request_limiter=request_limiter,
+        )
     except Exception as exc:
         logger.error("Concept re-synthesis failed for '%s': %s", concept.slug, exc)
         return None

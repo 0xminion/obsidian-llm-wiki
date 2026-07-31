@@ -25,6 +25,7 @@ from __future__ import annotations
 import logging
 import math
 import re
+from collections.abc import Mapping, Sequence
 
 from obsidian_llm_wiki.core.models import (
     ConceptNote,
@@ -41,6 +42,7 @@ __all__ = [
     "propagate_backlinks",
     "semantic_dedupe_concepts",
     "assign_orphans_to_mocs",
+    "ensure_concept_embeddings",
 ]
 
 logger = logging.getLogger("obswiki.synth.dedupe")
@@ -304,6 +306,15 @@ def _embed_concepts_batch(
             embeddings_cache[concept.slug] = emb
 
 
+def ensure_concept_embeddings(
+    concepts: list[ConceptNote],
+    embeddings_cache: dict[str, list[float]],
+    embedding_options: dict[str, object] | None = None,
+) -> None:
+    """Populate missing concept vectors in provider-sized batches."""
+    _embed_concepts_batch(concepts, embeddings_cache, embedding_options)
+
+
 def semantic_dedupe_concepts(
     bundle: SynthesisBundle,
     threshold: float = 0.85,
@@ -311,6 +322,7 @@ def semantic_dedupe_concepts(
     embeddings_cache: dict[str, list[float]] | None = None,
     embedding_options: dict[str, object] | None = None,
     new_slugs: set[str] | None = None,
+    candidate_slugs_by_slug: Mapping[str, Sequence[str]] | None = None,
 ) -> None:
     """Merge same-language concepts with high embedding cosine similarity.
 
@@ -337,18 +349,32 @@ def semantic_dedupe_concepts(
 
     if not bundle.concepts or len(bundle.concepts) < 2:
         return
+    if new_slugs is not None and not new_slugs:
+        logger.info("Semantic dedup: no new concepts this run — skipping")
+        return
 
-    # Batch-embed concepts missing from the cache before pairwise comparison.
+    relevant_slugs: set[str] | None = None
+    if new_slugs is not None and candidate_slugs_by_slug is not None:
+        relevant_slugs = set(new_slugs)
+        for slug in new_slugs:
+            relevant_slugs.update(candidate_slugs_by_slug.get(slug, ()))
+    relevant_concepts = (
+        [concept for concept in bundle.concepts if concept.slug in relevant_slugs]
+        if relevant_slugs is not None
+        else bundle.concepts
+    )
+
+    # Embed only initiators and bounded ANN candidates on incremental runs.
     if embeddings_cache is not None:
         _embed_concepts_batch(
-            bundle.concepts, embeddings_cache, embedding_options,
+            relevant_concepts, embeddings_cache, embedding_options,
         )
 
     # Build embeddings for all concepts.
     embeddings: dict[str, list[float]] = {}
     concept_langs: dict[str, str] = {}
 
-    for concept in bundle.concepts:
+    for concept in relevant_concepts:
         emb = _embed_concept(concept, embeddings_cache, embedding_options)
         if emb:
             embeddings[concept.slug] = emb
@@ -369,16 +395,6 @@ def semantic_dedupe_concepts(
     merge_map: dict[str, str] = {}  # merged_slug → surviving_slug
     merged_slugs: set[str] = set()
 
-    # When new_slugs is provided and non-empty, only compare new concepts
-    # against all.  Existing-vs-existing pairs were compared in a previous
-    # run with the same embeddings and threshold — they won't merge now.
-    # An empty set means "no new concepts this run" — skip dedup entirely
-    # (equivalent to new_slugs=None for comparison purposes, but we short-
-    # circuit to avoid the full O(N²) loop).
-    if new_slugs is not None and not new_slugs:
-        logger.info("Semantic dedup: no new concepts this run — skipping")
-        return
-
     comparison_slugs = new_slugs if new_slugs is not None else None
 
     for i, slug_a in enumerate(slugs):
@@ -389,9 +405,14 @@ def semantic_dedupe_concepts(
         # Default path (new_slugs=None): use slugs[i+1:] to avoid 2× comparisons.
         # Incremental path (new_slugs=set): compare against ALL slugs (including
         # existing ones) so new concepts can merge with existing concepts.
-        inner_slugs = slugs[i + 1:] if comparison_slugs is None else slugs
+        if candidate_slugs_by_slug is not None:
+            inner_slugs = candidate_slugs_by_slug.get(slug_a, ())
+        else:
+            inner_slugs = slugs[i + 1:] if comparison_slugs is None else slugs
         for slug_b in inner_slugs:
             if slug_a == slug_b:
+                continue
+            if slug_b not in embeddings or slug_b not in concept_map:
                 continue
             if slug_a in merged_slugs:
                 break
@@ -462,11 +483,15 @@ def semantic_dedupe_concepts(
     # from the same per-source objects — leaving victims here would render
     # [[victim]] links to pages that no longer exist and feed deleted slugs
     # back into the next run's dedup context.
+    canonical_ids = {
+        concept.slug: concept.canonical_id for concept in bundle.concepts
+    }
     for synthesis in bundle.sources:
         seen_source_slugs: set[str] = set()
         remapped_concepts = []
         for concept in synthesis.concepts:
             concept.slug = merge_map.get(concept.slug, concept.slug)
+            concept.canonical_id = canonical_ids.get(concept.slug, concept.canonical_id)
             # Also remap related links on source-local concepts
             for link in concept.related:
                 if link.slug in merge_map:
@@ -507,6 +532,7 @@ def assign_orphans_to_mocs(
     *,
     embeddings_cache: dict[str, list[float]] | None = None,
     embedding_options: dict[str, object] | None = None,
+    candidate_mocs_by_slug: Mapping[str, Sequence[str]] | None = None,
 ) -> None:
     """Assign concepts not in any MoC to the most semantically similar MoC.
 
@@ -531,6 +557,14 @@ def assign_orphans_to_mocs(
         moced_slugs.update(moc.concept_slugs)
 
     orphans = [c for c in bundle.concepts if c.slug not in moced_slugs]
+    target_moc_slugs: set[str] | None = None
+    if candidate_mocs_by_slug is not None:
+        orphans = [c for c in orphans if c.slug in candidate_mocs_by_slug]
+        target_moc_slugs = {
+            moc_slug
+            for orphan in orphans
+            for moc_slug in candidate_mocs_by_slug.get(orphan.slug, ())
+        }
     if not orphans:
         return
 
@@ -554,6 +588,8 @@ def assign_orphans_to_mocs(
     # Compute average embedding for each MoC.
     moc_avg_embs: dict[str, list[float]] = {}
     for moc in bundle.maps:
+        if target_moc_slugs is not None and moc.slug not in target_moc_slugs:
+            continue
         moc_embeddings: list[list[float]] = []
         for slug in moc.concept_slugs:
             concept = concept_by_slug.get(slug)
@@ -595,7 +631,15 @@ def assign_orphans_to_mocs(
         best_moc: str | None = None
         best_sim = threshold  # Must exceed threshold
 
-        for moc_slug, moc_avg in moc_avg_embs.items():
+        candidate_mocs = (
+            candidate_mocs_by_slug.get(slug, ())
+            if candidate_mocs_by_slug is not None
+            else moc_avg_embs
+        )
+        for moc_slug in candidate_mocs:
+            moc_avg = moc_avg_embs.get(moc_slug)
+            if moc_avg is None:
+                continue
             sim = cosine_similarity(emb, moc_avg)
             if sim > best_sim:
                 best_sim = sim

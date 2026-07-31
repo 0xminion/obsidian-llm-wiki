@@ -2,11 +2,11 @@
 
 ## Scope and conclusion
 
-This document assesses a target vault of **5,000 sources, 50,000 concepts, and 20,000 MoCs**. The current implementation is suitable for a small personal vault but is not safe at that steady state: normal builds contain full-corpus prompt construction, pairwise similarity passes, and full-tree rendering.
+This document defines and tracks a target vault of **5,000 sources, 50,000 concepts, and 20,000 MoCs**. The v2 runtime implements the required storage, bounded retrieval, ANN candidate generation, path-incremental rendering, sharded derived artifacts, and incremental maintenance model.
 
-The target must be treated as a v2 storage/indexing project, not a tuning exercise.
+The target is a v2 storage/indexing architecture, not a collection of tuning flags. Markdown and JSON remain portable artifacts; `.llmwiki/registry.db` is the authoritative incremental runtime index.
 
-## Verified current constraints
+## Superseded v1 constraints
 
 | Constraint | Current path | Why it fails at target scale |
 | --- | --- | --- |
@@ -79,3 +79,31 @@ The target must be treated as a v2 storage/indexing project, not a tuning exerci
 - A normal incremental build writes only affected pages plus bounded index shards.
 - Cache/model/schema changes create explicit dirty records and observable migration work.
 - Bulk ingestion resumes safely after interruption without duplicate extraction or synthesis.
+
+## Implemented v2 runtime
+
+| Requirement | Implementation |
+| --- | --- |
+| Transactional registry and migrations | `core/registry.py` — SQLite WAL schema v3, legacy JSON import marker, stable concept IDs, source ownership, FTS5, versioned synthesis rows, leased dirty/retry queues, render manifests, ingest hashes, and maintenance cursor. |
+| Bounded candidate retrieval | `synth/retrieval.py` — FTS5 plus optional ANN union, candidate count and character budgets, canonical-ID prompt contract. |
+| ANN without optional native dependencies | `core/registry.py` — deterministic multi-table sparse random-hyperplane LSH over float32 vectors with exact cosine reranking capped by `ann_candidate_pool`. |
+| Bounded two-pass prompts | `synth/evidence_windows.py`, `core/request_limiter.py`, `synth/quality.py` — evidence windows and one shared request/rate limiter across extraction, expansion, retries, and resynthesis. |
+| Durable ingest | `cli/ingest.py` — one-time legacy hash backfill, indexed URL/content dedupe, bounded extraction prefetch, and exponential retry records. |
+| Incremental rendering | `render/obsidian.py` — model fingerprints, registry-selected dirty paths, timestamp-insensitive no-op writes, and lazy touched-path rollback/backups. |
+| Sharded derived artifacts | `render/graph_export.py`, `render/dataview.py`, `render/obsidian.py` — stable hash-bucket graph shards, bounded static report shards, and bounded directory index shards. Mermaid becomes a summary beyond the configured monolith threshold. |
+| Incremental maintenance | `cli/health.py` — persistent round-robin page batches by default; `olw health --full` remains the explicit full audit. |
+| Capacity gates | `tests/new/test_scalability_capacity.py` and `tests/new/test_scalability_*` exercise the exact 5k/50k/20k fixture and enforce candidate, queue, index, graph, report, evidence, and concurrency budgets. |
+
+### Runtime budgets
+
+The defaults are deliberately conservative for a small server:
+
+- synthesis and extraction concurrency: `COMPILE_CONCURRENCY=3` / `olw ingest --parallel 3` (hard-capped to eight extraction workers);
+- lexical/ANN prompt candidates: `CANDIDATE_LIMIT=100`, `CANDIDATE_CHAR_BUDGET=16000`;
+- ANN exact rerank pool: `ANN_CANDIDATE_POOL=1000`;
+- Pass 2 evidence: `EVIDENCE_WINDOW_CHARS=15000`;
+- index/report shards: `INDEX_SHARD_SIZE=2000`, `REPORT_SHARD_SIZE=2000`;
+- graph shards/monolith cutoff: `GRAPH_SHARD_SIZE=5000`, `GRAPH_MONOLITH_THRESHOLD=10000`;
+- routine health maintenance: `olw health --batch-size 1000`.
+
+The deterministic capacity gate completes with every graph node/edge shard at or below 5,000 records, every index/report shard at or below 2,000 records, FTS candidates at or below 100, and dirty-queue claims at or below the requested worker batch.

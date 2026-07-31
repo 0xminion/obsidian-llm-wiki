@@ -63,6 +63,18 @@ class Config:
 
     # ── Concurrency ─────────────────────────────────
     compile_concurrency: int = 3
+    request_min_interval_ms: int = 0
+
+    # ── Scalable retrieval / evidence ─────────────────
+    candidate_limit: int = 100
+    candidate_char_budget: int = 16_000
+    ann_candidate_pool: int = 1_000
+    evidence_window_chars: int = 15_000
+    evidence_context_paragraphs: int = 1
+    index_shard_size: int = 2_000
+    report_shard_size: int = 2_000
+    graph_shard_size: int = 5_000
+    graph_monolith_threshold: int = 10_000
 
     # ── Language ────────────────────────────────────
     output_language: str = ""
@@ -272,6 +284,16 @@ def load_config(env_file: str | None = None, **overrides: str) -> Config:
         min_source_chars=_int_env("MIN_SOURCE_CHARS", 50, env),
         chunk_size=_int_env("CHUNK_SIZE", 30_000, env),
         compile_concurrency=_int_env("COMPILE_CONCURRENCY", 3, env),
+        request_min_interval_ms=_int_env("REQUEST_MIN_INTERVAL_MS", 0, env),
+        candidate_limit=_int_env("CANDIDATE_LIMIT", 100, env),
+        candidate_char_budget=_int_env("CANDIDATE_CHAR_BUDGET", 16_000, env),
+        ann_candidate_pool=_int_env("ANN_CANDIDATE_POOL", 1_000, env),
+        evidence_window_chars=_int_env("EVIDENCE_WINDOW_CHARS", 15_000, env),
+        evidence_context_paragraphs=_int_env("EVIDENCE_CONTEXT_PARAGRAPHS", 1, env),
+        index_shard_size=_int_env("INDEX_SHARD_SIZE", 2_000, env),
+        report_shard_size=_int_env("REPORT_SHARD_SIZE", 2_000, env),
+        graph_shard_size=_int_env("GRAPH_SHARD_SIZE", 5_000, env),
+        graph_monolith_threshold=_int_env("GRAPH_MONOLITH_THRESHOLD", 10_000, env),
         output_language=get("OUTPUT_LANGUAGE", ""),
         synthesis_mode=get("SYNTHESIS_MODE", "single"),
         concept_min_body_chars=_int_env("CONCEPT_MIN_BODY_CHARS", 1200, env),
