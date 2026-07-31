@@ -23,9 +23,7 @@ def test_liteparse_cli_parses_minimal_pdf_to_nonempty_markdown() -> None:
         "parse",
         str(FIXTURE),
         "--format",
-        "markdown",
-        "--image-mode",
-        "off",
+        "text",
         "--quiet",
     ]
     try:

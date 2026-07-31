@@ -142,14 +142,14 @@ class TestMetricsCollector:
         assert "test.md" in captured.out
 
 
-# ── Retry with truncation tests ────────────────────────────────────────────
+# ── Full-source retry tests ───────────────────────────────────────────────
 
 
-class TestRetryWithTruncation:
-    """Test that synthesis retries with progressively shorter content."""
+class TestRetryWithoutDataLoss:
+    """Parser retries must never turn a source into an arbitrary prefix."""
 
-    def test_retry_truncates_on_failure(self):
-        """When synthesis fails (returns None), retry with shorter content."""
+    def test_retry_preserves_full_content_on_parser_failure(self):
+        """When parsing fails, retry the identical complete source once."""
         from obsidian_llm_wiki.config import Config
         from obsidian_llm_wiki.core.models import SourceDoc
         from obsidian_llm_wiki.core.pipeline import _synthesize_with_retry
@@ -157,7 +157,7 @@ class TestRetryWithTruncation:
         config = Config()
         source = SourceDoc(
             title="Test Source",
-            content="x" * 60_000,  # 60K chars — larger than 50K truncation
+            content="x" * 60_000,
             source_file="test.md",
         )
 
@@ -166,8 +166,7 @@ class TestRetryWithTruncation:
 
         async def mock_synth(config, filename, src, existing_concepts, **_kwargs):
             call_lengths.append(len(src.content))
-            # Fail on full and 50K, succeed on 20K
-            if len(src.content) > 20_000:
+            if len(call_lengths) == 1:
                 return None
             from obsidian_llm_wiki.core.models import SourceSynthesis
             return SourceSynthesis(
@@ -184,17 +183,12 @@ class TestRetryWithTruncation:
                 _synthesize_with_retry(config, "test.md", source, [])
             )
 
-        # Should have tried 3 times: full (60K), 50K, 20K
-        assert len(call_lengths) == 3
-        assert call_lengths[0] == 60_000  # full
-        assert call_lengths[1] == 50_000  # truncated to 50K
-        assert call_lengths[2] == 20_000  # truncated to 20K
-        # Should succeed on the third attempt
+        assert call_lengths == [60_000, 60_000]
         assert result is not None
         assert result.source_title == "Test"
 
-    def test_retry_preserves_source_metadata_when_truncating(self):
-        """Retry copies metadata needed for language and granularity policy."""
+    def test_retry_preserves_source_metadata(self):
+        """The retry receives the original source object, metadata intact."""
         from obsidian_llm_wiki.config import Config
         from obsidian_llm_wiki.core.models import SourceDoc, SourceProvenance, SourceSynthesis
         from obsidian_llm_wiki.core.pipeline import _synthesize_with_retry
@@ -223,15 +217,16 @@ class TestRetryWithTruncation:
 
         assert result is not None
         assert len(seen) == 2
-        truncated = seen[1]
-        assert len(truncated.content) == 50_000
-        assert truncated.source_type == "scientific-paper"
-        assert truncated.aliases == ["Paper"]
-        assert truncated.tags == ["research"]
-        assert truncated.provenance == source.provenance
+        retried = seen[1]
+        assert retried is source
+        assert len(retried.content) == 60_000
+        assert retried.source_type == "scientific-paper"
+        assert retried.aliases == ["Paper"]
+        assert retried.tags == ["research"]
+        assert retried.provenance == source.provenance
 
-    def test_all_levels_fail_returns_none(self):
-        """When all truncation levels fail, return None."""
+    def test_all_complete_source_attempts_fail_returns_none(self):
+        """When all parser attempts fail, return None without data loss."""
         from obsidian_llm_wiki.config import Config
         from obsidian_llm_wiki.core.models import SourceDoc
         from obsidian_llm_wiki.core.pipeline import _synthesize_with_retry
@@ -256,8 +251,8 @@ class TestRetryWithTruncation:
 
         assert result is None
 
-    def test_short_source_no_truncation(self):
-        """Short sources (< 50K) don't get truncated at any level."""
+    def test_successful_source_runs_once(self):
+        """A successful source has no redundant retry."""
         from obsidian_llm_wiki.config import Config
         from obsidian_llm_wiki.core.models import SourceDoc
         from obsidian_llm_wiki.core.pipeline import _synthesize_with_retry

@@ -11,8 +11,8 @@ import pytest
 from obsidian_llm_wiki.core.models import SourceDoc
 
 
-def test_parse_document_runs_lit_cli_and_returns_markdown(tmp_path: Path):
-    """LiteParse invokes the documented quiet Markdown CLI and builds a SourceDoc."""
+def test_parse_document_runs_lit_cli_and_returns_text(tmp_path: Path):
+    """LiteParse invokes the compatible quiet text CLI and builds a SourceDoc."""
     from obsidian_llm_wiki.ingest.liteparse import parse_document
 
     document = tmp_path / "paper.pdf"
@@ -22,9 +22,7 @@ def test_parse_document_runs_lit_cli_and_returns_markdown(tmp_path: Path):
         "parse",
         str(document),
         "--format",
-        "markdown",
-        "--image-mode",
-        "off",
+        "text",
         "--quiet",
     ]
     with (

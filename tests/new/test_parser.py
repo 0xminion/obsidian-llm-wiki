@@ -33,6 +33,25 @@ def test_parse_single_with_prose_around():
     assert synth.source_title == "P"
 
 
+def test_parse_single_repairs_invalid_latex_escape():
+    """A literal LaTeX command is not a legal JSON escape sequence."""
+    response = r'{"source_title":"P","source_summary":"Uses $\epsilon$ risk."}'
+
+    synth = parse_single_source_synthesis(response)
+
+    assert synth is not None
+    assert synth.source_summary == r"Uses $\epsilon$ risk."
+
+
+def test_parse_single_repairs_trailing_comma():
+    response = '{"source_title":"P","source_summary":"S",}'
+
+    synth = parse_single_source_synthesis(response)
+
+    assert synth is not None
+    assert synth.source_title == "P"
+
+
 def test_parse_single_empty():
     assert parse_single_source_synthesis("") is None
     assert parse_single_source_synthesis("   ") is None
@@ -52,9 +71,9 @@ def test_parse_single_array_takes_first():
     assert synth.source_title == "First"
 
 
-def test_parse_single_repairs_invalid_latex_escape():
+def test_parse_single_repairs_invalid_latex_double_escape():
     response = (
-        '{"source_title":"Paper","source_summary":"Uses \\epsilon notation",'
+        '{"source_title":"Paper","source_summary":"Uses \\\\epsilon notation",'
         '"concepts":[]}'
     )
 

@@ -13,7 +13,11 @@ from types import SimpleNamespace
 
 import pytest
 
-from obsidian_llm_wiki.cli.ingest import _scan_inbox_urls
+from obsidian_llm_wiki.cli.ingest import (
+    _archive_inbox_url_files,
+    _inbox_url_paths,
+    _scan_inbox_urls,
+)
 
 
 def _make_config(vault_dir: Path) -> SimpleNamespace:
@@ -152,3 +156,27 @@ def test_scan_inbox_only_takes_first_url_per_file(tmp_path: Path):
     config = _make_config(tmp_path)
     urls = _scan_inbox_urls(config)
     assert urls == ["https://first.com"]
+
+
+def test_inbox_url_paths_preserve_duplicate_queue_records(tmp_path: Path):
+    inbox = tmp_path / "00-Inbox"
+    inbox.mkdir()
+    (inbox / "a.url").write_text("https://example.com/dup\n", encoding="utf-8")
+    (inbox / "b.url").write_text("https://example.com/dup\n", encoding="utf-8")
+
+    paths = _inbox_url_paths(_make_config(tmp_path))
+
+    assert [path.name for path in paths["https://example.com/dup"]] == ["a.url", "b.url"]
+
+
+def test_archive_inbox_url_files_moves_only_confirmed_records(tmp_path: Path):
+    inbox = tmp_path / "00-Inbox"
+    inbox.mkdir()
+    queued = inbox / "article.url"
+    queued.write_text("https://example.com/article\n", encoding="utf-8")
+
+    archived = _archive_inbox_url_files([queued], _make_config(tmp_path))
+
+    assert not queued.exists()
+    assert archived == [inbox / "processed" / "article.url"]
+    assert archived[0].read_text(encoding="utf-8") == "https://example.com/article\n"

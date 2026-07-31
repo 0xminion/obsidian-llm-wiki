@@ -606,30 +606,28 @@ def extract(raw_url: str) -> SourceDoc:
     result = _dispatch_remote_connectors(raw_url)
     if result.succeeded:
         assert result.source is not None
-        stamped = _stamp_extracted_source(result.source, raw_url, result.connector_name)
+        source = result.source
         if result.connector_name != "generic_web":
-            return _require_usable_source(stamped)
+            return _stamp_extracted_source(source, raw_url, result.connector_name)
 
-        # Last-resort: if generic web extraction produced a stub, try deep
-        # search for the same title across accessible scholarly sources and use
-        # the best alternative. Gated to keep CI deterministic.
-        if _deep_search_enabled():
-            passed, _reason = _check_extraction_quality(stamped)
-            if not passed:
-                try:
-                    ds = _deep_search_fallback(stamped.title or "", raw_url)
-                    if len(ds.content or "") > len(stamped.content or ""):
-                        logger.info(
-                            "Deep search fallback replacing stub for %s "
-                            "(stub=%d chars → deep_search=%d chars).",
-                            raw_url, len(stamped.content or ""), len(ds.content or ""),
-                        )
-                        return _require_usable_source(
-                            _stamp_extracted_source(ds, raw_url, "deep_search_fallback")
-                        )
-                except Exception as ds_exc:
-                    logger.warning("Deep search fallback failed for stub %s: %s", raw_url, ds_exc)
-        return _require_usable_source(stamped)
+        # Last-resort: a generic stub gets its deep-search opportunity before
+        # the admission gate rejects it. Stamping first made this fallback
+        # unreachable because `_stamp_extracted_source` correctly rejects
+        # non-X stubs rather than persisting them.
+        passed, _reason = _check_extraction_quality(source)
+        if _deep_search_enabled() and not passed:
+            try:
+                ds = _deep_search_fallback(source.title or "", raw_url)
+                if len(ds.content or "") > len(source.content or ""):
+                    logger.info(
+                        "Deep search fallback replacing stub for %s "
+                        "(stub=%d chars → deep_search=%d chars).",
+                        raw_url, len(source.content or ""), len(ds.content or ""),
+                    )
+                    return _stamp_extracted_source(ds, raw_url, "deep_search_fallback")
+            except Exception as ds_exc:
+                logger.warning("Deep search fallback failed for stub %s: %s", raw_url, ds_exc)
+        return _stamp_extracted_source(source, raw_url, result.connector_name)
 
     assert result.failure is not None
     if result.connector_name == "specialist_dispatch" and _deep_search_enabled():
@@ -687,6 +685,13 @@ def _stamp_extracted_source(source: SourceDoc, raw_url: str, extractor: str) -> 
             "Extraction quality gate: %s for '%s' (extractor=%s, content_len=%d)",
             reason, raw_url, extractor, len(source.content or ""),
         )
+        # Generic web content and scholarly last-resort results are the paths
+        # where boilerplate/stubs otherwise reach durable source pages. Local
+        # clippings and specialist extractors have their own semantics (a
+        # short manually supplied note or a terse real X post is not web-page
+        # chrome), so retain their diagnostic without treating it as a reject.
+        if extractor in {"generic_web", "deep_search_fallback"}:
+            raise RuntimeError(f"Extraction quality gate failed for {raw_url}: {reason}")
         diagnostics = (f"extraction_quality: {reason}",)
     else:
         diagnostics = ()
@@ -748,6 +753,9 @@ with suppress(ImportError):
 
 with suppress(ImportError):
     from obsidian_llm_wiki.ingest.extractors import jats as _jats  # noqa: F401
+
+with suppress(ImportError):
+    from obsidian_llm_wiki.ingest.extractors import notion as _notion  # noqa: F401
 
 with suppress(ImportError):
     from obsidian_llm_wiki.ingest.extractors import podcast as _podcast  # noqa: F401

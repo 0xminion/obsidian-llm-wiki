@@ -1,8 +1,8 @@
 """Regression tests for the deferred review items.
 
 Covers: semantic dedup moved from the render layer into the pipeline,
-failure-classified truncation retries, shared embedding cache between the
-dedup passes, and the graph-export index lookups.
+lossless synthesis retries, shared embedding cache between the dedup passes,
+and the graph-export index lookups.
 """
 
 from __future__ import annotations
@@ -140,7 +140,7 @@ def test_pipeline_dedup_failure_is_survivable_and_visible(tmp_path, monkeypatch,
     assert any("Semantic dedup failed" in r.message for r in caplog.records)
 
 
-# ── Truncation ladder: only size-related failures escalate ────────────────
+# ── Complete-source retry policy ──────────────────────────────────────────
 
 
 def _retry_config():
@@ -148,10 +148,8 @@ def _retry_config():
     return Config()
 
 
-def test_connection_error_does_not_trigger_truncation_retry():
-    """A connection failure re-raises immediately: the provider layer already
-    retried it, and truncating the source cannot fix a dead server — it would
-    only disguise data loss as recovery."""
+def test_connection_error_does_not_retry_or_discard_content():
+    """A provider failure re-raises immediately and never truncates content."""
     from obsidian_llm_wiki.core.pipeline import _synthesize_with_retry
 
     calls: list[int] = []
@@ -167,19 +165,19 @@ def test_connection_error_does_not_trigger_truncation_retry():
     ), pytest.raises(httpx.ConnectError):
         asyncio.run(_synthesize_with_retry(_retry_config(), "t.md", source, []))
 
-    assert len(calls) == 1, "non-size failures must not burn truncated retries"
+    assert calls == [60_000]
 
 
-def test_timeout_still_escalates_through_truncation_levels():
-    """Timeouts are the size-related case truncation exists for."""
+def test_parser_retry_keeps_complete_source():
+    """A parser miss gets one retry of the full source, never a prefix."""
     from obsidian_llm_wiki.core.pipeline import _synthesize_with_retry
 
     calls: list[int] = []
 
-    async def times_out_when_large(config, filename, src, existing, **_kwargs):
+    async def parse_miss_once(config, filename, src, existing, **_kwargs):
         calls.append(len(src.content))
-        if len(src.content) > 20_000:
-            raise httpx.ReadTimeout("model too slow for this prompt")
+        if len(calls) == 1:
+            return None
         return SourceSynthesis(
             source_title="T", source_summary="s", source_file=filename,
         )
@@ -187,22 +185,12 @@ def test_timeout_still_escalates_through_truncation_levels():
     source = SourceDoc(title="T", content="x" * 60_000, source_file="t.md")
     with mock.patch(
         "obsidian_llm_wiki.core.pipeline._synthesize_source",
-        side_effect=times_out_when_large,
+        side_effect=parse_miss_once,
     ):
         result = asyncio.run(_synthesize_with_retry(_retry_config(), "t.md", source, []))
 
     assert result is not None
-    assert calls == [60_000, 50_000, 20_000]
-
-
-def test_size_failure_classifier():
-    from obsidian_llm_wiki.core.pipeline import _is_size_related_failure
-
-    assert _is_size_related_failure(TimeoutError("x")) is True
-    assert _is_size_related_failure(httpx.ReadTimeout("x")) is True
-    assert _is_size_related_failure(httpx.ConnectError("x")) is False
-    assert _is_size_related_failure(ValueError("x")) is False
-    assert _is_size_related_failure(RuntimeError("chunked incomplete")) is False
+    assert calls == [60_000, 60_000]
 
 
 # ── Shared embedding cache between dedup passes ────────────────────────────

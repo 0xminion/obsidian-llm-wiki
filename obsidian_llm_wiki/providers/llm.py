@@ -91,9 +91,11 @@ class OllamaClient(LLMClient):
             num_ctx = self.config.context_window
         if num_ctx:
             options.setdefault("num_ctx", num_ctx)
-        # Allow generous output tokens — the timeout is the real ceiling.
-        # Some Ollama proxies reject num_predict=-1, so use a large positive value.
-        options.setdefault("num_predict", 65536)
+        # Keep a bounded output reserve. Ollama's context window covers prompt
+        # and completion; a 128K output allowance makes large inputs exceed a
+        # 256K model context before generation starts. Synthesis overrides this
+        # explicitly, while 16K remains a safe default for generic calls.
+        options.setdefault("num_predict", 16_384)
         if options:
             body["options"] = options
         body.update(kwargs)
@@ -129,7 +131,7 @@ class OpenAICompatibleClient(LLMClient):
                 {"role": "user", "content": user},
             ],
             "max_tokens": kwargs.pop(
-                "max_tokens", 65536,  # 64K output — enough for full synthesis JSON
+                "max_tokens", 16_384,
             ),
             "stream": False,
         }

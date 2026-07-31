@@ -132,8 +132,8 @@ def test_quality_gate_empty_content():
 # ── _stamp_extracted_source integration ──────────────────────────────
 
 
-def test_stamp_adds_diagnostic_on_quality_gate_failure():
-    """When the quality gate fails, a diagnostic is added to provenance."""
+def test_stamp_adds_diagnostic_on_specialist_quality_gate_failure():
+    """Specialist diagnostics survive for their extractor-specific policy."""
     source = SourceDoc(title="Stub", content="Too short.")
     stamped = _stamp_extracted_source(source, "https://example.com", "test_extractor")
 

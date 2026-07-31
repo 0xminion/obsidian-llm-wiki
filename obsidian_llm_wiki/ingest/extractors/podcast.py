@@ -136,6 +136,7 @@ _PODCAST_KEYWORDS = (
     "podcast", "episode", "transcript", "show notes",
     "listen", "audio player", "subscribe", "rss feed",
 )
+_MIN_CATCH_ALL_PODCAST_CHARS = 500
 
 
 _PODCAST_PRECHECK_TIMEOUT_SECONDS = 5
@@ -289,11 +290,16 @@ def extract_catch_all_podcast(raw_url: str) -> SourceDoc:
             f"catch-all podcast: no podcast signals found in page head for {raw_url}"
         )
     try:
-        return _extract_podcast(raw_url, platform="generic")
+        source = _extract_podcast(raw_url, platform="generic")
     except RuntimeError as exc:
         raise ExtractorNotApplicableError(
             f"catch-all podcast: no audio enclosure or episode description found for {raw_url}"
         ) from exc
+    if len(source.content.strip()) < _MIN_CATCH_ALL_PODCAST_CHARS:
+        raise ExtractorNotApplicableError(
+            "catch-all podcast: extracted description is too short to prove this is an episode"
+        )
+    return source
 
 
 @register_extractor(lambda _parsed, raw: _is_rss_feed(raw))

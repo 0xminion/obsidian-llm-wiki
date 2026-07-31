@@ -44,9 +44,7 @@ def parse_document(
         "parse",
         str(document),
         "--format",
-        "markdown",
-        "--image-mode",
-        "off",
+        "text",
         "--quiet",
     ]
     try:

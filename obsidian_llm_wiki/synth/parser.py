@@ -131,6 +131,54 @@ def _sanitize_latex_artifacts(data: Any) -> Any:
 
 # ── JSON extraction ─────────────────────────────────────────────────────
 
+# Valid JSON escape characters (after backslash): " \ / b f n r t u
+# Everything else is invalid and causes json.loads to fail.
+# LaTeX commands like \epsilon, \alpha, \rightarrow produce invalid escapes.
+_VALID_JSON_ESCAPES = frozenset('"\\/bfnrtu')
+
+
+def _fix_invalid_escapes(text: str) -> str:
+    """Replace invalid JSON escape sequences with safe alternatives.
+
+    LLMs sometimes include LaTeX (``$\\epsilon$``, ``\\rightarrow``) in text
+    fields. JSON only allows ``\\n \\t \\r \\b \\f \\\\ \\" \\/ \\uXXXX`` —
+    all other ``\\X`` sequences are invalid and break ``json.loads``.
+
+    This function finds backslash + letter sequences that are NOT valid JSON
+    escapes and replaces the backslash with a doubled backslash (``\\\\``)
+    so the literal text survives JSON round-tripping.
+    """
+    # We need to handle escapes only inside JSON strings (between quotes),
+    # but a full string-aware parser is expensive. Instead, we use a
+    # regex that matches backslash followed by a character that is NOT a
+    # valid JSON escape, and doubles the backslash.
+    #
+    # This is safe because:
+    # - Valid escapes (\n, \t, etc.) are NOT matched (they're in the exclusion set)
+    # - \\ is already doubled and won't be matched (second \ is not in the set)
+    # - \uXXXX is not matched because 'u' is in the valid set
+    # - LaTeX like \epsilon → \\epsilon (literal backslash in JSON string)
+    result = []
+    i = 0
+    while i < len(text):
+        char = text[i]
+        if char == "\\" and i + 1 < len(text):
+            next_char = text[i + 1]
+            if next_char in _VALID_JSON_ESCAPES:
+                # Valid escape — keep both chars
+                result.append(char)
+                result.append(next_char)
+                i += 2
+                continue
+            # Invalid escape — double the backslash
+            result.append("\\\\")
+            result.append(next_char)
+            i += 2
+            continue
+        result.append(char)
+        i += 1
+    return "".join(result)
+
 
 def _extract_json(text: str) -> list[Any] | dict[str, Any] | None:
     """Extract the first valid JSON array or object from ``text``.
@@ -147,6 +195,12 @@ def _extract_json(text: str) -> list[Any] | dict[str, Any] | None:
     text = re.sub(r"^```(?:json)?\s*", "", text)
     text = re.sub(r"\s*```\s*$", "", text)
     text = text.strip()
+
+    # Fix invalid JSON escape sequences from LaTeX in LLM output.
+    # LLMs produce $\epsilon$, $\alpha$, \rightarrow, etc. in text fields.
+    # JSON only allows \n \t \r \b \f \\ \" \/ \uXXXX — all other \X sequences
+    # are invalid and cause json.loads to fail. Replace them before parsing.
+    text = _fix_invalid_escapes(text)
 
     # Fast path: already valid JSON.
     try:
@@ -171,14 +225,134 @@ def _extract_json(text: str) -> list[Any] | dict[str, Any] | None:
 
     text = text[start:]
 
-    # Decode one JSON value from the first object/array. ``raw_decode`` accepts
+    # Decode one JSON value from the first object/array.  ``raw_decode`` accepts
     # explanatory trailing prose while keeping malformed-input work bounded.
     try:
         value, _end = json.JSONDecoder().raw_decode(text)
         return value
     except json.JSONDecodeError:
-        logger.warning("Could not parse JSON from response (first 200 chars): %s", text[:200])
+        pass
+
+    # ── Repair common LLM JSON issues ──────────────────────────────────
+
+    # 1. Trailing commas before } or ] (common LLM output error).
+    repaired = re.sub(r",\s*([}\]])", r"\1", text)
+    if repaired != text:
+        try:
+            value, _end = json.JSONDecoder().raw_decode(repaired)
+            return value
+        except json.JSONDecodeError:
+            pass
+
+    # 2. Truncated JSON — the LLM hit the output token limit mid-object.
+    #    Attempt to close incomplete JSON by counting open brackets/braces
+    #    and appending the needed closers.  This is a best-effort recovery
+    #    that salvage partially-truncated synthesis output.
+    repaired = _repair_truncated_json(text)
+    if repaired and repaired != text:
+        try:
+            value = json.loads(repaired)
+            logger.info(
+                "Recovered truncated JSON (%d → %d chars)", len(text), len(repaired),
+            )
+            return value
+        except json.JSONDecodeError:
+            pass
+
+    logger.warning("Could not parse JSON from response (first 200 chars): %s", text[:200])
+    return None
+
+
+def _repair_truncated_json(text: str) -> str | None:
+    """Attempt to close truncated JSON by appending missing brackets/braces.
+
+    The LLM sometimes hits the output token limit mid-object, producing
+    valid JSON up to a point and then nothing.  This function counts
+    open delimiters (ignoring those inside strings) and appends the
+    needed closers.  It also strips trailing partial key-value pairs
+    that were cut mid-string.
+    """
+    if not text or text[0] not in "{[":
         return None
+
+    # First pass: count depth and detect if we're inside a string
+    depth_brace = 0
+    depth_bracket = 0
+    in_string = False
+    escape = False
+    last_complete_pos = 0  # position after the last , or complete value
+
+    for pos, char in enumerate(text):
+        if escape:
+            escape = False
+            continue
+        if char == "\\":
+            escape = True
+            continue
+        if char == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if char == "{":
+            depth_brace += 1
+        elif char == "}":
+            depth_brace -= 1
+        elif char == "[":
+            depth_bracket += 1
+        elif char == "]":
+            depth_bracket -= 1
+        elif char == ",":
+            # Record position after the comma — a valid break point
+            last_complete_pos = pos
+
+    if depth_brace == 0 and depth_bracket == 0:
+        return None  # Not truncated
+
+    # If we're inside a string, truncate to the last comma (which is a
+    # safe break point).  Otherwise, try to use the last comma position.
+    candidate = text[:last_complete_pos].rstrip()
+    if candidate.endswith(","):
+        candidate = candidate[:-1]
+
+    # Re-count depth on the stripped version, tracking open order
+    depth_brace = 0
+    depth_bracket = 0
+    in_string = False
+    escape = False
+    open_stack: list[str] = []  # track order of opens for correct closing
+    for char in candidate:
+        if escape:
+            escape = False
+            continue
+        if char == "\\":
+            escape = True
+            continue
+        if char == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if char == "{":
+            depth_brace += 1
+            open_stack.append("}")
+        elif char == "}":
+            depth_brace -= 1
+            if open_stack and open_stack[-1] == "}":
+                open_stack.pop()
+        elif char == "[":
+            depth_bracket += 1
+            open_stack.append("]")
+        elif char == "]":
+            depth_bracket -= 1
+            if open_stack and open_stack[-1] == "]":
+                open_stack.pop()
+
+    # Append closers in reverse order of opening (stack order)
+    closers = "".join(reversed(open_stack))
+    if closers:
+        return candidate + closers
+    return None
 
 
 def _repair_json_response(text: str) -> str:

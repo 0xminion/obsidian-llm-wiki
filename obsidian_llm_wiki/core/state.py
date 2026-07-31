@@ -10,7 +10,9 @@ import json
 from pathlib import Path
 
 from obsidian_llm_wiki.core.models import SourceChange, SourceStatus, WikiState
-from obsidian_llm_wiki.render.obsidian import atomic_write, safe_read_file
+from obsidian_llm_wiki.render.obsidian import atomic_write, parse_frontmatter, safe_read_file
+
+_NON_SOURCE_FILENAMES = frozenset({"failed_urls.md", "index.md"})
 
 __all__ = [
     "read_state",
@@ -18,6 +20,7 @@ __all__ = [
     "update_source_state",
     "remove_source_state",
     "hash_file",
+    "hash_source_file",
     "hash_content",
     "detect_changes",
 ]
@@ -38,6 +41,19 @@ def hash_content(content: str) -> str:
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 
+def hash_source_file(file_path: str | Path) -> str:
+    """Hash the source body exactly as the compiler stores it in state.
+
+    Source state intentionally tracks synthesis input, not volatile extraction
+    metadata such as retrieval timestamps or provenance diagnostics. Comparing
+    a full rendered markdown file against a body-only state hash invalidates
+    every source on every build and turns incremental compilation into theater.
+    """
+    raw = safe_read_file(file_path)
+    _metadata, body = parse_frontmatter(raw)
+    return hash_content(body)
+
+
 def detect_changes(sources_dir: str | Path, prev_state: WikiState) -> list[SourceChange]:
     """Scan sources directory and compare hashes against previous state."""
     sp = Path(sources_dir)
@@ -47,6 +63,8 @@ def detect_changes(sources_dir: str | Path, prev_state: WikiState) -> list[Sourc
     if sp.exists():
         for f in sp.iterdir():
             if f.suffix == ".md" and f.is_file():
+                if f.name in _NON_SOURCE_FILENAMES:
+                    continue
                 current_files.add(f.name)
                 status = _classify(f, prev_state)
                 changes.append(SourceChange(file=f.name, status=status))
@@ -60,7 +78,7 @@ def detect_changes(sources_dir: str | Path, prev_state: WikiState) -> list[Sourc
 
 def _classify(file_path: Path, prev_state: WikiState) -> SourceStatus:
     """Classify a source file as new, changed, or unchanged."""
-    file_hash = hash_file(file_path)
+    file_hash = hash_source_file(file_path)
     prev = prev_state.sources.get(file_path.name)
     if not prev:
         return SourceStatus.NEW

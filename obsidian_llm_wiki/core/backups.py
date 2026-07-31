@@ -16,6 +16,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 __all__ = ["backup_file", "create_backup", "list_backups"]
+_MAX_BACKUP_FILENAME_BYTES = 240
 
 
 def _source_directory(source: Path, backups_root: Path) -> Path:
@@ -26,6 +27,15 @@ def _source_directory(source: Path, backups_root: Path) -> Path:
 def _validate_max_backups(max_backups: int) -> None:
     if isinstance(max_backups, bool) or not isinstance(max_backups, int) or max_backups < 1:
         raise ValueError("max_backups must be a positive integer")
+
+
+def _backup_filename(timestamp: str, nonce: str, source_name: str) -> str:
+    """Create a unique backup component that remains safe for atomic rename."""
+    candidate = f"{timestamp}-{nonce}-{source_name}.bak"
+    if len(candidate.encode("utf-8")) <= _MAX_BACKUP_FILENAME_BYTES:
+        return candidate
+    digest = hashlib.sha256(source_name.encode("utf-8")).hexdigest()
+    return f"{timestamp}-{nonce}-sha256-{digest}.bak"
 
 
 def list_backups(source_path: str | Path, backups_root: str | Path) -> list[Path]:
@@ -59,11 +69,7 @@ def backup_file(
     directory = _source_directory(source, Path(backups_root))
     directory.mkdir(parents=True, exist_ok=True)
     name = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
-    prefix = f"{name}-{uuid.uuid4().hex}-"
-    suffix = ".bak"
-    max_source_name_bytes = 255 - len(os.fsencode(prefix + suffix))
-    source_name = os.fsdecode(os.fsencode(source.name)[:max_source_name_bytes])
-    destination = directory / f"{prefix}{source_name}{suffix}"
+    destination = directory / _backup_filename(name, uuid.uuid4().hex, source.name)
 
     fd, temporary_name = tempfile.mkstemp(dir=directory, prefix=".backup-", suffix=".tmp")
     temporary = Path(temporary_name)

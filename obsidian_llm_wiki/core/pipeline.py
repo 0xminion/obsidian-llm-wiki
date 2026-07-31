@@ -85,25 +85,86 @@ _SYSTEM_PROMPT = (
     "Return ONLY a JSON object, no prose, no code fences."
 )
 
-# ── Retry truncation levels ────────────────────────────────────────────────
-# When a source fails synthesis for a SIZE-RELATED reason, progressively
-# truncate content and retry.
-_TRUNCATION_LEVELS = [None, 50_000, 20_000]  # full → 50K → 20K
+# ── Structured synthesis request policy ───────────────────────────────────
+#
+# The model supports a 256K context, but context and output share that budget.
+# Asking for 128K output for every source both wastes capacity and makes large
+# prompts exceed the window.  16K is ample for a concise 3–8-concept synthesis;
+# larger documents are losslessly split into chunks below.
+_SYNTHESIS_NUM_PREDICT = 16_384
+_SYNTHESIS_TEMPERATURE = 0
+_SYNTHESIS_PARSE_ATTEMPTS = 2
+_SYNTHESIS_RESPONSE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "source_title": {"type": "string"},
+        "source_summary": {"type": "string"},
+        "source_tags": {"type": "array", "items": {"type": "string"}},
+        "key_points": {"type": "array", "items": {"type": "string"}},
+        "open_questions": {"type": "array", "items": {"type": "string"}},
+        "language": {"type": "string"},
+        "concepts": {"type": "array", "items": {"type": "object"}},
+        "maps": {"type": "array", "items": {"type": "object"}},
+    },
+    "required": ["source_title", "source_summary", "concepts", "maps"],
+}
 
 
-def _is_size_related_failure(exc: BaseException) -> bool:
-    """Whether truncating the source content could plausibly fix *exc*.
+async def _call_structured_synthesis(
+    prompt: str,
+    messages: list[dict[str, str]],
+    config: Config,
+    *,
+    llm_semaphore: asyncio.Semaphore | None = None,
+) -> str:
+    """Run one bounded, JSON-mode synthesis request.
 
-    Only timeouts qualify: on a local LLM they usually mean the prompt is too
-    large for the model/host to finish in time. Everything else (connection
-    refused, HTTP errors, auth, bugs) is NOT fixed by discarding content —
-    the provider layer already retried transient errors with backoff, and
-    "retrying" such a failure at 20K of a 200K source would just build the
-    wiki from a fraction of the document while reporting success.
+    The semaphore belongs around the actual remote request rather than a
+    whole source.  This keeps every in-flight LLM call within the server's
+    parallelism limit while allowing chunks from a large source to share the
+    same capacity with ordinary sources.
     """
-    import httpx
+    from obsidian_llm_wiki.providers.llm import acall_llm
 
-    return isinstance(exc, TimeoutError | httpx.TimeoutException)
+    async def _request() -> str:
+        return await acall_llm(
+            prompt,
+            messages,
+            config,
+            task="ingest",
+            format=_SYNTHESIS_RESPONSE_SCHEMA,
+            options={
+                "num_predict": _SYNTHESIS_NUM_PREDICT,
+                "temperature": _SYNTHESIS_TEMPERATURE,
+            },
+        )
+
+    if llm_semaphore is None:
+        return await _request()
+    async with llm_semaphore:
+        return await _request()
+
+
+async def _retry_chunk_synthesis(synthesize, filename: str, chunk_index: int, chunk_count: int):
+    """Retry one failed chunk without accepting an incomplete source."""
+    for attempt in range(_SYNTHESIS_PARSE_ATTEMPTS):
+        try:
+            result = await synthesize()
+        except Exception as exc:
+            logger.warning(
+                "Chunk %d/%d for '%s' failed on attempt %d/%d: %s",
+                chunk_index, chunk_count, filename, attempt + 1,
+                _SYNTHESIS_PARSE_ATTEMPTS, exc,
+            )
+            continue
+        if result is not None:
+            return result
+        logger.warning(
+            "Chunk %d/%d for '%s' produced no parseable output on attempt %d/%d",
+            chunk_index, chunk_count, filename, attempt + 1,
+            _SYNTHESIS_PARSE_ATTEMPTS,
+        )
+    return None
 
 
 async def run_pipeline(
@@ -236,25 +297,73 @@ async def run_pipeline(
             # ── Build existing concept index for dedup context ─────────
             existing_concepts = _existing_concept_slugs(state, all_syntheses_by_file)
 
-            # ── Synthesise with truncation-based retry ──────────────────
-            # Each source is tried at full content, then 50K, then 20K.
-            sem = asyncio.Semaphore(config.compile_concurrency)
+            # ── Synthesise with a global request limiter ────────────────
+            # Limit actual model calls, not whole source jobs.  Large sources
+            # are losslessly chunked, so holding one slot while processing all
+            # of their chunks would starve every normal source.
+            llm_semaphore = asyncio.Semaphore(config.compile_concurrency)
 
-            async def _synth_one(filename: str, source: SourceDoc):
-                async with sem:
-                    return await _synthesize_with_retry(
-                        config,
-                        filename,
-                        source,
-                        existing_concepts,
-                        metrics=metrics,
-                        schema_policy=schema_policy,
-                    )
+            # A semaphore alone does not provide queue backpressure: creating
+            # one task per source still lets hundreds of prompt-building
+            # coroutines pile up behind it.  Keep only server-capacity-sized
+            # source jobs alive at once; each job shares the request limiter
+            # above for its normal call or lossless chunk calls.
+            pending_sources = iter(to_compile.items())
+            results_by_filename: dict[str, SourceSynthesis | None | Exception] = {}
+            completed_sources = 0
+            completion_lock = asyncio.Lock()
 
-            synth_results = await asyncio.gather(
-                *[_synth_one(f, s) for f, s in to_compile.items()],
-                return_exceptions=True,
-            )
+            async def _worker() -> None:
+                nonlocal completed_sources
+                while True:
+                    try:
+                        filename, source = next(pending_sources)
+                    except StopIteration:
+                        return
+                    try:
+                        results_by_filename[filename] = await _synthesize_with_retry(
+                            config,
+                            filename,
+                            source,
+                            existing_concepts,
+                            metrics=metrics,
+                            schema_policy=schema_policy,
+                            llm_semaphore=llm_semaphore,
+                        )
+                    except Exception as exc:
+                        results_by_filename[filename] = exc
+                    async with completion_lock:
+                        completed_sources += 1
+                        completed = results_by_filename[filename]
+                        if isinstance(completed, SourceSynthesis):
+                            _normalize_synthesis_identity(completed)
+                            save_synthesis(completed, config.llmwiki_dir, filename)
+                            logger.info(
+                                "Synthesis %d/%d ready: '%s' (%d concepts)",
+                                completed_sources,
+                                len(to_compile),
+                                filename,
+                                len(completed.concepts),
+                            )
+                        elif completed is None:
+                            logger.warning(
+                                "Synthesis %d/%d produced no output: '%s'",
+                                completed_sources,
+                                len(to_compile),
+                                filename,
+                            )
+                        else:
+                            logger.error(
+                                "Synthesis %d/%d failed: '%s': %s",
+                                completed_sources,
+                                len(to_compile),
+                                filename,
+                                completed,
+                            )
+
+            worker_count = min(config.compile_concurrency, len(to_compile))
+            await asyncio.gather(*(_worker() for _ in range(worker_count)))
+            synth_results = [results_by_filename[f] for f in to_compile]
 
             # ── Collect successful syntheses + cache them ──────────────
             filenames_done: list[str] = []
@@ -543,6 +652,7 @@ async def _synthesize_source(
     existing_concepts: list[str],
     *,
     schema_policy: SchemaPolicy = DEFAULT_SCHEMA_POLICY,
+    llm_semaphore: asyncio.Semaphore | None = None,
 ) -> SourceSynthesis | None:
     """Call the LLM to synthesise one source into a SourceSynthesis.
 
@@ -570,16 +680,92 @@ async def _synthesize_source(
             granularity=granularity,
         )
         if synth is not None:
-            if not synth.source_title:
-                synth.source_title = source.title
+            # Source-frontmatter title is canonical. Letting a model-provided
+            # title win creates duplicated/hallucinated entry filenames on a
+            # retry even when extraction already established the source title.
+            synth.source_title = source.title
             synth.source_file = filename
             if source_lang and not synth.language:
                 synth.language = source_lang
             resolve_synthesis_evidence(synth, source, filename)
         return synth
 
-    from obsidian_llm_wiki.providers.llm import acall_llm
+    # ── Chunking for large sources ─────────────────────────────────────
+    # Sources exceeding chunk_size are split and every chunk is synthesized.
+    # This preserves the full document instead of treating a context-window
+    # error as permission to silently drop its tail.
+    chunk_size = getattr(config, "chunk_size", 30_000)
+    content_len = len(source.content)
 
+    if content_len > chunk_size:
+        from obsidian_llm_wiki.synth.quality import chunk_content, merge_skeletons
+
+        chunks = chunk_content(source.content, chunk_size)
+        logger.info(
+            "Chunking '%s': %d chars → %d chunks (%d chars each)",
+            filename, content_len, len(chunks), chunk_size,
+        )
+
+        async def _synth_chunk_once(chunk_content_str: str) -> SourceSynthesis | None:
+            chunk_source = replace(source, content=chunk_content_str)
+            chunk_prompt = build_synthesis_prompt(
+                chunk_source.title,
+                chunk_source.content,
+                existing_concepts=existing_concepts,
+                language=source_lang,
+                schema_policy=schema_policy,
+                granularity=granularity,
+            )
+            chunk_messages = [
+                {"role": "system", "content": _SYSTEM_PROMPT},
+                {"role": "user", "content": chunk_prompt},
+            ]
+            chunk_response = await _call_structured_synthesis(
+                chunk_prompt,
+                chunk_messages,
+                config,
+                llm_semaphore=llm_semaphore,
+            )
+            return parse_single_source_synthesis(chunk_response)
+
+        chunk_synths = await asyncio.gather(
+            *(
+                _retry_chunk_synthesis(
+                    lambda chunk=chunk: _synth_chunk_once(chunk),
+                    filename,
+                    index,
+                    len(chunks),
+                )
+                for index, chunk in enumerate(chunks, start=1)
+            ),
+            return_exceptions=True,
+        )
+        failures = [s for s in chunk_synths if s is None or isinstance(s, BaseException)]
+        if failures:
+            raise RuntimeError(
+                f"chunked synthesis incomplete for '{filename}': "
+                f"{len(failures)} of {len(chunks)} chunks failed"
+            )
+        valid_synths = [s for s in chunk_synths if isinstance(s, SourceSynthesis)]
+
+        if len(valid_synths) == 1:
+            synthesis = valid_synths[0]
+        else:
+            # Merge skeletons: union concepts by slug, union MoCs by slug,
+            # dedup key_points/open_questions
+            merged = merge_skeletons(valid_synths)
+            synthesis = merged
+
+        if synthesis is not None:
+            if not synthesis.source_title:
+                synthesis.source_title = source.title
+            synthesis.source_file = filename
+            if source_lang and not synthesis.language:
+                synthesis.language = source_lang
+            resolve_synthesis_evidence(synthesis, source, filename)
+        return synthesis
+
+    # ── Single-call path for normal-sized sources ──────────────────────
     prompt = build_synthesis_prompt(
         source.title,
         source.content,
@@ -595,7 +781,12 @@ async def _synthesize_source(
     ]
 
     try:
-        response = await acall_llm(prompt, messages, config, task="ingest")
+        response = await _call_structured_synthesis(
+            prompt,
+            messages,
+            config,
+            llm_semaphore=llm_semaphore,
+        )
     except Exception as exc:
         logger.error("LLM call failed for '%s': %s", filename, exc)
         raise
@@ -605,9 +796,9 @@ async def _synthesize_source(
         logger.warning("Could not parse synthesis JSON for '%s'", filename)
         return None
 
-    # Ensure source title and file are set.
-    if not synthesis.source_title:
-        synthesis.source_title = source.title
+    # Source-frontmatter title is canonical; synthesis may summarize it but
+    # must not rename the source identity used for entries and filenames.
+    synthesis.source_title = source.title
     synthesis.source_file = filename
 
     if source_lang and not synthesis.language:
@@ -626,45 +817,31 @@ async def _synthesize_with_retry(
     metrics: MetricsCollector | None = None,
     *,
     schema_policy: SchemaPolicy = DEFAULT_SCHEMA_POLICY,
+    llm_semaphore: asyncio.Semaphore | None = None,
 ) -> SourceSynthesis | None:
-    """Synthesize a source with progressive content truncation on failure.
+    """Synthesize one source without dropping source content on failure.
 
-    Tries (in order):
-      1. Full content
-      2. Content truncated to 50K chars
-      3. Content truncated to 20K chars
-
-    If all attempts fail, logs as permanently failed and returns None.
-    Records each attempt via the metrics collector if provided.
+    Context safety is handled by lossless chunking in ``_synthesize_source``.
+    A parser failure retries the *same* complete source once because model
+    sampling can still produce an invalid semantic payload despite JSON mode.
     """
-    for level_idx, truncation_chars in enumerate(_TRUNCATION_LEVELS):
-        if truncation_chars is not None and len(source.content) > truncation_chars:
-            truncated_source = replace(source, content=source.content[:truncation_chars])
-            level_label = f"{truncation_chars // 1000}K"
-        else:
-            truncated_source = source
-            level_label = "full"
-
-        if level_idx > 0:
-            logger.info(
-                "Retrying '%s' with truncated content (%s chars, level %d)",
-                filename, level_label, level_idx,
-            )
+    for attempt in range(_SYNTHESIS_PARSE_ATTEMPTS):
 
         synth_start = time.monotonic()
         try:
             synth = await _synthesize_source(
                 config,
                 filename,
-                truncated_source,
+                source,
                 existing_concepts,
                 schema_policy=schema_policy,
+                llm_semaphore=llm_semaphore,
             )
         except Exception as exc:
             synth_time = time.monotonic() - synth_start
             logger.error(
-                "Synthesis attempt %d failed for '%s' (%s): %s",
-                level_idx + 1, filename, level_label, exc,
+                "Synthesis attempt %d failed for '%s': %s",
+                attempt + 1, filename, exc,
             )
             if metrics:
                 metrics.record_synthesis(
@@ -673,33 +850,11 @@ async def _synthesize_with_retry(
                     success=False,
                     error_type=type(exc).__name__,
                 )
-            # Truncation only helps size-related failures. Anything else
-            # (connection errors, HTTP failures, bugs) re-raises immediately:
-            # the provider layer already retried transient errors, and
-            # silently discarding content would disguise data loss as
-            # recovery.
-            if (
-                _is_size_related_failure(exc)
-                and level_idx < len(_TRUNCATION_LEVELS) - 1
-            ):
-                continue
             raise
 
         synth_time = time.monotonic() - synth_start
 
         if synth is not None:
-            if level_idx > 0:
-                # Evidence must describe the source revision persisted and
-                # rendered, never the temporary retry prefix.
-                resolve_synthesis_evidence(synth, source, filename)
-                # Success on truncated content is a degraded result, not a
-                # clean one — the wiki was built from a fraction of the source.
-                logger.warning(
-                    "Synthesized '%s' from TRUNCATED content (%s of %d chars) "
-                    "after %d failed attempt(s) — concepts beyond the cut "
-                    "are missing.",
-                    filename, level_label, len(source.content), level_idx,
-                )
             if metrics:
                 metrics.record_synthesis(
                     source_file=filename,
@@ -709,7 +864,7 @@ async def _synthesize_with_retry(
                 )
             return synth
 
-        # synth is None — no output, try next truncation level
+        # synth is None — retry the same full source once, never a prefix.
         if metrics:
             metrics.record_synthesis(
                 source_file=filename,
@@ -718,15 +873,15 @@ async def _synthesize_with_retry(
                 error_type="no_output",
             )
         logger.warning(
-            "Synthesis produced no output for '%s' at level %d (%s)",
-            filename, level_idx + 1, level_label,
+            "Synthesis produced no output for '%s' on attempt %d of %d",
+            filename, attempt + 1, _SYNTHESIS_PARSE_ATTEMPTS,
         )
 
-    # All truncation levels exhausted — permanent failure
+    # All complete-source attempts exhausted — permanent failure.
     logger.error(
-        "Permanent synthesis failure for '%s': all %d truncation levels exhausted. "
+        "Permanent synthesis failure for '%s': all %d complete-source attempts exhausted. "
         "Content length: %d chars.",
-        filename, len(_TRUNCATION_LEVELS), len(source.content),
+        filename, _SYNTHESIS_PARSE_ATTEMPTS, len(source.content),
     )
     return None
 
