@@ -18,6 +18,7 @@ from obsidian_llm_wiki.core.maintenance import (
     FindingSeverity,
     MaintenanceFinding,
 )
+from obsidian_llm_wiki.core.registry import VaultRegistry
 from obsidian_llm_wiki.core.review import is_reviewed_page
 from obsidian_llm_wiki.render.frontmatter import sanitize_tag
 from obsidian_llm_wiki.render.obsidian import parse_frontmatter, safe_read_file
@@ -58,6 +59,12 @@ def health(
     json_output: bool = typer.Option(
         False, "--json", help="Emit stable typed maintenance findings as JSON"
     ),
+    full: bool = typer.Option(
+        False, "--full", help="Scan every generated note instead of one bounded batch"
+    ),
+    batch_size: int = typer.Option(
+        1_000, "--batch-size", min=1, help="Maximum notes in an incremental scan"
+    ),
 ) -> None:
     """Generate a vault health report or JSON maintenance findings.
 
@@ -76,12 +83,41 @@ def health(
             typer.echo(f"❌ Bundle directory not found: {bundle_dir}")
         raise typer.Exit(code=1)
 
+    incremental_scan: tuple[int, list[MaintenanceFinding]] | None = None
+    cycle_complete = True
+    if not full:
+        with VaultRegistry(config.llmwiki_dir) as registry:
+            relative_paths, cycle_complete = registry.next_maintenance_batch(
+                limit=batch_size
+            )
+            concept_stems, moced_slugs = registry.maintenance_graph_sets()
+        selected = [
+            bundle_dir / path
+            for path in relative_paths
+            if (bundle_dir / path).is_file()
+        ]
+        if selected or not _content_markdown_files(bundle_dir):
+            incremental_scan = _scan_selected_maintenance_findings(
+                bundle_dir, selected, concept_stems, moced_slugs
+            )
+
     if json_output:
-        payload = _health_json_payload(bundle_dir)
+        payload = _health_json_payload(
+            bundle_dir,
+            scan=incremental_scan,
+            incremental=incremental_scan is not None,
+            cycle_complete=cycle_complete,
+        )
         typer.echo(json.dumps(payload, ensure_ascii=False, sort_keys=True))
         return
 
-    report = _generate_health_report(bundle_dir)
+    report = (
+        _generate_incremental_health_report(
+            incremental_scan[0], incremental_scan[1], cycle_complete
+        )
+        if incremental_scan is not None
+        else _generate_health_report(bundle_dir)
+    )
     typer.echo(report)
 
     if write:
@@ -92,14 +128,22 @@ def health(
         typer.echo(f"\n📄 Report written to: {report_path}")
 
 
-def _health_json_payload(bundle_dir: Path) -> dict[str, Any]:
+def _health_json_payload(
+    bundle_dir: Path,
+    *,
+    scan: tuple[int, list[MaintenanceFinding]] | None = None,
+    incremental: bool = False,
+    cycle_complete: bool = True,
+) -> dict[str, Any]:
     """Build a stable JSON-safe health result without making any changes."""
-    files_scanned, findings = _scan_maintenance_findings(bundle_dir)
+    files_scanned, findings = scan or _scan_maintenance_findings(bundle_dir)
     payload: dict[str, Any] = {
         "files_scanned": files_scanned,
         "findings": [_finding_payload(finding) for finding in findings],
         "summary": dict(Counter(finding.kind.value for finding in findings)),
     }
+    if incremental:
+        payload.update(incremental=True, cycle_complete=cycle_complete)
     store_path = bundle_dir / ".llmwiki" / "contradictions.json"
     if store_path.is_file():
         try:
@@ -186,6 +230,54 @@ def _scan_maintenance_findings(bundle_dir: Path) -> tuple[int, list[MaintenanceF
             )
 
     return len(all_md_files), sorted(
+        findings, key=lambda item: (item.path, item.kind.value, item.message)
+    )
+
+
+def _scan_selected_maintenance_findings(
+    bundle_dir: Path,
+    markdown_files: list[Path],
+    concept_stems: set[str],
+    moced_slugs: set[str],
+) -> tuple[int, list[MaintenanceFinding]]:
+    """Apply deterministic checks to one registry-selected maintenance batch."""
+    findings: list[MaintenanceFinding] = []
+    for md_file in markdown_files:
+        if md_file.name in _RESERVED:
+            continue
+        raw = safe_read_file(md_file)
+        if not raw.strip():
+            continue
+        metadata, body = parse_frontmatter(raw)
+        relative_path = str(md_file.relative_to(bundle_dir))
+        reviewed = is_reviewed_page(raw)
+        findings.extend(
+            _relation_findings(metadata, concept_stems, relative_path, reviewed)
+        )
+        findings.extend(_tag_findings(metadata, relative_path, reviewed))
+        findings.extend(_alias_findings(metadata, relative_path, reviewed))
+        if metadata.get("generated") is True and not body.strip():
+            findings.append(
+                MaintenanceFinding(
+                    kind=FindingKind.EMPTY_GENERATED_STUB,
+                    path=relative_path,
+                    message="Generated page has an empty body",
+                    reviewed=reviewed,
+                )
+            )
+        if (
+            str(metadata.get("type", "")).strip() == "Concept"
+            and md_file.stem not in moced_slugs
+        ):
+            findings.append(
+                MaintenanceFinding(
+                    kind=FindingKind.ORPHAN_CONCEPT,
+                    path=relative_path,
+                    message="Concept is not in any MoC",
+                    reviewed=reviewed,
+                )
+            )
+    return len(markdown_files), sorted(
         findings, key=lambda item: (item.path, item.kind.value, item.message)
     )
 
@@ -316,6 +408,32 @@ def _alias_findings(
             )
         )
     return findings
+
+
+def _generate_incremental_health_report(
+    files_scanned: int,
+    findings: list[MaintenanceFinding],
+    cycle_complete: bool,
+) -> str:
+    lines = [
+        "# Vault Health Report (Incremental)",
+        "",
+        f"- Files scanned this batch: **{files_scanned}**",
+        f"- Maintenance cycle complete: **{'yes' if cycle_complete else 'no'}**",
+        f"- Findings: **{len(findings)}**",
+        "",
+    ]
+    if findings:
+        lines.extend(["## Findings", ""])
+        lines.extend(
+            f"- **{finding.severity.value} / {finding.kind.value}** "
+            f"`{finding.path}` — {finding.message}"
+            for finding in findings
+        )
+        lines.append("")
+    else:
+        lines.extend(["✅ No issues in this batch.", ""])
+    return "\n".join(lines)
 
 
 def _generate_health_report(bundle_dir: Path) -> str:

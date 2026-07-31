@@ -12,6 +12,8 @@ single input; the output is a complete vault directory tree.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import os
 import shutil
@@ -19,8 +21,9 @@ import tempfile
 from contextlib import suppress
 from contextvars import ContextVar
 from copy import deepcopy
+from dataclasses import asdict
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from obsidian_llm_wiki.core.models import (
     ConceptNote,
@@ -29,8 +32,14 @@ from obsidian_llm_wiki.core.models import (
     SourceDoc,
     SourceSynthesis,
     SynthesisBundle,
+    concept_note_to_dict,
+    moc_to_dict,
     normalize_slug,
+    source_synthesis_to_dict,
 )
+
+if TYPE_CHECKING:
+    from obsidian_llm_wiki.core.registry import RenderDiff, VaultRegistry
 
 # Shared helpers live in their own modules; the names are re-exported here
 # (see __all__) because many callers import them from render.obsidian.
@@ -78,6 +87,40 @@ logger = logging.getLogger("obswiki.render.obsidian")
 _ACTIVE_RENDER_TRANSACTION: ContextVar[Any] = ContextVar(
     "active_render_transaction", default=None
 )
+
+
+def _render_fingerprint(payload: object) -> str:
+    raw = json.dumps(
+        payload,
+        sort_keys=True,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        default=str,
+    )
+    return hashlib.sha256(f"render-v2\x00{raw}".encode()).hexdigest()
+
+
+def _configured_int(config: Any, name: str, default: int) -> int:
+    value = getattr(config, name, default)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        return default
+    return value
+
+
+def _diff_render_manifest(
+    registry: VaultRegistry | None,
+    kind: str,
+    manifest: dict[str, tuple[str, str]],
+    pending: list[tuple[str, dict[str, tuple[str, str]], RenderDiff]],
+    *,
+    force: bool = False,
+) -> tuple[set[str], tuple[str, ...]]:
+    if registry is None:
+        return set(manifest), ()
+    diff = registry.render_diff(kind, manifest)
+    pending.append((kind, manifest, diff))
+    return (set(manifest) if force else set(diff.changed_keys)), diff.stale_paths
+
 
 _PROVENANCE_SCALAR_KEYS = (
     "requested_url",
@@ -174,10 +217,11 @@ def _write_generated_page(path: Path, page: str, bundle_dir: Path) -> bool:
     inode.  Reviewed pages retain their body while their generated metadata is
     refreshed.
     """
+    transaction = _ACTIVE_RENDER_TRANSACTION.get()
     if path.exists():
         existing = safe_read_file(path)
         try:
-            from obsidian_llm_wiki.core.backups import backup_file
+            from obsidian_llm_wiki.core.backups import backup_file, list_backups
             from obsidian_llm_wiki.core.review import is_reviewed_page
 
             if is_reviewed_page(existing):
@@ -186,16 +230,58 @@ def _write_generated_page(path: Path, page: str, bundle_dir: Path) -> bool:
                 generated_meta["reviewed"] = True
                 page = f"{build_frontmatter(generated_meta)}\n{reviewed_body.lstrip()}"
 
-            if page == existing:
+            if page == existing or _same_generated_page(page, existing):
                 return False
-            backup_file(path, bundle_dir / ".llmwiki" / "backups")
+            if transaction is not None:
+                transaction.before_change(path)
+                for backup in list_backups(path, bundle_dir / ".llmwiki" / "backups"):
+                    transaction.before_change(backup)
+            backup = backup_file(path, bundle_dir / ".llmwiki" / "backups")
+            if transaction is not None:
+                transaction.record_created(backup)
         except Exception as exc:
             raise RuntimeError(f"Could not safely replace generated page {path}: {exc}") from exc
+    elif transaction is not None:
+        transaction.before_change(path)
 
     atomic_write(path, page)
-    transaction = _ACTIVE_RENDER_TRANSACTION.get()
     if transaction is not None:
         transaction.record_write(path, page)
+    return True
+
+
+def _same_generated_page(left: str, right: str) -> bool:
+    """Ignore volatile generation timestamps when semantic output is unchanged."""
+    left_meta, left_body = parse_frontmatter(left)
+    right_meta, right_body = parse_frontmatter(right)
+    left_meta.pop("timestamp", None)
+    right_meta.pop("timestamp", None)
+    return left_meta == right_meta and left_body == right_body
+
+
+def _write_generated_artifact(path: Path, content: str, bundle_dir: Path) -> bool:
+    """Atomically write a non-page artifact only when its bytes changed."""
+    existing = safe_read_file(path) if path.is_file() else None
+    if existing == content:
+        return False
+    transaction = _ACTIVE_RENDER_TRANSACTION.get()
+    if transaction is not None:
+        transaction.before_change(path)
+    atomic_write(path, content)
+    if transaction is not None:
+        transaction.record_write(path, content)
+    return True
+
+
+def _delete_generated_artifact(path: Path, bundle_dir: Path) -> bool:
+    """Delete one stale generated artifact with transaction rollback support."""
+    if not path.is_file():
+        return False
+    transaction = _ACTIVE_RENDER_TRANSACTION.get()
+    if transaction is not None:
+        transaction.before_change(path)
+        transaction.record_delete(path)
+    path.unlink()
     return True
 
 
@@ -571,6 +657,60 @@ def render_directory_index(
     return "\n".join(parts)
 
 
+def _render_directory_indexes(
+    dir_name: str,
+    dir_path: Path,
+    items: list[tuple[str, str]],
+    bundle_dir: Path,
+    *,
+    shard_size: int,
+) -> list[str]:
+    """Write bounded index pages from entity metadata, never a directory scan."""
+    if shard_size < 1:
+        raise ValueError("index_shard_size must be positive")
+    ordered = sorted(items)
+    written: list[str] = []
+    keep: set[Path] = set()
+
+    if len(ordered) <= shard_size:
+        body = [f"# {dir_name.title()}", ""]
+        body.extend(f"- [[{slug}|{title}]]" for slug, title in ordered)
+        body.append("")
+        index_path = dir_path / "index.md"
+        if _write_generated_page(index_path, "\n".join(body), bundle_dir):
+            written.append(str(index_path))
+    else:
+        shard_links: list[str] = []
+        for index, start in enumerate(range(0, len(ordered), shard_size), 1):
+            chunk = ordered[start:start + shard_size]
+            shard_path = dir_path / f"index-{index:05d}.md"
+            body = [f"# {dir_name.title()} · {index}", ""]
+            body.extend(f"- [[{slug}|{title}]]" for slug, title in chunk)
+            body.append("")
+            if _write_generated_page(shard_path, "\n".join(body), bundle_dir):
+                written.append(str(shard_path))
+            keep.add(shard_path)
+            shard_links.append(
+                f"- [[{shard_path.stem}|Items {start + 1}–{start + len(chunk)}]]"
+            )
+        index_path = dir_path / "index.md"
+        index_body = [
+            f"# {dir_name.title()}",
+            "",
+            f"{len(ordered)} items across {len(shard_links)} shards.",
+            "",
+            *shard_links,
+            "",
+        ]
+        if _write_generated_page(index_path, "\n".join(index_body), bundle_dir):
+            written.append(str(index_path))
+
+    for stale in dir_path.glob("index-*.md"):
+        if stale not in keep and _delete_generated_artifact(stale, bundle_dir):
+            written.append(str(stale))
+    return written
+
+
 def render_bundle_index(
     bundle_dir: Path,
     concept_count: int,
@@ -614,8 +754,9 @@ class _RenderTransaction:
     created by an aborted render while retaining the pre-existing backup set.
     """
 
-    def __init__(self, bundle_dir: Path) -> None:
+    def __init__(self, bundle_dir: Path, *, lazy: bool = False) -> None:
         self.bundle_dir = bundle_dir
+        self._lazy = lazy
         self._staging = tempfile.TemporaryDirectory(prefix="obsidian-render-")
         self._staging_dir = Path(self._staging.name)
         self._root_existed = bundle_dir.exists()
@@ -623,7 +764,27 @@ class _RenderTransaction:
         self._passthrough_files: set[Path] = set()
         self._original_dirs: set[Path] = set()
         self._expected_outputs: dict[Path, str | None] = {}
-        self._snapshot()
+        if not lazy:
+            self._snapshot()
+
+    def before_change(self, path: Path) -> None:
+        """Lazily snapshot one path before a renderer mutation."""
+        if not self._lazy:
+            return
+        relative = path.relative_to(self.bundle_dir)
+        if relative in self._original_files or relative in self._expected_outputs:
+            return
+        if path.is_file():
+            destination = self._staging_dir / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(path, destination)
+            self._original_files.add(relative)
+
+    def record_created(self, path: Path) -> None:
+        """Track a new append-only artifact such as a page backup."""
+        if self._lazy and path.is_file():
+            relative = path.relative_to(self.bundle_dir)
+            self._expected_outputs[relative] = safe_read_file(path)
 
     def record_write(self, path: Path, content: str) -> None:
         self._expected_outputs[path.relative_to(self.bundle_dir)] = content
@@ -662,6 +823,9 @@ class _RenderTransaction:
 
     def rollback(self) -> None:
         """Restore the exact pre-render snapshot, including reviewed metadata."""
+        if self._lazy:
+            self._rollback_lazy()
+            return
         if self.bundle_dir.exists():
             for path in sorted(
                 (p for p in self.bundle_dir.rglob("*") if p.is_file()),
@@ -713,6 +877,43 @@ class _RenderTransaction:
                     self.bundle_dir.rmdir()
         self._staging.cleanup()
 
+    def _rollback_lazy(self) -> None:
+        """Restore only paths touched by a scalable render transaction."""
+        expected_paths = set(self._expected_outputs)
+        for relative, expected in sorted(
+            self._expected_outputs.items(),
+            key=lambda item: len(item[0].parts),
+            reverse=True,
+        ):
+            destination = self.bundle_dir / relative
+            original = self._staging_dir / relative
+            if relative in self._original_files:
+                current_matches = (
+                    (expected is None and not destination.exists())
+                    or (
+                        expected is not None
+                        and destination.is_file()
+                        and safe_read_file(destination) == expected
+                    )
+                )
+                if not current_matches:
+                    logger.warning("Preserving concurrent edit during rollback: %s", destination)
+                    continue
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                os.replace(original, destination)
+            elif destination.is_file() and expected is not None:
+                if safe_read_file(destination) == expected:
+                    destination.unlink()
+                else:
+                    logger.warning("Preserving concurrent edit during rollback: %s", destination)
+
+        for relative in self._original_files - expected_paths:
+            source = self._staging_dir / relative
+            destination = self.bundle_dir / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(source, destination)
+        self._staging.cleanup()
+
 
 def _render_vault(
     bundle_dir: Path,
@@ -721,6 +922,8 @@ def _render_vault(
     config: Any = None,
     *,
     cross_lingual_links: dict[str, list[tuple[str, float, str]]] | None = None,
+    render_registry: VaultRegistry | None = None,
+    force_render: bool = False,
 ) -> list[str]:
     """Render a complete vault from a SynthesisBundle.
 
@@ -740,6 +943,9 @@ def _render_vault(
     """
     written: list[str] = []
     stale_files: list[Path] = []
+    pending_manifests: list[
+        tuple[str, dict[str, tuple[str, str]], RenderDiff]
+    ] = []
     ts = _timestamp()
 
     # ── Backlink propagation ─────────────────────────────────────────
@@ -776,27 +982,48 @@ def _render_vault(
     # ── Render source pages ──────────────────────────────────────────
     from obsidian_llm_wiki.core.source_files import source_file_path
 
+    source_paths = {
+        filename: source_file_path(dirs["sources"], filename)
+        for filename in sources
+    }
+    source_manifest = {
+        filename: (
+            str(path.relative_to(bundle_dir)),
+            _render_fingerprint(asdict(sources[filename])),
+        )
+        for filename, path in source_paths.items()
+    }
+    dirty_sources, stale_source_paths = _diff_render_manifest(
+        render_registry,
+        "source-page",
+        source_manifest,
+        pending_manifests,
+        force=force_render,
+    )
+    stale_files.extend(bundle_dir / path for path in stale_source_paths)
     for filename, source in sources.items():
+        if filename not in dirty_sources:
+            continue
         page = render_source_page(source, ts)
-        path = source_file_path(dirs["sources"], filename)
+        path = source_paths[filename]
         if _write_generated_page(path, page, bundle_dir):
             written.append(str(path))
 
     # ── Render entry pages ───────────────────────────────────────────
     # Remove stale entry files from previous runs.
     from obsidian_llm_wiki.core.review import is_reviewed_page
-    current_entry_slugs = {
-        normalize_slug(slugify(s.source_title), s.source_title)
-        for s in bundle.sources
-    }
-    current_entry_slugs.add("index.md")
-    for old_file in dirs["entries"].glob("*.md"):
-        if (
-            old_file.stem not in current_entry_slugs
-            and old_file.name != "index.md"
-            and not is_reviewed_page(safe_read_file(old_file))
-        ):
-            stale_files.append(old_file)
+    if render_registry is None:
+        current_entry_slugs = {
+            normalize_slug(slugify(s.source_title), s.source_title)
+            for s in bundle.sources
+        }
+        for old_file in dirs["entries"].glob("*.md"):
+            if (
+                old_file.stem not in current_entry_slugs
+                and old_file.name != "index.md"
+                and not is_reviewed_page(safe_read_file(old_file))
+            ):
+                stale_files.append(old_file)
 
     # Build a lookup from slugified source_title → actual source filename
     # so the Source wikilink in each entry resolves to the real source note.
@@ -833,16 +1060,45 @@ def _render_vault(
                             source_filename_lookup[title_slug] = source_filename_lookup[s]
                             break
 
+    entry_records: list[tuple[str, SourceSynthesis, str, list[str], Path]] = []
+    entry_manifest: dict[str, tuple[str, str]] = {}
     for synthesis in bundle.sources:
-        entry_slug = normalize_slug(slugify(synthesis.source_title), synthesis.source_title)
+        entry_slug = normalize_slug(
+            slugify(synthesis.source_title), synthesis.source_title
+        )
         actual_source_stem = source_filename_lookup.get(entry_slug, entry_slug)
         concept_slugs = [
             concept.slug
             for concept in synthesis.concepts
             if concept.slug in current_concept_slugs
         ]
-        page = render_entry_page(synthesis, actual_source_stem, concept_slugs, ts)
         path = _safe_page_path(dirs["entries"], entry_slug, synthesis.source_title)
+        key = synthesis.source_file or entry_slug
+        entry_records.append(
+            (key, synthesis, actual_source_stem, concept_slugs, path)
+        )
+        entry_manifest[key] = (
+            str(path.relative_to(bundle_dir)),
+            _render_fingerprint(
+                {
+                    "synthesis": source_synthesis_to_dict(synthesis),
+                    "source_stem": actual_source_stem,
+                    "concept_slugs": concept_slugs,
+                }
+            ),
+        )
+    dirty_entries, stale_entry_paths = _diff_render_manifest(
+        render_registry,
+        "entry-page",
+        entry_manifest,
+        pending_manifests,
+        force=force_render,
+    )
+    stale_files.extend(bundle_dir / path for path in stale_entry_paths)
+    for key, synthesis, actual_source_stem, concept_slugs, path in entry_records:
+        if key not in dirty_entries:
+            continue
+        page = render_entry_page(synthesis, actual_source_stem, concept_slugs, ts)
         if _write_generated_page(path, page, bundle_dir):
             written.append(str(path))
 
@@ -873,57 +1129,151 @@ def _render_vault(
     # old files remain on disk and pollute the vault.
     from obsidian_llm_wiki.core.review import is_reviewed_page
 
-    for old_file in dirs["concepts"].glob("*.md"):
-        if old_file.name == "index.md":
-            continue
-        if old_file.stem in current_concept_slugs:
-            continue
+    if render_registry is None:
+        for old_file in dirs["concepts"].glob("*.md"):
+            if old_file.name == "index.md":
+                continue
+            if old_file.stem in current_concept_slugs:
+                continue
+            old_content = safe_read_file(old_file)
+            if is_reviewed_page(old_content):
+                continue
+            # Don't delete orphaned concepts — they're intentionally kept
+            # when their source is deleted but the concept still has value.
+            old_meta, _ = parse_frontmatter(old_content)
+            if old_meta.get("orphaned") is True:
+                continue
+            stale_files.append(old_file)
+
+    concept_paths = {
+        concept.slug: _safe_page_path(
+            dirs["concepts"], concept.slug, concept.title
+        )
+        for concept in bundle.concepts
+    }
+    concept_manifest = {
+        concept.slug: (
+            str(concept_paths[concept.slug].relative_to(bundle_dir)),
+            _render_fingerprint(
+                {
+                    "concept": concept_note_to_dict(concept),
+                    "related_titles": {
+                        link.slug: concept_map[link.slug].title
+                        for link in concept.related
+                        if link.slug in concept_map
+                    },
+                }
+            ),
+        )
+        for concept in bundle.concepts
+    }
+    dirty_concepts, stale_concept_paths = _diff_render_manifest(
+        render_registry,
+        "concept-page",
+        concept_manifest,
+        pending_manifests,
+        force=force_render,
+    )
+    for relative in stale_concept_paths:
+        old_file = bundle_dir / relative
         old_content = safe_read_file(old_file)
-        if is_reviewed_page(old_content):
-            continue
-        # Don't delete orphaned concepts — they're intentionally kept
-        # when their source is deleted but the concept still has value.
         old_meta, _ = parse_frontmatter(old_content)
-        if old_meta.get("orphaned") is True:
-            continue
-        stale_files.append(old_file)
+        if not is_reviewed_page(old_content) and old_meta.get("orphaned") is not True:
+            stale_files.append(old_file)
 
     for concept in bundle.concepts:
+        if concept.slug not in dirty_concepts:
+            continue
         page = render_concept_page(concept, ts, all_concepts=concept_map)
-        path = _safe_page_path(dirs["concepts"], concept.slug, concept.title)
+        path = concept_paths[concept.slug]
         if _write_generated_page(path, page, bundle_dir):
             written.append(str(path))
 
     # ── Render MOC pages ─────────────────────────────────────────────
     # Remove stale MoC files from previous runs.
     current_moc_slugs = {m.slug for m in bundle.maps}
-    for old_file in dirs["mocs"].glob("*.md"):
-        if (
-            old_file.stem not in current_moc_slugs
-            and old_file.name != "index.md"
-            and not is_reviewed_page(safe_read_file(old_file))
-        ):
-            stale_files.append(old_file)
+    if render_registry is None:
+        for old_file in dirs["mocs"].glob("*.md"):
+            if (
+                old_file.stem not in current_moc_slugs
+                and old_file.name != "index.md"
+                and not is_reviewed_page(safe_read_file(old_file))
+            ):
+                stale_files.append(old_file)
 
+    moc_paths = {
+        moc.slug: _safe_page_path(dirs["mocs"], moc.slug, moc.title)
+        for moc in bundle.maps
+    }
+    moc_manifest = {
+        moc.slug: (
+            str(moc_paths[moc.slug].relative_to(bundle_dir)),
+            _render_fingerprint(
+                {
+                    "moc": moc_to_dict(moc),
+                    "members": {
+                        slug: concept_note_to_dict(concept_map[slug])
+                        for slug in moc.concept_slugs
+                        if slug in concept_map
+                    },
+                    "cross_lingual": {
+                        slug: (cross_lingual_links or {}).get(slug, [])
+                        for slug in moc.concept_slugs
+                    },
+                }
+            ),
+        )
+        for moc in bundle.maps
+    }
+    dirty_mocs, stale_moc_paths = _diff_render_manifest(
+        render_registry,
+        "moc-page",
+        moc_manifest,
+        pending_manifests,
+        force=force_render,
+    )
+    for relative in stale_moc_paths:
+        old_file = bundle_dir / relative
+        if not is_reviewed_page(safe_read_file(old_file)):
+            stale_files.append(old_file)
     for moc in bundle.maps:
+        if moc.slug not in dirty_mocs:
+            continue
         page = render_moc_page(
             moc, ts,
             all_concepts=concept_map,
             cross_lingual_links=cross_lingual_links or None,
         )
-        path = _safe_page_path(dirs["mocs"], moc.slug, moc.title)
+        path = moc_paths[moc.slug]
         if _write_generated_page(path, page, bundle_dir):
             written.append(str(path))
 
     # ── Per-directory index.md ───────────────────────────────────────
+    index_items = {
+        "sources": [
+            (source_paths[filename].stem, source.title)
+            for filename, source in sources.items()
+        ],
+        "entries": [
+            (path.stem, synthesis.source_title)
+            for _key, synthesis, _stem, _slugs, path in entry_records
+        ],
+        "concepts": [
+            (concept.slug, concept.title) for concept in bundle.concepts
+        ],
+        "mocs": [(moc.slug, moc.title) for moc in bundle.maps],
+    }
+    index_shard_size = _configured_int(config, "index_shard_size", 2_000)
     for dir_name, dir_path in dirs.items():
-        md_files = [f for f in dir_path.glob("*.md")
-                    if f.name not in ("index.md", "log.md") and f not in stale_files]
-        if md_files:
-            idx = render_directory_index(dir_name, md_files, bundle_dir)
-            idx_path = dir_path / "index.md"
-            if _write_generated_page(idx_path, idx, bundle_dir):
-                written.append(str(idx_path))
+        written.extend(
+            _render_directory_indexes(
+                dir_name,
+                dir_path,
+                index_items[dir_name],
+                bundle_dir,
+                shard_size=index_shard_size,
+            )
+        )
 
     # ── Bundle-root index.md ─────────────────────────────────────────
     source_count = len(sources)
@@ -943,9 +1293,16 @@ def _render_vault(
     try:
         from obsidian_llm_wiki.render.graph_export import export_graph
         graph_dir = bundle_dir / ".llmwiki"
-        export_graph(bundle, graph_dir)
-        written.append(str(graph_dir / "graph.json"))
-        written.append(str(graph_dir / "graph.mmd"))
+        written.extend(
+            export_graph(
+                bundle,
+                graph_dir,
+                shard_size=_configured_int(config, "graph_shard_size", 5_000),
+                monolith_threshold=_configured_int(
+                    config, "graph_monolith_threshold", 10_000
+                ),
+            )
+        )
     except Exception as exc:
         raise RuntimeError("Graph export failed during vault render") from exc
 
@@ -955,7 +1312,12 @@ def _render_vault(
     try:
         from obsidian_llm_wiki.render.dataview import render_dataview_views
         written.extend(
-            render_dataview_views(bundle_dir, bundle, sources)
+            render_dataview_views(
+                bundle_dir,
+                bundle,
+                sources,
+                shard_size=_configured_int(config, "report_shard_size", 2_000),
+            )
         )
     except Exception as exc:
         raise RuntimeError("Dataview view render failed") from exc
@@ -982,21 +1344,34 @@ def _render_vault(
         ]
         if bundle.errors:
             body_lines.append(f"- errors: {len(bundle.errors)}")
+        transaction = _ACTIVE_RENDER_TRANSACTION.get()
+        expected_log_path = bundle_dir / "log.md"
+        if transaction is not None:
+            transaction.before_change(expected_log_path)
         log_path = append_log(
             bundle_dir, "build",
             f"rendered vault ({source_count} sources, {concept_count} concepts)",
             body=body_lines,
         )
+        if transaction is not None:
+            transaction.record_write(log_path, safe_read_file(log_path))
         written.append(str(log_path))
     except Exception as exc:
         raise RuntimeError("Vault log append failed") from exc
 
     for old_file in stale_files:
+        if not old_file.is_file() or is_reviewed_page(safe_read_file(old_file)):
+            continue
         transaction = _ACTIVE_RENDER_TRANSACTION.get()
         if transaction is not None:
+            transaction.before_change(old_file)
             transaction.record_delete(old_file)
         old_file.unlink()
         logger.debug("Removed stale generated page: %s", old_file)
+
+    if render_registry is not None:
+        for kind, manifest, diff in pending_manifests:
+            render_registry.commit_render_manifest(kind, manifest, diff)
 
     return written
 
@@ -1008,6 +1383,8 @@ def render_vault(
     config: Any = None,
     *,
     cross_lingual_links: dict[str, list[tuple[str, float, str]]] | None = None,
+    render_registry: VaultRegistry | None = None,
+    force_render: bool = False,
 ) -> list[str]:
     """Render a vault atomically with respect to generated output.
 
@@ -1017,7 +1394,7 @@ def render_vault(
     renderer-local output preparation, not caller-visible state changes. Stale
     pages are removed only after every output has been written successfully.
     """
-    transaction = _RenderTransaction(bundle_dir)
+    transaction = _RenderTransaction(bundle_dir, lazy=True)
     render_bundle = deepcopy(bundle)
     token = _ACTIVE_RENDER_TRANSACTION.set(transaction)
     try:
@@ -1027,6 +1404,8 @@ def render_vault(
             sources,
             config,
             cross_lingual_links=cross_lingual_links,
+            render_registry=render_registry,
+            force_render=force_render,
         )
     except BaseException:
         try:

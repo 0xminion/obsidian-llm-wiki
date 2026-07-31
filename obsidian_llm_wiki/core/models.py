@@ -277,6 +277,9 @@ class ConceptNote:
     confidence: float = 1.0
     provenance: str = "extracted"
     is_new: bool = True
+    # Stable registry identity. Slugs remain human-readable filenames and may
+    # be normalized; canonical_id is the durable cross-version reference.
+    canonical_id: str = ""
 
 
 @dataclass
@@ -486,6 +489,7 @@ def _concept_from_dict(data: dict[str, Any]) -> ConceptNote:
         confidence=confidence,
         provenance=_string(data.get("provenance", data.get("provenance_state", "extracted"))),
         is_new=data.get("is_new", True),
+        canonical_id=_string(data.get("canonical_id", "")),
     )
 
 
@@ -508,6 +512,7 @@ def concept_note_to_dict(c: ConceptNote) -> dict[str, Any]:
     return {
         "title": c.title,
         "slug": c.slug,
+        "canonical_id": c.canonical_id,
         "summary": c.summary,
         "tags": c.tags,
         "aliases": c.aliases,

@@ -217,11 +217,50 @@ def render_sources_by_freshness_view(
 # ── Top-level orchestrator ──────────────────────────────────────────────
 
 
+def _shard_static_rows(
+    *,
+    base_name: str,
+    title: str,
+    intro: list[str],
+    table_header: list[str],
+    rows: list[str],
+    shard_size: int,
+) -> tuple[str, dict[str, str]]:
+    shards: dict[str, str] = {}
+    links: list[str] = []
+    for index, start in enumerate(range(0, len(rows), shard_size), 1):
+        chunk = rows[start:start + shard_size]
+        filename = f"{base_name}-{index:05d}.md"
+        shard_title = f"{title} · {index}"
+        shards[filename] = _view_document(
+            shard_title,
+            "\n".join([f"# {shard_title}", "", *table_header, *chunk, ""]),
+        )
+        links.append(
+            f"- [[{Path(filename).stem}|Items {start + 1}–{start + len(chunk)}]]"
+        )
+    root = "\n".join(
+        [
+            f"# {title}",
+            "",
+            *intro,
+            "",
+            f"## Static View ({len(rows)} items)",
+            "",
+            *links,
+            "",
+        ]
+    )
+    return root, shards
+
+
 def render_dataview_views(
     bundle_dir: Path,
     bundle: SynthesisBundle,
     sources: dict[str, Any],
     contradictions_path: Path | None = None,
+    *,
+    shard_size: int = 2_000,
 ) -> list[str]:
     """Generate all Dataview/Bases view files in ``bundle_dir/views/``.
 
@@ -242,34 +281,138 @@ def render_dataview_views(
         contradictions_path = bundle_dir / ".llmwiki" / "contradictions.json"
 
     written: list[str] = []
+    if shard_size < 1:
+        raise ValueError("report shard_size must be positive")
     views: list[tuple[str, str]] = []
+    shard_documents: dict[str, str] = {}
 
     try:
-        views.append((
-            "concepts-by-confidence.md",
-            render_concepts_by_confidence_view(bundle),
-        ))
-        views.append((
-            "mocs-by-count.md",
-            render_mocs_by_count_view(bundle),
-        ))
+        if len(bundle.concepts) > shard_size:
+            concept_rows = [
+                f"| [[{concept.slug}|{concept.title}]] | {concept.confidence:.2f} | "
+                f"{', '.join(concept.tags) or '—'} |"
+                for concept in sorted(
+                    bundle.concepts, key=lambda item: (-item.confidence, item.slug)
+                )
+            ]
+            root, shards = _shard_static_rows(
+                base_name="concepts-by-confidence",
+                title="Concepts by Confidence",
+                intro=[
+                    "> Concepts sorted from highest to lowest confidence.",
+                    "",
+                    "```dataview",
+                    'TABLE confidence AS "Confidence", tags AS "Tags"',
+                    'FROM "concepts"',
+                    "SORT confidence DESC",
+                    "```",
+                ],
+                table_header=[
+                    "| Concept | Confidence | Tags |",
+                    "|---------|------------|------|",
+                ],
+                rows=concept_rows,
+                shard_size=shard_size,
+            )
+            views.append(("concepts-by-confidence.md", root))
+            shard_documents.update(shards)
+        else:
+            views.append((
+                "concepts-by-confidence.md",
+                render_concepts_by_confidence_view(bundle),
+            ))
+        if len(bundle.maps) > shard_size:
+            moc_rows = [
+                f"| [[{moc.slug}|{moc.title}]] | {len(moc.concept_slugs)} | "
+                f"{', '.join(moc.tags) or '—'} |"
+                for moc in sorted(
+                    bundle.maps, key=lambda item: (-len(item.concept_slugs), item.slug)
+                )
+            ]
+            root, shards = _shard_static_rows(
+                base_name="mocs-by-count",
+                title="Maps of Content by Concept Count",
+                intro=["> MoCs sorted by number of contained concepts."],
+                table_header=[
+                    "| MoC | Concepts | Tags |",
+                    "|-----|----------|------|",
+                ],
+                rows=moc_rows,
+                shard_size=shard_size,
+            )
+            views.append(("mocs-by-count.md", root))
+            shard_documents.update(shards)
+        else:
+            views.append((
+                "mocs-by-count.md",
+                render_mocs_by_count_view(bundle),
+            ))
         views.append((
             "contradictions-by-status.md",
             render_contradictions_by_status_view(contradictions_path),
         ))
-        views.append((
-            "sources-by-freshness.md",
-            render_sources_by_freshness_view(sources, bundle),
-        ))
+        if len(sources) > shard_size:
+            source_rows: list[tuple[str, str]] = []
+            for filename, source in sources.items():
+                retrieved = getattr(source.provenance, "retrieved_at", "")
+                source_type = getattr(source, "source_type", "") or "—"
+                url = getattr(source, "url", "") or "—"
+                stem = filename.removesuffix(".md")
+                row = (
+                    f"| [[{stem}|{source.title}]] | {retrieved or '—'} | "
+                    f"{source_type} | {url} |"
+                )
+                source_rows.append((retrieved, row))
+            root, shards = _shard_static_rows(
+                base_name="sources-by-freshness",
+                title="Sources by Freshness",
+                intro=["> Sources sorted by retrieval/recency timestamp."],
+                table_header=[
+                    "| Source | Retrieved | Type | URL |",
+                    "|--------|-----------|------|-----|",
+                ],
+                rows=[row for _retrieved, row in sorted(source_rows, reverse=True)],
+                shard_size=shard_size,
+            )
+            views.append(("sources-by-freshness.md", root))
+            shard_documents.update(shards)
+        else:
+            views.append((
+                "sources-by-freshness.md",
+                render_sources_by_freshness_view(sources, bundle),
+            ))
     except Exception as exc:
         logger.debug("Dataview views skipped: %s", exc)
         return written
 
+    from obsidian_llm_wiki.render.obsidian import _write_generated_artifact
+
     for filename, content in views:
         path = views_dir / filename
         title = content.splitlines()[0].removeprefix("# ")
-        path.write_text(_view_document(title, content), encoding="utf-8")
-        written.append(str(path))
+        if _write_generated_artifact(
+            path, _view_document(title, content), bundle_dir
+        ):
+            written.append(str(path))
+
+    for filename, content in sorted(shard_documents.items()):
+        path = views_dir / filename
+        if _write_generated_artifact(path, content, bundle_dir):
+            written.append(str(path))
+
+    shard_prefixes = (
+        "concepts-by-confidence-",
+        "mocs-by-count-",
+        "sources-by-freshness-",
+    )
+    for path in views_dir.glob("*.md"):
+        if path.name in shard_documents:
+            continue
+        if any(path.name.startswith(prefix) for prefix in shard_prefixes):
+            from obsidian_llm_wiki.render.obsidian import _delete_generated_artifact
+
+            if _delete_generated_artifact(path, bundle_dir):
+                written.append(str(path))
 
     # Write a views index.
     idx = views_dir / "index.md"
@@ -284,10 +427,12 @@ def render_dataview_views(
         "- [[sources-by-freshness|Sources by Freshness]]",
         "",
     ]
-    idx.write_text(
-        _view_document("Dataview Views", "\n".join(idx_lines)), encoding="utf-8"
-    )
-    written.append(str(idx))
+    if _write_generated_artifact(
+        idx,
+        _view_document("Dataview Views", "\n".join(idx_lines)),
+        bundle_dir,
+    ):
+        written.append(str(idx))
 
     logger.info("Dataview views generated: %d files → %s", len(written), views_dir)
     return written

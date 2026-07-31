@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Mapping
 from contextlib import suppress
 from hashlib import sha256
 from pathlib import Path
@@ -30,6 +31,7 @@ from obsidian_llm_wiki.render.obsidian import atomic_write, safe_read_file
 
 logger = logging.getLogger("obswiki.core.cache")
 _MAX_CACHE_FILENAME_BYTES = 200
+_CACHE_ARTIFACT_SCHEMA_VERSION = 2
 
 __all__ = [
     "synthesis_cache_dir",
@@ -71,10 +73,19 @@ def save_synthesis(
     synthesis: SourceSynthesis,
     cache_root: Path,
     source_file: str,
+    *,
+    artifact_versions: Mapping[str, str] | None = None,
 ) -> None:
     """Persist a SourceSynthesis to the cache, keyed by source filename."""
     synthesis.source_file = source_file
-    data = source_synthesis_to_dict(synthesis)
+    data = {
+        "_artifact": {
+            "kind": "source_synthesis",
+            "schema_version": _CACHE_ARTIFACT_SCHEMA_VERSION,
+            "versions": dict(artifact_versions or {}),
+        },
+        "payload": source_synthesis_to_dict(synthesis),
+    }
     path = synthesis_cache_path(cache_root, source_file)
     atomic_write(path, json.dumps(data, indent=2, ensure_ascii=False))
 
@@ -96,8 +107,9 @@ def load_synthesis(cache_root: Path, source_file: str) -> SourceSynthesis | None
     if not isinstance(data, dict):
         logger.warning("Invalid synthesis cache for '%s' — will recompile.", source_file)
         return None
+    payload = _cache_payload(data)
     try:
-        synth = source_synthesis_from_dict(data)
+        synth = source_synthesis_from_dict(payload)
     except (AttributeError, KeyError, TypeError, ValueError):
         logger.warning("Invalid synthesis cache for '%s' — will recompile.", source_file)
         return None
@@ -131,8 +143,9 @@ def load_all_cached_syntheses(cache_root: Path) -> dict[str, SourceSynthesis]:
         if not isinstance(data, dict):
             logger.warning("Invalid synthesis cache for '%s' — skipping.", fallback_source_file)
             continue
+        payload = _cache_payload(data)
         try:
-            synth = source_synthesis_from_dict(data)
+            synth = source_synthesis_from_dict(payload)
         except (AttributeError, KeyError, TypeError, ValueError):
             logger.warning("Invalid synthesis cache for '%s' — skipping.", fallback_source_file)
             continue
@@ -140,6 +153,15 @@ def load_all_cached_syntheses(cache_root: Path) -> dict[str, SourceSynthesis]:
         synth.source_file = source_file
         result[source_file] = synth
     return result
+
+
+def _cache_payload(data: dict[str, object]) -> dict[str, object]:
+    """Unwrap v2 artifacts while accepting portable legacy payloads."""
+    artifact = data.get("_artifact")
+    payload = data.get("payload")
+    if isinstance(artifact, dict) and isinstance(payload, dict):
+        return payload
+    return data
 
 
 def delete_cached_synthesis(cache_root: Path, source_file: str) -> None:

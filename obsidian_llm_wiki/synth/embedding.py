@@ -23,6 +23,7 @@ import logging
 import math
 import os
 import tempfile
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -44,6 +45,19 @@ _EMBED_TIMEOUT = 30  # seconds — allow for cold model loading
 _BATCH_SIZE = 8  # texts per Ollama /api/embed call — keeps RAM under ~2GB
 _ROUND_DECIMALS = 8
 _CACHE_VERSION = 2
+
+
+class _EmbeddingCache(dict[str, list[float]]):
+    def __init__(
+        self,
+        values: dict[str, list[float]],
+        *,
+        input_hashes: dict[str, str],
+        versioned_inputs: bool,
+    ) -> None:
+        super().__init__(values)
+        self.input_hashes = input_hashes
+        self.versioned_inputs = versioned_inputs
 
 
 def _canonical_embedding(value: object) -> list[float] | None:
@@ -200,7 +214,10 @@ def embed_batch(
 
 
 def load_embeddings_cache(
-    cache_path: Path, *, model: str | None = None
+    cache_path: Path,
+    *,
+    model: str | None = None,
+    artifact_versions: Mapping[str, str] | None = None,
 ) -> dict[str, list[float]]:
     """Load persisted embeddings from ``embeddings.json``.
 
@@ -226,21 +243,55 @@ def load_embeddings_cache(
             cached_model, current_model,
         )
         return {}
+    if artifact_versions is not None:
+        expected_versions = {
+            str(key): str(value) for key, value in artifact_versions.items()
+        }
+        cached_versions = data.get("_artifact_versions")
+        if cached_versions != expected_versions:
+            logger.info("Embeddings cache artifact versions changed — rebuilding")
+            return {}
 
     embeddings: dict[str, list[float]] = {}
     raw_embeddings = data.get("embeddings", {})
     if not isinstance(raw_embeddings, dict):
         return {}
+    dimensions = data.get("_dimensions")
+    if dimensions is not None and (
+        isinstance(dimensions, bool)
+        or not isinstance(dimensions, int)
+        or dimensions < 1
+    ):
+        return {}
     for slug, vec in raw_embeddings.items():
         canonical = _canonical_embedding(vec)
-        if isinstance(slug, str) and canonical is not None:
+        if (
+            isinstance(slug, str)
+            and canonical is not None
+            and (dimensions is None or len(canonical) == dimensions)
+        ):
             embeddings[slug] = canonical
+    raw_hashes = data.get("_input_hashes", {})
+    input_hashes = (
+        {str(slug): str(value) for slug, value in raw_hashes.items()}
+        if isinstance(raw_hashes, dict)
+        else {}
+    )
     logger.info("Loaded %d cached embeddings from %s", len(embeddings), cache_path)
-    return embeddings
+    return _EmbeddingCache(
+        embeddings,
+        input_hashes=input_hashes,
+        versioned_inputs="_input_hashes" in data,
+    )
 
 
 def save_embeddings_cache(
-    cache_path: Path, embeddings: dict[str, list[float]], *, model: str | None = None
+    cache_path: Path,
+    embeddings: dict[str, list[float]],
+    *,
+    model: str | None = None,
+    input_hashes: Mapping[str, str] | None = None,
+    artifact_versions: Mapping[str, str] | None = None,
 ) -> None:
     """Persist canonical embeddings atomically without shared temp-file races."""
     if not embeddings:
@@ -254,9 +305,22 @@ def save_embeddings_cache(
     }
     if not rounded:
         return
+    dimensions = len(next(iter(rounded.values())))
+    rounded = {
+        slug: vector for slug, vector in rounded.items() if len(vector) == dimensions
+    }
     data = {
         "_cache_version": _CACHE_VERSION,
         "_model": model or _embedding_model(),
+        "_dimensions": dimensions,
+        "_artifact_versions": {
+            str(key): str(value) for key, value in (artifact_versions or {}).items()
+        },
+        "_input_hashes": {
+            slug: str(input_hashes[slug])
+            for slug in rounded
+            if input_hashes is not None and slug in input_hashes
+        },
         "embeddings": rounded,
     }
     tmp_name = ""
@@ -307,6 +371,8 @@ def find_cross_lingual_links(
     model: str | None = None,
     host: str | None = None,
     embeddings_cache: dict[str, list[float]] | None = None,
+    comparison_slugs: set[str] | None = None,
+    candidate_slugs_by_slug: Mapping[str, Sequence[str]] | None = None,
 ) -> dict[str, list[tuple[str, float, str]]]:
     """Find cross-lingual concept pairs with high semantic similarity.
 
@@ -321,13 +387,23 @@ def find_cross_lingual_links(
     # a victim slug until persistence prunes it after semantic dedup; allowing
     # that stale key into this comparison would emit links to deleted pages.
     cache = embeddings_cache if embeddings_cache is not None else {}
-    live_slugs = {concept.slug for concept in concepts}
+    relevant_slugs: set[str] | None = None
+    if comparison_slugs is not None and candidate_slugs_by_slug is not None:
+        relevant_slugs = set(comparison_slugs)
+        for slug in comparison_slugs:
+            relevant_slugs.update(candidate_slugs_by_slug.get(slug, ()))
+    relevant_concepts = (
+        [concept for concept in concepts if concept.slug in relevant_slugs]
+        if relevant_slugs is not None
+        else concepts
+    )
+    live_slugs = {concept.slug for concept in relevant_concepts}
     embeddings: dict[str, list[float]] = {
         slug: vector for slug, vector in cache.items() if slug in live_slugs
     }
     concept_langs: dict[str, str] = {}
 
-    for concept in concepts:
+    for concept in relevant_concepts:
         if concept.slug in embeddings:
             lang = detect_language(f"{concept.title}. {concept.summary or ''}")
             concept_langs[concept.slug] = lang
@@ -351,8 +427,21 @@ def find_cross_lingual_links(
     links: dict[str, list[tuple[str, float, str]]] = {}
     slugs = list(embeddings.keys())
 
-    for i, slug_a in enumerate(slugs):
-        for slug_b in slugs[i + 1:]:
+    seen_pairs: set[tuple[str, str]] = set()
+    initiators = [slug for slug in slugs if comparison_slugs is None or slug in comparison_slugs]
+    for i, slug_a in enumerate(initiators):
+        candidates = (
+            candidate_slugs_by_slug.get(slug_a, ())
+            if candidate_slugs_by_slug is not None
+            else slugs[i + 1:]
+        )
+        for slug_b in candidates:
+            if slug_b == slug_a or slug_b not in embeddings:
+                continue
+            pair = (slug_a, slug_b) if slug_a < slug_b else (slug_b, slug_a)
+            if pair in seen_pairs:
+                continue
+            seen_pairs.add(pair)
             lang_a = concept_langs.get(slug_a, "en")
             lang_b = concept_langs.get(slug_b, "en")
 

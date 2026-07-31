@@ -53,6 +53,7 @@ SYNTHESIS_SCHEMA: dict[str, Any] = {
         {
             "title": "string — concise descriptive title (3-8 words)",
             "slug": "string — filename-safe slug (lowercase, hyphens, no spaces)",
+            "canonical_id": "string — exact stable ID from a supplied candidate when reusing it; empty for a genuinely new concept",
             "summary": "string — 1-2 sentence summary capturing the essential meaning",
             "tags": ["string — 2-4 lowercase categorical tags"],
             "aliases": ["string — alternative names for this concept"],
@@ -168,8 +169,7 @@ generous with cross-references — a good knowledge graph has many edges.
 Only create a MOC if 2+ concepts share a theme. Each MOC summary must be \
 3-5 sentences of insightful synthesis — NOT a generic one-liner. Explain \
 the key tension, how the concepts interact, and why this grouping matters.
-* Review the existing concept index below to avoid duplicates.  Set \
-"is_new" to false for concepts that already exist.
+* Review the bounded candidate index below to avoid duplicates; reuse a candidate only by canonical_id: copy its exact stable ID and canonical slug, then set "is_new" to false. Leave canonical_id empty for a genuinely new concept. Never invent or alter a candidate ID.
 * Surface ALL available insights — do not produce stubs or shallow summaries.
 * Claims should be specific, evidence-backed statements from the source. Include an exact verbatim supporting quote for every claim; do not paraphrase the quote.
 * Keep each concept to its 1-3 strongest claims and quote only the minimum exact span needed to support each claim.
@@ -177,7 +177,7 @@ the key tension, how the concepts interact, and why this grouping matters.
 {schema_guidance}
 {RELATIONSHIP_FEWSHOT}
 
---- EXISTING CONCEPT INDEX ---
+--- BOUNDED CONCEPT CANDIDATES (stable ID | slug | title) ---
 {existing_str}
 
 --- SOURCE DOCUMENT ---

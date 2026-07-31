@@ -12,6 +12,7 @@ import signal
 import threading
 import uuid
 from collections.abc import Iterator
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
@@ -24,6 +25,7 @@ from obsidian_llm_wiki.cli import app
 from obsidian_llm_wiki.cli._helpers import print_result_summary, resolve_vault
 from obsidian_llm_wiki.core.models import SourceDoc
 from obsidian_llm_wiki.core.operations import OperationRecord, OperationStatus, OperationStore
+from obsidian_llm_wiki.core.registry import VaultRegistry
 from obsidian_llm_wiki.ingest.sources import load_sources_from_dir
 from obsidian_llm_wiki.render.frontmatter import parse_frontmatter
 from obsidian_llm_wiki.render.obsidian import atomic_write, slugify
@@ -59,6 +61,96 @@ class _CancellationToken:
 
     def request(self, _signum: int, _frame: object) -> None:
         self.cancelled = True
+
+
+def _extract_direct(url: str) -> SourceDoc:
+    from obsidian_llm_wiki.ingest.extractors import extract
+
+    return extract(url)
+
+
+class _BoundedURLExtractor:
+    """Prefetch URL extraction with a fixed in-memory and worker budget."""
+
+    def __init__(self, urls: list[str], config: Any, workers: int) -> None:
+        self._urls = iter(urls)
+        self._config = config
+        self._workers = max(1, min(workers, 8))
+        self._executor: ThreadPoolExecutor | None = None
+        self._environment: Any = None
+        self._active: dict[str, Future[SourceDoc]] = {}
+        self._completed: dict[str, SourceDoc | BaseException] = {}
+
+    def __enter__(self) -> _BoundedURLExtractor:
+        from obsidian_llm_wiki.config import extraction_environment
+
+        self._environment = extraction_environment(
+            self._config, use_residential_proxy=False
+        )
+        self._environment.__enter__()
+        self._executor = ThreadPoolExecutor(
+            max_workers=self._workers,
+            thread_name_prefix="olw-extract",
+        )
+        self._refill()
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        if self._executor is not None:
+            self._executor.shutdown(wait=True, cancel_futures=True)
+        if self._environment is not None:
+            self._environment.__exit__(exc_type, exc, traceback)
+
+    def extract(self, url: str) -> SourceDoc:
+        outcome: SourceDoc | BaseException
+        if url in self._completed:
+            outcome = self._completed.pop(url)
+        else:
+            future = self._active.pop(url, None)
+            if future is None:
+                raise RuntimeError(f"URL extraction was not scheduled: {url}")
+            try:
+                outcome = future.result()
+            except BaseException as exc:
+                outcome = exc
+
+        if isinstance(outcome, BaseException):
+            # Proxy fallback mutates a compatibility environment bridge. Drain
+            # the bounded direct window first so no worker observes that change.
+            self._drain_active()
+            if (
+                self._config.residential_proxy_url
+                and _can_retry_with_residential_proxy(url)
+            ):
+                from obsidian_llm_wiki.config import extraction_environment
+
+                logger.info("Retrying extraction through residential proxy: %s", url)
+                try:
+                    with extraction_environment(self._config):
+                        outcome = _extract_direct(url)
+                except BaseException as exc:
+                    outcome = exc
+        self._refill()
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+    def _drain_active(self) -> None:
+        for url, future in list(self._active.items()):
+            try:
+                self._completed[url] = future.result()
+            except BaseException as exc:
+                self._completed[url] = exc
+        self._active.clear()
+
+    def _refill(self) -> None:
+        assert self._executor is not None
+        while len(self._active) + len(self._completed) < self._workers:
+            try:
+                url = next(self._urls)
+            except StopIteration:
+                return
+            self._active[url] = self._executor.submit(_extract_direct, url)
 
 
 @contextmanager
@@ -194,6 +286,37 @@ def _content_hash_matches_existing(
     return None
 
 
+def _backfill_ingest_index(registry: VaultRegistry, sources_dir: Path) -> None:
+    """Scan legacy source files once, then use indexed duplicate lookups."""
+    if registry.ingest_backfill_complete():
+        return
+    if not sources_dir.is_dir():
+        registry.mark_ingest_backfill_complete()
+        return
+    from obsidian_llm_wiki.core.state import hash_content
+
+    for existing in sorted(sources_dir.glob("*.md")):
+        if existing.name in {"failed_urls.md", "index.md"}:
+            continue
+        try:
+            metadata, body = parse_frontmatter(existing.read_text(encoding="utf-8"))
+        except OSError:
+            continue
+        body_stripped = body.strip()
+        if body_stripped.startswith("# "):
+            first_newline = body_stripped.find("\n")
+            if first_newline > 0:
+                body_stripped = body_stripped[first_newline + 1:].strip()
+        requested_url = str(metadata.get("url", ""))
+        registry.upsert_ingest_hash(
+            requested_url=requested_url or f"legacy:{existing.name}",
+            canonical_url=requested_url,
+            content_hash=hash_content(body_stripped),
+            output_file=existing.name,
+        )
+    registry.mark_ingest_backfill_complete()
+
+
 def _archive_clipping(clipping_path: Path, config: Any) -> Path | None:
     """Move a processed clipping to 02-Clippings/processed/, preserving its name.
 
@@ -247,7 +370,10 @@ def ingest(
         None, "--url", "-u", help="URLs to ingest (can be repeated)"
     ),
     parallel: int = typer.Option(
-        3, "--parallel", "-p", help="Concurrent LLM calls during synthesis"
+        3,
+        "--parallel",
+        "-p",
+        help="Bounded concurrent extraction and synthesis requests",
     ),
     dry_run: bool = typer.Option(False, "--dry-run", help="Deprecated alias for --plan"),
     plan: bool = typer.Option(
@@ -368,11 +494,44 @@ def ingest(
         )
         return
 
+    if not preview_mode:
+        with VaultRegistry(config.llmwiki_dir) as ingest_registry:
+            _backfill_ingest_index(ingest_registry, config.sources_dir)
+
+    known_url_duplicates: dict[str, tuple[Path, str, int]] = {}
+    if not preview_mode:
+        with VaultRegistry(config.llmwiki_dir) as ingest_registry:
+            for source_kind, identifier, _source, _resuming in planned:
+                if source_kind != "url":
+                    continue
+                match = ingest_registry.find_ingest_duplicate(
+                    requested_url=identifier
+                )
+                if match is None:
+                    continue
+                path = config.sources_dir / match.output_file
+                if not path.is_file():
+                    continue
+                raw = path.read_text(encoding="utf-8")
+                metadata, body = parse_frontmatter(raw)
+                known_url_duplicates[identifier] = (
+                    path,
+                    str(metadata.get("title", path.stem)),
+                    len(body.encode("utf-8")),
+                )
+
     new_count = 0
     failed_urls: list[tuple[str, str]] = []
     processed_clipping_paths: list[Path] = []
     cancellation = _CancellationToken()
-    with _cooperative_sigint(cancellation):
+    planned_urls = [
+        identifier
+        for source_kind, identifier, _source, _resuming in planned
+        if source_kind == "url" and identifier not in known_url_duplicates
+    ]
+    with _cooperative_sigint(cancellation), _BoundedURLExtractor(
+        planned_urls, config, parallel
+    ) as url_extractor:
         for index, (source_kind, identifier, clipped_source, resuming_source) in enumerate(
             planned
         ):
@@ -387,6 +546,7 @@ def ingest(
                 raise typer.Exit(code=130)
 
             record: OperationRecord | None = None
+            queue_id: int | None = None
             if not preview_mode:
                 record = _operation_for_source(
                     store,
@@ -396,28 +556,53 @@ def ingest(
                     resume=resuming_source,
                 )
                 store.transition(record, OperationStatus.RUNNING)
+                with VaultRegistry(config.llmwiki_dir) as ingest_registry:
+                    queue_id = ingest_registry.enqueue_dirty(
+                        "ingest",
+                        identifier,
+                        "requested",
+                        {"source_kind": source_kind, "run_id": run_id},
+                    )
+                    ingest_registry.start_dirty(queue_id, worker_id=run_id)
 
             try:
+                known_duplicate = known_url_duplicates.get(identifier)
+                if source_kind == "url" and known_duplicate is not None:
+                    duplicate_path, duplicate_title, duplicate_size = known_duplicate
+                    if queue_id is not None:
+                        with VaultRegistry(config.llmwiki_dir) as ingest_registry:
+                            ingest_registry.complete_dirty(queue_id)
+                    if record is not None:
+                        store.transition(
+                            record,
+                            OperationStatus.SUCCEEDED,
+                            title=duplicate_title,
+                            bytes_extracted=duplicate_size,
+                            output_file=duplicate_path.name,
+                        )
+                    _archive_inbox_url_files(
+                        inbox_url_paths.pop(identifier, []), config
+                    )
+                    _emit(
+                        json_output,
+                        _source_event(
+                            identifier,
+                            source_kind,
+                            OperationStatus.SUCCEEDED,
+                            run_id=run_id,
+                            title=duplicate_title,
+                            bytes=duplicate_size,
+                            output_file=duplicate_path.name,
+                            duplicate_of=duplicate_path.name,
+                        ),
+                        f"   ⏭ {duplicate_title[:60]} — already indexed",
+                    )
+                    continue
                 if source_kind == "clipping":
                     assert clipped_source is not None
                     source = clipped_source
                 else:
-                    from obsidian_llm_wiki.config import extraction_environment
-                    from obsidian_llm_wiki.ingest.extractors import extract
-
-                    try:
-                        # Direct egress is the normal path. A configured
-                        # residential proxy is a bounded fallback for sites
-                        # that reject the VPS/datacenter address.
-                        with extraction_environment(config, use_residential_proxy=False):
-                            source = extract(identifier)
-                    except Exception:
-                        proxy_allowed = _can_retry_with_residential_proxy(identifier)
-                        if not config.residential_proxy_url or not proxy_allowed:
-                            raise
-                        logger.info("Retrying extraction through residential proxy: %s", identifier)
-                        with extraction_environment(config):
-                            source = extract(identifier)
+                    source = url_extractor.extract(identifier)
                 source, truncated = _bounded_source(source, config.max_source_chars)
                 size = len(source.content.encode("utf-8"))
                 output_file = ""
@@ -431,10 +616,31 @@ def ingest(
                     # existing source already has the same content hash.
                     # This catches both same-URL re-extraction and
                     # different-URL-same-content duplicates.
-                    dup_path = _content_hash_matches_existing(
-                        config.sources_dir, source.content
+                    from obsidian_llm_wiki.core.state import hash_content
+
+                    content_hash = hash_content(source.content.strip())
+                    with VaultRegistry(config.llmwiki_dir) as ingest_registry:
+                        duplicate = ingest_registry.find_ingest_duplicate(
+                            requested_url=identifier if source_kind == "url" else "",
+                            content_hash=content_hash,
+                        )
+                    dup_path = (
+                        config.sources_dir / duplicate.output_file
+                        if duplicate is not None
+                        else None
                     )
+                    if dup_path is not None and not dup_path.is_file():
+                        dup_path = None
                     if dup_path is not None:
+                        with VaultRegistry(config.llmwiki_dir) as ingest_registry:
+                            ingest_registry.upsert_ingest_hash(
+                                requested_url=identifier,
+                                canonical_url=source.url or identifier,
+                                content_hash=content_hash,
+                                output_file=dup_path.name,
+                            )
+                            if queue_id is not None:
+                                ingest_registry.complete_dirty(queue_id)
                         _emit(
                             json_output,
                             _source_event(
@@ -484,6 +690,15 @@ def ingest(
                         filepath.unlink(missing_ok=True)
                         raise
                     output_file = filepath.name
+                    with VaultRegistry(config.llmwiki_dir) as ingest_registry:
+                        ingest_registry.upsert_ingest_hash(
+                            requested_url=identifier,
+                            canonical_url=source.url or identifier,
+                            content_hash=content_hash,
+                            output_file=output_file,
+                        )
+                        if queue_id is not None:
+                            ingest_registry.complete_dirty(queue_id)
                     assert record is not None
                     store.transition(
                         record,
@@ -526,6 +741,9 @@ def ingest(
             except KeyboardInterrupt:
                 if record is not None:
                     store.transition(record, OperationStatus.CANCELLED, error="interrupted")
+                if queue_id is not None:
+                    with VaultRegistry(config.llmwiki_dir) as ingest_registry:
+                        ingest_registry.fail_dirty(queue_id, "interrupted")
                 _cancel_remaining(
                     store,
                     run_id,
@@ -539,6 +757,9 @@ def ingest(
                 error = str(exc)
                 if record is not None:
                     store.transition(record, OperationStatus.FAILED, error=error)
+                if queue_id is not None:
+                    with VaultRegistry(config.llmwiki_dir) as ingest_registry:
+                        ingest_registry.fail_dirty(queue_id, error)
                 if source_kind == "url":
                     failed_urls.append((identifier, error))
                 _emit(
