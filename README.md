@@ -4,23 +4,6 @@ LLM-powered knowledge compiler for Obsidian vaults — give it any link, get a s
 
 `obsidian-llm-wiki` ingests web articles, YouTube videos, PDFs, podcasts, scientific papers, X/Twitter posts, and plain text — synthesises them via LLM into structured concepts with typed cross-references — and renders an Obsidian vault with YAML frontmatter, wikilinks, machine-readable `relations[]`, and MOC groupings. All markdown generation is deterministic; the LLM only produces the intermediate synthesis JSON.
 
-**Version 3.0** — implements the [Five-Year Scalability Roadmap](docs/scalability-roadmap.md) for a target vault of **5,000 sources, 50,000 concepts, and 20,000 MoCs**.
-
----
-
-## What's New in v3
-
-The v3 rewrite replaced the monolithic JSON/filesystem architecture with a SQLite-backed incremental runtime. Key changes:
-
-| v1/v2 constraint | v3 solution |
-|---|---|
-| Full concept index in synthesis prompts | Bounded FTS5 + ANN retrieval (50–200 candidates) |
-| Pairwise O(N²) semantic dedupe | Multi-table LSH ANN with exact cosine reranking |
-| Full-vault render rewrites | Path-incremental rendering with write journals |
-| JSON state/cache files | SQLite WAL registry with versioned entities |
-| Sequential ingest dedup scans | Indexed URL/content hash lookups |
-| Full health scans every build | Incremental round-robin health with explicit full audit |
-
 **947 tests** | **~20,800 lines of Python** | **83 source modules** | MIT licensed
 
 ---
@@ -45,6 +28,9 @@ Sources / URLs / Files  →  Extract  →  Synthesise  →  Merge  →  Render
 ### Key design decisions
 
 - **Synthesis cache** (`.llmwiki/cache/<filename>.json`) — incremental builds reuse cached syntheses for unchanged sources, so the rendered corpus is always complete — not just the subset that changed in this run.
+- **SQLite WAL registry** (`04-Wiki/.llmwiki/registry.db`, schema v3) — the authoritative incremental index. Source hashes, canonical URLs, artifact versions, concept stable IDs, serialized syntheses, float32 embeddings, dirty/retry queues, render manifests, ingest hashes, and maintenance cursor. Normal builds use indexed rows, not filesystem scans.
+- **Bounded retrieval** — FTS5 lexical search + multi-table LSH ANN with exact cosine reranking replaces full-corpus prompt context. Synthesis receives 50–200 candidates per source, not the entire concept registry.
+- **Path-incremental rendering** — a write journal records changed source, entry, concept, MoC, index shard, and graph shard paths. Backs up only paths that will change; restores only journaled paths on failure while preserving concurrent human edits.
 - **Orphan detection** — when a source is deleted, its exclusively-owned concepts get `orphaned: true` in frontmatter. Shared concepts are preserved.
 - **Full-corpus rendering** — `render_vault()` always receives the complete set of sources, not just changed ones. This prevents silent data loss.
 - **Typed relationships** — concepts carry `related: [{slug, relation, display}]` with normalised relation types (`variant_of`, `depends_on`, `component_of`, etc.). These render as both human-readable `[[slug|display]] — \`relation\`` in the body and machine-readable `relations[]` in frontmatter.
@@ -52,6 +38,10 @@ Sources / URLs / Files  →  Extract  →  Synthesise  →  Merge  →  Render
 - **Bilingual title normalization** — Chinese-derived titles are deterministically reformatted to English-first bilingual format (`English Title (中文标题)`) at render time, even when the LLM doesn't comply.
 - **Gradient confidence scoring** — thin concepts get a continuous confidence score (0.1–1.0) based on body length, replacing the old binary 0.3/1.0 threshold.
 - **Content chunking** — sources above `CHUNK_SIZE` (default 30K chars) are split into paragraph-boundary chunks. Each chunk is independently synthesised, and skeletons are merged before Pass 2 expansion.
+- **Sharded derived artifacts** — directory indexes, graph JSON, and reports shard above configured thresholds. Mermaid graph export is omitted above its safe threshold rather than emitting unusable files.
+- **Durable ingest** — indexed URL/content dedupe, bounded extraction workers, failed-URL retry queue with next-attempt time. `olw ingest --resume` reconstructs interrupted operations from SQLite and releases dead-run leases.
+- **Version contract** — every record carries extractor/prompt/schema/model/embedding versions; incompatible versions create explicit dirty queue entries, never silently reuse stale data.
+- **Shared request limiter** — one limiter per pipeline run, shared across single-pass synthesis, chunked Pass 1, two-pass Pass 2 expansion, parse repair/retry, and concept resynthesis.
 
 ### The Synthesis Contract
 
@@ -89,26 +79,23 @@ The LLM produces one structured JSON object per source containing everything the
 | **Single-pass** (default) | `single` | 1 per source | Fast, good for short articles |
 | **Two-pass quality** | `two_pass` | 1 + N (per concept) | Deep, evidence-backed sections |
 
-In two-pass mode, Pass 1 extracts a concept skeleton (title, slug, rationale), then Pass 2 expands each concept with a focused prompt producing 300+ word sections. A quality gate assigns gradient confidence scores to thin concepts. Pass 2 uses evidence-selected source windows (not the entire source per concept) under one shared request/rate limiter.
+In two-pass mode, Pass 1 extracts a concept skeleton (title, slug, rationale), then Pass 2 expands each concept with a focused prompt producing 300+ word sections. A quality gate assigns gradient confidence scores to thin concepts. Pass 2 uses evidence-selected source windows (not the entire source per concept) under the shared request limiter.
 
-### Incremental Architecture (v2 scalability)
+### Semantic features
 
-The v3 runtime is built around the SQLite registry (`04-Wiki/.llmwiki/registry.db`, WAL mode, schema v3):
+- **Cross-lingual embedding links** — when `EMBEDDINGS_ENABLED=true`, concepts across languages are linked via cosine similarity (threshold 0.60) using `embeddinggemma:300m` embeddings.
+- **Semantic concept deduplication** — same-language concepts with >0.85 cosine similarity are merged automatically. ANN candidate search replaces all-pairs similarity — only top-k candidates are compared, never the full corpus.
+- **Embedding-based MoC assignment** — orphan concepts (not in any MoC) are assigned to the most semantically similar MoC via ANN candidates.
+- **Graph visualization** — `graph.json` (D3.js/Obsidian compatible) and `graph.mmd` (Mermaid) are exported to `.llmwiki/`. Above the monolith threshold, graph JSON is sharded and Mermaid becomes a summary.
+- **Vault health report** — `olw health` checks for broken wikilinks, orphan concepts, stub entries, low-confidence concepts, and tag violations.
 
-| Component | What it does |
-|---|---|
-| **Registry** | Source hashes, canonical URLs, artifact versions, concept stable IDs, serialized syntheses, float32 embeddings, dirty/retry queues, render manifests, ingest hashes, maintenance cursor |
-| **FTS5 search** | Bounded lexical concept retrieval replaces full-corpus prompt context |
-| **ANN index** | Multi-table sparse random-hyperplane LSH with exact cosine reranking — replaces O(N²) pairwise similarity |
-| **Version contract** | Every record carries extractor/prompt/schema/model/embedding versions; incompatible versions create explicit dirty queue entries |
-| **Write journal** | Lazy preimage journal enables rollback on render failure while preserving concurrent human edits |
-| **Sharded artifacts** | Directory indexes, graph JSON, and reports shard above configured thresholds; Mermaid disabled above monolith threshold |
-| **Incremental health** | Round-robin page batches by default; `olw health --full` remains the explicit complete audit |
-| **Durable ingest** | Indexed URL/content dedupe, bounded extraction workers, failed-URL retry queue with next-attempt time. `olw ingest --resume` reconstructs interrupted operations from SQLite and releases dead-run leases |
+Embeddings are opt-in and fail closed: if the local embedding endpoint is unavailable or returns an invalid vector, normal synthesis and rendering still complete without semantic deduplication, automatic MoC assignment, or cross-lingual expansion.
+
+Set `EMBEDDING_MODEL` to a model that supports every language in the vault. For English+Chinese vaults, use a multilingual embedding model such as the locally installed `qwen3-embedding:0.6b` rather than assuming a default model is bilingual.
 
 ### Runtime Budgets
 
-Defaults are deliberately conservative for a small server:
+The system is designed for a steady-state vault of **5,000 sources, 50,000 concepts, and 20,000 MoCs**. Defaults are deliberately conservative for a small server:
 
 | Budget | Default | Env var |
 |---|---|---|
@@ -122,18 +109,6 @@ Defaults are deliberately conservative for a small server:
 | Graph monolith threshold | 10,000 | `GRAPH_MONOLITH_THRESHOLD` |
 | Max source chars | 1,000,000 | `MAX_SOURCE_CHARS` |
 | Concept min body | 1,200 chars | `CONCEPT_MIN_BODY_CHARS` |
-
-### Semantic features
-
-- **Cross-lingual embedding links** — when `EMBEDDINGS_ENABLED=true`, concepts across languages are linked via cosine similarity (threshold 0.60) using `embeddinggemma:300m` embeddings.
-- **Semantic concept deduplication** — same-language concepts with >0.85 cosine similarity are merged automatically.
-- **Embedding-based MoC assignment** — orphan concepts (not in any MoC) are assigned to the most semantically similar MoC.
-- **Graph visualization** — `graph.json` (D3.js/Obsidian compatible) and `graph.mmd` (Mermaid) are exported to `.llmwiki/`. Above the monolith threshold, graph JSON is sharded and Mermaid becomes a summary.
-- **Vault health report** — `olw health` checks for broken wikilinks, orphan concepts, stub entries, low-confidence concepts, and tag violations.
-
-Embeddings are opt-in and fail closed: if the local embedding endpoint is unavailable or returns an invalid vector, normal synthesis and rendering still complete without semantic deduplication, automatic MoC assignment, or cross-lingual expansion.
-
-Set `EMBEDDING_MODEL` to a model that supports every language in the vault. For English+Chinese vaults, use a multilingual embedding model such as the locally installed `qwen3-embedding:0.6b` rather than assuming a default model is bilingual.
 
 ---
 
@@ -365,7 +340,7 @@ Typed, machine-readable maintenance findings:
 | `missing_provenance` | Source page without provenance |
 | `undersized_moc` | MoC with too few members |
 
-Default mode scans incrementally (round-robin batches); `--full` performs a complete audit.
+Default mode scans incrementally (round-robin page batches); `--full` performs a complete audit.
 
 ### Fix (`olw fix`)
 
@@ -436,7 +411,7 @@ CHUNK_SIZE=30000
 COMPILE_CONCURRENCY=3
 REQUEST_MIN_INTERVAL_MS=0
 
-# Five-year scalability budgets (5k sources / 50k concepts / 20k MoCs)
+# Scalability budgets (5k sources / 50k concepts / 20k MoCs)
 CANDIDATE_LIMIT=100
 CANDIDATE_CHAR_BUDGET=16000
 ANN_CANDIDATE_POOL=1000
@@ -671,7 +646,7 @@ GitHub Actions (`.github/workflows/ci.yml`):
 
 ## Documentation
 
-- [Five-Year Scalability Roadmap](docs/scalability-roadmap.md) — v2 architecture design and acceptance criteria
+- [Five-Year Scalability Roadmap](docs/scalability-roadmap.md) — architecture design and acceptance criteria
 - [Implementation Plan](docs/plans/2026-07-31-five-year-scalability-v2.md) — TDD delivery slices and capacity gates
 - [Knowledge Engine Hardening Plan](docs/plans/2026-07-13-knowledge-engine-hardening.md) — provenance, safety, maintenance, and query design
 - [Evidence Connectors + Render Integrity](docs/plans/2026-07-14-evidence-connectors-render-integrity.md) — Phase 2 hardening
