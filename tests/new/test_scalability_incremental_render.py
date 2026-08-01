@@ -5,6 +5,8 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from obsidian_llm_wiki.core.models import (
     ConceptLink,
     ConceptNote,
@@ -95,6 +97,28 @@ def test_unchanged_pages_keep_their_inodes_across_render_timestamps(
     assert not ({str(path) for path in tracked} & set(written))
 
 
+def test_registry_backed_noop_render_does_not_grow_the_vault_log(tmp_path: Path) -> None:
+    bundle_dir = tmp_path / "04-Wiki"
+    bundle = _bundle()
+    sources = {
+        "incremental.md": SourceDoc(
+            title="Incremental Source",
+            content="Stable source content.",
+            source_file="incremental.md",
+        )
+    }
+    with VaultRegistry(tmp_path / ".llmwiki") as registry:
+        render_vault(bundle_dir, bundle, sources, render_registry=registry)
+        log_path = bundle_dir / "log.md"
+        before = (log_path.read_bytes(), log_path.stat().st_mtime_ns)
+        time.sleep(0.01)
+
+        written = render_vault(bundle_dir, bundle, sources, render_registry=registry)
+
+    assert (log_path.read_bytes(), log_path.stat().st_mtime_ns) == before
+    assert str(log_path) not in written
+
+
 def test_render_transaction_does_not_scan_the_whole_vault(tmp_path: Path, monkeypatch) -> None:
     bundle_dir = tmp_path / "04-Wiki"
     bundle_dir.mkdir(parents=True)
@@ -149,6 +173,62 @@ def test_render_registry_materializes_only_changed_concept_paths(
     registry.close()
 
     assert calls == ["concept-7"]
+
+
+def test_render_manifest_batch_rolls_back_when_a_later_manifest_fails(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Filesystem rollback and render-state rollback are one commit boundary."""
+    bundle_dir = tmp_path / "04-Wiki"
+    sources = {
+        "incremental.md": SourceDoc("Incremental Source", "Original source body.")
+    }
+    with VaultRegistry(tmp_path / ".llmwiki") as registry:
+        original_bundle = _bundle(2)
+        render_vault(
+            bundle_dir,
+            original_bundle,
+            sources,
+            render_registry=registry,
+        )
+        source_path = bundle_dir / "sources" / "incremental.md"
+        original_page = source_path.read_text(encoding="utf-8")
+
+        changed_bundle = _bundle(2)
+        changed_sources = {
+            "incremental.md": SourceDoc("Incremental Source", "Changed source body.")
+        }
+        commit_one = registry._commit_render_manifest_unlocked
+        calls = 0
+
+        def fail_second(kind, manifest, diff):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise RuntimeError("injected render-state failure")
+            commit_one(kind, manifest, diff)
+
+        monkeypatch.setattr(registry, "_commit_render_manifest_unlocked", fail_second)
+        with pytest.raises(RuntimeError, match="render-state failure"):
+            render_vault(
+                bundle_dir,
+                changed_bundle,
+                changed_sources,
+                render_registry=registry,
+            )
+        assert source_path.read_text(encoding="utf-8") == original_page
+
+        monkeypatch.setattr(registry, "_commit_render_manifest_unlocked", commit_one)
+        written = render_vault(
+            bundle_dir,
+            changed_bundle,
+            changed_sources,
+            render_registry=registry,
+        )
+
+    assert str(source_path) in written
+    assert "Changed source body." in source_path.read_text(encoding="utf-8")
 
 
 def test_force_render_rebuilds_manifest_clean_page_after_manual_unreview(
@@ -224,11 +304,30 @@ def test_large_graph_export_writes_bounded_shards_and_manifest(tmp_path: Path) -
     assert len([path for path in changed if "/nodes-" in path]) == 1
 
 
+def test_graph_threshold_accounts_for_edge_volume(tmp_path: Path) -> None:
+    bundle = _bundle(2)
+    bundle.concepts[0].related = [
+        ConceptLink(slug=bundle.concepts[1].slug, relation=f"relation-{index}")
+        for index in range(30)
+    ]
+
+    export_graph(
+        bundle,
+        tmp_path,
+        shard_size=5,
+        monolith_threshold=10,
+    )
+
+    assert (tmp_path / "graph" / "manifest.json").is_file()
+    assert not (tmp_path / "graph.json").exists()
+
+
 def test_large_directory_indexes_are_sharded_without_page_globs(tmp_path: Path) -> None:
     bundle_dir = tmp_path / "04-Wiki"
+    bundle = _bundle(11)
     render_vault(
         bundle_dir,
-        _bundle(11),
+        bundle,
         {"incremental.md": SourceDoc("Incremental Source", "Stable content.")},
         config=SimpleNamespace(
             index_shard_size=3,
@@ -239,13 +338,32 @@ def test_large_directory_indexes_are_sharded_without_page_globs(tmp_path: Path) 
 
     index = (bundle_dir / "concepts" / "index.md").read_text()
     shards = sorted((bundle_dir / "concepts").glob("index-*.md"))
-    assert "[[index-00001|Items 1–3]]" in index
-    assert len(shards) == 4
+    assert "|Bucket " in index
+    assert 1 <= len(shards) <= 11
     assert all(
         sum(line.startswith("- [[concept-") for line in shard.read_text().splitlines())
         <= 3
         for shard in shards
     )
+
+    bundle.concepts[7].title = "Changed Indexed Title"
+    changed = render_vault(
+        bundle_dir,
+        bundle,
+        {"incremental.md": SourceDoc("Incremental Source", "Stable content.")},
+        config=SimpleNamespace(
+            index_shard_size=3,
+            graph_shard_size=100,
+            graph_monolith_threshold=100,
+        ),
+    )
+    assert len(
+        [
+            path
+            for path in changed
+            if "/concepts/index-b" in path and path.endswith(".md")
+        ]
+    ) == 1
 
 
 def test_large_static_reports_are_sharded(tmp_path: Path) -> None:
@@ -262,10 +380,26 @@ def test_large_static_reports_are_sharded(tmp_path: Path) -> None:
     shards = sorted(
         (bundle_dir / "views").glob("concepts-by-confidence-*.md")
     )
-    assert "[[concepts-by-confidence-00001|Items 1–3]]" in root
-    assert len(shards) == 4
+    assert "|Bucket " in root
+    assert 1 <= len(shards) <= 11
     assert all(
         sum(line.startswith("| [[concept-") for line in shard.read_text().splitlines())
         <= 3
         for shard in shards
     )
+
+    bundle.concepts[7].title = "Changed Report Title"
+    changed = render_dataview_views(
+        bundle_dir,
+        bundle,
+        {},
+        shard_size=3,
+    )
+    assert len(
+        [
+            path
+            for path in changed
+            if "/views/concepts-by-confidence-b" in path
+            and path.endswith(".md")
+        ]
+    ) == 1

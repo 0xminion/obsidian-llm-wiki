@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import json
 import logging
 import os
@@ -15,6 +16,7 @@ from collections.abc import Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import UTC, datetime
+from functools import wraps
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -23,10 +25,11 @@ import typer
 
 from obsidian_llm_wiki.cli import app
 from obsidian_llm_wiki.cli._helpers import print_result_summary, resolve_vault
+from obsidian_llm_wiki.core.lock import acquire_lock, release_lock
 from obsidian_llm_wiki.core.models import SourceDoc
 from obsidian_llm_wiki.core.operations import OperationRecord, OperationStatus, OperationStore
 from obsidian_llm_wiki.core.registry import VaultRegistry
-from obsidian_llm_wiki.ingest.sources import load_sources_from_dir
+from obsidian_llm_wiki.ingest.sources import load_sources_incremental
 from obsidian_llm_wiki.render.frontmatter import parse_frontmatter
 from obsidian_llm_wiki.render.obsidian import atomic_write, slugify
 
@@ -295,12 +298,14 @@ def _backfill_ingest_index(registry: VaultRegistry, sources_dir: Path) -> None:
         return
     from obsidian_llm_wiki.core.state import hash_content
 
+    read_failed = False
     for existing in sorted(sources_dir.glob("*.md")):
         if existing.name in {"failed_urls.md", "index.md"}:
             continue
         try:
             metadata, body = parse_frontmatter(existing.read_text(encoding="utf-8"))
         except OSError:
+            read_failed = True
             continue
         body_stripped = body.strip()
         if body_stripped.startswith("# "):
@@ -314,7 +319,8 @@ def _backfill_ingest_index(registry: VaultRegistry, sources_dir: Path) -> None:
             content_hash=hash_content(body_stripped),
             output_file=existing.name,
         )
-    registry.mark_ingest_backfill_complete()
+    if not read_failed:
+        registry.mark_ingest_backfill_complete()
 
 
 def _archive_clipping(clipping_path: Path, config: Any) -> Path | None:
@@ -350,7 +356,12 @@ def _operation_for_source(
 ) -> OperationRecord:
     """Create a record, reusing a cancelled/failed record when explicitly resumed."""
     previous = store.latest_for_source(source) if resume else None
-    if previous and previous.status in {OperationStatus.CANCELLED, OperationStatus.FAILED}:
+    if previous and previous.status in {
+        OperationStatus.CANCELLED,
+        OperationStatus.FAILED,
+        OperationStatus.RUNNING,
+        OperationStatus.RETRYING,
+    }:
         previous.run_id = run_id
         store.transition(previous, OperationStatus.RETRYING)
         return previous
@@ -363,7 +374,33 @@ def _operation_for_source(
     return record
 
 
+def _serialize_ingest(func: Any) -> Any:
+    """Prevent two ingest processes from racing extraction and dedup writes."""
+
+    @wraps(func)
+    def wrapped(*args: Any, **kwargs: Any) -> Any:
+        arguments = inspect.signature(func).bind_partial(*args, **kwargs).arguments
+        if any(arguments.get(option, False) for option in ("plan", "dry_run", "preview")):
+            return func(*args, **kwargs)
+        raw_vault = arguments.get("vault")
+        if raw_vault is None:
+            return func(*args, **kwargs)
+        vault_path, _config = resolve_vault(str(raw_vault))
+        lock_file = vault_path / "04-Wiki" / ".llmwiki" / "ingest.lock"
+        if not acquire_lock(lock_file):
+            raise typer.BadParameter(
+                "another ingest process is already active for this vault"
+            )
+        try:
+            return func(*args, **kwargs)
+        finally:
+            release_lock(lock_file)
+
+    return wrapped
+
+
 @app.command()
+@_serialize_ingest
 def ingest(
     vault: str = typer.Argument(..., help="Path to Obsidian vault"),
     urls: list[str] | None = typer.Option(
@@ -418,6 +455,27 @@ def ingest(
     store = OperationStore(config.llmwiki_dir)
     requested_urls = list(dict.fromkeys(urls or []))
     resume_sources = store.read_resume_marker() if resume else []
+    interrupted_operations = store.interrupted_ingest_operations() if resume else []
+    if interrupted_operations:
+        resumed_keys = {
+            (item["source_kind"], item["source"]) for item in resume_sources
+        }
+        for operation in interrupted_operations:
+            key = (operation.source_kind, operation.source)
+            if key not in resumed_keys:
+                resume_sources.append(
+                    {
+                        "source": operation.source,
+                        "source_kind": operation.source_kind,
+                        "status": operation.status.value,
+                    }
+                )
+                resumed_keys.add(key)
+        with VaultRegistry(config.llmwiki_dir) as registry:
+            for previous_run_id in {
+                operation.run_id for operation in interrupted_operations if operation.run_id
+            }:
+                registry.release_dirty_worker(previous_run_id)
     run_id = _run_id()
     mode = "plan" if plan_mode else "preview" if preview_mode else "ingest"
     _emit(
@@ -547,6 +605,7 @@ def ingest(
 
             record: OperationRecord | None = None
             queue_id: int | None = None
+            queue_claimed = True
             if not preview_mode:
                 record = _operation_for_source(
                     store,
@@ -563,15 +622,19 @@ def ingest(
                         "requested",
                         {"source_kind": source_kind, "run_id": run_id},
                     )
-                    ingest_registry.start_dirty(queue_id, worker_id=run_id)
+                    queue_claimed = ingest_registry.start_dirty(
+                        queue_id, worker_id=run_id
+                    )
 
             try:
+                if not queue_claimed:
+                    raise RuntimeError("ingest queue item has an active lease")
                 known_duplicate = known_url_duplicates.get(identifier)
                 if source_kind == "url" and known_duplicate is not None:
                     duplicate_path, duplicate_title, duplicate_size = known_duplicate
                     if queue_id is not None:
                         with VaultRegistry(config.llmwiki_dir) as ingest_registry:
-                            ingest_registry.complete_dirty(queue_id)
+                            ingest_registry.complete_dirty(queue_id, worker_id=run_id)
                     if record is not None:
                         store.transition(
                             record,
@@ -640,7 +703,9 @@ def ingest(
                                 output_file=dup_path.name,
                             )
                             if queue_id is not None:
-                                ingest_registry.complete_dirty(queue_id)
+                                ingest_registry.complete_dirty(
+                                    queue_id, worker_id=run_id
+                                )
                         _emit(
                             json_output,
                             _source_event(
@@ -698,7 +763,7 @@ def ingest(
                             output_file=output_file,
                         )
                         if queue_id is not None:
-                            ingest_registry.complete_dirty(queue_id)
+                            ingest_registry.complete_dirty(queue_id, worker_id=run_id)
                     assert record is not None
                     store.transition(
                         record,
@@ -743,7 +808,11 @@ def ingest(
                     store.transition(record, OperationStatus.CANCELLED, error="interrupted")
                 if queue_id is not None:
                     with VaultRegistry(config.llmwiki_dir) as ingest_registry:
-                        ingest_registry.fail_dirty(queue_id, "interrupted")
+                        ingest_registry.fail_dirty(
+                            queue_id,
+                            "interrupted",
+                            worker_id=run_id,
+                        )
                 _cancel_remaining(
                     store,
                     run_id,
@@ -759,7 +828,11 @@ def ingest(
                     store.transition(record, OperationStatus.FAILED, error=error)
                 if queue_id is not None:
                     with VaultRegistry(config.llmwiki_dir) as ingest_registry:
-                        ingest_registry.fail_dirty(queue_id, error)
+                        ingest_registry.fail_dirty(
+                            queue_id,
+                            error,
+                            worker_id=run_id,
+                        )
                 if source_kind == "url":
                     failed_urls.append((identifier, error))
                 _emit(
@@ -833,7 +906,9 @@ def ingest(
         )
         return
 
-    full_corpus = load_sources_from_dir(config.sources_dir)
+    with VaultRegistry(config.llmwiki_dir) as source_registry:
+        source_load = load_sources_incremental(config.sources_dir, source_registry)
+    full_corpus = source_load.sources
     if not full_corpus:
         _emit(
             json_output,
@@ -861,7 +936,15 @@ def ingest(
     from obsidian_llm_wiki.core.pipeline import run_pipeline
 
     try:
-        result = asyncio.run(run_pipeline(vault_path, full_corpus, config))
+        result = asyncio.run(
+            run_pipeline(
+                vault_path,
+                full_corpus,
+                config,
+                unchanged_filenames=source_load.unchanged_filenames,
+                source_file_signatures=source_load.signatures,
+            )
+        )
     except KeyboardInterrupt:
         _emit(
             json_output,

@@ -27,6 +27,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from obsidian_llm_wiki.core.registry import VaultRegistry
+
 logger = logging.getLogger("obswiki.core.metrics")
 
 __all__ = [
@@ -221,6 +223,8 @@ class MetricsCollector:
         """
         self.llmwiki_dir.mkdir(parents=True, exist_ok=True)
         current_run = self._to_dict()
+        with VaultRegistry(self.llmwiki_dir) as registry:
+            registry.upsert_metric_run(current_run)
 
         # Load existing metrics to preserve history.
         existing: dict[str, Any] = {}

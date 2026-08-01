@@ -102,6 +102,15 @@ def english_alias(aliases: list[str]) -> str:
     return ""
 
 
+def chinese_alias(aliases: list[str]) -> str:
+    """Pick the first Chinese-only alias if one exists."""
+    for alias in aliases or []:
+        alias = (alias or "").strip()
+        if alias and is_chinese(alias) and not has_latin(alias):
+            return alias
+    return ""
+
+
 def ensure_english_first_bilingual(
     title: str,
     *,
@@ -155,10 +164,24 @@ def normalize_bilingual_titles_and_slugs(bundle: SynthesisBundle) -> dict[str, s
             concept.slug = _bilingual_slug(concept.title)
             if old_slug and old_slug != concept.slug:
                 slug_map[old_slug] = concept.slug
+        else:
+            chinese = chinese_alias(concept.aliases)
+            if chinese:
+                concept.title = f"{concept.title} ({chinese})"
+
+    canonical_slug_by_id = {
+        concept.canonical_id: concept.slug
+        for concept in bundle.concepts
+        if concept.canonical_id
+    }
 
     # Source-local concept objects may not be the same instances.
     for synthesis in bundle.sources:
         for concept in synthesis.concepts:
+            canonical_slug = canonical_slug_by_id.get(concept.canonical_id)
+            if canonical_slug:
+                concept.slug = canonical_slug
+                continue
             if concept.slug in slug_map:
                 concept.slug = slug_map[concept.slug]
             if is_chinese(concept.title):

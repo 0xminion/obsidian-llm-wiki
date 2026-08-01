@@ -8,7 +8,8 @@ import typer
 
 from obsidian_llm_wiki.cli import app
 from obsidian_llm_wiki.cli._helpers import print_result_summary, resolve_vault
-from obsidian_llm_wiki.ingest.sources import load_sources_from_dir
+from obsidian_llm_wiki.core.registry import VaultRegistry
+from obsidian_llm_wiki.ingest.sources import load_sources_incremental
 
 
 @app.command()
@@ -45,8 +46,15 @@ def build(
     print(f"📂 Vault: {vault_path}")
     print(f"🤖 Model: {config.llm.model}")
 
-    # ── Load the FULL corpus from sources/ ──────────────────────────────
-    sources = load_sources_from_dir(config.sources_dir)
+    # Enumerate the full corpus but read bodies only for new/changed sources.
+    # Registry metadata stubs preserve source indexes for unchanged pages.
+    with VaultRegistry(config.llmwiki_dir) as registry:
+        source_load = load_sources_incremental(
+            config.sources_dir,
+            registry,
+            force=force,
+        )
+    sources = source_load.sources
 
     print(f"\n📦 Found {len(sources)} source file(s)")
 
@@ -58,7 +66,16 @@ def build(
     print("\n🤖 Running synthesis pipeline...")
     from obsidian_llm_wiki.core.pipeline import run_pipeline
 
-    result = asyncio.run(run_pipeline(vault_path, sources, config, force=force))
+    result = asyncio.run(
+        run_pipeline(
+            vault_path,
+            sources,
+            config,
+            force=force,
+            unchanged_filenames=source_load.unchanged_filenames,
+            source_file_signatures=source_load.signatures,
+        )
+    )
 
     if not force and result.compiled == 0 and not result.errors:
         print("✅ Already up-to-date.")

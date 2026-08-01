@@ -24,10 +24,13 @@ import math
 import os
 import tempfile
 from collections.abc import Mapping, Sequence
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
 import httpx
+
+from obsidian_llm_wiki.core.request_limiter import ThreadsafeRequestGate
 
 logger = logging.getLogger("obswiki.synth.embedding")
 
@@ -95,6 +98,7 @@ def embed_text(
     enabled: bool | None = None,
     model: str | None = None,
     host: str | None = None,
+    request_gate: ThreadsafeRequestGate | None = None,
 ) -> list[float] | None:
     """Generate embedding for a text string via Ollama.
 
@@ -118,22 +122,24 @@ def embed_text(
     try:
         with httpx.Client(timeout=_EMBED_TIMEOUT) as client:
             # Use /api/embed (Ollama 0.4+) with fallback to /api/embeddings (older)
-            resp = client.post(
-                f"{host}/api/embed",
-                json={
-                    "model": model,
-                    "input": text[:2000],  # Truncate to avoid timeout
-                },
-            )
-            if resp.status_code != 200:
-                # Fallback to old API
+            with request_gate.slot() if request_gate else nullcontext():
                 resp = client.post(
-                    f"{host}/api/embeddings",
+                    f"{host}/api/embed",
                     json={
                         "model": model,
-                        "prompt": text[:2000],
+                        "input": text[:2000],  # Truncate to avoid timeout
                     },
                 )
+            if resp.status_code != 200:
+                # Fallback to old API
+                with request_gate.slot() if request_gate else nullcontext():
+                    resp = client.post(
+                        f"{host}/api/embeddings",
+                        json={
+                            "model": model,
+                            "prompt": text[:2000],
+                        },
+                    )
                 if resp.status_code != 200:
                     logger.debug(
                         "Embedding API returned %d — model may not be loaded",
@@ -159,6 +165,7 @@ def embed_batch(
     model: str | None = None,
     host: str | None = None,
     batch_size: int = _BATCH_SIZE,
+    request_gate: ThreadsafeRequestGate | None = None,
 ) -> list[list[float] | None]:
     """Embed multiple texts efficiently using Ollama's batched /api/embed.
 
@@ -182,16 +189,21 @@ def embed_batch(
         truncated = [t[:2000] for t in batch]
         try:
             with httpx.Client(timeout=_EMBED_TIMEOUT) as client:
-                resp = client.post(
-                    f"{host}/api/embed",
-                    json={"model": model, "input": truncated},
-                )
+                with request_gate.slot() if request_gate else nullcontext():
+                    resp = client.post(
+                        f"{host}/api/embed",
+                        json={"model": model, "input": truncated},
+                    )
                 if resp.status_code != 200:
                     for i, text in enumerate(batch):
                         idx = start + i
                         if results[idx] is None:
                             results[idx] = embed_text(
-                                text, enabled=enabled, model=model, host=host,
+                                text,
+                                enabled=enabled,
+                                model=model,
+                                host=host,
+                                request_gate=request_gate,
                             )
                     continue
                 data = resp.json()
@@ -207,7 +219,11 @@ def embed_batch(
                 idx = start + i
                 if results[idx] is None:
                     results[idx] = embed_text(
-                        text, enabled=enabled, model=model, host=host,
+                        text,
+                        enabled=enabled,
+                        model=model,
+                        host=host,
+                        request_gate=request_gate,
                     )
 
     return results
@@ -370,6 +386,7 @@ def find_cross_lingual_links(
     enabled: bool | None = None,
     model: str | None = None,
     host: str | None = None,
+    request_gate: ThreadsafeRequestGate | None = None,
     embeddings_cache: dict[str, list[float]] | None = None,
     comparison_slugs: set[str] | None = None,
     candidate_slugs_by_slug: Mapping[str, Sequence[str]] | None = None,
@@ -409,7 +426,13 @@ def find_cross_lingual_links(
             concept_langs[concept.slug] = lang
             continue
         text = f"{concept.title}. {concept.summary or ''}"
-        emb = embed_text(text, enabled=enabled, model=model, host=host)
+        emb = embed_text(
+            text,
+            enabled=enabled,
+            model=model,
+            host=host,
+            request_gate=request_gate,
+        )
         if emb:
             cache[concept.slug] = emb
             embeddings[concept.slug] = emb

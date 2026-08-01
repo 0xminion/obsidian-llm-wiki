@@ -43,6 +43,7 @@ from obsidian_llm_wiki.core.models import (
 )
 from obsidian_llm_wiki.core.request_limiter import AsyncRequestLimiter
 from obsidian_llm_wiki.core.schema import Granularity, SchemaPolicy, format_schema_guidance
+from obsidian_llm_wiki.core.text_quality import dedupe_statements, dedupe_tags
 from obsidian_llm_wiki.synth.evidence_windows import build_evidence_window
 from obsidian_llm_wiki.synth.parser import parse_single_source_synthesis
 
@@ -202,7 +203,7 @@ def merge_skeletons(skeletons: list[SourceSynthesis]) -> SourceSynthesis:
     all_tags: set[str] = set()
     for s in skeletons:
         all_tags.update(s.source_tags)
-    merged.source_tags = sorted(all_tags)
+    merged.source_tags = dedupe_tags(sorted(all_tags))
 
     # Union key_points (dedup by string equality)
     seen_points: set[str] = set()
@@ -211,6 +212,7 @@ def merge_skeletons(skeletons: list[SourceSynthesis]) -> SourceSynthesis:
             if kp not in seen_points:
                 seen_points.add(kp)
                 merged.key_points.append(kp)
+    merged.key_points = dedupe_statements(merged.key_points)
 
     # Union open_questions (dedup)
     seen_q: set[str] = set()
@@ -219,6 +221,7 @@ def merge_skeletons(skeletons: list[SourceSynthesis]) -> SourceSynthesis:
             if q not in seen_q:
                 seen_q.add(q)
                 merged.open_questions.append(q)
+    merged.open_questions = dedupe_statements(merged.open_questions)
 
     # Union concepts by slug — first occurrence wins for body/summary,
     # but tags are unioned across chunks.
@@ -304,7 +307,7 @@ def merge_entry_syntheses(
 
     # ── Union entry-level metadata ──────────────────────────────────
     all_tags: set[str] = set(primary.source_tags) | set(secondary.source_tags)
-    merged.source_tags = sorted(all_tags)
+    merged.source_tags = dedupe_tags(sorted(all_tags))
 
     seen_points: set[str] = set()
     for kp in primary.key_points:
@@ -315,6 +318,7 @@ def merge_entry_syntheses(
         if kp not in seen_points:
             seen_points.add(kp)
             merged.key_points.append(kp)
+    merged.key_points = dedupe_statements(merged.key_points)
 
     seen_q: set[str] = set()
     for q in primary.open_questions:
@@ -325,6 +329,7 @@ def merge_entry_syntheses(
         if q not in seen_q:
             seen_q.add(q)
             merged.open_questions.append(q)
+    merged.open_questions = dedupe_statements(merged.open_questions)
 
     # ── Merge concepts by slug ──────────────────────────────────────
     concept_by_slug: dict[str, ConceptNote] = {}

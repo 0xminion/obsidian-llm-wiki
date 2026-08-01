@@ -5,8 +5,11 @@ import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import pytest
+
 from obsidian_llm_wiki.core.cache import load_synthesis, save_synthesis
 from obsidian_llm_wiki.core.models import (
+    ConceptLink,
     ConceptNote,
     MapOfContent,
     SourceDoc,
@@ -42,10 +45,173 @@ def test_registry_creates_the_v2_schema_in_wal_mode(tmp_path: Path) -> None:
         "health_finding",
         "meta",
     } <= tables
-    assert journal_mode.lower() == "wal"
+    assert journal_mode == "wal"
+
+
+@pytest.mark.parametrize("marker", ["999", "not-a-version"])
+def test_registry_rejects_future_or_malformed_schema_versions(
+    tmp_path: Path,
+    marker: str,
+) -> None:
+    llmwiki_dir = tmp_path / ".llmwiki"
+    with VaultRegistry(llmwiki_dir):
+        pass
+    with sqlite3.connect(llmwiki_dir / "registry.db") as connection:
+        connection.execute(
+            "UPDATE meta SET value=? WHERE key='schema_version'", (marker,)
+        )
+
+    with pytest.raises(RuntimeError, match="schema version|newer than this binary"):
+        VaultRegistry(llmwiki_dir)
+
+    with sqlite3.connect(llmwiki_dir / "registry.db") as connection:
+        persisted = connection.execute(
+            "SELECT value FROM meta WHERE key='schema_version'"
+        ).fetchone()[0]
+    assert persisted == marker
 
     with sqlite3.connect(tmp_path / ".llmwiki" / "registry.db") as connection:
         assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+
+
+def test_canonical_id_assignment_remaps_slugs_links_and_moc_memberships(
+    tmp_path: Path,
+) -> None:
+    versions = ArtifactVersions("extract-v2", "prompt-v2", "schema-v2", "model-a")
+    source = SourceDoc(title="English", content="body " * 30, source_file="en.md")
+    existing = SourceSynthesis(
+        source_title="English",
+        source_summary="summary",
+        source_file="en.md",
+        concepts=[
+            ConceptNote(
+                title="Transformer Architecture",
+                slug="transformer-architecture",
+                summary="architecture",
+            ),
+            ConceptNote(
+                title="Positional Encoding",
+                slug="positional-encoding",
+                summary="positions",
+            ),
+        ],
+    )
+    with VaultRegistry(tmp_path / ".llmwiki") as registry:
+        registry.upsert_synthesis("en.md", source, existing, versions)
+        ids = {concept.slug: concept.canonical_id for concept in existing.concepts}
+        incoming = SourceSynthesis(
+            source_title="中文",
+            source_summary="摘要",
+            source_file="zh.md",
+            concepts=[
+                ConceptNote(
+                    title="Transformer Architecture (Transformer 架构)",
+                    slug="transformer-architecture-transformer-架构",
+                    summary="架构",
+                    canonical_id=ids["transformer-architecture"],
+                    related=[
+                        ConceptLink(
+                            slug="positional-encoding-位置编码",
+                            relation="depends_on",
+                        )
+                    ],
+                ),
+                ConceptNote(
+                    title="Positional Encoding (位置编码)",
+                    slug="positional-encoding-位置编码",
+                    summary="位置",
+                    canonical_id=ids["positional-encoding"],
+                ),
+            ],
+            maps=[
+                MapOfContent(
+                    title="Transformer 核心",
+                    slug="transformer-core",
+                    summary="核心",
+                    concept_slugs=[
+                        "transformer-architecture-transformer-架构",
+                        "positional-encoding-位置编码",
+                    ],
+                )
+            ],
+        )
+
+        registry.assign_canonical_ids(incoming)
+
+    assert [concept.slug for concept in incoming.concepts] == [
+        "transformer-architecture",
+        "positional-encoding",
+    ]
+    assert incoming.concepts[0].related[0].slug == "positional-encoding"
+    assert incoming.maps[0].concept_slugs == [
+        "transformer-architecture",
+        "positional-encoding",
+    ]
+
+
+def test_canonical_concept_payload_aggregates_all_current_source_owners(
+    tmp_path: Path,
+) -> None:
+    versions = ArtifactVersions("extract", "prompt", "schema", "model")
+    source_one = SourceDoc("One", "one " * 30, source_file="one.md")
+    source_two = SourceDoc("Two", "two " * 30, source_file="two.md")
+    synthesis_one = SourceSynthesis(
+        source_title="One",
+        source_summary="one",
+        source_file="one.md",
+        concepts=[
+            ConceptNote(
+                title="Shared",
+                slug="shared",
+                summary="short",
+                aliases=["alias-one"],
+                tags=["one"],
+            )
+        ],
+    )
+    synthesis_two = SourceSynthesis(
+        source_title="Two",
+        source_summary="two",
+        source_file="two.md",
+        concepts=[
+            ConceptNote(
+                title="Shared",
+                slug="shared",
+                summary="a much longer summary from the second owner",
+                aliases=["alias-two"],
+                tags=["two"],
+            )
+        ],
+    )
+
+    with VaultRegistry(tmp_path / ".llmwiki") as registry:
+        registry.upsert_synthesis("one.md", source_one, synthesis_one, versions)
+        registry.upsert_synthesis("two.md", source_two, synthesis_two, versions)
+        row = registry.connection.execute(
+            "SELECT payload_json FROM concept WHERE slug='shared'"
+        ).fetchone()
+        aggregate = json.loads(row[0])
+        assert set(aggregate["aliases"]) == {"alias-one", "alias-two"}
+        assert set(aggregate["tags"]) == {"one", "two"}
+        assert aggregate["summary"] == "a much longer summary from the second owner"
+
+        registry.upsert_synthesis(
+            "two.md",
+            source_two,
+            SourceSynthesis(
+                source_title="Two",
+                source_summary="two",
+                source_file="two.md",
+            ),
+            versions,
+        )
+        row = registry.connection.execute(
+            "SELECT payload_json FROM concept WHERE slug='shared'"
+        ).fetchone()
+        aggregate = json.loads(row[0])
+        assert aggregate["aliases"] == ["alias-one"]
+        assert aggregate["tags"] == ["one"]
+        assert aggregate["summary"] == "short"
 
 
 def test_registry_round_trips_synthesis_and_enqueues_version_invalidation(
@@ -107,10 +273,11 @@ def test_dirty_queue_claims_are_bounded_and_survive_reopen(tmp_path: Path) -> No
         first = registry.claim_dirty(limit=2, worker_id="worker-a")
         assert [item.entity_id for item in first] == ["source-0.md", "source-1.md"]
         assert all(item.state == "running" and item.attempts == 1 for item in first)
-        registry.complete_dirty(first[0].id)
+        registry.complete_dirty(first[0].id, worker_id="worker-a")
         registry.fail_dirty(
             first[1].id,
             "temporary model failure",
+            worker_id="worker-a",
             next_attempt_at="2999-01-01T00:00:00+00:00",
         )
 
@@ -122,6 +289,27 @@ def test_dirty_queue_claims_are_bounded_and_survive_reopen(tmp_path: Path) -> No
             "source-4.md",
         ]
         assert registry.list_dirty(state="completed", limit=10)[0].entity_id == "source-0.md"
+
+
+def test_stale_dirty_worker_cannot_finish_a_reclaimed_lease(tmp_path: Path) -> None:
+    with VaultRegistry(tmp_path / ".llmwiki") as registry:
+        record_id = registry.enqueue_dirty("source", "leased.md", "retry")
+        assert registry.start_dirty(record_id, worker_id="worker-a")
+        assert not registry.start_dirty(record_id, worker_id="worker-b")
+        registry.connection.execute(
+            "UPDATE dirty_queue SET lease_expires_at=? WHERE id=?",
+            ("2000-01-01T00:00:00+00:00", record_id),
+        )
+        registry.connection.commit()
+
+        assert registry.start_dirty(record_id, worker_id="worker-b")
+        assert not registry.complete_dirty(record_id, worker_id="worker-a")
+        assert not registry.fail_dirty(
+            record_id,
+            "stale failure",
+            worker_id="worker-a",
+        )
+        assert registry.complete_dirty(record_id, worker_id="worker-b")
 
 
 def test_ingest_hash_index_normalizes_urls_and_resolves_content_duplicates(
@@ -259,11 +447,16 @@ def test_maintenance_cursor_cycles_through_bounded_render_batches(
         registry.commit_render_manifest("concept-page", manifest, diff)
 
         first, first_complete = registry.next_maintenance_batch(limit=2)
+        uncommitted_retry, _ = registry.next_maintenance_batch(limit=2)
+        registry.commit_maintenance_batch(first, (), cycle_complete=first_complete)
         second, second_complete = registry.next_maintenance_batch(limit=2)
+        registry.commit_maintenance_batch(second, (), cycle_complete=second_complete)
         third, third_complete = registry.next_maintenance_batch(limit=2)
+        registry.commit_maintenance_batch(third, (), cycle_complete=third_complete)
         restarted, _ = registry.next_maintenance_batch(limit=2)
 
     assert first == ["concepts/concept-0.md", "concepts/concept-1.md"]
+    assert uncommitted_retry == first
     assert second == ["concepts/concept-2.md", "concepts/concept-3.md"]
     assert third == ["concepts/concept-4.md"]
     assert restarted == first

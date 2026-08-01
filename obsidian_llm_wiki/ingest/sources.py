@@ -9,17 +9,37 @@ from __future__ import annotations
 
 import re
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from obsidian_llm_wiki.core.models import SourceDoc, SourceProvenance
 from obsidian_llm_wiki.render.frontmatter import sanitize_tag
 from obsidian_llm_wiki.render.obsidian import parse_frontmatter, safe_read_file
 
-__all__ = ["load_source_file", "load_sources_from_dir"]
+if TYPE_CHECKING:
+    from obsidian_llm_wiki.core.registry import VaultRegistry
+
+__all__ = [
+    "IncrementalSourceLoad",
+    "load_source_file",
+    "load_sources_from_dir",
+    "load_sources_incremental",
+]
 
 _MAX_SOURCE_METADATA_ITEMS = 32
 _MAX_ALIAS_CHARS = 160
 _MAX_SOURCE_TYPE_CHARS = 64
+_SOURCE_METADATA_FILES = frozenset({"failed_urls.md", "index.md"})
+
+
+@dataclass(frozen=True)
+class IncrementalSourceLoad:
+    """Source stubs plus the bounded set whose Markdown bodies were loaded."""
+
+    sources: dict[str, SourceDoc]
+    unchanged_filenames: set[str]
+    signatures: dict[str, tuple[int, int]]
 
 
 def _metadata_strings(
@@ -138,7 +158,10 @@ def load_source_file(path: Path) -> SourceDoc | None:
     provenance = _source_provenance(meta.get("provenance"))
     return SourceDoc(
         title=title,
-        content=body,
+        # The renderer canonicalizes source bodies with ``strip()``. Apply the
+        # same normalization on ingest so a generated source page is hash-
+        # stable when it is read again after a metadata-only edit.
+        content=body.strip(),
         url=url,
         source_file=path.name,
         provenance=provenance,
@@ -160,9 +183,59 @@ def load_sources_from_dir(sources_dir: Path) -> dict[str, SourceDoc]:
         # Never process the failed URL ledger or index files as sources —
         # they are pipeline metadata, not extracted content. Processing
         # them pollutes the vault with concepts about error handling.
-        if f.name in {"failed_urls.md", "index.md"}:
+        if f.name in _SOURCE_METADATA_FILES:
             continue
         doc = load_source_file(f)
         if doc is not None:
             result[f.name] = doc
     return result
+
+
+def load_sources_incremental(
+    sources_dir: Path,
+    registry: VaultRegistry,
+    *,
+    force: bool = False,
+) -> IncrementalSourceLoad:
+    """Read only new/changed source bodies using committed file signatures.
+
+    Directory enumeration and ``stat`` remain O(source count), but unchanged
+    Markdown bodies are represented by registry metadata stubs. A changed
+    source is read with a stable before/after signature so the pipeline never
+    commits a signature for bytes different from those it synthesized.
+    """
+    if not sources_dir.is_dir():
+        return IncrementalSourceLoad({}, set(), {})
+    indexed = registry.source_file_states()
+    sources: dict[str, SourceDoc] = {}
+    unchanged: set[str] = set()
+    signatures: dict[str, tuple[int, int]] = {}
+    for path in sorted(sources_dir.glob("*.md")):
+        if path.name in _SOURCE_METADATA_FILES:
+            continue
+        stat = path.stat()
+        signature = (stat.st_mtime_ns, stat.st_size)
+        indexed_state = indexed.get(path.name)
+        if not force and indexed_state is not None and signature == indexed_state[:2]:
+            sources[path.name] = indexed_state[2]
+            unchanged.add(path.name)
+            signatures[path.name] = signature
+            continue
+        doc, signature = _load_source_with_stable_stat(path)
+        signatures[path.name] = signature
+        if doc is not None:
+            sources[path.name] = doc
+    return IncrementalSourceLoad(sources, unchanged, signatures)
+
+
+def _load_source_with_stable_stat(path: Path) -> tuple[SourceDoc | None, tuple[int, int]]:
+    """Read one source only when its signature is stable across the read."""
+    for _attempt in range(2):
+        before = path.stat()
+        doc = load_source_file(path)
+        after = path.stat()
+        before_signature = (before.st_mtime_ns, before.st_size)
+        after_signature = (after.st_mtime_ns, after.st_size)
+        if before_signature == after_signature:
+            return doc, after_signature
+    raise OSError(f"Source changed while it was being read: {path}")

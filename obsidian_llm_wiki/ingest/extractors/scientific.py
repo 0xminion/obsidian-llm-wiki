@@ -16,7 +16,7 @@ from urllib.parse import urljoin, urlparse
 
 import httpx
 
-from obsidian_llm_wiki.core.models import SourceDoc
+from obsidian_llm_wiki.core.models import SourceDoc, SourceProvenance
 from obsidian_llm_wiki.ingest.extractors import register_extractor
 from obsidian_llm_wiki.ingest.http_headers import BROWSER_HEADERS, DEFAULT_TIMEOUT
 
@@ -317,10 +317,43 @@ def extract_arxiv(raw_url: str) -> SourceDoc:
         raise RuntimeError(f"Could not parse arXiv paper ID from {raw_url}")
 
     html_url = f"https://arxiv.org/html/{paper_id}"
+    pdf_url = f"https://arxiv.org/pdf/{paper_id}"
     try:
         html = _fetch_public_html(html_url, DEFAULT_TIMEOUT)
-        return extract_scientific_html(html, html_url)
+        html_source = extract_scientific_html(html, html_url)
+        if "/pdf/" not in urlparse(raw_url).path:
+            return html_source
+        try:
+            pdf_source = _extract_pdf(pdf_url)
+        except Exception as exc:
+            logger.info(
+                "Official arXiv PDF unavailable for %s: %s; using HTML",
+                paper_id,
+                exc,
+            )
+            return html_source
+        provenance = pdf_source.provenance
+        return SourceDoc(
+            title=html_source.title,
+            content=pdf_source.content,
+            url=html_url,
+            source_file=pdf_source.source_file,
+            provenance=SourceProvenance(
+                requested_url=raw_url,
+                resolved_url=pdf_url,
+                extracted_url=pdf_url,
+                extractor_chain=("extract_arxiv_pdf", *provenance.extractor_chain),
+                content_type=provenance.content_type,
+                document_format=provenance.document_format or "pdf",
+                retrieved_at=provenance.retrieved_at,
+                content_sha256=provenance.content_sha256,
+                diagnostics=provenance.diagnostics,
+            ),
+            aliases=html_source.aliases,
+            tags=html_source.tags,
+            source_type=html_source.source_type or pdf_source.source_type,
+        )
     except Exception as exc:
         logger.info("Official arXiv HTML unavailable for %s: %s; trying PDF", paper_id, exc)
 
-    return _extract_pdf(f"https://arxiv.org/pdf/{paper_id}")
+    return _extract_pdf(pdf_url)

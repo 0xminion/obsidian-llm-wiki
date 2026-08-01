@@ -91,6 +91,7 @@ class Config:
 
     # ── Semantic dedup ──────────────────────────────────────
     similarity_dedup_threshold: float = 0.85
+    cross_lingual_threshold: float = 0.82
 
     # ── MoC orphan assignment ───────────────────────────────
     moc_assignment_threshold: float = 0.55
@@ -300,6 +301,7 @@ def load_config(env_file: str | None = None, **overrides: str) -> Config:
         entry_min_body_chars=_int_env("ENTRY_MIN_BODY_CHARS", 500, env),
         clipping_min_body_chars=_int_env("CLIPPING_MIN_BODY_CHARS", 500, env),
         similarity_dedup_threshold=_float_env("SIMILARITY_DEDUP_THRESHOLD", 0.85, env),
+        cross_lingual_threshold=_float_env("CROSS_LINGUAL_THRESHOLD", 0.82, env),
         moc_assignment_threshold=_float_env("MOC_ASSIGNMENT_THRESHOLD", 0.55, env),
         retry_count=_int_env("RETRY_COUNT", 3, env),
         retry_base_ms=_int_env("RETRY_BASE_MS", 1_000, env),

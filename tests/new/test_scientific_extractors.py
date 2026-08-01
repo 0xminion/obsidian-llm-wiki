@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
-from obsidian_llm_wiki.core.models import SourceDoc
+from obsidian_llm_wiki.core.models import SourceDoc, SourceProvenance
 
 
 def test_arxiv_uses_official_accessible_html_before_pdf() -> None:
@@ -92,6 +92,46 @@ def test_arxiv_html_unavailable_falls_back_to_official_pdf() -> None:
 
     extract_pdf.assert_called_once_with("https://arxiv.org/pdf/1706.03762v2")
     assert result is pdf_source
+
+
+def test_direct_arxiv_pdf_keeps_pdf_math_with_html_title() -> None:
+    """A requested PDF keeps equations while borrowing accessible metadata."""
+    from obsidian_llm_wiki.ingest.extractors.scientific import extract_arxiv
+
+    html = """
+    <html><head><title>Attention Is All You Need</title></head>
+    <body><main><h1>Attention Is All You Need</h1>
+    <p>Accessible abstract and metadata for the paper.</p></main></body></html>
+    """
+    pdf_source = SourceDoc(
+        title="1706",
+        content="Attention(Q, K, V) = softmax(QKᵀ / √dₖ)V\n" + "paper body " * 50,
+        url="https://arxiv.org/pdf/1706.03762",
+        provenance=SourceProvenance(
+            resolved_url="https://arxiv.org/pdf/1706.03762",
+            extractor_chain=("document-download",),
+            document_format="pdf",
+        ),
+    )
+    with (
+        patch(
+            "obsidian_llm_wiki.ingest.extractors.scientific._fetch_public_html",
+            return_value=html,
+        ),
+        patch(
+            "obsidian_llm_wiki.ingest.extractors.scientific._extract_pdf",
+            return_value=pdf_source,
+        ) as extract_pdf,
+    ):
+        result = extract_arxiv("https://arxiv.org/pdf/1706.03762")
+
+    extract_pdf.assert_called_once_with("https://arxiv.org/pdf/1706.03762")
+    assert result.title == "Attention Is All You Need"
+    assert "softmax(QKᵀ / √dₖ)" in result.content
+    assert result.provenance.extractor_chain == (
+        "extract_arxiv_pdf",
+        "document-download",
+    )
 
 
 def test_public_scientific_fetch_sends_no_cookie_or_auth_headers() -> None:

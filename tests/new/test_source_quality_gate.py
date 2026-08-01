@@ -111,3 +111,31 @@ def test_bilingual_entry_normalization_is_idempotent_for_inline_latin() -> None:
 
     assert synthesis.source_title == first
     assert first.count(title) == 1
+
+
+def test_bilingual_alias_keeps_canonical_slug_and_source_links() -> None:
+    canonical = ConceptNote(
+        title="Transformer Architecture",
+        slug="transformer-architecture",
+        canonical_id="concept-transformer",
+        summary="Architecture summary.",
+        aliases=["变换器架构"],
+    )
+    source_local = ConceptNote(
+        title="Transformer Architecture (Transformer 架构)",
+        slug="transformer-architecture-transformer-架构",
+        canonical_id="concept-transformer",
+        summary="架构摘要。",
+    )
+    synthesis = SourceSynthesis(
+        source_title="Transformer 架构",
+        source_summary="摘要。",
+        concepts=[source_local],
+    )
+    bundle = SynthesisBundle(sources=[synthesis], concepts=[canonical])
+
+    normalize_bilingual_titles_and_slugs(bundle)
+
+    assert canonical.title == "Transformer Architecture (变换器架构)"
+    assert canonical.slug == "transformer-architecture"
+    assert source_local.slug == "transformer-architecture"

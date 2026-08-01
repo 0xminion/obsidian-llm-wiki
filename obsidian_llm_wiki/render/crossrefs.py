@@ -36,42 +36,26 @@ def build_cross_ref_diagram(
         if not target:
             continue
 
-        target_display = link.display or target.slug
         relation_type = link.relation or "related_to"
+        relation_label = relation_type
+        if link.display and link.display.casefold() != target.title.casefold():
+            relation_label = f"{relation_type} ({link.display})"
 
         lines.append(concept.title)
-        lines.append(f"    ↓ {relation_type}")
-
-        # Target line with any sub-relationships
-        target_sub = ""
-        if target.related:
-            sub_links = [
-                r for r in target.related
-                if r.slug != concept.slug
-            ][:2]
-            if sub_links:
-                sub_parts = []
-                for sl in sub_links:
-                    sub_target = all_concepts.get(sl.slug)
-                    if sub_target:
-                        sub_parts.append(sub_target.title)
-                if sub_parts:
-                    target_sub = " → " + " → ".join(sub_parts)
+        lines.append(f"    ↓ {relation_label}")
 
         # Check for bidirectional edge
         reverse_links = [
             r for r in (target.related or [])
             if r.slug == concept.slug
         ]
-        if reverse_links and not target_sub:
+        if reverse_links:
             rev_rel = reverse_links[0].relation or "related_to"
             lines.append(
                 f"{target.title} ↔ {concept.title} ({rev_rel})"
             )
-        elif target_sub:
-            lines.append(f"{target_display}{target_sub}")
         else:
-            lines.append(f"{target_display}")
+            lines.append(target.title)
 
     return lines
 

@@ -3,18 +3,78 @@ incremental (new-vs-existing) semantic dedup comparison."""
 
 from __future__ import annotations
 
+import asyncio
 import json
 from unittest import mock
 
 import pytest
 
+from obsidian_llm_wiki.core.request_limiter import (
+    AsyncRequestLimiter,
+    ThreadsafeRequestGate,
+)
 from obsidian_llm_wiki.synth.embedding import (
     cosine_similarity,
     embed_batch,
+    embed_text,
     find_cross_lingual_links,
     load_embeddings_cache,
     save_embeddings_cache,
 )
+
+
+def test_embedding_requests_share_the_source_run_limiter(monkeypatch):
+    class Response:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return {"embeddings": [[1.0, 0.0]]}
+
+    class Client:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        @staticmethod
+        def post(*args, **kwargs):
+            return Response()
+
+    monkeypatch.setattr("obsidian_llm_wiki.synth.embedding.httpx.Client", Client)
+
+    async def scenario() -> AsyncRequestLimiter:
+        limiter = AsyncRequestLimiter(1)
+        gate = ThreadsafeRequestGate(limiter, asyncio.get_running_loop())
+
+        async def synthesis_request() -> None:
+            async with limiter.slot():
+                await asyncio.sleep(0.05)
+
+        synthesis = asyncio.create_task(synthesis_request())
+        await asyncio.sleep(0)
+        embeddings = [
+            asyncio.to_thread(
+                embed_text,
+                text,
+                enabled=True,
+                model="embedding-model",
+                host="http://embedding.test",
+                request_gate=gate,
+            )
+            for text in ("one", "two")
+        ]
+        await asyncio.wait_for(asyncio.gather(synthesis, *embeddings), timeout=2)
+        return limiter
+
+    limiter = asyncio.run(scenario())
+    assert limiter.requests_started == 3
+    assert limiter.max_active == 1
+
 
 # ── Fix 1: Embedding persistence ──────────────────────────────────────
 

@@ -10,6 +10,7 @@ from obsidian_llm_wiki.core.operations import (
     OperationStatus,
     OperationStore,
 )
+from obsidian_llm_wiki.core.registry import VaultRegistry
 
 
 def _save_many(llmwiki_dir: str, worker: int, start: multiprocessing.synchronize.Event) -> None:
@@ -89,6 +90,35 @@ def test_operation_store_serializes_concurrent_process_saves(tmp_path) -> None:
     assert len(payload["operations"]) == 80
 
 
+def test_corrupt_legacy_operations_file_is_marked_as_inspected(tmp_path) -> None:
+    llmwiki_dir = tmp_path / ".llmwiki"
+    llmwiki_dir.mkdir()
+    operations_path = llmwiki_dir / "operations.json"
+    operations_path.write_text("{not-json", encoding="utf-8")
+
+    with VaultRegistry(llmwiki_dir) as registry:
+        marker = registry.connection.execute(
+            "SELECT value FROM meta WHERE key='legacy_operations_migration_complete'"
+        ).fetchone()
+    assert marker is not None
+    assert tuple(marker) == ("invalid-json",)
+
+    operations_path.write_text(
+        json.dumps(
+            {
+                "operations": [
+                    OperationRecord.create(
+                        run_id="late-valid-file", source="https://example.test/late"
+                    ).to_dict()
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    with VaultRegistry(llmwiki_dir) as registry:
+        assert registry.latest_operation_for_source("https://example.test/late") is None
+
+
 def test_resume_marker_removal_is_interprocess_safe_and_preserves_run_id(tmp_path) -> None:
     llmwiki_dir = tmp_path / ".llmwiki"
     store = OperationStore(llmwiki_dir)
@@ -116,3 +146,51 @@ def test_resume_marker_removal_is_interprocess_safe_and_preserves_run_id(tmp_pat
     marker = json.loads((llmwiki_dir / "ingest-resume.json").read_text(encoding="utf-8"))
     assert marker["run_id"] == "run-1"
     assert marker["sources"] == [sources[-1]]
+
+
+def test_legacy_operations_migrate_once_and_remain_queryable(tmp_path) -> None:
+    llmwiki_dir = tmp_path / ".llmwiki"
+    llmwiki_dir.mkdir()
+    record = OperationRecord.create(run_id="legacy-run", source="legacy-source")
+    (llmwiki_dir / "operations.json").write_text(
+        json.dumps({"operations": [record.to_dict()]}),
+        encoding="utf-8",
+    )
+
+    with VaultRegistry(llmwiki_dir) as registry:
+        assert registry.latest_operation_for_source("legacy-source") is not None
+
+    second = OperationRecord.create(run_id="late-run", source="late-json-only")
+    (llmwiki_dir / "operations.json").write_text(
+        json.dumps({"operations": [record.to_dict(), second.to_dict()]}),
+        encoding="utf-8",
+    )
+    with VaultRegistry(llmwiki_dir) as registry:
+        assert registry.latest_operation_for_source("legacy-source") is not None
+        assert registry.latest_operation_for_source("late-json-only") is None
+
+
+def test_operation_rows_archive_instead_of_disappearing(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    import obsidian_llm_wiki.core.registry as registry_module
+
+    monkeypatch.setattr(registry_module, "_LIVE_OPERATION_HISTORY", 2)
+    store = OperationStore(tmp_path / ".llmwiki")
+    records = [
+        OperationRecord.create(run_id=f"run-{index}", source=f"source-{index}")
+        for index in range(3)
+    ]
+    for index, record in enumerate(records):
+        record.created_at = f"2026-01-01T00:00:0{index}+00:00"
+        record.updated_at = record.created_at
+        store.save(record)
+
+    with VaultRegistry(tmp_path / ".llmwiki") as registry:
+        live = registry.connection.execute("SELECT count(*) FROM operation").fetchone()[0]
+        archived = registry.connection.execute(
+            "SELECT count(*) FROM operation_archive"
+        ).fetchone()[0]
+        assert (live, archived) == (2, 1)
+        assert registry.latest_operation_for_source("source-0") is not None

@@ -64,6 +64,22 @@ def test_stale_concept_cleanup_deletes_non_reviewed(tmp_path: Path):
     assert (tmp_path / "concepts" / "new-concept.md").exists()
 
 
+def test_reviewed_human_index_shard_survives_legacy_cleanup(tmp_path: Path):
+    curated = tmp_path / "concepts" / "index-curated.md"
+    _write_md(curated, body="Human-maintained index", reviewed=True)
+
+    render_vault(
+        tmp_path,
+        SynthesisBundle(
+            concepts=[ConceptNote(title="Concept", slug="concept", summary="Summary")]
+        ),
+        {},
+    )
+
+    assert curated.is_file()
+    assert "Human-maintained index" in curated.read_text(encoding="utf-8")
+
+
 def _vault_snapshot(vault: Path) -> dict[str, bytes]:
     """Return every regular file in the vault keyed by its relative path."""
     return {

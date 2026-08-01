@@ -46,16 +46,29 @@ class ConceptRetriever:
         self.embedding_model = embedding_model
         self.embedder = embedder
 
-    def retrieve(self, source_title: str, source_content: str) -> RetrievalResult:
+    @staticmethod
+    def query_text(source_title: str, source_content: str) -> str:
+        """Build the bounded lexical/semantic query shared by async callers."""
+        return f"{source_title}\n{source_content[:8_000]}"
+
+    def retrieve(
+        self,
+        source_title: str,
+        source_content: str,
+        *,
+        query_vector: list[float] | None = None,
+    ) -> RetrievalResult:
         """Union bounded FTS and ANN results and format stable-ID prompt lines."""
-        query = f"{source_title}\n{source_content[:8_000]}"
+        query = self.query_text(source_title, source_content)
         lexical = self.registry.search_concepts(query, limit=self.candidate_limit)
         ordered: list[ConceptCandidate] = list(lexical)
         seen = {candidate.id for candidate in ordered}
         ann_evaluated = 0
 
-        if self.embedder is not None and self.embedding_model:
-            vector = self.embedder(query)
+        if self.embedding_model:
+            vector = query_vector
+            if vector is None and self.embedder is not None:
+                vector = self.embedder(query)
             if vector:
                 ann = self.registry.search_ann(
                     "concept",

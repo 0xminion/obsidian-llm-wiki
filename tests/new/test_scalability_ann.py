@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import math
 from pathlib import Path
 
@@ -330,3 +331,75 @@ def test_candidate_ids_collapsing_distinct_model_slugs_are_merged(
 
     assert [concept.slug for concept in synthesis.concepts] == ["flash-attention"]
     assert synthesis.concepts[0].canonical_id == canonical_id
+
+
+def test_partial_embedding_namespace_resumes_missing_vectors(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """One surviving vector must not make an interrupted backfill look complete."""
+    from obsidian_llm_wiki.config import Config
+    from obsidian_llm_wiki.core import pipeline as pipeline_module
+
+    sources = {
+        "alpha.md": SourceDoc("Alpha Source", "alpha body " * 50, source_file="alpha.md"),
+        "beta.md": SourceDoc("Beta Source", "beta body " * 50, source_file="beta.md"),
+    }
+
+    async def fake_retry(_config, filename, source, *_args, **_kwargs):
+        slug = filename.removesuffix(".md")
+        return SourceSynthesis(
+            source_title=source.title,
+            source_summary="summary",
+            source_file=filename,
+            concepts=[ConceptNote(slug.title(), slug, f"{slug} summary")],
+        )
+
+    def fake_embed_text(text, **_kwargs):
+        return _unit(0.0 if "alpha" in text.casefold() else math.pi / 2)
+
+    def fake_embed_batch(texts, **_kwargs):
+        return [fake_embed_text(text) for text in texts]
+
+    monkeypatch.setattr(pipeline_module, "_synthesize_with_retry", fake_retry)
+    monkeypatch.setattr(
+        "obsidian_llm_wiki.synth.embedding.embed_text", fake_embed_text
+    )
+    monkeypatch.setattr(
+        "obsidian_llm_wiki.synth.embedding.embed_batch", fake_embed_batch
+    )
+    config = Config(
+        vault_path=str(tmp_path),
+        embeddings_enabled=True,
+        similarity_dedup_threshold=0.99,
+    )
+
+    asyncio.run(pipeline_module.run_pipeline(tmp_path, sources, config))
+    with VaultRegistry(config.llmwiki_dir) as registry:
+        rows = registry.connection.execute(
+            """
+            SELECT entity_id, schema_version FROM embedding
+            WHERE entity_kind='concept' ORDER BY entity_id
+            """
+        ).fetchall()
+        assert len(rows) == 2
+        missing_id = str(rows[0][0])
+        schema_version = str(rows[0][1])
+        with registry.connection:
+            registry.connection.execute(
+                "DELETE FROM ann_bucket WHERE entity_kind='concept' AND entity_id=?",
+                (missing_id,),
+            )
+            registry.connection.execute(
+                "DELETE FROM embedding WHERE entity_kind='concept' AND entity_id=?",
+                (missing_id,),
+            )
+
+    asyncio.run(pipeline_module.run_pipeline(tmp_path, sources, config))
+
+    with VaultRegistry(config.llmwiki_dir) as registry:
+        assert registry.embedding_count(
+            "concept",
+            model_id=config.embedding_model,
+            schema_version=schema_version,
+        ) == 2

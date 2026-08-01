@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from collections.abc import AsyncIterator, Iterator
+from contextlib import asynccontextmanager, contextmanager
+from typing import Any
 
-__all__ = ["AsyncRequestLimiter"]
+__all__ = ["AsyncRequestLimiter", "ThreadsafeRequestGate"]
 
 
 class AsyncRequestLimiter:
@@ -53,3 +54,22 @@ class AsyncRequestLimiter:
                 yield
             finally:
                 self._active -= 1
+
+
+class ThreadsafeRequestGate:
+    """Expose one async limiter to synchronous requests running in worker threads."""
+
+    def __init__(self, limiter: AsyncRequestLimiter, loop: asyncio.AbstractEventLoop) -> None:
+        self.limiter = limiter
+        self.loop = loop
+
+    @contextmanager
+    def slot(self) -> Iterator[None]:
+        context: Any = self.limiter.slot()
+        asyncio.run_coroutine_threadsafe(context.__aenter__(), self.loop).result()
+        try:
+            yield
+        finally:
+            asyncio.run_coroutine_threadsafe(
+                context.__aexit__(None, None, None), self.loop
+            ).result()
