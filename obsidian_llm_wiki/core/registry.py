@@ -22,7 +22,9 @@ from types import TracebackType
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from obsidian_llm_wiki.core.models import (
+    ConceptNote,
     SourceDoc,
+    SourceProvenance,
     SourceSynthesis,
     concept_note_to_dict,
     moc_to_dict,
@@ -41,11 +43,12 @@ __all__ = [
     "VaultRegistry",
 ]
 
-_SCHEMA_VERSION = 3
+_SCHEMA_VERSION = 4
 _LSH_TABLES = 8
 _LSH_BITS = 12
 _LSH_SPARSITY = 8
 _COMPLETED_QUEUE_HISTORY = 10_000
+_LIVE_OPERATION_HISTORY = 1_000
 _DIRTY_LEASE_SECONDS = 600
 
 _SCHEMA = """
@@ -68,6 +71,13 @@ CREATE TABLE IF NOT EXISTS source (
 );
 CREATE INDEX IF NOT EXISTS source_content_hash_idx ON source(content_hash);
 CREATE INDEX IF NOT EXISTS source_canonical_url_idx ON source(canonical_url);
+
+CREATE TABLE IF NOT EXISTS source_file_state (
+    source_id INTEGER PRIMARY KEY REFERENCES source(id) ON DELETE CASCADE,
+    mtime_ns INTEGER NOT NULL,
+    size_bytes INTEGER NOT NULL,
+    updated_at TEXT NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS source_version (
     id INTEGER PRIMARY KEY,
@@ -232,6 +242,54 @@ CREATE TABLE IF NOT EXISTS operation (
     updated_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS operation_source_idx ON operation(source, updated_at);
+
+CREATE TABLE IF NOT EXISTS operation_archive (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    source TEXT NOT NULL,
+    source_kind TEXT NOT NULL,
+    mode TEXT NOT NULL,
+    status TEXT NOT NULL,
+    attempt INTEGER NOT NULL,
+    payload_json TEXT NOT NULL DEFAULT '{}',
+    error TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS operation_archive_source_idx
+    ON operation_archive(source, updated_at);
+
+CREATE TABLE IF NOT EXISTS metric_run (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    started_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS metric_run_started_idx ON metric_run(started_at, id);
+
+CREATE TABLE IF NOT EXISTS metric_run_archive (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    started_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS metric_run_archive_started_idx
+    ON metric_run_archive(started_at, id);
+
+CREATE TABLE IF NOT EXISTS cross_lingual_link (
+    source_slug TEXT NOT NULL,
+    target_slug TEXT NOT NULL,
+    score REAL NOT NULL,
+    display TEXT NOT NULL DEFAULT '',
+    model_id TEXT NOT NULL,
+    schema_version TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(source_slug, target_slug, model_id, schema_version)
+);
+CREATE INDEX IF NOT EXISTS cross_lingual_link_namespace_idx
+    ON cross_lingual_link(model_id, schema_version, source_slug);
 
 CREATE TABLE IF NOT EXISTS ingest_hash (
     normalized_url TEXT PRIMARY KEY,
@@ -413,6 +471,70 @@ class RenderDiff:
     stale_keys: frozenset[str]
 
 
+def _source_metadata_payload(source: SourceDoc) -> dict[str, object]:
+    """Serialize the metadata needed to render unchanged source indexes."""
+    provenance = source.provenance
+    return {
+        "aliases": list(source.aliases),
+        "tags": list(source.tags),
+        "source_type": source.source_type,
+        "provenance": {
+            "requested_url": provenance.requested_url,
+            "resolved_url": provenance.resolved_url,
+            "extracted_url": provenance.extracted_url,
+            "extractor_chain": list(provenance.extractor_chain),
+            "content_type": provenance.content_type,
+            "document_format": provenance.document_format,
+            "retrieved_at": provenance.retrieved_at,
+            "content_sha256": provenance.content_sha256,
+            "diagnostics": list(provenance.diagnostics),
+        },
+    }
+
+
+def _metadata_text(value: object) -> str:
+    if isinstance(value, (str, int, float)) and not isinstance(value, bool):
+        return str(value)
+    return ""
+
+
+def _metadata_list(value: object) -> list[str]:
+    return [str(item) for item in value if isinstance(item, str)] if isinstance(value, list) else []
+
+
+def _source_stub_from_metadata(
+    *,
+    filename: str,
+    title: str,
+    canonical_url: str,
+    metadata: dict[str, object],
+) -> SourceDoc:
+    """Restore metadata without loading the source Markdown body."""
+    raw_provenance = metadata.get("provenance")
+    provenance_data = raw_provenance if isinstance(raw_provenance, dict) else metadata
+    provenance = SourceProvenance(
+        requested_url=_metadata_text(provenance_data.get("requested_url")),
+        resolved_url=_metadata_text(provenance_data.get("resolved_url")),
+        extracted_url=_metadata_text(provenance_data.get("extracted_url")),
+        extractor_chain=tuple(_metadata_list(provenance_data.get("extractor_chain"))),
+        content_type=_metadata_text(provenance_data.get("content_type")),
+        document_format=_metadata_text(provenance_data.get("document_format")),
+        retrieved_at=_metadata_text(provenance_data.get("retrieved_at")),
+        content_sha256=_metadata_text(provenance_data.get("content_sha256")),
+        diagnostics=tuple(_metadata_list(provenance_data.get("diagnostics"))),
+    )
+    return SourceDoc(
+        title=title or Path(filename).stem,
+        content="",
+        url=canonical_url or None,
+        source_file=filename,
+        provenance=provenance,
+        aliases=_metadata_list(metadata.get("aliases")),
+        tags=_metadata_list(metadata.get("tags")),
+        source_type=_metadata_text(metadata.get("source_type")),
+    )
+
+
 class VaultRegistry:
     """Own the vault-local SQLite registry and its transactional schema."""
 
@@ -426,6 +548,26 @@ class VaultRegistry:
         self.connection.execute("PRAGMA busy_timeout = 30000")
         self.connection.execute("PRAGMA journal_mode = WAL")
         self.connection.execute("PRAGMA synchronous = NORMAL")
+        previous_version = 0
+        meta_exists = self.connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='meta'"
+        ).fetchone()
+        if meta_exists is not None:
+            version_row = self.connection.execute(
+                "SELECT value FROM meta WHERE key='schema_version'"
+            ).fetchone()
+            if version_row is not None:
+                try:
+                    previous_version = int(version_row[0])
+                except (TypeError, ValueError) as exc:
+                    self.connection.close()
+                    raise RuntimeError("Registry has an invalid schema version") from exc
+                if previous_version > _SCHEMA_VERSION:
+                    self.connection.close()
+                    raise RuntimeError(
+                        "Registry schema is newer than this binary "
+                        f"({previous_version} > {_SCHEMA_VERSION})"
+                    )
         self.connection.executescript(_SCHEMA)
         dirty_columns = {
             str(row[1])
@@ -436,15 +578,9 @@ class VaultRegistry:
                 "ALTER TABLE dirty_queue "
                 "ADD COLUMN lease_expires_at TEXT NOT NULL DEFAULT ''"
             )
-        version_row = self.connection.execute(
-            "SELECT value FROM meta WHERE key='schema_version'"
-        ).fetchone()
-        try:
-            previous_version = int(version_row[0]) if version_row is not None else 0
-        except (TypeError, ValueError):
-            previous_version = 0
         if previous_version < 3:
             self._backfill_entity_sources()
+        self._migrate_legacy_operations()
         self.connection.execute(
             "INSERT INTO meta(key, value) VALUES('schema_version', ?) "
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -511,6 +647,221 @@ class VaultRegistry:
             self._rebuild_moc_memberships(moc_ids)
             self._cleanup_unreferenced_entities()
 
+    def _migrate_legacy_operations(self) -> bool:
+        """Import the bounded JSON operation ledger exactly once."""
+        completed = self.connection.execute(
+            "SELECT 1 FROM meta WHERE key='legacy_operations_migration_complete'"
+        ).fetchone()
+        if completed is not None:
+            return False
+        path = self.llmwiki_dir / "operations.json"
+        if not path.is_file():
+            with self.connection:
+                self._set_meta_unlocked("legacy_operations_migration_complete", "1")
+            return False
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            with self.connection:
+                self._set_meta_unlocked(
+                    "legacy_operations_migration_complete", "invalid-json"
+                )
+            return False
+        raw_operations = payload.get("operations", []) if isinstance(payload, dict) else []
+        if not isinstance(raw_operations, list):
+            with self.connection:
+                self._set_meta_unlocked(
+                    "legacy_operations_migration_complete", "invalid-payload"
+                )
+            return False
+        with self.connection:
+            for operation in raw_operations:
+                if isinstance(operation, dict):
+                    self._upsert_operation_unlocked(operation)
+            self._set_meta_unlocked("legacy_operations_migration_complete", "1")
+        return True
+
+    def upsert_operation(self, operation: dict[str, object]) -> None:
+        """Persist one operation and archive rows beyond the live-history cap."""
+        with self.connection:
+            self._upsert_operation_unlocked(operation)
+
+    def _upsert_operation_unlocked(self, operation: dict[str, object]) -> None:
+        operation_id = _metadata_text(operation.get("id"))
+        if not operation_id:
+            return
+        raw_attempt = operation.get("attempt", 1)
+        try:
+            attempt = max(
+                1,
+                int(raw_attempt)
+                if isinstance(raw_attempt, (str, int)) and not isinstance(raw_attempt, bool)
+                else 1,
+            )
+        except (TypeError, ValueError):
+            attempt = 1
+        payload_json = json.dumps(operation, ensure_ascii=False, separators=(",", ":"))
+        values = (
+            operation_id,
+            _metadata_text(operation.get("run_id")),
+            _metadata_text(operation.get("source")),
+            _metadata_text(operation.get("source_kind")) or "url",
+            _metadata_text(operation.get("mode")) or "ingest",
+            _metadata_text(operation.get("status")) or "planned",
+            attempt,
+            payload_json,
+            _metadata_text(operation.get("error"))[:1_000],
+            _metadata_text(operation.get("created_at")) or _now(),
+            _metadata_text(operation.get("updated_at")) or _now(),
+        )
+        self.connection.execute("DELETE FROM operation_archive WHERE id=?", (operation_id,))
+        self.connection.execute(
+            """
+            INSERT INTO operation(
+                id, run_id, source, source_kind, mode, status, attempt,
+                payload_json, error, created_at, updated_at
+            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                run_id=excluded.run_id,
+                source=excluded.source,
+                source_kind=excluded.source_kind,
+                mode=excluded.mode,
+                status=excluded.status,
+                attempt=excluded.attempt,
+                payload_json=excluded.payload_json,
+                error=excluded.error,
+                updated_at=excluded.updated_at
+            """,
+            values,
+        )
+        count_row = self.connection.execute("SELECT count(*) FROM operation").fetchone()
+        overflow = max(0, int(count_row[0]) - _LIVE_OPERATION_HISTORY)
+        if not overflow:
+            return
+        self.connection.execute(
+            """
+            INSERT OR REPLACE INTO operation_archive
+            SELECT * FROM operation ORDER BY updated_at, id LIMIT ?
+            """,
+            (overflow,),
+        )
+        self.connection.execute(
+            """
+            DELETE FROM operation WHERE id IN (
+                SELECT id FROM operation ORDER BY updated_at, id LIMIT ?
+            )
+            """,
+            (overflow,),
+        )
+
+    def latest_operation_for_source(self, source: str) -> dict[str, object] | None:
+        """Read the latest live or archived operation for an exact source."""
+        row = self.connection.execute(
+            """
+            SELECT payload_json FROM (
+                SELECT source, updated_at, id, payload_json FROM operation
+                UNION ALL
+                SELECT source, updated_at, id, payload_json FROM operation_archive
+            )
+            WHERE source=? ORDER BY updated_at DESC, id DESC LIMIT 1
+            """,
+            (source,),
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            payload = json.loads(str(row[0]))
+        except json.JSONDecodeError:
+            return None
+        return payload if isinstance(payload, dict) else None
+
+    def interrupted_ingest_operations(self) -> list[dict[str, object]]:
+        """Return latest operations left running by an unclean process exit."""
+        rows = self.connection.execute(
+            """
+            SELECT payload_json FROM (
+                SELECT *, ROW_NUMBER() OVER (
+                    PARTITION BY source ORDER BY updated_at DESC, id DESC
+                ) AS source_rank
+                FROM (
+                    SELECT * FROM operation
+                    UNION ALL
+                    SELECT * FROM operation_archive
+                )
+                WHERE mode='ingest'
+            )
+            WHERE source_rank=1 AND status IN ('running', 'retrying')
+            ORDER BY updated_at, id
+            """
+        ).fetchall()
+        operations: list[dict[str, object]] = []
+        for row in rows:
+            try:
+                payload = json.loads(str(row[0]))
+            except json.JSONDecodeError:
+                continue
+            if isinstance(payload, dict):
+                operations.append(payload)
+        return operations
+
+    def release_dirty_worker(self, worker_id: str) -> int:
+        """Release leases from a proven-dead ingest run during explicit resume."""
+        with self.connection:
+            cursor = self.connection.execute(
+                """
+                UPDATE dirty_queue
+                SET state='pending', claimed_by='', lease_expires_at='', updated_at=?
+                WHERE state='running' AND claimed_by=?
+                """,
+                (_now(), worker_id),
+            )
+        return cursor.rowcount
+
+    def upsert_metric_run(
+        self,
+        metrics: dict[str, object],
+        *,
+        live_limit: int = 50,
+    ) -> None:
+        """Keep a bounded live metrics window while archiving older runs."""
+        payload_json = json.dumps(metrics, ensure_ascii=False, separators=(",", ":"))
+        run_id = _metadata_text(metrics.get("run_id"))
+        started_at = _metadata_text(metrics.get("started_at"))
+        identity = hashlib.sha256(
+            f"{run_id}\x00{started_at}".encode()
+        ).hexdigest()
+        now = _now()
+        with self.connection:
+            self.connection.execute("DELETE FROM metric_run_archive WHERE id=?", (identity,))
+            self.connection.execute(
+                """
+                INSERT INTO metric_run(id, run_id, payload_json, started_at, updated_at)
+                VALUES(?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    payload_json=excluded.payload_json,
+                    updated_at=excluded.updated_at
+                """,
+                (identity, run_id, payload_json, started_at, now),
+            )
+            count_row = self.connection.execute("SELECT count(*) FROM metric_run").fetchone()
+            overflow = max(0, int(count_row[0]) - max(1, live_limit))
+            if overflow:
+                self.connection.execute(
+                    """
+                    INSERT OR REPLACE INTO metric_run_archive
+                    SELECT * FROM metric_run ORDER BY started_at, id LIMIT ?
+                    """,
+                    (overflow,),
+                )
+                self.connection.execute(
+                    """
+                    DELETE FROM metric_run WHERE id IN (
+                        SELECT id FROM metric_run ORDER BY started_at, id LIMIT ?
+                    )
+                    """,
+                    (overflow,),
+                )
+
     def upsert_synthesis(
         self,
         filename: str,
@@ -530,19 +881,8 @@ class VaultRegistry:
             or ""
         )
         synthesis.source_file = filename
-        payload = json.dumps(
-            source_synthesis_to_dict(synthesis),
-            ensure_ascii=False,
-            separators=(",", ":"),
-        )
         metadata = json.dumps(
-            {
-                "content_type": source.provenance.content_type,
-                "diagnostics": list(source.provenance.diagnostics),
-                "document_format": source.provenance.document_format,
-                "extractor_chain": list(source.provenance.extractor_chain),
-                "source_type": source.source_type,
-            },
+            _source_metadata_payload(source),
             ensure_ascii=False,
             separators=(",", ":"),
         )
@@ -580,10 +920,14 @@ class VaultRegistry:
             )
             self.connection.execute(
                 """
-                INSERT OR IGNORE INTO source_version(
+                INSERT INTO source_version(
                     source_id, content_hash, extractor_version, requested_url,
                     canonical_url, metadata_json, created_at
                 ) VALUES(?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(source_id, content_hash, extractor_version) DO UPDATE SET
+                    requested_url=excluded.requested_url,
+                    canonical_url=excluded.canonical_url,
+                    metadata_json=excluded.metadata_json
                 """,
                 (
                     source_id,
@@ -595,83 +939,114 @@ class VaultRegistry:
                     now,
                 ),
             )
-            self.connection.execute(
-                """
-                INSERT INTO synthesis(
-                    source_id, payload_json, input_hash, prompt_version,
-                    schema_version, model_id, status, parse_error_json, updated_at
-                ) VALUES(?, ?, ?, ?, ?, ?, 'ready', '{}', ?)
-                ON CONFLICT(source_id) DO UPDATE SET
-                    payload_json=excluded.payload_json,
-                    input_hash=excluded.input_hash,
-                    prompt_version=excluded.prompt_version,
-                    schema_version=excluded.schema_version,
-                    model_id=excluded.model_id,
-                    status='ready',
-                    parse_error_json='{}',
-                    updated_at=excluded.updated_at
-                """,
-                (
-                    source_id,
-                    payload,
-                    input_hash,
-                    versions.prompt,
-                    versions.schema,
-                    versions.synthesis_model,
-                    now,
-                ),
+            self._upsert_synthesis_payload_unlocked(
+                source_id, filename, input_hash, synthesis, versions, now
             )
-            self.connection.execute(
-                """
-                UPDATE dirty_queue
-                SET state='completed', claimed_by='', lease_expires_at='',
-                    updated_at=?, error=''
-                WHERE entity_type='source' AND entity_id=?
-                  AND state IN ('pending', 'running')
-                """,
-                (now, filename),
+
+    def update_synthesis(
+        self,
+        filename: str,
+        synthesis: SourceSynthesis,
+        versions: ArtifactVersions,
+    ) -> None:
+        """Update synthesis ownership without rewriting its source revision."""
+        row = self.connection.execute(
+            "SELECT id, content_hash FROM source WHERE filename=?", (filename,)
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"Unknown source: {filename}")
+        self._assign_canonical_ids(synthesis)
+        now = _now()
+        with self.connection:
+            self._upsert_synthesis_payload_unlocked(
+                int(row[0]), filename, str(row[1]), synthesis, versions, now
             )
-            self._prune_completed_dirty_unlocked()
-            touched_moc_ids = {
-                str(row[0])
-                for row in self.connection.execute(
-                    "SELECT moc_id FROM moc_source WHERE source_id=?", (source_id,)
-                )
-            }
-            touched_concept_ids = {
-                str(row[0])
-                for row in self.connection.execute(
-                    "SELECT concept_id FROM concept_source WHERE source_id=?",
-                    (source_id,),
-                )
-            }
-            self.connection.execute(
-                "DELETE FROM membership_source WHERE source_id=?", (source_id,)
+
+    def _upsert_synthesis_payload_unlocked(
+        self,
+        source_id: int,
+        filename: str,
+        input_hash: str,
+        synthesis: SourceSynthesis,
+        versions: ArtifactVersions,
+        now: str,
+    ) -> None:
+        """Persist one synthesis and rebuild its canonical ownership rows."""
+        synthesis.source_file = filename
+        payload = json.dumps(
+            source_synthesis_to_dict(synthesis),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        self.connection.execute(
+            """
+            INSERT INTO synthesis(
+                source_id, payload_json, input_hash, prompt_version,
+                schema_version, model_id, status, parse_error_json, updated_at
+            ) VALUES(?, ?, ?, ?, ?, ?, 'ready', '{}', ?)
+            ON CONFLICT(source_id) DO UPDATE SET
+                payload_json=excluded.payload_json,
+                input_hash=excluded.input_hash,
+                prompt_version=excluded.prompt_version,
+                schema_version=excluded.schema_version,
+                model_id=excluded.model_id,
+                status='ready',
+                parse_error_json='{}',
+                updated_at=excluded.updated_at
+            """,
+            (
+                source_id,
+                payload,
+                input_hash,
+                versions.prompt,
+                versions.schema,
+                versions.synthesis_model,
+                now,
+            ),
+        )
+        touched_moc_ids = {
+            str(row[0])
+            for row in self.connection.execute(
+                "SELECT moc_id FROM moc_source WHERE source_id=?", (source_id,)
             )
-            self.connection.execute(
-                "DELETE FROM concept_source WHERE source_id=?", (source_id,)
+        }
+        touched_concept_ids = {
+            str(row[0])
+            for row in self.connection.execute(
+                "SELECT concept_id FROM concept_source WHERE source_id=?",
+                (source_id,),
             )
-            self.connection.execute(
-                "DELETE FROM moc_source WHERE source_id=?", (source_id,)
+        }
+        self.connection.execute(
+            "DELETE FROM membership_source WHERE source_id=?", (source_id,)
+        )
+        self.connection.execute("DELETE FROM concept_source WHERE source_id=?", (source_id,))
+        self.connection.execute("DELETE FROM moc_source WHERE source_id=?", (source_id,))
+        self._upsert_synthesis_entities(source_id, synthesis, versions, now)
+        touched_concept_ids.update(
+            str(row[0])
+            for row in self.connection.execute(
+                "SELECT concept_id FROM concept_source WHERE source_id=?", (source_id,)
             )
-            self._upsert_synthesis_entities(
-                source_id, synthesis, versions, now
+        )
+        touched_moc_ids.update(
+            str(row[0])
+            for row in self.connection.execute(
+                "SELECT moc_id FROM moc_source WHERE source_id=?", (source_id,)
             )
-            touched_moc_ids.update(
-                str(row[0])
-                for row in self.connection.execute(
-                    "SELECT moc_id FROM moc_source WHERE source_id=?", (source_id,)
-                )
-            )
-            self._rebuild_moc_memberships(touched_moc_ids)
-            self._cleanup_unreferenced_entities(
-                concept_ids=touched_concept_ids,
-                moc_ids=touched_moc_ids,
-            )
+        )
+        self._rebuild_moc_memberships(touched_moc_ids)
+        self._cleanup_unreferenced_entities(
+            concept_ids=touched_concept_ids,
+            moc_ids=touched_moc_ids,
+        )
+        self._rebuild_concept_aggregates(touched_concept_ids, versions, now)
 
     def _assign_canonical_ids(self, synthesis: SourceSynthesis) -> None:
         """Resolve model-provided IDs only when they already exist locally."""
+        slug_map: dict[str, str] = {}
         for concept in synthesis.concepts:
+            original_slug = concept.slug
             row = None
             if concept.canonical_id:
                 row = self.connection.execute(
@@ -686,6 +1061,37 @@ class VaultRegistry:
                 concept.slug = str(row[1])
             else:
                 concept.canonical_id = self._stable_id("concept", concept.slug)
+            slug_map[original_slug] = concept.slug
+
+        for concept in synthesis.concepts:
+            for link in concept.related:
+                link.slug = slug_map.get(link.slug, link.slug)
+        for moc in synthesis.maps:
+            moc.concept_slugs = list(
+                dict.fromkeys(slug_map.get(slug, slug) for slug in moc.concept_slugs)
+            )
+
+        concepts_by_slug: dict[str, ConceptNote] = {}
+        for concept in synthesis.concepts:
+            existing = concepts_by_slug.get(concept.slug)
+            if existing is None:
+                concepts_by_slug[concept.slug] = concept
+                continue
+            existing.tags = list(dict.fromkeys([*existing.tags, *concept.tags]))
+            existing.aliases = list(
+                dict.fromkeys([*existing.aliases, concept.title, *concept.aliases])
+            )
+            existing.sections.extend(concept.sections)
+            existing.claims.extend(concept.claims)
+            existing_links = {(link.slug, link.relation) for link in existing.related}
+            for link in concept.related:
+                identity = (link.slug, link.relation)
+                if identity not in existing_links:
+                    existing.related.append(link)
+                    existing_links.add(identity)
+            existing.confidence = max(existing.confidence, concept.confidence)
+            existing.is_new = existing.is_new and concept.is_new
+        synthesis.concepts = list(concepts_by_slug.values())
 
     def assign_canonical_ids(self, synthesis: SourceSynthesis) -> None:
         """Populate trusted stable IDs without persisting synthesis state."""
@@ -822,6 +1228,111 @@ class VaultRegistry:
                         """,
                         (source_id, moc_id, str(row[0]), position),
                     )
+
+    def _rebuild_concept_aggregates(
+        self,
+        concept_ids: set[str],
+        versions: ArtifactVersions,
+        now: str,
+    ) -> None:
+        """Rebuild canonical concept payloads from every current source owner."""
+        from obsidian_llm_wiki.synth.dedupe import merge_concepts
+
+        for concept_id in sorted(concept_ids):
+            rows = self.connection.execute(
+                """
+                SELECT synthesis.payload_json
+                FROM concept_source
+                JOIN source ON source.id=concept_source.source_id
+                JOIN synthesis ON synthesis.source_id=source.id
+                WHERE concept_source.concept_id=? AND synthesis.status='ready'
+                ORDER BY source.filename
+                """,
+                (concept_id,),
+            ).fetchall()
+            contributions: list[ConceptNote] = []
+            for row in rows:
+                try:
+                    source_synthesis = source_synthesis_from_dict(json.loads(row[0]))
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    continue
+                for concept in source_synthesis.concepts:
+                    candidate_id = concept.canonical_id or self._stable_id(
+                        "concept", concept.slug
+                    )
+                    if candidate_id == concept_id:
+                        contributions.append(concept)
+            if not contributions:
+                continue
+            titles = [concept.title for concept in contributions if concept.title]
+            merged = merge_concepts(contributions)[0]
+            merged.canonical_id = concept_id
+            merged.aliases = list(
+                dict.fromkeys(
+                    [*merged.aliases, *(title for title in titles if title != merged.title)]
+                )
+            )
+            merged.summary = max(
+                (concept.summary for concept in contributions),
+                key=len,
+                default=merged.summary,
+            )
+            payload_json = json.dumps(
+                concept_note_to_dict(merged), ensure_ascii=False, separators=(",", ":")
+            )
+            self.connection.execute(
+                """
+                UPDATE concept
+                SET slug=?, title=?, summary=?, tags_json=?, payload_json=?,
+                    content_hash=?, prompt_version=?, schema_version=?, model_id=?,
+                    updated_at=?
+                WHERE id=?
+                """,
+                (
+                    merged.slug,
+                    merged.title,
+                    merged.summary,
+                    json.dumps(merged.tags, ensure_ascii=False, separators=(",", ":")),
+                    payload_json,
+                    _content_hash(payload_json),
+                    versions.prompt,
+                    versions.schema,
+                    versions.synthesis_model,
+                    now,
+                    concept_id,
+                ),
+            )
+            self.connection.execute(
+                "DELETE FROM concept_alias WHERE concept_id=?", (concept_id,)
+            )
+            aliases = list(dict.fromkeys([merged.slug, merged.title, *merged.aliases]))
+            for alias in aliases:
+                normalized = " ".join(alias.casefold().split())
+                if normalized:
+                    self.connection.execute(
+                        """
+                        INSERT INTO concept_alias(alias, concept_id) VALUES(?, ?)
+                        ON CONFLICT(alias) DO UPDATE SET concept_id=excluded.concept_id
+                        """,
+                        (normalized, concept_id),
+                    )
+            self.connection.execute(
+                "DELETE FROM concept_fts WHERE concept_id=?", (concept_id,)
+            )
+            self.connection.execute(
+                """
+                INSERT INTO concept_fts(concept_id, slug, title, aliases, tags, summary)
+                VALUES(?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    concept_id,
+                    merged.slug,
+                    merged.title,
+                    " ".join(merged.aliases),
+                    " ".join(merged.tags),
+                    merged.summary,
+                ),
+            )
 
     def _rebuild_moc_memberships(self, moc_ids: set[str]) -> None:
         ordered = sorted(moc_ids)
@@ -1000,6 +1511,160 @@ class VaultRegistry:
             )
         }
 
+    def source_content_hashes(self) -> dict[str, str]:
+        """Return authoritative source hashes for explicit full audits."""
+        return {
+            str(row[0]): str(row[1])
+            for row in self.connection.execute(
+                "SELECT filename, content_hash FROM source WHERE status='active'"
+            )
+        }
+
+    def rendered_paths(self) -> set[str]:
+        """Return renderer-owned paths for explicit stale-artifact audits."""
+        return {
+            str(row[0])
+            for row in self.connection.execute("SELECT path FROM render_state")
+        }
+
+    def source_file_states(self) -> dict[str, tuple[int, int, SourceDoc]]:
+        """Return indexed file signatures and metadata-only source stubs."""
+        rows = self.connection.execute(
+            """
+            SELECT source.filename, source.title, source.canonical_url,
+                   source_file_state.mtime_ns, source_file_state.size_bytes,
+                   COALESCE((
+                       SELECT source_version.metadata_json
+                       FROM source_version
+                       WHERE source_version.source_id=source.id
+                       ORDER BY source_version.id DESC LIMIT 1
+                   ), '{}') AS metadata_json
+            FROM source
+            JOIN source_file_state ON source_file_state.source_id=source.id
+            WHERE source.status='active'
+            ORDER BY source.filename
+            """
+        ).fetchall()
+        states: dict[str, tuple[int, int, SourceDoc]] = {}
+        for row in rows:
+            filename = str(row["filename"])
+            try:
+                metadata = json.loads(str(row["metadata_json"]))
+            except (TypeError, json.JSONDecodeError):
+                metadata = {}
+            states[filename] = (
+                int(row["mtime_ns"]),
+                int(row["size_bytes"]),
+                _source_stub_from_metadata(
+                    filename=filename,
+                    title=str(row["title"]),
+                    canonical_url=str(row["canonical_url"]),
+                    metadata=metadata if isinstance(metadata, dict) else {},
+                ),
+            )
+        return states
+
+    def record_source_file_state(
+        self,
+        filename: str,
+        *,
+        mtime_ns: int,
+        size_bytes: int,
+    ) -> bool:
+        """Commit a verified source-file signature after pipeline success."""
+        with self.connection:
+            cursor = self.connection.execute(
+                """
+                INSERT INTO source_file_state(source_id, mtime_ns, size_bytes, updated_at)
+                SELECT id, ?, ?, ? FROM source WHERE filename=? AND status='active'
+                ON CONFLICT(source_id) DO UPDATE SET
+                    mtime_ns=excluded.mtime_ns,
+                    size_bytes=excluded.size_bytes,
+                    updated_at=excluded.updated_at
+                """,
+                (int(mtime_ns), int(size_bytes), _now(), filename),
+            )
+        return cursor.rowcount > 0
+
+    def refresh_source_metadata(
+        self,
+        filename: str,
+        source: SourceDoc,
+        versions: ArtifactVersions,
+    ) -> None:
+        """Refresh provenance when the body hash and synthesis stay current."""
+        metadata = json.dumps(
+            _source_metadata_payload(source),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        content_hash = _content_hash(source.content)
+        with self.connection:
+            self.connection.execute(
+                """
+                UPDATE source SET title=?, canonical_url=?, updated_at=?
+                WHERE filename=? AND content_hash=? AND status='active'
+                """,
+                (source.title, source.url or "", _now(), filename, content_hash),
+            )
+            self.connection.execute(
+                """
+                UPDATE source_version SET
+                    requested_url=?, canonical_url=?, metadata_json=?
+                WHERE source_id=(SELECT id FROM source WHERE filename=?)
+                  AND content_hash=? AND extractor_version=?
+                """,
+                (
+                    source.provenance.requested_url,
+                    source.url or "",
+                    metadata,
+                    filename,
+                    content_hash,
+                    versions.extractor,
+                ),
+            )
+
+    def synthesis_versions_current(
+        self,
+        filename: str,
+        versions: ArtifactVersions,
+    ) -> bool:
+        """Check non-content versions when an indexed file signature is unchanged."""
+        row = self.connection.execute(
+            """
+            SELECT source.extractor_version, synthesis.prompt_version,
+                   synthesis.schema_version, synthesis.model_id
+            FROM synthesis
+            JOIN source ON source.id=synthesis.source_id
+            WHERE source.filename=? AND synthesis.status='ready'
+            """,
+            (filename,),
+        ).fetchone()
+        if row is None:
+            return False
+        expected = (
+            versions.extractor,
+            versions.prompt,
+            versions.schema,
+            versions.synthesis_model,
+        )
+        actual = tuple(row)
+        if actual == expected:
+            return True
+        reasons = (
+            "extractor_version_changed",
+            "prompt_version_changed",
+            "schema_version_changed",
+            "synthesis_model_changed",
+        )
+        reason = next(
+            reason
+            for reason, current, wanted in zip(reasons, actual, expected, strict=True)
+            if current != wanted
+        )
+        self.enqueue_dirty("source", filename, reason)
+        return False
+
     def delete_source(self, filename: str) -> None:
         """Delete one source and its versioned synthesis rows transactionally."""
         with self.connection:
@@ -1057,34 +1722,87 @@ class VaultRegistry:
             stale_keys=frozenset(stale_keys),
         )
 
+    def render_manifest(self, entity_kind: str) -> dict[str, tuple[str, str]]:
+        """Return one indexed render manifest without reading generated pages."""
+        return {
+            str(row["entity_key"]): (str(row["path"]), str(row["content_hash"]))
+            for row in self.connection.execute(
+                """
+                SELECT entity_key, path, content_hash FROM render_state
+                WHERE entity_kind=?
+                """,
+                (entity_kind,),
+            )
+        }
+
     def commit_render_manifest(
         self,
         entity_kind: str,
         manifest: dict[str, tuple[str, str]],
         diff: RenderDiff,
     ) -> None:
-        """Commit only changed/stale render fingerprints after render success."""
-        now = _now()
+        """Commit one render manifest atomically after render success."""
+        self.commit_render_manifests(((entity_kind, manifest, diff),))
+
+    def commit_render_manifests(
+        self,
+        manifests: Iterable[
+            tuple[str, dict[str, tuple[str, str]], RenderDiff]
+        ],
+    ) -> None:
+        """Commit every render manifest in one SQLite transaction.
+
+        The filesystem renderer rolls back all touched paths when any late
+        render step fails.  Render-state must use the same all-or-nothing
+        boundary; otherwise an early manifest can be committed before a later
+        manifest fails, causing the retry to skip a file that was rolled back.
+        """
+        changed = False
         with self.connection:
-            for key in diff.changed_keys:
-                path, content_hash = manifest[key]
+            for entity_kind, manifest, diff in manifests:
+                self._commit_render_manifest_unlocked(entity_kind, manifest, diff)
+                changed = changed or bool(diff.changed_keys or diff.stale_keys)
+            if changed:
                 self.connection.execute(
                     """
-                    INSERT INTO render_state(
-                        entity_kind, entity_key, path, content_hash, updated_at
-                    ) VALUES(?, ?, ?, ?, ?)
-                    ON CONFLICT(entity_kind, entity_key) DO UPDATE SET
-                        path=excluded.path,
-                        content_hash=excluded.content_hash,
-                        updated_at=excluded.updated_at
-                    """,
-                    (entity_kind, key, path, content_hash, now),
+                    INSERT INTO meta(key, value)
+                    VALUES('maintenance_snapshot_complete', '0')
+                    ON CONFLICT(key) DO UPDATE SET value='0'
+                    """
                 )
-            if diff.stale_keys:
-                self.connection.executemany(
-                    "DELETE FROM render_state WHERE entity_kind=? AND entity_key=?",
-                    [(entity_kind, key) for key in diff.stale_keys],
-                )
+
+    def _commit_render_manifest_unlocked(
+        self,
+        entity_kind: str,
+        manifest: dict[str, tuple[str, str]],
+        diff: RenderDiff,
+    ) -> None:
+        """Apply one manifest while the caller owns the transaction."""
+        now = _now()
+        for key in diff.changed_keys:
+            path, content_hash = manifest[key]
+            self.connection.execute(
+                """
+                INSERT INTO render_state(
+                    entity_kind, entity_key, path, content_hash, updated_at
+                ) VALUES(?, ?, ?, ?, ?)
+                ON CONFLICT(entity_kind, entity_key) DO UPDATE SET
+                    path=excluded.path,
+                    content_hash=excluded.content_hash,
+                    updated_at=excluded.updated_at
+                """,
+                (entity_kind, key, path, content_hash, now),
+            )
+        if diff.stale_keys:
+            self.connection.executemany(
+                "DELETE FROM render_state WHERE entity_kind=? AND entity_key=?",
+                [(entity_kind, key) for key in diff.stale_keys],
+            )
+        if diff.stale_paths:
+            self.connection.executemany(
+                "DELETE FROM health_finding WHERE path=?",
+                [(path,) for path in diff.stale_paths],
+            )
 
     def next_maintenance_batch(self, *, limit: int) -> tuple[list[str], bool]:
         """Return a bounded, persistent round-robin batch of rendered pages."""
@@ -1105,16 +1823,29 @@ class VaultRegistry:
         ).fetchall()
         cycle_complete = len(rows) <= limit
         paths = [str(row[0]) for row in rows[:limit]]
-        next_cursor = "" if cycle_complete else paths[-1]
-        with self.connection:
-            self.connection.execute(
-                """
-                INSERT INTO meta(key, value) VALUES('maintenance_cursor', ?)
-                ON CONFLICT(key) DO UPDATE SET value=excluded.value
-                """,
-                (next_cursor,),
-            )
         return paths, cycle_complete
+
+    def commit_maintenance_batch(
+        self,
+        scanned_paths: Iterable[str],
+        findings: Iterable[dict[str, object]],
+        *,
+        cycle_complete: bool,
+    ) -> None:
+        """Persist findings and advance their cursor in one transaction."""
+        paths = tuple(dict.fromkeys(str(path) for path in scanned_paths if path))
+        rows = tuple(findings)
+        next_cursor = "" if cycle_complete or not paths else paths[-1]
+        with self.connection:
+            if paths:
+                self.connection.executemany(
+                    "DELETE FROM health_finding WHERE path=?",
+                    ((path,) for path in paths),
+                )
+            self._insert_health_findings_unlocked(rows, now=_now())
+            self._set_meta_unlocked("maintenance_cursor", next_cursor)
+            if cycle_complete:
+                self._set_meta_unlocked("maintenance_snapshot_complete", "1")
 
     def maintenance_graph_sets(self) -> tuple[set[str], set[str]]:
         """Return current concept and MoC-membership slugs from indexed state."""
@@ -1138,6 +1869,144 @@ class VaultRegistry:
             )
         }
         return concepts, moced
+
+    def maintenance_page_sets(
+        self,
+    ) -> tuple[set[str], set[str], set[str], set[str], dict[str, int]]:
+        """Return indexed page/link sets needed by bounded health batches."""
+        rows = self.connection.execute(
+            "SELECT entity_kind, path FROM render_state"
+        ).fetchall()
+        all_stems = {Path(str(row[1])).stem for row in rows}
+        all_stems.update({"index", "log"})
+        concept_stems = {
+            Path(str(row[1])).stem for row in rows if str(row[0]) == "concept-page"
+        }
+        source_stems = {
+            Path(str(row[1])).stem for row in rows if str(row[0]) == "source-page"
+        }
+        _, moced_slugs = self.maintenance_graph_sets()
+        moc_counts = {
+            str(row[0]): int(row[1])
+            for row in self.connection.execute(
+                """
+                SELECT moc.slug, COUNT(DISTINCT membership.concept_id)
+                FROM moc
+                LEFT JOIN membership ON membership.moc_id=moc.id
+                GROUP BY moc.id, moc.slug
+                """
+            )
+        }
+        return all_stems, concept_stems, source_stems, moced_slugs, moc_counts
+
+    def replace_health_findings(
+        self,
+        scanned_paths: Iterable[str],
+        findings: Iterable[dict[str, object]],
+    ) -> None:
+        """Replace findings for one maintenance batch without losing peers."""
+        paths = tuple(dict.fromkeys(str(path) for path in scanned_paths if path))
+        rows = tuple(findings)
+        with self.connection:
+            if paths:
+                self.connection.executemany(
+                    "DELETE FROM health_finding WHERE path=?",
+                    ((path,) for path in paths),
+                )
+            self._insert_health_findings_unlocked(rows, now=_now())
+
+    def replace_all_health_findings(
+        self,
+        findings: Iterable[dict[str, object]],
+    ) -> None:
+        """Replace the complete indexed health snapshot after a full audit."""
+        rows = tuple(findings)
+        with self.connection:
+            self.connection.execute("DELETE FROM health_finding")
+            self._insert_health_findings_unlocked(rows, now=_now())
+            self._set_meta_unlocked("maintenance_snapshot_complete", "1")
+
+    def _insert_health_findings_unlocked(
+        self,
+        findings: Iterable[dict[str, object]],
+        *,
+        now: str,
+    ) -> None:
+        self.connection.executemany(
+            """
+            INSERT INTO health_finding(
+                path, kind, severity, message, details_json, reviewed, updated_at
+            ) VALUES(?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(path, kind, message) DO UPDATE SET
+                severity=excluded.severity,
+                details_json=excluded.details_json,
+                reviewed=excluded.reviewed,
+                updated_at=excluded.updated_at
+            """,
+            (
+                (
+                    str(finding.get("path", "")),
+                    str(finding.get("kind", "")),
+                    str(finding.get("severity", "warning")),
+                    str(finding.get("message", "")),
+                    json.dumps(
+                        finding.get("details", {}),
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    ),
+                    int(bool(finding.get("reviewed", False))),
+                    now,
+                )
+                for finding in findings
+                if finding.get("path") and finding.get("kind") and finding.get("message")
+            ),
+        )
+
+    def health_findings(self) -> list[dict[str, object]]:
+        """Return the durable whole-vault finding snapshot in stable order."""
+        rows = self.connection.execute(
+            """
+            SELECT path, kind, severity, message, details_json, reviewed
+            FROM health_finding
+            ORDER BY path, kind, message
+            """
+        ).fetchall()
+        findings: list[dict[str, object]] = []
+        for row in rows:
+            try:
+                details = json.loads(str(row["details_json"]))
+            except (TypeError, json.JSONDecodeError):
+                details = {}
+            findings.append(
+                {
+                    "path": str(row["path"]),
+                    "kind": str(row["kind"]),
+                    "severity": str(row["severity"]),
+                    "message": str(row["message"]),
+                    "details": details if isinstance(details, dict) else {},
+                    "reviewed": bool(row["reviewed"]),
+                }
+            )
+        return findings
+
+    def mark_maintenance_snapshot_complete(self) -> None:
+        with self.connection:
+            self._set_meta_unlocked("maintenance_snapshot_complete", "1")
+
+    def maintenance_snapshot_complete(self) -> bool:
+        row = self.connection.execute(
+            "SELECT value FROM meta WHERE key='maintenance_snapshot_complete'"
+        ).fetchone()
+        return bool(row and str(row["value"]) == "1")
+
+    def _set_meta_unlocked(self, key: str, value: str) -> None:
+        self.connection.execute(
+            """
+            INSERT INTO meta(key, value) VALUES(?, ?)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value
+            """,
+            (key, value),
+        )
 
     def search_concepts(self, query: str, *, limit: int) -> list[ConceptCandidate]:
         """Return a bounded FTS5 candidate set without scanning concept rows."""
@@ -1389,6 +2258,164 @@ class VaultRegistry:
                 (entity_kind, model_id, schema_version),
             ).fetchone()
         return row is not None
+
+    def embedding_count(
+        self,
+        entity_kind: str,
+        *,
+        model_id: str,
+        schema_version: str,
+    ) -> int:
+        """Count current vectors without loading float blobs into memory."""
+        row = self.connection.execute(
+            """
+            SELECT count(*) FROM embedding
+            WHERE entity_kind=? AND model_id=? AND schema_version=?
+            """,
+            (entity_kind, model_id, schema_version),
+        ).fetchone()
+        return int(row[0]) if row is not None else 0
+
+    def embedding_input_hashes(
+        self,
+        entity_kind: str,
+        *,
+        model_id: str,
+        schema_version: str,
+        entity_ids: Iterable[str] | None = None,
+    ) -> dict[str, str]:
+        """Load only vector metadata needed to resume partial indexing."""
+        if entity_ids is None:
+            rows = self.connection.execute(
+                """
+                SELECT entity_id, input_hash FROM embedding
+                WHERE entity_kind=? AND model_id=? AND schema_version=?
+                """,
+                (entity_kind, model_id, schema_version),
+            ).fetchall()
+            return {str(row[0]): str(row[1]) for row in rows}
+
+        ordered = sorted(set(entity_ids))
+        result: dict[str, str] = {}
+        for offset in range(0, len(ordered), 500):
+            chunk = ordered[offset:offset + 500]
+            if not chunk:
+                continue
+            placeholders = ",".join("?" for _ in chunk)
+            rows = self.connection.execute(
+                f"""
+                SELECT entity_id, input_hash FROM embedding
+                WHERE entity_kind=? AND model_id=? AND schema_version=?
+                  AND entity_id IN ({placeholders})
+                """,
+                (entity_kind, model_id, schema_version, *chunk),
+            ).fetchall()
+            result.update((str(row[0]), str(row[1])) for row in rows)
+        return result
+
+    @staticmethod
+    def _semantic_namespace_key(model_id: str, schema_version: str) -> str:
+        digest = hashlib.sha256(f"{model_id}\x00{schema_version}".encode()).hexdigest()
+        return f"cross_lingual_complete:{digest}"
+
+    def cross_lingual_namespace_complete(
+        self,
+        *,
+        model_id: str,
+        schema_version: str,
+    ) -> bool:
+        key = self._semantic_namespace_key(model_id, schema_version)
+        row = self.connection.execute(
+            "SELECT value FROM meta WHERE key=?",
+            (key,),
+        ).fetchone()
+        return row is not None and str(row[0]) == "1"
+
+    def replace_cross_lingual_links(
+        self,
+        source_slugs: Iterable[str],
+        links: dict[str, list[tuple[str, float, str]]],
+        *,
+        model_id: str,
+        schema_version: str,
+        namespace_complete: bool = False,
+    ) -> None:
+        """Replace directional links for a bounded set of comparison slugs."""
+        slugs = sorted(set(source_slugs))
+        now = _now()
+        with self.connection:
+            for offset in range(0, len(slugs), 500):
+                chunk = slugs[offset:offset + 500]
+                placeholders = ",".join("?" for _ in chunk)
+                self.connection.execute(
+                    f"""
+                    DELETE FROM cross_lingual_link
+                    WHERE model_id=? AND schema_version=?
+                      AND source_slug IN ({placeholders})
+                    """,
+                    (model_id, schema_version, *chunk),
+                )
+            self.connection.executemany(
+                """
+                INSERT INTO cross_lingual_link(
+                    source_slug, target_slug, score, display,
+                    model_id, schema_version, updated_at
+                ) VALUES(?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(source_slug, target_slug, model_id, schema_version)
+                DO UPDATE SET
+                    score=excluded.score,
+                    display=excluded.display,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    (source, target, float(score), display, model_id, schema_version, now)
+                    for source in slugs
+                    for target, score, display in links.get(source, ())
+                    if source != target
+                ),
+            )
+            if namespace_complete:
+                self._set_meta_unlocked(
+                    self._semantic_namespace_key(model_id, schema_version),
+                    "1",
+                )
+
+    def load_cross_lingual_links(
+        self,
+        *,
+        model_id: str,
+        schema_version: str,
+        live_slugs: set[str],
+    ) -> dict[str, list[tuple[str, float, str]]]:
+        """Load a durable whole-vault semantic-link snapshot."""
+        links: dict[str, list[tuple[str, float, str]]] = {}
+        rows = self.connection.execute(
+            """
+            SELECT source_slug, target_slug, score, display
+            FROM cross_lingual_link
+            WHERE model_id=? AND schema_version=?
+            ORDER BY source_slug, score DESC, target_slug
+            """,
+            (model_id, schema_version),
+        ).fetchall()
+        for row in rows:
+            source = str(row[0])
+            target = str(row[1])
+            if source not in live_slugs or target not in live_slugs:
+                continue
+            links.setdefault(source, []).append((target, float(row[2]), str(row[3])))
+        return links
+
+    def prune_cross_lingual_links(self) -> None:
+        """Remove links whose canonical concept no longer exists."""
+        with self.connection:
+            self.connection.execute(
+                """
+                DELETE FROM cross_lingual_link
+                WHERE source_slug NOT IN (SELECT slug FROM concept)
+                   OR target_slug NOT IN (SELECT slug FROM concept)
+                """
+            )
 
     def search_ann(
         self,
@@ -1665,38 +2692,46 @@ class VaultRegistry:
             ).fetchall()
         return sorted(self._dirty_records(rows), key=lambda record: record.id)
 
-    def start_dirty(self, record_id: int, *, worker_id: str) -> None:
+    def start_dirty(self, record_id: int, *, worker_id: str) -> bool:
         """Claim a known item owned by an external sequential work plan."""
         now = datetime.now(UTC)
         with self.connection:
-            self.connection.execute(
+            cursor = self.connection.execute(
                 """
                 UPDATE dirty_queue
                 SET state='running', attempts=attempts+1, claimed_by=?,
                     lease_expires_at=?, updated_at=?
-                WHERE id=? AND state IN ('pending', 'running')
+                WHERE id=? AND (
+                    (state='pending' AND next_attempt_at<=?)
+                    OR (state='running' AND lease_expires_at<=?)
+                )
                 """,
                 (
                     worker_id,
                     (now + timedelta(seconds=_DIRTY_LEASE_SECONDS)).isoformat(),
                     now.isoformat(),
                     record_id,
+                    now.isoformat(),
+                    now.isoformat(),
                 ),
             )
+        return cursor.rowcount == 1
 
-    def complete_dirty(self, record_id: int) -> None:
-        """Mark a claimed queue item complete."""
+    def complete_dirty(self, record_id: int, *, worker_id: str) -> bool:
+        """Complete an item only while the caller still owns its lease."""
         with self.connection:
-            self.connection.execute(
+            cursor = self.connection.execute(
                 """
                 UPDATE dirty_queue
                 SET state='completed', claimed_by='', lease_expires_at='',
                     error='', updated_at=?
-                WHERE id=?
+                WHERE id=? AND state='running' AND claimed_by=?
                 """,
-                (_now(), record_id),
+                (_now(), record_id, worker_id),
             )
-            self._prune_completed_dirty_unlocked()
+            if cursor.rowcount == 1:
+                self._prune_completed_dirty_unlocked()
+        return cursor.rowcount == 1
 
     def _prune_completed_dirty_unlocked(
         self, keep: int = _COMPLETED_QUEUE_HISTORY
@@ -1720,29 +2755,37 @@ class VaultRegistry:
         record_id: int,
         error: str,
         *,
+        worker_id: str,
         next_attempt_at: str | None = None,
-    ) -> None:
+    ) -> bool:
         """Return a failed claim to the retry queue with bounded diagnostics."""
         if next_attempt_at is None:
             row = self.connection.execute(
-                "SELECT attempts FROM dirty_queue WHERE id=?", (record_id,)
+                """
+                SELECT attempts FROM dirty_queue
+                WHERE id=? AND state='running' AND claimed_by=?
+                """,
+                (record_id, worker_id),
             ).fetchone()
-            attempts = int(row[0]) if row is not None else 1
+            if row is None:
+                return False
+            attempts = int(row[0])
             delay_seconds = min(86_400, 60 * (2 ** max(0, attempts - 1)))
             next_attempt_at = datetime.fromtimestamp(
                 datetime.now(UTC).timestamp() + delay_seconds,
                 tz=UTC,
             ).isoformat()
         with self.connection:
-            self.connection.execute(
+            cursor = self.connection.execute(
                 """
                 UPDATE dirty_queue
                 SET state='pending', claimed_by='', lease_expires_at='',
                     error=?, next_attempt_at=?, updated_at=?
-                WHERE id=?
+                WHERE id=? AND state='running' AND claimed_by=?
                 """,
-                (error[:1_000], next_attempt_at, _now(), record_id),
+                (error[:1_000], next_attempt_at, _now(), record_id, worker_id),
             )
+        return cursor.rowcount == 1
 
     def upsert_ingest_hash(
         self,

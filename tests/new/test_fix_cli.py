@@ -52,7 +52,7 @@ def test_fix_dry_run_is_nonmutating_and_apply_repairs_only_safe_unreviewed_pages
     assert generated.exists()
     plan = json.loads(dry_run.output)
     assert plan["mode"] == "dry-run"
-    assert plan["summary"] == {"applicable": 3, "requires_review": 1, "skipped_reviewed": 3}
+    assert plan["summary"] == {"applicable": 3, "requires_review": 2, "skipped_reviewed": 4}
 
     applied = runner.invoke(app, ["fix", str(vault), "--apply", "--json"])
 
@@ -68,8 +68,8 @@ def test_fix_dry_run_is_nonmutating_and_apply_repairs_only_safe_unreviewed_pages
     )
     assert json.loads(applied.output)["summary"] == {
         "applied": 3,
-        "requires_review": 1,
-        "skipped_reviewed": 3,
+        "requires_review": 2,
+        "skipped_reviewed": 4,
     }
 
     repeated = runner.invoke(app, ["fix", str(vault), "--apply", "--json"])

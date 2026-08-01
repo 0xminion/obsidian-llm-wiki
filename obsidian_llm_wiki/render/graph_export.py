@@ -99,8 +99,10 @@ def export_graph(
     if shard_size < 1 or monolith_threshold < 1:
         raise ValueError("graph shard limits must be positive")
     output_dir.mkdir(parents=True, exist_ok=True)
+    stale_shards = _previous_graph_shards(output_dir)
     total_nodes = len(bundle.concepts) + len(bundle.maps) + len(bundle.sources)
-    if total_nodes <= monolith_threshold:
+    total_edges = sum(1 for _ in _iter_graph_edges(bundle))
+    if total_nodes + total_edges <= monolith_threshold:
         written: list[str] = []
         graph_json = output_dir / "graph.json"
         graph_mmd = output_dir / "graph.mmd"
@@ -108,9 +110,14 @@ def export_graph(
             written.append(str(graph_json))
         if export_graph_mermaid(bundle, graph_mmd):
             written.append(str(graph_mmd))
-        _remove_stale_shards(output_dir, keep=set())
+        _remove_stale_shards(output_dir, keep=set(), stale=stale_shards)
         return written
-    return _export_sharded_graph(bundle, output_dir, shard_size=shard_size)
+    return _export_sharded_graph(
+        bundle,
+        output_dir,
+        shard_size=shard_size,
+        stale_shards=stale_shards,
+    )
 
 
 def _iter_graph_nodes(bundle: SynthesisBundle) -> Iterator[dict[str, Any]]:
@@ -200,6 +207,7 @@ def _export_sharded_graph(
     output_dir: Path,
     *,
     shard_size: int,
+    stale_shards: set[Path],
 ) -> list[str]:
     from obsidian_llm_wiki.render.obsidian import (
         _delete_generated_artifact,
@@ -277,17 +285,46 @@ def _export_sharded_graph(
     monolith = output_dir / "graph.json"
     if _delete_generated_artifact(monolith, output_dir.parent):
         written.append(str(monolith))
-    _remove_stale_shards(output_dir, keep=keep)
+    _remove_stale_shards(output_dir, keep=keep, stale=stale_shards)
     return written
 
 
-def _remove_stale_shards(output_dir: Path, *, keep: set[Path]) -> None:
+def _previous_graph_shards(output_dir: Path) -> set[Path]:
+    """Read the previous manifest; glob only once for legacy migration."""
+    graph_dir = output_dir / "graph"
+    manifest_path = graph_dir / "manifest.json"
+    if manifest_path.is_file():
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            manifest = None
+        if isinstance(manifest, dict):
+            records: list[dict[str, Any]] = []
+            for key in ("shards", "edge_shards"):
+                raw_records = manifest.get(key, [])
+                if isinstance(raw_records, list):
+                    records.extend(
+                        record for record in raw_records if isinstance(record, dict)
+                    )
+            return {
+                graph_dir / str(record["path"])
+                for record in records
+                if isinstance(record.get("path"), str)
+            } | {manifest_path}
+    if not graph_dir.is_dir():
+        return set()
+    return set(graph_dir.glob("*.json"))
+
+
+def _remove_stale_shards(
+    output_dir: Path,
+    *,
+    keep: set[Path],
+    stale: set[Path],
+) -> None:
     from obsidian_llm_wiki.render.obsidian import _delete_generated_artifact
 
-    graph_dir = output_dir / "graph"
-    if not graph_dir.is_dir():
-        return
-    for path in graph_dir.glob("*.json"):
+    for path in sorted(stale):
         if path not in keep:
             _delete_generated_artifact(path, output_dir.parent)
 

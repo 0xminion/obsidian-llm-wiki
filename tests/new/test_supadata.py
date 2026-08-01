@@ -40,6 +40,8 @@ class TestYouTubeExtraction:
 
         assert result is not None
         assert "Hello world" in result.content
+        command = mock_run.call_args.args[0]
+        assert command[command.index("--js-runtimes") + 1] == "node"
 
     def test_oembed_fallback_on_all_failures(self):
         """All transcript methods fail → oEmbed metadata used as last resort."""

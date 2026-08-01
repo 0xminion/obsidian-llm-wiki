@@ -19,6 +19,8 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
+from obsidian_llm_wiki.core.registry import VaultRegistry
+
 __all__ = ["OperationRecord", "OperationStatus", "OperationStore"]
 
 _MAX_OPERATIONS = 500
@@ -127,6 +129,9 @@ class OperationStore:
     def save(self, record: OperationRecord) -> None:
         """Persist a record atomically, retaining a bounded local history."""
         with self._locked(write=True):
+            payload = record.to_dict()
+            with VaultRegistry(self.llmwiki_dir) as registry:
+                registry.upsert_operation(payload)
             records = self._read_records()
             records = [existing for existing in records if existing.id != record.id]
             records.append(record)
@@ -161,11 +166,30 @@ class OperationStore:
 
     def latest_for_source(self, source: str) -> OperationRecord | None:
         """Return the most recently updated record for an exact source identifier."""
+        with VaultRegistry(self.llmwiki_dir) as registry:
+            payload = registry.latest_operation_for_source(source)
+        if payload is not None:
+            try:
+                return OperationRecord.from_dict(payload)
+            except (TypeError, ValueError):
+                pass
         with self._locked(write=False):
             candidates = [record for record in self._read_records() if record.source == source]
         if not candidates:
             return None
         return max(candidates, key=lambda record: (record.updated_at, record.created_at, record.id))
+
+    def interrupted_ingest_operations(self) -> list[OperationRecord]:
+        """Return operations durably left running without a resume marker."""
+        with VaultRegistry(self.llmwiki_dir) as registry:
+            payloads = registry.interrupted_ingest_operations()
+        records: list[OperationRecord] = []
+        for payload in payloads:
+            try:
+                records.append(OperationRecord.from_dict(payload))
+            except (TypeError, ValueError):
+                continue
+        return records
 
     def write_resume_marker(
         self, run_id: str, sources: Sequence[Mapping[str, object] | str]

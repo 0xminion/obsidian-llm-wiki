@@ -84,29 +84,85 @@ def health(
         raise typer.Exit(code=1)
 
     incremental_scan: tuple[int, list[MaintenanceFinding]] | None = None
+    indexed_full_scan: tuple[int, list[MaintenanceFinding]] | None = None
     cycle_complete = True
+    snapshot_complete = True
     if not full:
         with VaultRegistry(config.llmwiki_dir) as registry:
             relative_paths, cycle_complete = registry.next_maintenance_batch(
                 limit=batch_size
             )
-            concept_stems, moced_slugs = registry.maintenance_graph_sets()
-        selected = [
-            bundle_dir / path
-            for path in relative_paths
-            if (bundle_dir / path).is_file()
-        ]
-        if selected or not _content_markdown_files(bundle_dir):
-            incremental_scan = _scan_selected_maintenance_findings(
-                bundle_dir, selected, concept_stems, moced_slugs
+            (
+                all_stems,
+                concept_stems,
+                source_stems,
+                moced_slugs,
+                moc_counts,
+            ) = registry.maintenance_page_sets()
+            selected = [
+                bundle_dir / path
+                for path in relative_paths
+                if (bundle_dir / path).is_file()
+            ]
+            if relative_paths or not _content_markdown_files(bundle_dir):
+                batch_scan = _scan_selected_maintenance_findings(
+                    bundle_dir,
+                    selected,
+                    all_stems,
+                    concept_stems,
+                    source_stems,
+                    moced_slugs,
+                    moc_counts,
+                )
+                registry.commit_maintenance_batch(
+                    relative_paths,
+                    (_finding_payload(finding) for finding in batch_scan[1]),
+                    cycle_complete=cycle_complete,
+                )
+                snapshot_complete = registry.maintenance_snapshot_complete()
+                incremental_scan = (
+                    batch_scan[0],
+                    [
+                        _finding_from_registry_payload(finding)
+                        for finding in registry.health_findings()
+                    ],
+                )
+        if incremental_scan is None:
+            # Legacy vaults have no render manifest yet. Perform one explicit
+            # full scan and seed the durable snapshot instead of returning a
+            # batch-shaped result that silently omits unindexed pages.
+            with VaultRegistry(config.llmwiki_dir) as registry:
+                indexed_full_scan = _append_source_hash_findings(
+                    _scan_maintenance_findings(bundle_dir),
+                    bundle_dir,
+                    registry.source_content_hashes(),
+                )
+                registry.replace_all_health_findings(
+                    _finding_payload(finding) for finding in indexed_full_scan[1]
+                )
+    else:
+        with VaultRegistry(config.llmwiki_dir) as registry:
+            indexed_full_scan = _append_source_hash_findings(
+                _scan_maintenance_findings(bundle_dir),
+                bundle_dir,
+                registry.source_content_hashes(),
+            )
+            indexed_full_scan = _append_unmanaged_generated_findings(
+                indexed_full_scan,
+                bundle_dir,
+                registry.rendered_paths(),
+            )
+            registry.replace_all_health_findings(
+                _finding_payload(finding) for finding in indexed_full_scan[1]
             )
 
     if json_output:
         payload = _health_json_payload(
             bundle_dir,
-            scan=incremental_scan,
+            scan=incremental_scan or indexed_full_scan,
             incremental=incremental_scan is not None,
             cycle_complete=cycle_complete,
+            snapshot_complete=snapshot_complete,
         )
         typer.echo(json.dumps(payload, ensure_ascii=False, sort_keys=True))
         return
@@ -134,6 +190,7 @@ def _health_json_payload(
     scan: tuple[int, list[MaintenanceFinding]] | None = None,
     incremental: bool = False,
     cycle_complete: bool = True,
+    snapshot_complete: bool = True,
 ) -> dict[str, Any]:
     """Build a stable JSON-safe health result without making any changes."""
     files_scanned, findings = scan or _scan_maintenance_findings(bundle_dir)
@@ -143,7 +200,11 @@ def _health_json_payload(
         "summary": dict(Counter(finding.kind.value for finding in findings)),
     }
     if incremental:
-        payload.update(incremental=True, cycle_complete=cycle_complete)
+        payload.update(
+            incremental=True,
+            cycle_complete=cycle_complete,
+            snapshot_complete=snapshot_complete,
+        )
     store_path = bundle_dir / ".llmwiki" / "contradictions.json"
     if store_path.is_file():
         try:
@@ -186,11 +247,26 @@ def _finding_payload(finding: MaintenanceFinding) -> dict[str, Any]:
     }
 
 
+def _finding_from_registry_payload(payload: dict[str, object]) -> MaintenanceFinding:
+    """Restore a typed finding from one validated registry row."""
+    details = payload.get("details", {})
+    return MaintenanceFinding(
+        kind=FindingKind(str(payload["kind"])),
+        path=str(payload["path"]),
+        message=str(payload["message"]),
+        severity=FindingSeverity(str(payload.get("severity", "warning"))),
+        details=details if isinstance(details, dict) else {},
+        reviewed=bool(payload.get("reviewed", False)),
+    )
+
+
 def _scan_maintenance_findings(bundle_dir: Path) -> tuple[int, list[MaintenanceFinding]]:
     """Scan deterministic repair candidates without writing vault content."""
     all_md_files = _content_markdown_files(bundle_dir)
+    all_stems = {file.stem for file in all_md_files}
     concept_stems = {file.stem for file in all_md_files if file.parent.name == "concepts"}
-    moced_slugs = _moced_concept_slugs(bundle_dir, concept_stems)
+    source_stems = {file.stem for file in all_md_files if file.parent.name == "sources"}
+    moced_slugs, moc_counts = _moc_membership_data(bundle_dir, concept_stems)
     findings: list[MaintenanceFinding] = []
 
     for md_file in all_md_files:
@@ -208,6 +284,19 @@ def _scan_maintenance_findings(bundle_dir: Path) -> tuple[int, list[MaintenanceF
         )
         findings.extend(_tag_findings(metadata, relative_path, reviewed))
         findings.extend(_alias_findings(metadata, relative_path, reviewed))
+
+        findings.extend(
+            _content_findings(
+                metadata,
+                body,
+                relative_path,
+                md_file.stem,
+                reviewed,
+                all_stems=all_stems,
+                source_stems=source_stems,
+                moc_counts=moc_counts,
+            )
+        )
 
         if metadata.get("generated") is True and not body.strip():
             findings.append(
@@ -234,11 +323,79 @@ def _scan_maintenance_findings(bundle_dir: Path) -> tuple[int, list[MaintenanceF
     )
 
 
+def _append_source_hash_findings(
+    scan: tuple[int, list[MaintenanceFinding]],
+    bundle_dir: Path,
+    expected_hashes: dict[str, str],
+) -> tuple[int, list[MaintenanceFinding]]:
+    """Verify source bytes during explicit full scans, never normal builds."""
+    from obsidian_llm_wiki.core.state import hash_content
+    from obsidian_llm_wiki.ingest.sources import load_source_file
+
+    files_scanned, findings = scan
+    for filename, expected_hash in sorted(expected_hashes.items()):
+        source_path = bundle_dir / "sources" / filename
+        source = load_source_file(source_path) if source_path.is_file() else None
+        actual_hash = hash_content(source.content) if source is not None else ""
+        if actual_hash != expected_hash:
+            findings.append(
+                MaintenanceFinding(
+                    kind=FindingKind.SOURCE_HASH_MISMATCH,
+                    path=f"sources/{filename}",
+                    message="Source content differs from the authoritative registry hash",
+                    severity=FindingSeverity.ERROR,
+                    details={"actual": actual_hash, "expected": expected_hash},
+                )
+            )
+    return files_scanned, sorted(
+        findings, key=lambda item: (item.path, item.kind.value, item.message)
+    )
+
+
+def _append_unmanaged_generated_findings(
+    scan: tuple[int, list[MaintenanceFinding]],
+    bundle_dir: Path,
+    managed_paths: set[str],
+) -> tuple[int, list[MaintenanceFinding]]:
+    """Flag legacy generated pages no longer represented by a render manifest."""
+    files_scanned, findings = scan
+    if not managed_paths:
+        return scan
+    generated_types = {"Concept", "Entry", "Map of Content"}
+    for directory in ("concepts", "entries", "mocs"):
+        for path in sorted((bundle_dir / directory).glob("*.md")):
+            relative = path.relative_to(bundle_dir).as_posix()
+            if path.name in _RESERVED or relative in managed_paths:
+                continue
+            raw = safe_read_file(path)
+            metadata, _ = parse_frontmatter(raw)
+            if (
+                str(metadata.get("type", "")).strip() not in generated_types
+                or metadata.get("orphaned") is True
+                or is_reviewed_page(raw)
+            ):
+                continue
+            findings.append(
+                MaintenanceFinding(
+                    kind=FindingKind.UNMANAGED_GENERATED_PAGE,
+                    path=relative,
+                    message="Generated page is not owned by the current render manifest",
+                    details={"path": relative},
+                )
+            )
+    return files_scanned, sorted(
+        findings, key=lambda item: (item.path, item.kind.value, item.message)
+    )
+
+
 def _scan_selected_maintenance_findings(
     bundle_dir: Path,
     markdown_files: list[Path],
+    all_stems: set[str],
     concept_stems: set[str],
+    source_stems: set[str],
     moced_slugs: set[str],
+    moc_counts: dict[str, int],
 ) -> tuple[int, list[MaintenanceFinding]]:
     """Apply deterministic checks to one registry-selected maintenance batch."""
     findings: list[MaintenanceFinding] = []
@@ -256,6 +413,18 @@ def _scan_selected_maintenance_findings(
         )
         findings.extend(_tag_findings(metadata, relative_path, reviewed))
         findings.extend(_alias_findings(metadata, relative_path, reviewed))
+        findings.extend(
+            _content_findings(
+                metadata,
+                body,
+                relative_path,
+                md_file.stem,
+                reviewed,
+                all_stems=all_stems,
+                source_stems=source_stems,
+                moc_counts=moc_counts,
+            )
+        )
         if metadata.get("generated") is True and not body.strip():
             findings.append(
                 MaintenanceFinding(
@@ -282,21 +451,110 @@ def _scan_selected_maintenance_findings(
     )
 
 
-def _moced_concept_slugs(bundle_dir: Path, concept_stems: set[str]) -> set[str]:
+def _moc_membership_data(
+    bundle_dir: Path,
+    concept_stems: set[str],
+) -> tuple[set[str], dict[str, int]]:
     mocs_dir = bundle_dir / "mocs"
     if not mocs_dir.is_dir():
-        return set()
+        return set(), {}
     moced_slugs: set[str] = set()
+    moc_counts: dict[str, int] = {}
     for moc_file in sorted(mocs_dir.glob("*.md")):
         if moc_file.name in _RESERVED:
             continue
         _, body = parse_frontmatter(safe_read_file(moc_file))
-        moced_slugs.update(
+        slugs = {
             _normalize_wikilink_target(target)
             for target, _ in _WIKILINK_RE.findall(body)
             if _normalize_wikilink_target(target) in concept_stems
+        }
+        moced_slugs.update(slugs)
+        moc_counts[moc_file.stem] = len(slugs)
+    return moced_slugs, moc_counts
+
+
+def _moced_concept_slugs(bundle_dir: Path, concept_stems: set[str]) -> set[str]:
+    return _moc_membership_data(bundle_dir, concept_stems)[0]
+
+
+def _content_findings(
+    metadata: dict[str, Any],
+    body: str,
+    path: str,
+    stem: str,
+    reviewed: bool,
+    *,
+    all_stems: set[str],
+    source_stems: set[str],
+    moc_counts: dict[str, int],
+) -> list[MaintenanceFinding]:
+    """Return typed content-quality findings shared by full and batch scans."""
+    findings: list[MaintenanceFinding] = []
+    for raw_target, _ in _WIKILINK_RE.findall(body):
+        target = _normalize_wikilink_target(raw_target)
+        if target and target not in all_stems and "." not in target:
+            findings.append(
+                MaintenanceFinding(
+                    kind=FindingKind.BROKEN_WIKILINK,
+                    path=path,
+                    message=f"Wikilink target does not exist: {target}",
+                    severity=FindingSeverity.ERROR,
+                    details={"target": target},
+                    reviewed=reviewed,
+                )
+            )
+
+    page_type = str(metadata.get("type", "")).strip()
+    if page_type == "Concept":
+        confidence = metadata.get("confidence")
+        try:
+            if confidence is not None and float(confidence) < 0.5:
+                findings.append(
+                    MaintenanceFinding(
+                        kind=FindingKind.LOW_CONFIDENCE,
+                        path=path,
+                        message=f"Concept confidence is below 0.5: {confidence}",
+                        reviewed=reviewed,
+                    )
+                )
+        except (TypeError, ValueError):
+            pass
+        body_length = len(body.strip())
+        if body_length < 500:
+            findings.append(
+                MaintenanceFinding(
+                    kind=FindingKind.SHORT_CONCEPT_STUB,
+                    path=path,
+                    message=f"Concept body is shorter than 500 characters: {body_length}",
+                    reviewed=reviewed,
+                )
+            )
+    elif page_type == "Entry":
+        has_source = any(
+            target.strip().lower().startswith("source")
+            or _normalize_wikilink_target(target) in source_stems
+            for target, _ in _WIKILINK_RE.findall(body)
         )
-    return moced_slugs
+        if not has_source and "## Source" not in body:
+            findings.append(
+                MaintenanceFinding(
+                    kind=FindingKind.MISSING_SOURCE_LINK,
+                    path=path,
+                    message="Entry has no source wikilink",
+                    reviewed=reviewed,
+                )
+            )
+    elif page_type == "Map of Content" and moc_counts.get(stem, 0) < 2:
+        findings.append(
+            MaintenanceFinding(
+                kind=FindingKind.UNDERSIZED_MOC,
+                path=path,
+                message=f"MoC contains fewer than two concepts: {moc_counts.get(stem, 0)}",
+                reviewed=reviewed,
+            )
+        )
+    return findings
 
 
 def _parse_relation_target(relation: object) -> str | None:

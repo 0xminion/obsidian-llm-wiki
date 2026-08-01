@@ -119,3 +119,35 @@ def test_interrupted_ingest_backfill_resumes_until_marker_is_written(
 
     assert all(match is not None for match in matches)
     assert complete
+
+
+def test_ingest_backfill_retries_a_transient_source_read_failure(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    sources_dir = tmp_path / "01-Sources"
+    sources_dir.mkdir()
+    failed_path = sources_dir / "retry.md"
+    failed_path.write_text(
+        "---\ntitle: Retry\nurl: https://example.test/retry\n---\n# Retry\n\nBody\n",
+        encoding="utf-8",
+    )
+    original_read_text = Path.read_text
+    failed_once = False
+
+    def flaky_read_text(path: Path, *args, **kwargs):
+        nonlocal failed_once
+        if path == failed_path and not failed_once:
+            failed_once = True
+            raise OSError("transient read failure")
+        return original_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", flaky_read_text)
+    with VaultRegistry(tmp_path / ".llmwiki") as registry:
+        _backfill_ingest_index(registry, sources_dir)
+        assert not registry.ingest_backfill_complete()
+        _backfill_ingest_index(registry, sources_dir)
+        assert registry.ingest_backfill_complete()
+        assert registry.find_ingest_duplicate(
+            requested_url="https://example.test/retry"
+        ) is not None

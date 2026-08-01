@@ -16,8 +16,10 @@ optional ContradictionStore) are the single inputs.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
+import re
 from pathlib import Path
 from typing import Any
 
@@ -223,29 +225,43 @@ def _shard_static_rows(
     title: str,
     intro: list[str],
     table_header: list[str],
-    rows: list[str],
+    rows: list[tuple[str, str]],
     shard_size: int,
 ) -> tuple[str, dict[str, str]]:
     shards: dict[str, str] = {}
     links: list[str] = []
-    for index, start in enumerate(range(0, len(rows), shard_size), 1):
-        chunk = rows[start:start + shard_size]
-        filename = f"{base_name}-{index:05d}.md"
-        shard_title = f"{title} · {index}"
-        shards[filename] = _view_document(
-            shard_title,
-            "\n".join([f"# {shard_title}", "", *table_header, *chunk, ""]),
-        )
-        links.append(
-            f"- [[{Path(filename).stem}|Items {start + 1}–{start + len(chunk)}]]"
-        )
+    buckets: dict[str, list[tuple[str, str]]] = {}
+    for key, row in rows:
+        bucket = hashlib.blake2b(key.encode(), digest_size=1).hexdigest()
+        buckets.setdefault(bucket, []).append((key, row))
+    for bucket in sorted(buckets):
+        records = buckets[bucket]
+        for part, start in enumerate(range(0, len(records), shard_size)):
+            chunk = records[start:start + shard_size]
+            filename = f"{base_name}-b{bucket}-{part:03d}.md"
+            shard_title = f"{title} · {bucket.upper()} · {part + 1}"
+            shards[filename] = _view_document(
+                shard_title,
+                "\n".join(
+                    [
+                        f"# {shard_title}",
+                        "",
+                        *table_header,
+                        *(row for _key, row in chunk),
+                        "",
+                    ]
+                ),
+            )
+            links.append(
+                f"- [[{Path(filename).stem}|Bucket {bucket.upper()} · {part + 1}]]"
+            )
     root = "\n".join(
         [
             f"# {title}",
             "",
             *intro,
             "",
-            f"## Static View ({len(rows)} items)",
+            f"## Static View ({len(rows)} items; stable hash buckets)",
             "",
             *links,
             "",
@@ -289,8 +305,11 @@ def render_dataview_views(
     try:
         if len(bundle.concepts) > shard_size:
             concept_rows = [
-                f"| [[{concept.slug}|{concept.title}]] | {concept.confidence:.2f} | "
-                f"{', '.join(concept.tags) or '—'} |"
+                (
+                    concept.slug,
+                    f"| [[{concept.slug}|{concept.title}]] | {concept.confidence:.2f} | "
+                    f"{', '.join(concept.tags) or '—'} |",
+                )
                 for concept in sorted(
                     bundle.concepts, key=lambda item: (-item.confidence, item.slug)
                 )
@@ -323,8 +342,11 @@ def render_dataview_views(
             ))
         if len(bundle.maps) > shard_size:
             moc_rows = [
-                f"| [[{moc.slug}|{moc.title}]] | {len(moc.concept_slugs)} | "
-                f"{', '.join(moc.tags) or '—'} |"
+                (
+                    moc.slug,
+                    f"| [[{moc.slug}|{moc.title}]] | {len(moc.concept_slugs)} | "
+                    f"{', '.join(moc.tags) or '—'} |",
+                )
                 for moc in sorted(
                     bundle.maps, key=lambda item: (-len(item.concept_slugs), item.slug)
                 )
@@ -352,7 +374,7 @@ def render_dataview_views(
             render_contradictions_by_status_view(contradictions_path),
         ))
         if len(sources) > shard_size:
-            source_rows: list[tuple[str, str]] = []
+            source_rows: list[tuple[str, str, str]] = []
             for filename, source in sources.items():
                 retrieved = getattr(source.provenance, "retrieved_at", "")
                 source_type = getattr(source, "source_type", "") or "—"
@@ -362,7 +384,7 @@ def render_dataview_views(
                     f"| [[{stem}|{source.title}]] | {retrieved or '—'} | "
                     f"{source_type} | {url} |"
                 )
-                source_rows.append((retrieved, row))
+                source_rows.append((retrieved, stem, row))
             root, shards = _shard_static_rows(
                 base_name="sources-by-freshness",
                 title="Sources by Freshness",
@@ -371,7 +393,10 @@ def render_dataview_views(
                     "| Source | Retrieved | Type | URL |",
                     "|--------|-----------|------|-----|",
                 ],
-                rows=[row for _retrieved, row in sorted(source_rows, reverse=True)],
+                rows=[
+                    (stem, row)
+                    for _retrieved, stem, row in sorted(source_rows, reverse=True)
+                ],
                 shard_size=shard_size,
             )
             views.append(("sources-by-freshness.md", root))
@@ -385,7 +410,35 @@ def render_dataview_views(
         logger.debug("Dataview views skipped: %s", exc)
         return written
 
-    from obsidian_llm_wiki.render.obsidian import _write_generated_artifact
+    from obsidian_llm_wiki.render.obsidian import (
+        _delete_generated_artifact,
+        _write_generated_artifact,
+        safe_read_file,
+    )
+
+    shard_prefixes = (
+        "concepts-by-confidence-",
+        "mocs-by-count-",
+        "sources-by-freshness-",
+    )
+
+    def referenced_shards(content: str) -> set[str]:
+        references: set[str] = set()
+        for prefix in shard_prefixes:
+            references.update(
+                f"{stem}.md"
+                for stem in re.findall(
+                    rf"\[\[({re.escape(prefix)}[^|\]]+)(?:\|[^\]]*)?\]\]",
+                    content,
+                )
+            )
+        return references
+
+    old_shard_names: set[str] = set()
+    for root_name, _content in views:
+        if not any(root_name.startswith(prefix) for prefix in shard_prefixes):
+            continue
+        old_shard_names.update(referenced_shards(safe_read_file(views_dir / root_name)))
 
     for filename, content in views:
         path = views_dir / filename
@@ -400,19 +453,17 @@ def render_dataview_views(
         if _write_generated_artifact(path, content, bundle_dir):
             written.append(str(path))
 
-    shard_prefixes = (
-        "concepts-by-confidence-",
-        "mocs-by-count-",
-        "sources-by-freshness-",
-    )
-    for path in views_dir.glob("*.md"):
-        if path.name in shard_documents:
+    actual_shard_names: set[str] = set(shard_documents)
+    for root_name, _content in views:
+        if not any(root_name.startswith(prefix) for prefix in shard_prefixes):
             continue
-        if any(path.name.startswith(prefix) for prefix in shard_prefixes):
-            from obsidian_llm_wiki.render.obsidian import _delete_generated_artifact
-
-            if _delete_generated_artifact(path, bundle_dir):
-                written.append(str(path))
+        actual_shard_names.update(
+            referenced_shards(safe_read_file(views_dir / root_name))
+        )
+    for filename in sorted(old_shard_names - actual_shard_names):
+        path = views_dir / filename
+        if _delete_generated_artifact(path, bundle_dir):
+            written.append(str(path))
 
     # Write a views index.
     idx = views_dir / "index.md"

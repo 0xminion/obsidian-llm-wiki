@@ -160,6 +160,11 @@ def _ytdlp_transcript(url: str) -> SourceDoc | None:
             "--no-playlist",
             "-o", os.path.join(tmp_dir, "%(title)s.%(ext)s"),
         ]
+        # yt-dlp 2025.11+ no longer enables Node automatically. Without an
+        # explicit runtime, YouTube's current player challenge fails even when
+        # Node is installed and subtitles are public.
+        if "yt-dlp" in os.path.basename(ytdlp) and shutil.which("node"):
+            cmd.extend(["--js-runtimes", "node"])
 
         # Route yt-dlp through the residential proxy / Tailscale exit node
         # when configured. YouTube blocks requests from datacenter IPs;

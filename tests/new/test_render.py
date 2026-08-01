@@ -161,8 +161,12 @@ def test_render_concept_page_aliases_in_frontmatter():
 def test_render_entry_page():
     synth = SourceSynthesis(
         source_title="Paper", source_summary="A great paper",
-        source_tags=["ml"],
-        key_points=["Finding 1", "Finding 2"],
+        source_tags=["machine learning", "machine-learning", "ml"],
+        key_points=[
+            "The architecture uses only self-attention and no recurrent network.",
+            "The architecture uses self-attention without a recurrent network.",
+            "Finding 2",
+        ],
         open_questions=["Why does X happen?"],
         concepts=[ConceptNote(title="C", slug="c", summary="s")],
     )
@@ -171,11 +175,14 @@ def test_render_entry_page():
     assert "# Paper" in page
     assert "A great paper" in page
     assert "## Key Findings" in page
-    assert "- Finding 1" in page
+    assert page.count("recurrent network") == 1
     assert "## Open Questions" in page
     assert "## Linked Concepts" in page
     assert "[[c]]" in page
     assert "## Source" in page
+    assert "[[sources/paper|Paper]]" in page
+    meta, _ = parse_frontmatter(page)
+    assert meta["tags"] == ["machine-learning", "ml"]
 
 
 def test_render_moc_page():

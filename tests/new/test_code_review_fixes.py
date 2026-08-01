@@ -347,6 +347,13 @@ class TestMetricsHistoryPreservation:
 
         all_runs = load_all_metrics(tmp_path)
         assert len(all_runs) == 50
+        from obsidian_llm_wiki.core.registry import VaultRegistry
+
+        with VaultRegistry(tmp_path / "04-Wiki" / ".llmwiki") as registry:
+            archived = registry.connection.execute(
+                "SELECT count(*) FROM metric_run_archive"
+            ).fetchone()[0]
+        assert archived == 5
 
     def test_legacy_format_migration(self, tmp_path: Path):
         """Legacy flat-format metrics.json should be migrated to new format."""

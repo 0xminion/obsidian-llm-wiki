@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from hashlib import sha256
 
 from typer.testing import CliRunner
@@ -228,6 +229,57 @@ def test_resume_retries_cancelled_source_and_clears_marker(tmp_path, monkeypatch
     assert not (config.llmwiki_dir / "ingest-resume.json").exists()
 
 
+def test_resume_recovers_running_operation_after_unclean_exit_without_marker(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    import obsidian_llm_wiki.cli.ingest as ingest_module
+    from obsidian_llm_wiki.config import Config
+    from obsidian_llm_wiki.core.models import SourceDoc
+    from obsidian_llm_wiki.core.operations import (
+        OperationRecord,
+        OperationStatus,
+        OperationStore,
+    )
+    from obsidian_llm_wiki.core.registry import VaultRegistry
+
+    config = Config(vault_path=str(tmp_path))
+    store = OperationStore(config.llmwiki_dir)
+    record = OperationRecord.create(
+        run_id="crashed-run",
+        source="https://example.test/crashed",
+    )
+    store.save(record)
+    store.transition(record, OperationStatus.RUNNING)
+    with VaultRegistry(config.llmwiki_dir) as registry:
+        queue_id = registry.enqueue_dirty(
+            "ingest",
+            record.source,
+            "requested",
+            {"source_kind": "url", "run_id": record.run_id},
+        )
+        assert registry.start_dirty(queue_id, worker_id=record.run_id)
+
+    monkeypatch.setattr(ingest_module, "resolve_vault", lambda _vault: (tmp_path, config))
+    monkeypatch.setattr(
+        "obsidian_llm_wiki.ingest.extractors.extract",
+        lambda url: SourceDoc(title="Recovered", content="recovered body", url=url),
+    )
+
+    result = runner.invoke(
+        app,
+        ["ingest", str(tmp_path), "--resume", "--skip-synthesis", "--parallel", "0", "--json"],
+    )
+
+    assert result.exit_code == 0, result.output
+    recovered = store.latest_for_source(record.source)
+    assert recovered is not None
+    assert recovered.status is OperationStatus.SUCCEEDED
+    assert recovered.attempt == 2
+    with VaultRegistry(config.llmwiki_dir) as registry:
+        assert registry.list_dirty(state="running", limit=10) == []
+
+
 def test_preview_cancellation_never_creates_history_or_resume_files(tmp_path, monkeypatch) -> None:
     import obsidian_llm_wiki.cli.ingest as ingest_module
     from obsidian_llm_wiki.config import Config
@@ -320,3 +372,34 @@ def test_resume_preserves_clipping_kind_and_removes_each_success(tmp_path, monke
     assert store.read_resume_marker() == [
         {"source": "https://example.test/retry", "source_kind": "url", "status": "cancelled"}
     ]
+
+
+def test_concurrent_mutating_ingest_is_rejected_before_extraction(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    import obsidian_llm_wiki.cli.ingest as ingest_module
+    from obsidian_llm_wiki.config import Config
+
+    config = Config(vault_path=str(tmp_path))
+    monkeypatch.setattr(ingest_module, "resolve_vault", lambda _vault: (tmp_path, config))
+    config.llmwiki_dir.mkdir(parents=True)
+    (config.llmwiki_dir / "ingest.lock").write_text(str(os.getpid()), encoding="utf-8")
+
+    def unexpected_extract(_url: str):
+        raise AssertionError("a rejected concurrent ingest must not start extraction")
+
+    monkeypatch.setattr("obsidian_llm_wiki.ingest.extractors.extract", unexpected_extract)
+    result = runner.invoke(
+        app,
+        [
+            "ingest",
+            str(tmp_path),
+            "--url",
+            "https://example.test/a",
+            "--skip-synthesis",
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "another ingest process is already active" in result.output

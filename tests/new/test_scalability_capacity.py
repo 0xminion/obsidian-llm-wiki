@@ -188,10 +188,24 @@ def test_capacity_artifacts_are_sharded_at_fixed_budgets(tmp_path: Path) -> None
     )
     assert all(shard["count"] <= 5_000 for shard in graph_manifest["shards"])
     assert all(shard["count"] <= 5_000 for shard in graph_manifest["edge_shards"])
-    assert len(list((tmp_path / "04-Wiki" / "concepts").glob("index-*.md"))) == 25
-    assert len(
-        list((tmp_path / "04-Wiki" / "views").glob("concepts-by-confidence-*.md"))
-    ) == 25
+    index_shards = list(
+        (tmp_path / "04-Wiki" / "concepts").glob("index-b*.md")
+    )
+    report_shards = list(
+        (tmp_path / "04-Wiki" / "views").glob("concepts-by-confidence-b*.md")
+    )
+    assert 1 <= len(index_shards) <= 256
+    assert 1 <= len(report_shards) <= 256
+    assert all(
+        sum(line.startswith("- [[capacity-concept-") for line in shard.read_text().splitlines())
+        <= 2_000
+        for shard in index_shards
+    )
+    assert all(
+        sum(line.startswith("| [[capacity-concept-") for line in shard.read_text().splitlines())
+        <= 2_000
+        for shard in report_shards
+    )
     assert str(tmp_path / ".llmwiki" / "graph" / "manifest.json") in graph_paths
     assert index_paths
     assert report_paths

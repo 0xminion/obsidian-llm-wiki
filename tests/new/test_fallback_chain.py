@@ -174,13 +174,15 @@ def test_build_cross_ref_section_unidirectional():
     from obsidian_llm_wiki.render.obsidian import _build_cross_ref_diagram
 
     a = _make_concept("a", "Concept A", related=[
-        ConceptLink(slug="b", relation="related_to"),
+        ConceptLink(slug="b", relation="related_to", display="uses B internally"),
     ])
     b = _make_concept("b", "Concept B", related=[])
     lines = _build_cross_ref_diagram(a, {"a": a, "b": b})
     assert len(lines) >= 2
     # Should not have bidirectional arrow
     assert not any("↔" in line for line in lines)
+    assert lines[-1] == "Concept B"
+    assert any("uses B internally" in line for line in lines)
 
 
 def test_build_cross_ref_section_missing_target():

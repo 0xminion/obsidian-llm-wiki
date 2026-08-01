@@ -16,6 +16,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import shutil
 import tempfile
 from contextlib import suppress
@@ -37,6 +38,7 @@ from obsidian_llm_wiki.core.models import (
     normalize_slug,
     source_synthesis_to_dict,
 )
+from obsidian_llm_wiki.core.text_quality import dedupe_statements
 
 if TYPE_CHECKING:
     from obsidian_llm_wiki.core.registry import RenderDiff, VaultRegistry
@@ -97,7 +99,7 @@ def _render_fingerprint(payload: object) -> str:
         separators=(",", ":"),
         default=str,
     )
-    return hashlib.sha256(f"render-v2\x00{raw}".encode()).hexdigest()
+    return hashlib.sha256(f"render-v4\x00{raw}".encode()).hexdigest()
 
 
 def _configured_int(config: Any, name: str, default: int) -> int:
@@ -277,6 +279,11 @@ def _delete_generated_artifact(path: Path, bundle_dir: Path) -> bool:
     """Delete one stale generated artifact with transaction rollback support."""
     if not path.is_file():
         return False
+    if path.suffix.lower() == ".md":
+        from obsidian_llm_wiki.core.review import is_reviewed_page
+
+        if is_reviewed_page(safe_read_file(path)):
+            return False
     transaction = _ACTIVE_RENDER_TRANSACTION.get()
     if transaction is not None:
         transaction.before_change(path)
@@ -321,10 +328,17 @@ def render_entry_page(
 ) -> str:
     """Render an Entry-type page (synthesis of one source)."""
     ts = timestamp or _timestamp()
+    entry_tags = list(
+        dict.fromkeys(
+            normalized
+            for tag in synthesis.source_tags
+            if (normalized := _sanitize_tag(tag).casefold())
+        )
+    )
     fm = {
         "type": ConceptType.ENTRY.value,
         "title": synthesis.source_title,
-        "tags": synthesis.source_tags,
+        "tags": entry_tags,
         "timestamp": ts,
     }
 
@@ -335,7 +349,7 @@ def render_entry_page(
 
     if synthesis.key_points:
         parts.extend(["## Key Findings", ""])
-        for point in synthesis.key_points:
+        for point in dedupe_statements(synthesis.key_points):
             parts.append(f"- {point}")
         parts.append("")
 
@@ -347,14 +361,14 @@ def render_entry_page(
 
     if synthesis.open_questions:
         parts.extend(["## Open Questions", ""])
-        for q in synthesis.open_questions:
+        for q in dedupe_statements(synthesis.open_questions):
             parts.append(f"- {q}")
         parts.append("")
 
     parts.extend([
         "## Source",
         "",
-        f"- {make_wikilink(source_slug, synthesis.source_title)}",
+        f"- {make_wikilink(f'sources/{source_slug}', synthesis.source_title)}",
     ])
 
     body = "\n".join(parts)
@@ -671,29 +685,38 @@ def _render_directory_indexes(
     ordered = sorted(items)
     written: list[str] = []
     keep: set[Path] = set()
+    index_path = dir_path / "index.md"
+    previous_index = safe_read_file(index_path)
+    old_shard_stems = set(
+        re.findall(r"\[\[(index-[^|\]]+)(?:\|[^\]]*)?\]\]", previous_index)
+    )
 
     if len(ordered) <= shard_size:
         body = [f"# {dir_name.title()}", ""]
         body.extend(f"- [[{slug}|{title}]]" for slug, title in ordered)
         body.append("")
-        index_path = dir_path / "index.md"
         if _write_generated_page(index_path, "\n".join(body), bundle_dir):
             written.append(str(index_path))
     else:
         shard_links: list[str] = []
-        for index, start in enumerate(range(0, len(ordered), shard_size), 1):
-            chunk = ordered[start:start + shard_size]
-            shard_path = dir_path / f"index-{index:05d}.md"
-            body = [f"# {dir_name.title()} · {index}", ""]
-            body.extend(f"- [[{slug}|{title}]]" for slug, title in chunk)
-            body.append("")
-            if _write_generated_page(shard_path, "\n".join(body), bundle_dir):
-                written.append(str(shard_path))
-            keep.add(shard_path)
-            shard_links.append(
-                f"- [[{shard_path.stem}|Items {start + 1}–{start + len(chunk)}]]"
-            )
-        index_path = dir_path / "index.md"
+        buckets: dict[str, list[tuple[str, str]]] = {}
+        for slug, title in ordered:
+            bucket = hashlib.blake2b(slug.encode(), digest_size=1).hexdigest()
+            buckets.setdefault(bucket, []).append((slug, title))
+        for bucket in sorted(buckets):
+            records = sorted(buckets[bucket])
+            for part, start in enumerate(range(0, len(records), shard_size)):
+                chunk = records[start:start + shard_size]
+                shard_path = dir_path / f"index-b{bucket}-{part:03d}.md"
+                body = [f"# {dir_name.title()} · {bucket.upper()} · {part + 1}", ""]
+                body.extend(f"- [[{slug}|{title}]]" for slug, title in chunk)
+                body.append("")
+                if _write_generated_page(shard_path, "\n".join(body), bundle_dir):
+                    written.append(str(shard_path))
+                keep.add(shard_path)
+                shard_links.append(
+                    f"- [[{shard_path.stem}|Bucket {bucket.upper()} · {part + 1}]]"
+                )
         index_body = [
             f"# {dir_name.title()}",
             "",
@@ -705,7 +728,13 @@ def _render_directory_indexes(
         if _write_generated_page(index_path, "\n".join(index_body), bundle_dir):
             written.append(str(index_path))
 
-    for stale in dir_path.glob("index-*.md"):
+    actual_index = safe_read_file(index_path)
+    actual_shard_stems = set(
+        re.findall(r"\[\[(index-[^|\]]+)(?:\|[^\]]*)?\]\]", actual_index)
+    )
+    keep.update(dir_path / f"{stem}.md" for stem in actual_shard_stems)
+    for stale_stem in sorted(old_shard_stems - actual_shard_stems):
+        stale = dir_path / f"{stale_stem}.md"
         if stale not in keep and _delete_generated_artifact(stale, bundle_dir):
             written.append(str(stale))
     return written
@@ -924,6 +953,8 @@ def _render_vault(
     cross_lingual_links: dict[str, list[tuple[str, float, str]]] | None = None,
     render_registry: VaultRegistry | None = None,
     force_render: bool = False,
+    preserve_source_filenames: set[str] | None = None,
+    protected_stale_paths: set[str] | None = None,
 ) -> list[str]:
     """Render a complete vault from a SynthesisBundle.
 
@@ -986,19 +1017,32 @@ def _render_vault(
         filename: source_file_path(dirs["sources"], filename)
         for filename in sources
     }
-    source_manifest = {
-        filename: (
-            str(path.relative_to(bundle_dir)),
-            _render_fingerprint(asdict(sources[filename])),
-        )
-        for filename, path in source_paths.items()
-    }
+    previous_source_manifest = (
+        render_registry.render_manifest("source-page")
+        if render_registry is not None and preserve_source_filenames
+        else {}
+    )
+    preserved = preserve_source_filenames or set()
+    source_manifest: dict[str, tuple[str, str]] = {}
+    for filename, path in source_paths.items():
+        if filename in preserved and filename in previous_source_manifest:
+            source_manifest[filename] = previous_source_manifest[filename]
+        else:
+            source_manifest[filename] = (
+                str(path.relative_to(bundle_dir)),
+                _render_fingerprint(asdict(sources[filename])),
+            )
     dirty_sources, stale_source_paths = _diff_render_manifest(
         render_registry,
         "source-page",
         source_manifest,
         pending_manifests,
         force=force_render,
+    )
+    dirty_sources.difference_update(
+        filename
+        for filename in preserved
+        if filename in source_paths and source_paths[filename].is_file()
     )
     stale_files.extend(bundle_dir / path for path in stale_source_paths)
     for filename, source in sources.items():
@@ -1333,34 +1377,43 @@ def _render_vault(
         raise RuntimeError("Source dependency graph export failed") from exc
 
     # ── Vault log.md ─────────────────────────────────────────────────
-    # Append a chronological entry recording this build/render action.
-    try:
-        from obsidian_llm_wiki.render.log import append_log
-        body_lines = [
-            f"- sources: {source_count}",
-            f"- entries: {entry_count}",
-            f"- concepts: {concept_count}",
-            f"- mocs: {moc_count}",
-        ]
-        if bundle.errors:
-            body_lines.append(f"- errors: {len(bundle.errors)}")
-        transaction = _ACTIVE_RENDER_TRANSACTION.get()
-        expected_log_path = bundle_dir / "log.md"
-        if transaction is not None:
-            transaction.before_change(expected_log_path)
-        log_path = append_log(
-            bundle_dir, "build",
-            f"rendered vault ({source_count} sources, {concept_count} concepts)",
-            body=body_lines,
-        )
-        if transaction is not None:
-            transaction.record_write(log_path, safe_read_file(log_path))
-        written.append(str(log_path))
-    except Exception as exc:
-        raise RuntimeError("Vault log append failed") from exc
+    # Append only when the render changed an artifact. Otherwise every no-op
+    # build grows log.md forever and defeats bounded steady-state writes.
+    if written or stale_files:
+        try:
+            from obsidian_llm_wiki.render.log import append_log
+
+            body_lines = [
+                f"- sources: {source_count}",
+                f"- entries: {entry_count}",
+                f"- concepts: {concept_count}",
+                f"- mocs: {moc_count}",
+            ]
+            if bundle.errors:
+                body_lines.append(f"- errors: {len(bundle.errors)}")
+            transaction = _ACTIVE_RENDER_TRANSACTION.get()
+            expected_log_path = bundle_dir / "log.md"
+            if transaction is not None:
+                transaction.before_change(expected_log_path)
+            log_path = append_log(
+                bundle_dir,
+                "build",
+                f"rendered vault ({source_count} sources, {concept_count} concepts)",
+                body=body_lines,
+            )
+            if transaction is not None:
+                transaction.record_write(log_path, safe_read_file(log_path))
+            written.append(str(log_path))
+        except Exception as exc:
+            raise RuntimeError("Vault log append failed") from exc
 
     for old_file in stale_files:
-        if not old_file.is_file() or is_reviewed_page(safe_read_file(old_file)):
+        relative_old_file = old_file.relative_to(bundle_dir).as_posix()
+        if (
+            relative_old_file in (protected_stale_paths or set())
+            or not old_file.is_file()
+            or is_reviewed_page(safe_read_file(old_file))
+        ):
             continue
         transaction = _ACTIVE_RENDER_TRANSACTION.get()
         if transaction is not None:
@@ -1370,8 +1423,7 @@ def _render_vault(
         logger.debug("Removed stale generated page: %s", old_file)
 
     if render_registry is not None:
-        for kind, manifest, diff in pending_manifests:
-            render_registry.commit_render_manifest(kind, manifest, diff)
+        render_registry.commit_render_manifests(pending_manifests)
 
     return written
 
@@ -1385,6 +1437,8 @@ def render_vault(
     cross_lingual_links: dict[str, list[tuple[str, float, str]]] | None = None,
     render_registry: VaultRegistry | None = None,
     force_render: bool = False,
+    preserve_source_filenames: set[str] | None = None,
+    protected_stale_paths: set[str] | None = None,
 ) -> list[str]:
     """Render a vault atomically with respect to generated output.
 
@@ -1406,6 +1460,8 @@ def render_vault(
             cross_lingual_links=cross_lingual_links,
             render_registry=render_registry,
             force_render=force_render,
+            preserve_source_filenames=preserve_source_filenames,
+            protected_stale_paths=protected_stale_paths,
         )
     except BaseException:
         try:

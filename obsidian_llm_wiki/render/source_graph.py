@@ -65,6 +65,7 @@ def export_source_dependency_graph(
 
     # JSON
     json_path = output_dir / SOURCE_GRAPH_JSON
+    stale_shards = _previous_source_graph_shards(json_path)
     graph = build_source_dependency_dict(bundle)
     node_count = len(bundle.sources) + len(bundle.concepts)
     edge_count = sum(len(s.concepts) for s in bundle.sources)
@@ -87,6 +88,11 @@ def export_source_dependency_graph(
             output_dir.parent,
         ):
             written.append(str(mmd_path))
+        from obsidian_llm_wiki.render.obsidian import _delete_generated_artifact
+
+        for stale in sorted(stale_shards):
+            if _delete_generated_artifact(stale, output_dir.parent):
+                written.append(str(stale))
     else:
         written.extend(
             _export_sharded_source_graph(
@@ -94,6 +100,7 @@ def export_source_dependency_graph(
                 json_path,
                 shard_size=shard_size,
                 bundle_dir=output_dir.parent,
+                stale_shards=stale_shards,
             )
         )
 
@@ -243,6 +250,7 @@ def _export_sharded_source_graph(
     *,
     shard_size: int,
     bundle_dir: Path,
+    stale_shards: set[Path],
 ) -> list[str]:
     """Write deterministic, bounded source graph node/edge shards plus manifest."""
     from obsidian_llm_wiki.render.obsidian import (
@@ -322,8 +330,46 @@ def _export_sharded_source_graph(
         written.append(str(manifest_path))
     keep.add(manifest_path)
 
-    for stale in output_dir.glob("*.json"):
-        if stale not in keep:
-            _delete_generated_artifact(stale, bundle_dir)
+    summary_path = output_path.with_suffix(".mmd")
+    summary = (
+        "graph LR\n"
+        f'  source_graph_manifest["Sharded source graph: {len(node_records)} nodes / '
+        f'{len(graph.get("edges", []))} edges"]\n'
+    )
+    if _write_generated_artifact(summary_path, summary, bundle_dir):
+        written.append(str(summary_path))
+    if _delete_generated_artifact(output_path, bundle_dir):
+        written.append(str(output_path))
+
+    for stale in sorted(stale_shards):
+        if stale not in keep and _delete_generated_artifact(stale, bundle_dir):
+            written.append(str(stale))
 
     return written
+
+
+def _previous_source_graph_shards(output_path: Path) -> set[Path]:
+    """Load prior shard paths from the manifest, with one legacy fallback scan."""
+    output_dir = output_path.parent / f"{output_path.stem}-shards"
+    manifest_path = output_dir / "manifest.json"
+    if manifest_path.is_file():
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            manifest = None
+        if isinstance(manifest, dict):
+            records: list[dict[str, Any]] = []
+            for key in ("node_shards", "edge_shards"):
+                raw_records = manifest.get(key, [])
+                if isinstance(raw_records, list):
+                    records.extend(
+                        record for record in raw_records if isinstance(record, dict)
+                    )
+            return {
+                output_dir / str(record["path"])
+                for record in records
+                if isinstance(record.get("path"), str)
+            } | {manifest_path}
+    if not output_dir.is_dir():
+        return set()
+    return set(output_dir.glob("*.json"))

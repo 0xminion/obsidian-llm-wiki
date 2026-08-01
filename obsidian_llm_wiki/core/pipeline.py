@@ -29,9 +29,10 @@ import json
 import logging
 import time
 from collections.abc import Callable
-from dataclasses import replace
+from dataclasses import asdict, replace
 from datetime import UTC, datetime
 from pathlib import Path
+from uuid import uuid4
 
 from obsidian_llm_wiki.config import Config, load_config
 from obsidian_llm_wiki.core.cache import (
@@ -55,14 +56,21 @@ from obsidian_llm_wiki.core.models import (
     SourceSynthesis,
     SynthesisBundle,
     WikiState,
+    source_synthesis_to_dict,
 )
-from obsidian_llm_wiki.core.orphan import mark_orphaned_concepts
+from obsidian_llm_wiki.core.orphan import (
+    find_exclusively_owned_concepts,
+    mark_orphaned_concepts,
+)
 from obsidian_llm_wiki.core.registry import (
     AnnSearchResult,
     ArtifactVersions,
     VaultRegistry,
 )
-from obsidian_llm_wiki.core.request_limiter import AsyncRequestLimiter
+from obsidian_llm_wiki.core.request_limiter import (
+    AsyncRequestLimiter,
+    ThreadsafeRequestGate,
+)
 from obsidian_llm_wiki.core.schema import (
     DEFAULT_SCHEMA_POLICY,
     SchemaPolicy,
@@ -78,6 +86,7 @@ from obsidian_llm_wiki.core.state import (
     update_source_state,
     write_state,
 )
+from obsidian_llm_wiki.core.text_quality import dedupe_statements, dedupe_tags
 from obsidian_llm_wiki.render.obsidian import render_vault
 from obsidian_llm_wiki.synth.dedupe import merge_bundle
 from obsidian_llm_wiki.synth.parser import parse_single_source_synthesis
@@ -121,10 +130,35 @@ _SYNTHESIS_RESPONSE_SCHEMA = {
 }
 
 
-def _artifact_versions_for_config(config: Config) -> ArtifactVersions:
+def _artifact_versions_for_config(
+    config: Config,
+    schema_policy: SchemaPolicy = DEFAULT_SCHEMA_POLICY,
+) -> ArtifactVersions:
+    effective_synthesis = {
+        "prompt": _PROMPT_VERSION,
+        "provider": config.llm.provider,
+        "host": config.llm.host,
+        "ingest_model": config.llm.ingest_model or config.llm.model,
+        "expand_model": config.llm.expand_model or config.llm.model,
+        "synthesis_mode": config.synthesis_mode,
+        "output_language": config.output_language,
+        "chunk_size": config.chunk_size,
+        "candidate_limit": config.candidate_limit,
+        "candidate_char_budget": config.candidate_char_budget,
+        "ann_candidate_pool": config.ann_candidate_pool,
+        "evidence_window_chars": config.evidence_window_chars,
+        "evidence_context_paragraphs": config.evidence_context_paragraphs,
+        "similarity_dedup_threshold": config.similarity_dedup_threshold,
+        "cross_lingual_threshold": config.cross_lingual_threshold,
+        "moc_assignment_threshold": config.moc_assignment_threshold,
+        "schema_policy": asdict(schema_policy),
+    }
+    effective_hash = hashlib.sha256(
+        json.dumps(effective_synthesis, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()[:16]
     return ArtifactVersions(
         extractor=_EXTRACTOR_VERSION,
-        prompt=_PROMPT_VERSION,
+        prompt=f"{_PROMPT_VERSION}:{effective_hash}",
         schema=_SYNTHESIS_SCHEMA_VERSION,
         synthesis_model=config.llm.ingest_model or config.llm.model,
     )
@@ -197,6 +231,8 @@ async def run_pipeline(
     config: Config | None = None,
     *,
     force: bool = False,
+    unchanged_filenames: set[str] | None = None,
+    source_file_signatures: dict[str, tuple[int, int]] | None = None,
 ) -> CompileResult:
     """Run the full synthesis + render pipeline.
 
@@ -205,6 +241,10 @@ async def run_pipeline(
         sources: Dict mapping source filename → SourceDoc (the FULL corpus).
         config: Pipeline config (loaded from vault_path/.env if None).
         force: Force re-synthesis of all sources.
+        unchanged_filenames: Files represented by registry metadata because
+            their committed ``mtime_ns``/size signature is unchanged.
+        source_file_signatures: Discovery signatures committed only after a
+            successful render.
 
     Returns:
         CompileResult with counts and any errors.
@@ -213,6 +253,8 @@ async def run_pipeline(
     # Keep the bounded representation used for hashing, synthesis, cache, and
     # rendering local to this run without mutating the caller's source mapping.
     sources = dict(sources)
+    trusted_unchanged = set(unchanged_filenames or ())
+    observed_signatures = dict(source_file_signatures or {})
     result = CompileResult()
 
     # ── Load config ────────────────────────────────────────────────────
@@ -239,7 +281,8 @@ async def run_pipeline(
 
     try:
         registry = VaultRegistry(config.llmwiki_dir)
-        versions = _artifact_versions_for_config(config)
+        versions = _artifact_versions_for_config(config, schema_policy)
+        pipeline_worker_id = f"pipeline:{uuid4().hex}"
         registry.migrate_legacy(
             ArtifactVersions("legacy", "legacy", "legacy", "legacy")
         )
@@ -250,20 +293,11 @@ async def run_pipeline(
         live_filenames = set(sources.keys())
         state_filenames = set(state.sources.keys()) | registry.source_filenames()
         deleted_filenames = state_filenames - live_filenames
-
-        for filename in deleted_filenames:
-            orphaned = mark_orphaned_concepts(
-                config.concepts_dir, filename, state
-            )
-            delete_cached_synthesis(config.llmwiki_dir, filename)
-            registry.delete_source(filename)
-            remove_source_state(state, filename)
-            result.deleted += 1
-            if orphaned:
-                logger.info(
-                    "Deleted source '%s' orphaned %d concept(s): %s",
-                    filename, len(orphaned), ", ".join(orphaned),
-                )
+        protected_stale_paths = {
+            f"concepts/{slug}.md"
+            for filename in deleted_filenames
+            for slug in find_exclusively_owned_concepts(filename, state)
+        }
 
         # ── Load cached syntheses for unchanged sources ────────────────
         cached_syntheses = registry.load_syntheses(live_filenames)
@@ -271,23 +305,55 @@ async def run_pipeline(
         # the old identity while pages used the new slug. Migrate cached items
         # before they participate in dedup, prompts, or state updates.
         for filename, synthesis in cached_syntheses.items():
-            if _normalize_synthesis_identity(synthesis):
+            if _normalize_and_assign_synthesis_identity(synthesis, registry):
                 save_synthesis(
                     synthesis,
                     config.llmwiki_dir,
                     filename,
                     artifact_versions=versions.as_dict(),
                 )
-                source = sources.get(filename)
-                if source is not None:
-                    registry.upsert_synthesis(filename, source, synthesis, versions)
+                registry.update_synthesis(filename, synthesis, versions)
 
         # ── Classify sources: compile vs reuse cache ───────────────────
         to_compile: dict[str, SourceDoc] = {}
         all_syntheses_by_file: dict[str, SourceSynthesis] = {}
         changed_sources: dict[str, tuple[str, SourceSynthesis | None]] = {}
+        skipped_filenames: set[str] = set()
+        # Source Markdown is pipeline input, not a derived artifact. Never
+        # rewrite an existing source page during rendering: doing so can erase
+        # a concurrent human edit and makes the observed pre-read signature
+        # diverge from the file solely because the renderer touched it.
+        preserved_source_filenames: set[str] = {
+            filename
+            for filename in live_filenames
+            if source_file_path(config.sources_dir, filename).is_file()
+        }
 
         for filename, source in sources.items():
+            cache = cached_syntheses.get(filename)
+            if filename in trusted_unchanged:
+                if (
+                    not force
+                    and cache is not None
+                    and registry.synthesis_versions_current(filename, versions)
+                ):
+                    all_syntheses_by_file[filename] = cache
+                    result.skipped += 1
+                    skipped_filenames.add(filename)
+                    preserved_source_filenames.add(filename)
+                    continue
+                from obsidian_llm_wiki.ingest.sources import load_source_file
+
+                loaded_source = load_source_file(
+                    source_file_path(config.sources_dir, filename)
+                )
+                trusted_unchanged.discard(filename)
+                if loaded_source is None:
+                    result.errors.append(f"source:{filename}: empty or unreadable")
+                    continue
+                source = loaded_source
+                sources[filename] = loaded_source
+
             # Source length gate (B3 fix).
             content_len = len(source.content.encode("utf-8"))
             if content_len < config.min_source_chars:
@@ -319,13 +385,16 @@ async def run_pipeline(
             if unchanged and cache is not None:
                 all_syntheses_by_file[filename] = cache
                 result.skipped += 1
-                if _normalize_synthesis_identity(cache):
+                skipped_filenames.add(filename)
+                registry.refresh_source_metadata(filename, source, versions)
+                if _normalize_and_assign_synthesis_identity(cache, registry):
                     save_synthesis(
                         cache,
                         config.llmwiki_dir,
                         filename,
                         artifact_versions=versions.as_dict(),
                     )
+                    registry.update_synthesis(filename, cache, versions)
             else:
                 to_compile[filename] = source
                 if prev is not None and prev.hash != current_hash:
@@ -338,6 +407,9 @@ async def run_pipeline(
             config.compile_concurrency,
             min_interval_seconds=max(0, config.request_min_interval_ms) / 1_000,
         )
+        embedding_request_gate = ThreadsafeRequestGate(
+            request_limiter, asyncio.get_running_loop()
+        )
         candidate_embedder_fn: Callable[[str], list[float] | None] | None = None
         if config.embeddings_enabled:
             from obsidian_llm_wiki.synth.embedding import embed_text
@@ -348,6 +420,7 @@ async def run_pipeline(
                     enabled=True,
                     model=config.embedding_model,
                     host=config.embedding_host,
+                    request_gate=embedding_request_gate,
                 )
 
             candidate_embedder_fn = _candidate_embedder
@@ -358,9 +431,9 @@ async def run_pipeline(
             candidate_char_budget=config.candidate_char_budget,
             ann_candidate_pool=config.ann_candidate_pool,
             embedding_model=config.embedding_model if config.embeddings_enabled else "",
-            embedder=candidate_embedder_fn,
         )
         synthesis_queue_ids: dict[str, int] = {}
+        unclaimed_filenames: list[str] = []
         for filename in to_compile:
             queue_id = registry.enqueue_dirty(
                 "source",
@@ -368,8 +441,16 @@ async def run_pipeline(
                 "synthesis_retry",
                 {"versions": versions.as_dict()},
             )
-            registry.start_dirty(queue_id, worker_id="pipeline")
-            synthesis_queue_ids[filename] = queue_id
+            if registry.start_dirty(queue_id, worker_id=pipeline_worker_id):
+                synthesis_queue_ids[filename] = queue_id
+            else:
+                unclaimed_filenames.append(filename)
+                result.errors.append(f"queue:{filename}: active lease is owned by another worker")
+        for filename in unclaimed_filenames:
+            to_compile.pop(filename)
+            previous = changed_sources.get(filename, ("", None))[1]
+            if previous is not None:
+                all_syntheses_by_file[filename] = previous
 
         if to_compile:
             logger.info("Synthesising %d source(s)...", len(to_compile))
@@ -392,7 +473,17 @@ async def run_pipeline(
                     except StopIteration:
                         return
                     try:
-                        retrieval = retriever.retrieve(source.title, source.content)
+                        query_vector = None
+                        if candidate_embedder_fn is not None:
+                            query_vector = await asyncio.to_thread(
+                                candidate_embedder_fn,
+                                ConceptRetriever.query_text(source.title, source.content),
+                            )
+                        retrieval = retriever.retrieve(
+                            source.title,
+                            source.content,
+                            query_vector=query_vector,
+                        )
                         results_by_filename[filename] = await _synthesize_with_retry(
                             config,
                             filename,
@@ -408,7 +499,7 @@ async def run_pipeline(
                         completed_sources += 1
                         completed = results_by_filename[filename]
                         if isinstance(completed, SourceSynthesis):
-                            _normalize_synthesis_identity(completed)
+                            _normalize_and_assign_synthesis_identity(completed, registry)
                             save_synthesis(
                                 completed,
                                 config.llmwiki_dir,
@@ -451,7 +542,11 @@ async def run_pipeline(
                 if isinstance(res, BaseException):
                     logger.error("Synthesis failed for '%s': %s", filename, res)
                     result.errors.append(f"synth:{filename}:{res}")
-                    registry.fail_dirty(synthesis_queue_ids[filename], str(res))
+                    registry.fail_dirty(
+                        synthesis_queue_ids[filename],
+                        str(res),
+                        worker_id=pipeline_worker_id,
+                    )
                     # A transient failure must not erase a changed source's
                     # last successful knowledge from this render. Its state
                     # remains unchanged, so the source retries next run.
@@ -468,13 +563,14 @@ async def run_pipeline(
                     registry.fail_dirty(
                         synthesis_queue_ids[filename],
                         "no output (permanent failure)",
+                        worker_id=pipeline_worker_id,
                     )
                     previous = changed_sources.get(filename, ("", None))[1]
                     if previous is not None:
                         all_syntheses_by_file[filename] = previous
                     continue
                 assert isinstance(res, SourceSynthesis)
-                _normalize_synthesis_identity(res)
+                _normalize_and_assign_synthesis_identity(res, registry)
                 all_syntheses_by_file[filename] = res
                 save_synthesis(
                     res,
@@ -500,6 +596,7 @@ async def run_pipeline(
                 cross_lingual_links={},
                 render_registry=registry,
                 force_render=force,
+                preserve_source_filenames=preserved_source_filenames,
             )
             result.pages.extend(written)
             # Persist state even when no syntheses (e.g. all sources deleted).
@@ -509,10 +606,21 @@ async def run_pipeline(
         # ── Merge: full corpus dedup ───────────────────────────────────
         all_syntheses = list(all_syntheses_by_file.values())
         for synthesis in all_syntheses:
-            registry.assign_canonical_ids(synthesis)
-            _normalize_synthesis_identity(synthesis)
+            _normalize_and_assign_synthesis_identity(synthesis, registry)
         bundle = merge_bundle(all_syntheses)
         result.errors.extend(bundle.errors)
+        source_synthesis_fingerprints = {
+            synthesis.source_file: hash_content(
+                json.dumps(
+                    source_synthesis_to_dict(synthesis),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            )
+            for synthesis in bundle.sources
+            if synthesis.source_file
+        }
 
         # ── Backlink propagation: ensure bidirectional edges ──────────
         from obsidian_llm_wiki.synth.dedupe import propagate_backlinks
@@ -580,16 +688,25 @@ async def run_pipeline(
             "enabled": config.embeddings_enabled,
             "model": config.embedding_model,
             "host": config.embedding_host,
+            "request_gate": embedding_request_gate,
         }
         # Load persisted embeddings to avoid recomputing for unchanged concepts.
         # The cache is model-keyed — switching embedding models invalidates it.
         embeddings_cache_path = config.llmwiki_dir / "embeddings.json"
-        embedding_artifact_versions = versions.as_dict()
+        embedding_artifact_versions = {
+            **versions.as_dict(),
+            "embedding_model": config.embedding_model,
+            "embedding_host": config.embedding_host,
+        }
         embedding_version_hash = hash_content(
             json.dumps(embedding_artifact_versions, sort_keys=True)
         )[:16]
         concept_embedding_schema = f"concept-embedding-v2:{embedding_version_hash}"
         moc_embedding_schema = f"moc-centroid-v2:{embedding_version_hash}"
+        cross_lingual_schema = (
+            f"cross-lingual-v1:{embedding_version_hash}:"
+            f"{config.cross_lingual_threshold:.6f}"
+        )
         registry_has_concept_embeddings = False
         if config.embeddings_enabled:
             from obsidian_llm_wiki.synth.embedding import (
@@ -615,8 +732,49 @@ async def run_pipeline(
             if synth:
                 new_slugs.update(c.slug for c in synth.concepts)
         new_slugs.update(resynthesized)
-        concept_candidates: dict[str, list[str]] = {slug: [] for slug in new_slugs}
-        moc_candidates: dict[str, list[str]] = {slug: [] for slug in new_slugs}
+        semantic_work_slugs = set(new_slugs)
+        if config.embeddings_enabled:
+            concepts_by_id = {
+                concept.canonical_id: concept
+                for concept in bundle.concepts
+                if concept.canonical_id
+            }
+            expected_hashes = {
+                canonical_id: hash_content(f"{concept.title}\n{concept.summary}")
+                for canonical_id, concept in concepts_by_id.items()
+            }
+            current_count = registry.embedding_count(
+                "concept",
+                model_id=config.embedding_model,
+                schema_version=concept_embedding_schema,
+            )
+            ids_to_validate = (
+                set(expected_hashes)
+                if current_count != len(expected_hashes)
+                else {
+                    canonical_id
+                    for canonical_id, concept in concepts_by_id.items()
+                    if concept.slug in new_slugs
+                }
+            )
+            current_hashes = registry.embedding_input_hashes(
+                "concept",
+                model_id=config.embedding_model,
+                schema_version=concept_embedding_schema,
+                entity_ids=ids_to_validate,
+            )
+            semantic_work_slugs.update(
+                concept.slug
+                for canonical_id, concept in concepts_by_id.items()
+                if canonical_id in ids_to_validate
+                and current_hashes.get(canonical_id) != expected_hashes[canonical_id]
+            )
+        concept_candidates: dict[str, list[str]] = {
+            slug: [] for slug in semantic_work_slugs
+        }
+        moc_candidates: dict[str, list[str]] = {
+            slug: [] for slug in semantic_work_slugs
+        }
         try:
             if config.embeddings_enabled:
                 from obsidian_llm_wiki.synth.dedupe import ensure_concept_embeddings
@@ -629,11 +787,7 @@ async def run_pipeline(
                     concepts_by_slug = {
                         concept.slug: concept for concept in bundle.concepts
                     }
-                    validation_slugs = (
-                        new_slugs
-                        if registry_has_concept_embeddings
-                        else set(concepts_by_slug)
-                    )
+                    validation_slugs = semantic_work_slugs
                     for slug in validation_slugs:
                         concept = concepts_by_slug.get(slug)
                         expected_hash = (
@@ -646,33 +800,33 @@ async def run_pipeline(
                             or cached_input_hashes.get(slug) != expected_hash
                         ):
                             embeddings_cache.pop(slug, None)
-                concepts_to_embed = (
-                    [concept for concept in bundle.concepts if concept.slug in new_slugs]
-                    if registry_has_concept_embeddings
-                    else bundle.concepts
-                )
-                ensure_concept_embeddings(
-                    concepts_to_embed, embeddings_cache, embedding_options
+                concepts_to_embed = [
+                    concept
+                    for concept in bundle.concepts
+                    if concept.slug in semantic_work_slugs
+                ]
+                await asyncio.to_thread(
+                    ensure_concept_embeddings,
+                    concepts_to_embed,
+                    embeddings_cache,
+                    embedding_options,
                 )
                 concept_candidates = _ann_concept_candidates(
                     registry,
                     bundle,
                     embeddings_cache,
-                    new_slugs,
+                    semantic_work_slugs,
                     config,
-                    index_slugs=(
-                        new_slugs
-                        if registry_has_concept_embeddings
-                        else {concept.slug for concept in bundle.concepts}
-                    ),
+                    index_slugs=semantic_work_slugs,
                     schema_version=concept_embedding_schema,
                 )
-            semantic_dedupe_concepts(
+            await asyncio.to_thread(
+                semantic_dedupe_concepts,
                 bundle,
                 threshold=config.similarity_dedup_threshold,
                 embeddings_cache=embeddings_cache,
                 embedding_options=embedding_options,
-                new_slugs=new_slugs,
+                new_slugs=semantic_work_slugs,
                 candidate_slugs_by_slug=concept_candidates,
             )
         except Exception as exc:
@@ -683,11 +837,12 @@ async def run_pipeline(
                     registry,
                     bundle,
                     embeddings_cache,
-                    new_slugs,
+                    semantic_work_slugs,
                     config,
                     schema_version=moc_embedding_schema,
                 )
-            assign_orphans_to_mocs(
+            await asyncio.to_thread(
+                assign_orphans_to_mocs,
                 bundle,
                 threshold=config.moc_assignment_threshold,
                 embeddings_cache=embeddings_cache,
@@ -697,10 +852,25 @@ async def run_pipeline(
         except Exception as exc:
             logger.warning("MoC orphan assignment failed (continuing without): %s", exc)
 
-        # Semantic dedup remaps source-local concept slugs in memory. Persist
-        # those canonical source syntheses before a later no-embedding run can
-        # resurrect a dedup victim from a pre-dedup cache.
+        # Semantic dedup remaps source-local concept slugs in memory. Track and
+        # persist only source syntheses that actually changed; writing every
+        # portable cache on every incremental run recreates the v1 full-corpus
+        # I/O problem, while failing to update SQLite resurrects dedup victims.
+        canonicalized_source_files: set[str] = set()
         for synthesis in bundle.sources:
+            if not synthesis.source_file:
+                continue
+            current_fingerprint = hash_content(
+                json.dumps(
+                    source_synthesis_to_dict(synthesis),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            )
+            if source_synthesis_fingerprints.get(synthesis.source_file) == current_fingerprint:
+                continue
+            canonicalized_source_files.add(synthesis.source_file)
             save_synthesis(
                 synthesis,
                 config.llmwiki_dir,
@@ -709,20 +879,74 @@ async def run_pipeline(
             )
 
         cross_lingual_links: dict[str, list[tuple[str, float, str]]] = {}
+        live_concept_slugs = {concept.slug for concept in bundle.concepts}
+        cross_lingual_work_slugs = set(semantic_work_slugs)
+        cross_lingual_full_backfill = False
+        if config.embeddings_enabled and not registry.cross_lingual_namespace_complete(
+            model_id=config.embedding_model,
+            schema_version=cross_lingual_schema,
+        ):
+            cross_lingual_work_slugs = set(live_concept_slugs)
+            cross_lingual_full_backfill = True
         try:
             from obsidian_llm_wiki.synth.embedding import find_cross_lingual_links
 
-            cross_lingual_links = find_cross_lingual_links(
+            cross_lingual_candidates = concept_candidates
+            if config.embeddings_enabled and cross_lingual_work_slugs != semantic_work_slugs:
+                concept_by_slug = {
+                    concept.slug: concept for concept in bundle.concepts
+                }
+                _load_registry_concept_vectors(
+                    registry,
+                    concept_by_slug,
+                    cross_lingual_work_slugs,
+                    embeddings_cache,
+                    config.embedding_model,
+                )
+                cross_lingual_candidates = _ann_concept_candidates(
+                    registry,
+                    bundle,
+                    embeddings_cache,
+                    cross_lingual_work_slugs,
+                    config,
+                    index_slugs=set(),
+                    schema_version=concept_embedding_schema,
+                )
+            computed_cross_lingual_links = await asyncio.to_thread(
+                find_cross_lingual_links,
                 bundle.concepts,
                 enabled=config.embeddings_enabled,
                 model=config.embedding_model,
                 host=config.embedding_host,
+                request_gate=embedding_request_gate,
+                threshold=config.cross_lingual_threshold,
                 embeddings_cache=embeddings_cache,
-                comparison_slugs=new_slugs,
-                candidate_slugs_by_slug=concept_candidates,
+                comparison_slugs=cross_lingual_work_slugs,
+                candidate_slugs_by_slug=cross_lingual_candidates,
             )
+            if config.embeddings_enabled:
+                registry.replace_cross_lingual_links(
+                    cross_lingual_work_slugs,
+                    computed_cross_lingual_links,
+                    model_id=config.embedding_model,
+                    schema_version=cross_lingual_schema,
+                    namespace_complete=cross_lingual_full_backfill,
+                )
+                cross_lingual_links = registry.load_cross_lingual_links(
+                    model_id=config.embedding_model,
+                    schema_version=cross_lingual_schema,
+                    live_slugs=live_concept_slugs,
+                )
+            else:
+                cross_lingual_links = computed_cross_lingual_links
         except Exception as exc:
             logger.warning("Cross-lingual linking failed (continuing without): %s", exc)
+            if config.embeddings_enabled:
+                cross_lingual_links = registry.load_cross_lingual_links(
+                    model_id=config.embedding_model,
+                    schema_version=cross_lingual_schema,
+                    live_slugs=live_concept_slugs,
+                )
 
         # Persist embeddings for reuse on the next run.
         persisted_embedding_count = (
@@ -786,9 +1010,28 @@ async def run_pipeline(
             cross_lingual_links=cross_lingual_links,
             render_registry=registry,
             force_render=force,
+            preserve_source_filenames=preserved_source_filenames,
+            protected_stale_paths=protected_stale_paths,
         )
         result.pages.extend(written)
         result.concepts = bundle.concepts
+
+        # Deletions are destructive registry/cache mutations. Apply them only
+        # after rendering has committed so a late render failure leaves the
+        # complete pre-run source state available for a clean retry.
+        for filename in deleted_filenames:
+            orphaned = mark_orphaned_concepts(
+                config.concepts_dir, filename, state
+            )
+            delete_cached_synthesis(config.llmwiki_dir, filename)
+            registry.delete_source(filename)
+            remove_source_state(state, filename)
+            result.deleted += 1
+            if orphaned:
+                logger.info(
+                    "Deleted source '%s' orphaned %d concept(s): %s",
+                    filename, len(orphaned), ", ".join(orphaned),
+                )
 
         # ── Record rendering metrics ───────────────────────────────────
         render_time = time.monotonic() - render_start
@@ -807,15 +1050,29 @@ async def run_pipeline(
 
         # Rendering is the commit boundary: only now may a source/version be
         # considered reusable by the next incremental run.
-        for filename in filenames_done:
-            synthesis = all_syntheses_by_file.get(filename)
+        source_syntheses_after_normalization = {
+            synthesis.source_file: synthesis
+            for synthesis in bundle.sources
+            if synthesis.source_file
+        }
+        persisted_source_files = set(filenames_done) | canonicalized_source_files
+        for filename in sorted(persisted_source_files):
+            synthesis = source_syntheses_after_normalization.get(filename)
             if synthesis is not None:
-                registry.upsert_synthesis(
-                    filename,
-                    to_compile[filename],
-                    synthesis,
-                    versions,
-                )
+                if filename in filenames_done:
+                    source = sources.get(filename) or _source_from_synthesis(synthesis)
+                    registry.upsert_synthesis(
+                        filename,
+                        source,
+                        synthesis,
+                        versions,
+                    )
+                    registry.complete_dirty(
+                        synthesis_queue_ids[filename], worker_id=pipeline_worker_id
+                    )
+                else:
+                    registry.update_synthesis(filename, synthesis, versions)
+        registry.prune_cross_lingual_links()
 
         # ── Update state for compiled sources ─────────────────────────
         compiled_at = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -836,8 +1093,37 @@ async def run_pipeline(
                 concept_slugs,
                 compiled_at,
             )
+        for filename in sorted(canonicalized_source_files - set(filenames_done)):
+            synthesis = source_syntheses_after_normalization.get(filename)
+            source = sources.get(filename)
+            previous_state = state.sources.get(filename)
+            if synthesis is None or (source is None and previous_state is None):
+                continue
+            source_hash = (
+                hash_content(source.content)
+                if source is not None
+                else previous_state.hash if previous_state is not None else ""
+            )
+            update_source_state(
+                state,
+                filename,
+                source_hash,
+                [concept.slug for concept in synthesis.concepts],
+                compiled_at,
+            )
 
         write_state(config.state_file, state)
+
+        verified_source_files = (
+            skipped_filenames | set(filenames_done) | canonicalized_source_files
+        )
+        for filename in sorted(verified_source_files & set(observed_signatures)):
+            mtime_ns, size_bytes = observed_signatures[filename]
+            registry.record_source_file_state(
+                filename,
+                mtime_ns=mtime_ns,
+                size_bytes=size_bytes,
+            )
 
         logger.info(
             "Done: %d compiled, %d skipped, %d deleted, %d concepts, %d MOCs, %d errors",
@@ -968,6 +1254,9 @@ async def _synthesize_source(
             synthesis = merged
 
         if synthesis is not None:
+            synthesis.source_tags = dedupe_tags(synthesis.source_tags)
+            synthesis.key_points = dedupe_statements(synthesis.key_points)
+            synthesis.open_questions = dedupe_statements(synthesis.open_questions)
             if not synthesis.source_title:
                 synthesis.source_title = source.title
             synthesis.source_file = filename
@@ -1176,30 +1465,79 @@ async def recompile_single_source(
 
     try:
         state = read_state(config.state_file)
-        existing_concepts = _existing_concept_slugs(state)
+        versions = _artifact_versions_for_config(config, schema_policy)
+        with VaultRegistry(config.llmwiki_dir) as registry:
+            registry.migrate_legacy(
+                ArtifactVersions("legacy", "legacy", "legacy", "legacy")
+            )
+            request_limiter = AsyncRequestLimiter(
+                1,
+                min_interval_seconds=max(0, config.request_min_interval_ms) / 1_000,
+            )
+            embedding_request_gate = ThreadsafeRequestGate(
+                request_limiter, asyncio.get_running_loop()
+            )
+            candidate_embedder_fn: Callable[[str], list[float] | None] | None = None
+            if config.embeddings_enabled:
+                from obsidian_llm_wiki.synth.embedding import embed_text
 
-        synth = await _synthesize_with_retry(
-            config,
-            source_file,
-            source,
-            existing_concepts,
-            metrics=metrics,
-            schema_policy=schema_policy,
-        )
+                def _candidate_embedder(text: str) -> list[float] | None:
+                    return embed_text(
+                        text,
+                        enabled=True,
+                        model=config.embedding_model,
+                        host=config.embedding_host,
+                        request_gate=embedding_request_gate,
+                    )
 
-        if synth is None:
-            result.errors.append(f"synth:{source_file}: permanent failure (all truncation levels)")
-            return result
+                candidate_embedder_fn = _candidate_embedder
 
-        _normalize_synthesis_identity(synth)
-        save_synthesis(
-            synth,
-            config.llmwiki_dir,
-            source_file,
-            artifact_versions=_artifact_versions_for_config(config).as_dict(),
-        )
-        result.compiled += 1
-        result.concepts = synth.concepts
+            retriever = ConceptRetriever(
+                registry,
+                candidate_limit=config.candidate_limit,
+                candidate_char_budget=config.candidate_char_budget,
+                ann_candidate_pool=config.ann_candidate_pool,
+                embedding_model=(
+                    config.embedding_model if config.embeddings_enabled else ""
+                ),
+            )
+            query_vector = None
+            if candidate_embedder_fn is not None:
+                query_vector = await asyncio.to_thread(
+                    candidate_embedder_fn,
+                    ConceptRetriever.query_text(source.title, source.content),
+                )
+            retrieval = retriever.retrieve(
+                source.title,
+                source.content,
+                query_vector=query_vector,
+            )
+            synth = await _synthesize_with_retry(
+                config,
+                source_file,
+                source,
+                retrieval.prompt_lines,
+                metrics=metrics,
+                schema_policy=schema_policy,
+                request_limiter=request_limiter,
+            )
+
+            if synth is None:
+                result.errors.append(
+                    f"synth:{source_file}: permanent failure (all truncation levels)"
+                )
+                return result
+
+            _normalize_and_assign_synthesis_identity(synth, registry)
+            save_synthesis(
+                synth,
+                config.llmwiki_dir,
+                source_file,
+                artifact_versions=versions.as_dict(),
+            )
+            registry.upsert_synthesis(source_file, source, synth, versions)
+            result.compiled += 1
+            result.concepts = synth.concepts
 
         compiled_at = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
         update_source_state(
@@ -1231,6 +1569,17 @@ def _detect_source_language(content: str, filename: str) -> str:
         return lang
     except Exception:
         return ""
+
+
+def _normalize_and_assign_synthesis_identity(
+    synthesis: SourceSynthesis,
+    registry: VaultRegistry,
+) -> bool:
+    """Normalize identities and report only durable, post-canonical changes."""
+    before = source_synthesis_to_dict(synthesis)
+    _normalize_synthesis_identity(synthesis)
+    registry.assign_canonical_ids(synthesis)
+    return source_synthesis_to_dict(synthesis) != before
 
 
 def _normalize_synthesis_identity(synthesis: SourceSynthesis) -> bool:
@@ -1391,12 +1740,31 @@ def _ann_moc_candidates(
         for moc in bundle.maps
         if any(slug in comparison_slugs for slug in moc.concept_slugs)
     }
-    if not registry.has_embeddings(
+    expected_hashes = {
+        moc.slug: hash_content("\x1f".join(sorted(moc.concept_slugs)))
+        for moc in bundle.maps
+    }
+    current_count = registry.embedding_count(
         "moc",
         model_id=config.embedding_model,
         schema_version=schema_version,
-    ):
-        affected_mocs = {moc.slug for moc in bundle.maps}
+    )
+    mocs_to_validate = (
+        set(expected_hashes)
+        if current_count != len(expected_hashes)
+        else set(affected_mocs)
+    )
+    current_hashes = registry.embedding_input_hashes(
+        "moc",
+        model_id=config.embedding_model,
+        schema_version=schema_version,
+        entity_ids=mocs_to_validate,
+    )
+    affected_mocs.update(
+        slug
+        for slug in mocs_to_validate
+        if current_hashes.get(slug) != expected_hashes[slug]
+    )
 
     affected_member_slugs = {
         slug

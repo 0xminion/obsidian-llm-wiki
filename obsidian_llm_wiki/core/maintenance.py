@@ -39,6 +39,13 @@ class FindingKind(StrEnum):
     TAG_NORMALIZATION = "tag_normalization"
     ALIAS_CANDIDATE = "alias_candidate"
     EMPTY_GENERATED_STUB = "empty_generated_stub"
+    BROKEN_WIKILINK = "broken_wikilink"
+    SHORT_CONCEPT_STUB = "short_concept_stub"
+    LOW_CONFIDENCE = "low_confidence"
+    MISSING_SOURCE_LINK = "missing_source_link"
+    UNDERSIZED_MOC = "undersized_moc"
+    SOURCE_HASH_MISMATCH = "source_hash_mismatch"
+    UNMANAGED_GENERATED_PAGE = "unmanaged_generated_page"
 
 
 class FixKind(StrEnum):
@@ -49,6 +56,13 @@ class FixKind(StrEnum):
     NORMALIZE_TAG = "normalize_tag"
     PROPOSE_ALIAS = "propose_alias"
     REMOVE_EMPTY_GENERATED_STUB = "remove_empty_generated_stub"
+    REVIEW_BROKEN_WIKILINK = "review_broken_wikilink"
+    EXPAND_CONCEPT_STUB = "expand_concept_stub"
+    REVIEW_LOW_CONFIDENCE = "review_low_confidence"
+    ADD_SOURCE_LINK = "add_source_link"
+    EXPAND_MOC = "expand_moc"
+    REVIEW_SOURCE_HASH_MISMATCH = "review_source_hash_mismatch"
+    REVIEW_UNMANAGED_GENERATED_PAGE = "review_unmanaged_generated_page"
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,6 +94,16 @@ _FIX_BY_FINDING: dict[FindingKind, tuple[FixKind, bool]] = {
     FindingKind.TAG_NORMALIZATION: (FixKind.NORMALIZE_TAG, False),
     FindingKind.ALIAS_CANDIDATE: (FixKind.PROPOSE_ALIAS, True),
     FindingKind.EMPTY_GENERATED_STUB: (FixKind.REMOVE_EMPTY_GENERATED_STUB, False),
+    FindingKind.BROKEN_WIKILINK: (FixKind.REVIEW_BROKEN_WIKILINK, True),
+    FindingKind.SHORT_CONCEPT_STUB: (FixKind.EXPAND_CONCEPT_STUB, True),
+    FindingKind.LOW_CONFIDENCE: (FixKind.REVIEW_LOW_CONFIDENCE, True),
+    FindingKind.MISSING_SOURCE_LINK: (FixKind.ADD_SOURCE_LINK, True),
+    FindingKind.UNDERSIZED_MOC: (FixKind.EXPAND_MOC, True),
+    FindingKind.SOURCE_HASH_MISMATCH: (FixKind.REVIEW_SOURCE_HASH_MISMATCH, True),
+    FindingKind.UNMANAGED_GENERATED_PAGE: (
+        FixKind.REVIEW_UNMANAGED_GENERATED_PAGE,
+        True,
+    ),
 }
 
 

@@ -35,6 +35,31 @@ def _concept(slug: str, confidence: float = 0.8, related: list[str] | None = Non
     )
 
 
+def test_prompt_affecting_config_changes_invalidate_synthesis(tmp_path):
+    from obsidian_llm_wiki.config import Config
+    from obsidian_llm_wiki.core import pipeline as pl
+    from obsidian_llm_wiki.core.registry import VaultRegistry
+
+    base = Config(vault_path=str(tmp_path), synthesis_mode="single")
+    changed = Config(vault_path=str(tmp_path), synthesis_mode="two_pass")
+    changed.llm.expand_model = "different-expand-model"
+    base_versions = pl._artifact_versions_for_config(base)
+    changed_versions = pl._artifact_versions_for_config(changed)
+    assert base_versions.prompt != changed_versions.prompt
+
+    source = SourceDoc("Source", _BODY, source_file="source.md")
+    synthesis = SourceSynthesis(
+        source_title="Source",
+        source_summary="Summary",
+        source_file="source.md",
+        concepts=[_concept("concept")],
+    )
+    with VaultRegistry(base.llmwiki_dir) as registry:
+        registry.upsert_synthesis("source.md", source, synthesis, base_versions)
+        assert not registry.synthesis_versions_current("source.md", changed_versions)
+        assert registry.list_dirty(limit=1)[0].reason == "prompt_version_changed"
+
+
 # ── Ollama num_ctx must live in the options object ────────────────────────
 
 
@@ -488,6 +513,334 @@ def test_recompile_strips_frontmatter_and_matches_build_hash(tmp_path, monkeypat
     assert state.sources["article.md"].hash == hash_content(build_doc.content)
 
 
+def test_recompile_updates_the_authoritative_registry(tmp_path, monkeypatch):
+    """A v2 recompile must not update only the ignored portable JSON cache."""
+    from obsidian_llm_wiki.config import Config
+    from obsidian_llm_wiki.core import pipeline as pl
+    from obsidian_llm_wiki.core.registry import VaultRegistry
+
+    sources_dir = tmp_path / "04-Wiki" / "sources"
+    sources_dir.mkdir(parents=True)
+    (sources_dir / "article.md").write_text(
+        "---\ntype: Source\ntitle: Registry Article\n---\n\n" + "body " * 100,
+        encoding="utf-8",
+    )
+
+    synthesis = SourceSynthesis(
+        source_title="Registry Article",
+        source_summary="Updated synthesis.",
+        source_file="article.md",
+        concepts=[_concept("registry-concept")],
+    )
+
+    async def fake_retry(*_args, **_kwargs):
+        return synthesis
+
+    monkeypatch.setattr(pl, "_synthesize_with_retry", fake_retry)
+    config = Config(vault_path=str(tmp_path))
+    result = asyncio.run(pl.recompile_single_source(tmp_path, "article.md", config))
+
+    with VaultRegistry(config.llmwiki_dir) as registry:
+        loaded = registry.load_synthesis("article.md")
+
+    assert result.compiled == 1
+    assert loaded is not None
+    assert loaded.source_summary == "Updated synthesis."
+    assert [concept.slug for concept in loaded.concepts] == ["registry-concept"]
+
+
+def test_incremental_semantic_remap_persists_for_unchanged_sources(
+    tmp_path,
+    monkeypatch,
+):
+    """SQLite and the portable cache must not diverge after corpus dedup."""
+    from obsidian_llm_wiki.config import Config
+    from obsidian_llm_wiki.core import pipeline as pl
+    from obsidian_llm_wiki.core.registry import VaultRegistry
+
+    async def fake_retry(_config, filename, source, *_args, **_kwargs):
+        slug = "victim" if filename == "a.md" else "survivor"
+        return SourceSynthesis(
+            source_title=source.title,
+            source_summary="summary",
+            source_file=filename,
+            concepts=[_concept(slug)],
+        )
+
+    def fake_dedup(bundle, **_kwargs):
+        slugs = {concept.slug for concept in bundle.concepts}
+        if {"victim", "survivor"} <= slugs:
+            survivor = next(
+                concept for concept in bundle.concepts if concept.slug == "survivor"
+            )
+            bundle.concepts = [survivor]
+            for source_synthesis in bundle.sources:
+                if source_synthesis.source_file == "a.md":
+                    source_synthesis.concepts = [survivor]
+
+    monkeypatch.setattr(pl, "_synthesize_with_retry", fake_retry)
+    monkeypatch.setattr(pl, "render_vault", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(
+        "obsidian_llm_wiki.synth.dedupe.semantic_dedupe_concepts",
+        fake_dedup,
+    )
+    from obsidian_llm_wiki.ingest import sources as source_loader
+
+    config = Config(vault_path=str(tmp_path), embeddings_enabled=False)
+    config.sources_dir.mkdir(parents=True)
+    source_a_path = config.sources_dir / "a.md"
+    source_a_path.write_text(
+        "---\ntype: Source\ntitle: Source A\n---\n\n# Source A\n\n" + "body " * 100,
+        encoding="utf-8",
+    )
+    with VaultRegistry(config.llmwiki_dir) as registry:
+        initial = source_loader.load_sources_incremental(config.sources_dir, registry)
+    asyncio.run(
+        pl.run_pipeline(
+            tmp_path,
+            initial.sources,
+            config,
+            unchanged_filenames=initial.unchanged_filenames,
+            source_file_signatures=initial.signatures,
+        )
+    )
+    (config.sources_dir / "b.md").write_text(
+        "---\ntype: Source\ntitle: Source B\n---\n\n# Source B\n\n" + "body " * 100,
+        encoding="utf-8",
+    )
+    with VaultRegistry(config.llmwiki_dir) as registry:
+        incremental = source_loader.load_sources_incremental(config.sources_dir, registry)
+    assert incremental.sources["a.md"].content == ""
+    asyncio.run(
+        pl.run_pipeline(
+            tmp_path,
+            incremental.sources,
+            config,
+            unchanged_filenames=incremental.unchanged_filenames,
+            source_file_signatures=incremental.signatures,
+        )
+    )
+
+    with VaultRegistry(config.llmwiki_dir) as registry:
+        persisted = registry.load_synthesis("a.md")
+        persisted_hash = registry.connection.execute(
+            "SELECT content_hash FROM source WHERE filename='a.md'"
+        ).fetchone()[0]
+    loaded_a = source_loader.load_source_file(source_a_path)
+
+    assert persisted is not None
+    assert loaded_a is not None
+    assert [concept.slug for concept in persisted.concepts] == ["survivor"]
+    assert persisted_hash == pl.hash_content(loaded_a.content)
+
+
+def test_late_render_failure_preserves_deleted_source_registry_and_cache(
+    tmp_path,
+    monkeypatch,
+):
+    from obsidian_llm_wiki.config import Config
+    from obsidian_llm_wiki.core import pipeline as pl
+    from obsidian_llm_wiki.core.cache import synthesis_cache_path
+    from obsidian_llm_wiki.core.registry import VaultRegistry
+
+    async def fake_retry(_config, filename, source, *_args, **_kwargs):
+        return SourceSynthesis(
+            source_title=source.title,
+            source_summary="summary",
+            source_file=filename,
+            concepts=[_concept("surviving-concept")],
+        )
+
+    config = Config(vault_path=str(tmp_path), embeddings_enabled=False)
+    source = SourceDoc("Source", "body " * 100, source_file="source.md")
+    monkeypatch.setattr(pl, "_synthesize_with_retry", fake_retry)
+    monkeypatch.setattr(pl, "render_vault", lambda *_args, **_kwargs: [])
+    asyncio.run(pl.run_pipeline(tmp_path, {"source.md": source}, config))
+
+    cache_path = synthesis_cache_path(config.llmwiki_dir, "source.md")
+    assert cache_path.is_file()
+
+    def fail_render(*_args, **_kwargs):
+        raise RuntimeError("late render failure")
+
+    monkeypatch.setattr(pl, "render_vault", fail_render)
+    with pytest.raises(RuntimeError, match="late render failure"):
+        asyncio.run(pl.run_pipeline(tmp_path, {}, config))
+
+    with VaultRegistry(config.llmwiki_dir) as registry:
+        assert registry.load_synthesis("source.md") is not None
+    assert cache_path.is_file()
+
+
+def test_recorded_signature_matches_the_bytes_that_were_synthesized(
+    tmp_path,
+    monkeypatch,
+):
+    """A mid-run editor change must be rediscovered on the next run."""
+    from obsidian_llm_wiki.config import Config
+    from obsidian_llm_wiki.core import pipeline as pl
+    from obsidian_llm_wiki.core.registry import VaultRegistry
+    from obsidian_llm_wiki.ingest import sources as source_loader
+
+    config = Config(vault_path=str(tmp_path), embeddings_enabled=False)
+    config.sources_dir.mkdir(parents=True)
+    source_path = config.sources_dir / "source.md"
+    source_path.write_text(
+        "---\ntype: Source\ntitle: Source\n---\n\n# Source\n\n" + "original " * 100,
+        encoding="utf-8",
+    )
+    with VaultRegistry(config.llmwiki_dir) as registry:
+        initial = source_loader.load_sources_incremental(config.sources_dir, registry)
+
+    async def fake_retry(_config, filename, source, *_args, **_kwargs):
+        assert "original" in source.content
+        source_path.write_text(
+            "---\ntype: Source\ntitle: Source\n---\n\n# Source\n\n" + "edited " * 120,
+            encoding="utf-8",
+        )
+        return SourceSynthesis(
+            source_title=source.title,
+            source_summary="summary",
+            source_file=filename,
+            concepts=[_concept("source-concept")],
+        )
+
+    monkeypatch.setattr(pl, "_synthesize_with_retry", fake_retry)
+    monkeypatch.setattr(pl, "render_vault", lambda *_args, **_kwargs: [])
+    asyncio.run(
+        pl.run_pipeline(
+            tmp_path,
+            initial.sources,
+            config,
+            unchanged_filenames=initial.unchanged_filenames,
+            source_file_signatures=initial.signatures,
+        )
+    )
+
+    with VaultRegistry(config.llmwiki_dir) as registry:
+        next_run = source_loader.load_sources_incremental(config.sources_dir, registry)
+
+    assert "source.md" not in next_run.unchanged_filenames
+    assert "edited" in next_run.sources["source.md"].content
+
+
+def test_one_changed_source_reads_and_synthesizes_only_that_markdown(
+    tmp_path,
+    monkeypatch,
+):
+    """Registry signatures keep unchanged source bodies off the hot path."""
+    from obsidian_llm_wiki.config import Config
+    from obsidian_llm_wiki.core import pipeline as pl
+    from obsidian_llm_wiki.core.registry import VaultRegistry
+    from obsidian_llm_wiki.ingest import sources as source_loader
+
+    config = Config(vault_path=str(tmp_path), embeddings_enabled=False)
+    config.sources_dir.mkdir(parents=True)
+    for name, title in (("a.md", "Source A"), ("b.md", "Source B")):
+        (config.sources_dir / name).write_text(
+            f"---\ntype: Source\ntitle: {title}\n---\n\n"
+            f"# {title}\n\n"
+            + "body " * 100,
+            encoding="utf-8",
+        )
+
+    synthesis_calls: list[str] = []
+
+    async def fake_retry(_config, filename, source, *_args, **_kwargs):
+        synthesis_calls.append(filename)
+        return SourceSynthesis(
+            source_title=source.title,
+            source_summary="summary",
+            source_file=filename,
+            concepts=[_concept(f"concept-{filename[0]}")],
+        )
+
+    monkeypatch.setattr(pl, "_synthesize_with_retry", fake_retry)
+    with VaultRegistry(config.llmwiki_dir) as registry:
+        initial = source_loader.load_sources_incremental(config.sources_dir, registry)
+    asyncio.run(
+        pl.run_pipeline(
+            tmp_path,
+            initial.sources,
+            config,
+            unchanged_filenames=initial.unchanged_filenames,
+            source_file_signatures=initial.signatures,
+        )
+    )
+    assert synthesis_calls == ["a.md", "b.md"]
+    with VaultRegistry(config.llmwiki_dir) as registry:
+        stored_signature = registry.source_file_states()["a.md"][:2]
+    source_a_stat = (config.sources_dir / "a.md").stat()
+    assert stored_signature == (source_a_stat.st_mtime_ns, source_a_stat.st_size)
+
+    (config.sources_dir / "b.md").write_text(
+        "---\ntype: Source\ntitle: Source B\n---\n\n" + "changed " * 100,
+        encoding="utf-8",
+    )
+    real_load = source_loader.load_source_file
+    body_reads: list[str] = []
+
+    def counted_load(path):
+        body_reads.append(path.name)
+        return real_load(path)
+
+    monkeypatch.setattr(source_loader, "load_source_file", counted_load)
+    with VaultRegistry(config.llmwiki_dir) as registry:
+        incremental = source_loader.load_sources_incremental(
+            config.sources_dir,
+            registry,
+        )
+        assert registry.synthesis_versions_current(
+            "a.md", pl._artifact_versions_for_config(config)
+        )
+    assert body_reads == ["b.md"]
+
+    synthesis_calls.clear()
+    asyncio.run(
+        pl.run_pipeline(
+            tmp_path,
+            incremental.sources,
+            config,
+            unchanged_filenames=incremental.unchanged_filenames,
+            source_file_signatures=incremental.signatures,
+        )
+    )
+
+    assert body_reads == ["b.md"]
+    assert synthesis_calls == ["b.md"]
+    assert incremental.unchanged_filenames == {"a.md"}
+    assert incremental.sources["a.md"].content == ""
+
+    source_a_path = config.sources_dir / "a.md"
+    source_a_path.write_text(
+        source_a_path.read_text(encoding="utf-8").replace(
+            "type: Source",
+            "type: Source\ntags:\n  - reviewed-source",
+        ),
+        encoding="utf-8",
+    )
+    with VaultRegistry(config.llmwiki_dir) as registry:
+        metadata_only_change = source_loader.load_sources_incremental(
+            config.sources_dir,
+            registry,
+        )
+    synthesis_calls.clear()
+    asyncio.run(
+        pl.run_pipeline(
+            tmp_path,
+            metadata_only_change.sources,
+            config,
+            unchanged_filenames=metadata_only_change.unchanged_filenames,
+            source_file_signatures=metadata_only_change.signatures,
+        )
+    )
+    assert synthesis_calls == []
+    with VaultRegistry(config.llmwiki_dir) as registry:
+        final_load = source_loader.load_sources_incremental(config.sources_dir, registry)
+    assert final_load.unchanged_filenames == {"a.md", "b.md"}
+    assert final_load.sources["a.md"].tags == ["reviewed-source"]
+
+
 # ── Metrics: one failed source = its attempts, not attempts + 1 ───────────
 
 
@@ -551,32 +904,72 @@ def test_pipeline_records_and_reuses_cross_lingual_embedding_links(tmp_path, mon
 
     def fake_render(_dir, _bundle, _sources, **kwargs):
         captured["cross_lingual_links"] = kwargs["cross_lingual_links"]
+        captured["bundle_slugs"] = [concept.slug for concept in _bundle.concepts]
         return []
 
-    links = {
-        english.slug: [(chinese.slug, 0.91, chinese.title)],
-        chinese.slug: [(english.slug, 0.91, english.title)],
-    }
+    links: dict[str, list[tuple[str, float, str]]] = {}
     monkeypatch.setattr(pl, "_synthesize_with_retry", fake_retry)
     monkeypatch.setattr(pl, "render_vault", fake_render)
+
+    def fake_embed_batch(texts, **_kwargs):
+        return [
+            [0.0, 1.0] if "大语言模型" in text else [1.0, 0.0]
+            for text in texts
+        ]
+
+    monkeypatch.setattr(
+        "obsidian_llm_wiki.synth.embedding.embed_batch",
+        fake_embed_batch,
+    )
+    monkeypatch.setattr(
+        "obsidian_llm_wiki.synth.embedding.embed_text",
+        lambda _text, **_kwargs: [1.0, 0.0],
+    )
+    def fake_cross_lingual(concepts, **kwargs):
+        captured["comparison_slugs"] = set(kwargs["comparison_slugs"])
+        if not kwargs["comparison_slugs"]:
+            return {}
+        by_title = {concept.title: concept.slug for concept in concepts}
+        links.clear()
+        links.update(
+            {
+                by_title[english.title]: [
+                    (by_title[chinese.title], 0.91, chinese.title)
+                ],
+                by_title[chinese.title]: [
+                    (by_title[english.title], 0.91, english.title)
+                ],
+            }
+        )
+        return links
+
     monkeypatch.setattr(
         "obsidian_llm_wiki.synth.embedding.find_cross_lingual_links",
-        lambda _concepts, **_kwargs: links,
+        fake_cross_lingual,
     )
 
+    config = Config(vault_path=str(tmp_path), embeddings_enabled=True)
+    source = SourceDoc(title="Bilingual source", content="x " * 100)
     result = asyncio.run(
         pl.run_pipeline(
             tmp_path,
-            {"bilingual.md": SourceDoc(title="Bilingual source", content="x " * 100)},
-            Config(vault_path=str(tmp_path)),
+            {"bilingual.md": source},
+            config,
         )
     )
 
     assert result.compiled == 1
-    assert captured["cross_lingual_links"] == links
+    assert captured["cross_lingual_links"] == links, captured
     metrics_data = load_metrics(tmp_path)
     assert metrics_data is not None
     assert metrics_data["rendering"]["cross_lingual_links"] == 1
+
+    captured.clear()
+    second = asyncio.run(
+        pl.run_pipeline(tmp_path, {"bilingual.md": source}, config)
+    )
+    assert second.compiled == 0
+    assert captured["cross_lingual_links"] == links
 
 
 def test_pipeline_embedding_metric_uses_pruned_cache_count(tmp_path, monkeypatch):
