@@ -156,13 +156,23 @@ def extract_via_semantic_scholar(ssrn_url: str, timeout: int = DEFAULT_TIMEOUT) 
         )
 
     try:
-        with httpx.Client(
-            **make_client_kwargs(timeout=timeout, follow_redirects=True),
-        ) as client:
-            resp = client.get(url, headers=BROWSER_HEADERS)
-            if resp.status_code == 404:
-                raise RuntimeError(f"Paper not found on Semantic Scholar: SSRN:{paper_id}")
-            resp.raise_for_status()
+        from obsidian_llm_wiki.ingest.proxy import make_client_kwargs, make_proxy_client_kwargs
+
+        def _do_fetch(client_kwargs):
+            with httpx.Client(
+                **client_kwargs, follow_redirects=True,
+            ) as client:
+                resp = client.get(url, headers=BROWSER_HEADERS)
+                if resp.status_code == 404:
+                    raise RuntimeError(f"Paper not found on Semantic Scholar: SSRN:{paper_id}")
+                resp.raise_for_status()
+                return resp
+
+        # Try direct first, then proxy
+        try:
+            resp = _do_fetch(make_client_kwargs(timeout=timeout))
+        except Exception:
+            resp = _do_fetch(make_proxy_client_kwargs(timeout=timeout))
         data = resp.json()
 
         title = data.get("title", "") or ssrn_url

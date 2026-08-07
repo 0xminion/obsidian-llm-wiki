@@ -354,23 +354,35 @@ def _extract_defuddle_md(url: str, timeout: int) -> SourceDoc:
 
     defuddle.md renders JS-heavy pages and returns clean markdown with
     YAML frontmatter (title, author, published, word_count).
+
+    Tries a direct connection first, then retries through the residential
+    proxy if the direct attempt fails.
     """
     stripped = url.replace("https://", "").replace("http://", "")
     defuddle_url = f"https://defuddle.md/{stripped}"
 
-    with (
-        httpx.Client(
-            **make_client_kwargs(timeout=timeout, follow_redirects=False),
-            headers={
-                "User-Agent": BROWSER_HEADERS["User-Agent"],
-                "Accept": "text/html",
-            },
-        ) as client,
-        stream_with_validated_redirects(client, defuddle_url) as resp,
-    ):
-        if resp.status_code != 200:
-            raise RuntimeError(f"defuddle.md returned HTTP {resp.status_code}")
-        text = _read_bounded_html(resp, load_config().max_html_bytes).strip()
+    from obsidian_llm_wiki.ingest.proxy import make_client_kwargs, make_proxy_client_kwargs
+
+    def _do_fetch(client_kwargs):
+        with (
+            httpx.Client(
+                **client_kwargs,
+                headers={
+                    "User-Agent": BROWSER_HEADERS["User-Agent"],
+                    "Accept": "text/html",
+                },
+            ) as client,
+            stream_with_validated_redirects(client, defuddle_url) as resp,
+        ):
+            if resp.status_code != 200:
+                raise RuntimeError(f"defuddle.md returned HTTP {resp.status_code}")
+            return _read_bounded_html(resp, load_config().max_html_bytes).strip()
+
+    # Try direct first, then proxy
+    try:
+        text = _do_fetch(make_client_kwargs(timeout=timeout, follow_redirects=False))
+    except Exception:
+        text = _do_fetch(make_proxy_client_kwargs(timeout=timeout, follow_redirects=False))
 
     if not text or len(text) < 100:
         raise RuntimeError("defuddle.md returned empty content")

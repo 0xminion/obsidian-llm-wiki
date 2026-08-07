@@ -24,10 +24,10 @@ def test_make_client_kwargs_no_proxy_env(monkeypatch):
 
 
 def test_make_client_kwargs_with_proxy_url(monkeypatch):
-    """With RESIDENTIAL_PROXY_URL set, proxy key is in returned kwargs."""
+    """With RESIDENTIAL_PROXY_URL set, make_proxy_client_kwargs includes proxy."""
     monkeypatch.setenv("RESIDENTIAL_PROXY_URL", "http://proxy.example.com:8080")
-    from obsidian_llm_wiki.ingest.proxy import make_client_kwargs
-    kw = make_client_kwargs(timeout=30, follow_redirects=True)
+    from obsidian_llm_wiki.ingest.proxy import make_proxy_client_kwargs
+    kw = make_proxy_client_kwargs(timeout=30, follow_redirects=True)
     assert "proxy" in kw
     assert kw["timeout"] == 30
 
@@ -35,8 +35,8 @@ def test_make_client_kwargs_with_proxy_url(monkeypatch):
 def test_make_client_kwargs_socks5h_proxy(monkeypatch):
     """socks5h:// proxy URL is accepted without crashing."""
     monkeypatch.setenv("RESIDENTIAL_PROXY_URL", "socks5h://127.0.0.1:1080")
-    from obsidian_llm_wiki.ingest.proxy import make_client_kwargs
-    kw = make_client_kwargs(timeout=30, follow_redirects=True)
+    from obsidian_llm_wiki.ingest.proxy import make_proxy_client_kwargs
+    kw = make_proxy_client_kwargs(timeout=30, follow_redirects=True)
     assert "proxy" in kw
 
 

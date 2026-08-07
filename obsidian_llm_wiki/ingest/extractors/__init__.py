@@ -666,6 +666,16 @@ def extract(raw_url: str) -> SourceDoc:
         except Exception as ds_exc:
             logger.warning("Deep search fallback also failed for %s: %s", raw_url, ds_exc)
     if result.connector_name == "specialist_dispatch":
+        # Last resort: try the generic web extractor directly.
+        # Specialist extractors (Twitter, arXiv, etc.) can fail when their
+        # specific extraction paths (defuddle CLI, defuddle.md) are unreachable.
+        # The generic web extractor (trafilatura, liteparse, wayback) may still
+        # succeed via a different route.
+        try:
+            source = extract_web(raw_url)
+            return _stamp_extracted_source(source, raw_url, "specialist_fallback_web")
+        except Exception as web_exc:
+            logger.debug("Generic web fallback also failed for %s: %s", raw_url, web_exc)
         raise RuntimeError(
             f"All specialized extractors failed for {raw_url}: {result.failure.message}"
         )

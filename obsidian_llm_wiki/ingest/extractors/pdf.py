@@ -37,8 +37,33 @@ def _is_pdf(parsed, raw: str) -> bool:
 def extract_pdf(raw_url_or_path: str) -> SourceDoc:
     """Extract a local or remote PDF through the shared document boundary."""
     if raw_url_or_path.startswith(("http://", "https://")):
+        # Convert GitHub blob URLs to raw URLs for direct download.
+        # GitHub /blob/ URLs are HTML pages, not direct file links.
+        raw_url_or_path = _github_blob_to_raw(raw_url_or_path)
         return _extract_remote_pdf(raw_url_or_path)
     return _extract_local_pdf(raw_url_or_path)
+
+
+def _github_blob_to_raw(url: str) -> str:
+    """Convert a GitHub blob URL to a raw.githubusercontent.com URL.
+
+    ``https://github.com/owner/repo/blob/branch/path/file.pdf``
+    → ``https://raw.githubusercontent.com/owner/repo/branch/path/file.pdf``
+
+    Returns the original URL unchanged if it's not a GitHub blob URL.
+    """
+    if "/blob/" not in url:
+        return url
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    if host not in ("github.com", "www.github.com"):
+        return url
+    # Replace /blob/ with / and swap the host
+    path = parsed.path.replace("/blob/", "/", 1)
+    # URL-decode the path (GitHub blob URLs often have %26 etc.)
+    from urllib.parse import unquote
+    path = unquote(path)
+    return f"https://raw.githubusercontent.com{path}"
 
 
 def _extract_local_pdf(

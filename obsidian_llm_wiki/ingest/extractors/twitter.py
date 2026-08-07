@@ -154,21 +154,39 @@ def _extract_via_defuddle_md(url: str) -> SourceDoc | None:
     defuddle.md is a hosted version of defuddle that renders JS-heavy pages
     (including X Articles) and returns clean markdown with YAML frontmatter.
     URL format: https://defuddle.md/<original-url>
+
+    Tries a direct connection first, then retries through the residential
+    proxy if the direct attempt fails (e.g. geo-blocked or rate-limited).
     """
     # Build defuddle.md URL
     # Strip https:// from the original URL
     stripped = url.replace("https://", "").replace("http://", "")
     defuddle_url = f"https://defuddle.md/{stripped}"
 
-    with httpx.Client(
-        **make_client_kwargs(timeout=DEFAULT_TIMEOUT, follow_redirects=False),
-        headers={
-            "User-Agent": BROWSER_HEADERS["User-Agent"],
-            "Accept": "text/html",
-        },
-    ) as client:
-        from obsidian_llm_wiki.ingest.url_safety import get_with_validated_redirects
-        resp = get_with_validated_redirects(client, defuddle_url)
+    from obsidian_llm_wiki.ingest.proxy import make_proxy_client_kwargs
+
+    def _do_fetch(client_kwargs):
+        with httpx.Client(
+            **client_kwargs,
+            headers={
+                "User-Agent": BROWSER_HEADERS["User-Agent"],
+                "Accept": "text/html",
+            },
+        ) as client:
+            from obsidian_llm_wiki.ingest.url_safety import get_with_validated_redirects
+            return get_with_validated_redirects(client, defuddle_url)
+
+    # Try direct first
+    try:
+        resp = _do_fetch(make_client_kwargs(timeout=DEFAULT_TIMEOUT, follow_redirects=False))
+    except Exception:
+        # Retry through proxy
+        try:
+            resp = _do_fetch(
+                make_proxy_client_kwargs(timeout=DEFAULT_TIMEOUT, follow_redirects=False)
+            )
+        except Exception as exc:
+            raise RuntimeError(f"defuddle.md: {exc}") from exc
 
     if resp.status_code != 200:
         logger.debug("defuddle.md returned %d for %s", resp.status_code, url)

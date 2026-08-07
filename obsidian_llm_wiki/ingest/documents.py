@@ -181,47 +181,67 @@ def download_document(
     validate_remote_url(url)
     expected_suffix = _suffix_from_url(url)
     temp_path: Path | None = None
-    try:
-        with (
-            httpx.Client(
-                **make_client_kwargs(timeout=timeout, follow_redirects=False),
-                headers=BROWSER_HEADERS,
-            ) as client,
-            stream_with_validated_redirects(client, url) as response,
-        ):
-            response.raise_for_status()
-            resolved_url = str(response.url)
-            if (
-                required_host
-                and (urlparse(resolved_url).hostname or "").lower() != required_host
+
+    from obsidian_llm_wiki.ingest.proxy import make_client_kwargs, make_proxy_client_kwargs
+
+    # Try direct first; fall back to proxy on failure.
+    download_errors: list[Exception] = []
+    for client_kwargs_fn in (make_client_kwargs, make_proxy_client_kwargs):
+        try:
+            with (
+                httpx.Client(
+                    **client_kwargs_fn(timeout=timeout, follow_redirects=False),
+                    headers=BROWSER_HEADERS,
+                ) as client,
+                stream_with_validated_redirects(client, url) as response,
             ):
-                raise InvalidDocumentError("Document redirect left the official site")
-            content_type = _content_type(response.headers)
-            mime_suffix = _CONTENT_TYPE_SUFFIXES.get(content_type)
-            suffix = expected_suffix or mime_suffix
-            if suffix not in DOCUMENT_SUFFIXES:
-                raise InvalidDocumentError(
-                    f"Unsupported document MIME {content_type or 'missing'} for {resolved_url}"
-                )
-            _validate_mime(content_type, suffix)
-            declared_size = _content_length(response.headers)
-            if declared_size is not None and declared_size > cfg.max_document_bytes:
-                raise DocumentTooLargeError(
-                    f"Document Content-Length {declared_size} "
-                    f"exceeds {cfg.max_document_bytes} bytes"
-                )
+                response.raise_for_status()
+                resolved_url = str(response.url)
+                if (
+                    required_host
+                    and (urlparse(resolved_url).hostname or "").lower() != required_host
+                ):
+                    raise InvalidDocumentError("Document redirect left the official site")
+                content_type = _content_type(response.headers)
+                mime_suffix = _CONTENT_TYPE_SUFFIXES.get(content_type)
+                suffix = expected_suffix or mime_suffix
+                if suffix not in DOCUMENT_SUFFIXES:
+                    raise InvalidDocumentError(
+                        f"Unsupported document MIME {content_type or 'missing'} for {resolved_url}"
+                    )
+                _validate_mime(content_type, suffix)
+                declared_size = _content_length(response.headers)
+                if declared_size is not None and declared_size > cfg.max_document_bytes:
+                    raise DocumentTooLargeError(
+                        f"Document Content-Length {declared_size} "
+                        f"exceeds {cfg.max_document_bytes} bytes"
+                    )
 
-            with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as handle:
-                temp_path = Path(handle.name)
-                total = 0
-                for chunk in response.iter_bytes():
-                    total += len(chunk)
-                    if total > cfg.max_document_bytes:
-                        raise DocumentTooLargeError(
-                            f"Document stream exceeded {cfg.max_document_bytes} bytes"
-                        )
-                    handle.write(chunk)
+                with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as handle:
+                    temp_path = Path(handle.name)
+                    total = 0
+                    for chunk in response.iter_bytes():
+                        total += len(chunk)
+                        if total > cfg.max_document_bytes:
+                            raise DocumentTooLargeError(
+                                f"Document stream exceeded {cfg.max_document_bytes} bytes"
+                            )
+                        handle.write(chunk)
+            # Success — break out of the retry loop
+            break
+        except Exception as exc:
+            download_errors.append(exc)
+            if temp_path and temp_path.exists():
+                _remove_temp(temp_path)
+                temp_path = None
+            continue
+    else:
+        # Both direct and proxy failed
+        if download_errors:
+            raise download_errors[-1]
+        raise RuntimeError(f"Could not download document {url}")
 
+    try:
         if temp_path is None or temp_path.stat().st_size == 0:
             raise InvalidDocumentError(f"Downloaded empty document from {url}")
         _validate_signature(temp_path, suffix)
