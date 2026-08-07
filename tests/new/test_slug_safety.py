@@ -33,7 +33,7 @@ def _is_safe_slug(slug: str) -> bool:
         r"..\escape",
         "café\x00",
         "line\x00break",
-        "x" * 81,
+        "x" * 121,  # exceeds _MAX_SLUG_LENGTH (120)
     ],
 )
 def test_parser_regenerates_unsafe_concept_moc_and_relation_slugs(unsafe_slug: str) -> None:

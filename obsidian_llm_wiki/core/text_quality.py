@@ -1,8 +1,9 @@
-"""Deterministic text cleanup for repeated LLM list items."""
+"""Deterministic text cleanup for repeated LLM list items and title validation."""
 
 from __future__ import annotations
 
 import re
+from collections import Counter
 from collections.abc import Iterable
 from difflib import SequenceMatcher
 
@@ -59,3 +60,52 @@ def _same_statement(
     overlap = intersection / min(len(left_tokens), len(right_tokens))
     jaccard = intersection / union if union else 0.0
     return overlap >= 0.84 and jaccard >= 0.60
+
+
+# ── Title validation ────────────────────────────────────────────────────
+
+_TOKEN_RE = re.compile(r"[^\s\-_]+", re.UNICODE)
+
+
+def is_gibberish_title(title: str) -> bool:
+    """Detect LLM-generated repeated-token gibberish titles.
+
+    The LLM sometimes produces titles like ``"8n-8n-8n-8n-8n-8n-8-n"`` or
+    ``"ai-ai-ai-ai-ai-ai-ai-ai"`` when synthesis JSON parsing partially
+    succeeds on a malformed response.  These are not real titles — they
+    are token-repeat artifacts that must be rejected before they infect
+    the vault as filenames, wikilinks, and MoC entries.
+
+    Returns ``True`` when the title is gibberish (should be rejected).
+    """
+    cleaned = (title or "").strip()
+    if not cleaned:
+        return True
+
+    # Split on hyphens/underscores to get the repeated tokens
+    tokens = [t for t in re.split(r"[\-_\s]+", cleaned) if t]
+    if len(tokens) < 3:
+        return False
+
+    # Count token frequencies
+    counts = Counter(tokens)
+    most_common_count = counts.most_common(1)[0][1]
+
+    # If a single token appears 3+ times and makes up >60% of the title,
+    # it's a repeated-token artifact.
+    if most_common_count >= 3 and most_common_count / len(tokens) > 0.6:
+        return True
+
+    # Also catch patterns like "8n-8n-8n-8n-8n-8n-8-n" where the last token
+    # is a fragment: check if the dominant token (without the last char)
+    # repeats.  E.g. "8n" repeated with "n" at the end.
+    if len(tokens) >= 4:
+        # Remove single-char tokens and check again
+        long_tokens = [t for t in tokens if len(t) > 1]
+        if long_tokens:
+            counts2 = Counter(long_tokens)
+            mc2 = counts2.most_common(1)[0][1]
+            if mc2 >= 3 and mc2 / len(long_tokens) > 0.6:
+                return True
+
+    return False

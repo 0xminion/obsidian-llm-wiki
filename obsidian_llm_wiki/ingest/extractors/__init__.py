@@ -449,6 +449,13 @@ def _check_extraction_quality(source: SourceDoc) -> tuple[bool, str]:
     ):
         return (False, "invalid source title")
 
+    # Reject LLM-generated repeated-token gibberish titles like
+    # "8n-8n-8n-8n-8n-8n-8-n" or "ai-ai-ai-ai-ai-ai-ai-ai".
+    from obsidian_llm_wiki.core.text_quality import is_gibberish_title
+
+    if is_gibberish_title(title):
+        return (False, "gibberish repeated-token title")
+
     # X status pages frequently contain an article card plus a 1-2 sentence
     # preview. That is not the linked article; fail it instead of synthesizing
     # a plausible-looking graph from the login shell.
@@ -485,14 +492,34 @@ def _check_extraction_quality(source: SourceDoc) -> tuple[bool, str]:
             return (False, "stub fallback")
 
     # 3. Abstract-only — has an abstract but no full-text or body sections.
-    if "Abstract:" in content:
+    if "Abstract" in content:
         has_full_text = "## Full Text" in content or "## Full text" in content
         has_body_sections = bool(
             re.search(r"^#{1,4}\s+\S", content, re.MULTILINE)
         )
-        # Allow content that has body sections beyond the abstract.
+        # Check if the content beyond the abstract is substantial.
+        # Some pages (Springer, Elsevier) have heading-like nav sections
+        # that pass the body-section regex but are just navigation chrome.
+        abstract_idx = content.find("Abstract")
+        beyond_abstract = content[abstract_idx + len("Abstract"):] if abstract_idx >= 0 else ""
+        # Strip common nav/section artifacts to measure real body content
+        beyond_clean = re.sub(
+            r"^(References|Acknowledgements|Author information|"
+            r"Electronic supplementary material|Article metrics|"
+            r"Share this article|Avoid common mistakes|"
+            r"Subscribe to journal|Buy article|Rent article|"
+            r"Download references|About this article|"
+            r"Table of contents|Related articles|Cite this article)\s*$",
+            "", beyond_abstract, flags=re.MULTILINE,
+        ).strip()
+        # Allow content that has substantial body beyond the abstract.
+        # Use a low threshold (500 chars) so short but valid papers pass,
+        # while pure nav-chrome pages (which are typically ~200-400 chars of
+        # nav links after the abstract) are caught.
         if not has_full_text and not has_body_sections:
             return (False, "abstract only")
+        if not has_full_text and len(beyond_clean) < 500:
+            return (False, "abstract only with nav chrome")
 
     # 4. Metadata-only — content is dominated by metadata fields.
     metadata_prefixes = ("Title:", "Channel:", "Published:", "URL:", "Duration:")

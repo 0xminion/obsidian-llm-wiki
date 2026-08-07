@@ -83,7 +83,7 @@ VALID_RELATIONS: frozenset[str] = frozenset(r.value for r in RelationType)
 # than a general identifier: no separators, dots, or controls can cross the
 # parser boundary.  Unicode letters/digits remain supported for existing
 # bilingual vault filenames.
-_MAX_SLUG_LENGTH = 80
+_MAX_SLUG_LENGTH = 120
 
 
 def _is_safe_slug(value: object) -> bool:
@@ -421,16 +421,19 @@ def source_synthesis_from_dict(data: dict[str, Any]) -> SourceSynthesis:
     """Build a SourceSynthesis from a raw dict (LLM JSON output).
 
     Tolerant of missing/extra keys.  Validates required fields.
+    Filters out concepts and MoCs with gibberish repeated-token titles.
     """
+    from obsidian_llm_wiki.core.text_quality import is_gibberish_title
+
     concepts = [
         _concept_from_dict(c)
         for c in data.get("concepts", [])
-        if isinstance(c, dict)
+        if isinstance(c, dict) and not is_gibberish_title(_string(c.get("title", "")))
     ]
     maps = [
         _moc_from_dict(m)
         for m in data.get("maps", [])
-        if isinstance(m, dict)
+        if isinstance(m, dict) and not is_gibberish_title(_string(m.get("title", "")))
     ]
     return SourceSynthesis(
         source_title=_string(data.get("source_title", data.get("title", ""))),

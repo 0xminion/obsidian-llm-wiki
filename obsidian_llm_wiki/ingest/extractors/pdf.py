@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -111,9 +112,13 @@ def _extract_text_from_doc(doc, source_url: str) -> SourceDoc:
     """Common PyMuPDF extraction logic for local and remote PDFs."""
     meta = doc.metadata or {}
     title = (meta.get("title") or "").strip()
-    if not title:
+    if not _is_plausible_pdf_title(title):
+        # PDF metadata is often a paper number (e.g. NBER "35589") or empty.
+        # Fall back to the URL stem, then try to extract a title from page 1.
         parsed = urlparse(source_url)
         title = Path(parsed.path).stem if parsed.path else Path(source_url).stem
+        if not _is_plausible_pdf_title(title):
+            title = _extract_title_from_first_page(doc) or title
 
     pages: list[str] = []
     for page_num in range(len(doc)):
@@ -126,3 +131,45 @@ def _extract_text_from_doc(doc, source_url: str) -> SourceDoc:
         raise RuntimeError(f"PDF has no extractable text: {source_url}")
 
     return SourceDoc(title=title, content=content, url=source_url)
+
+
+def _is_plausible_pdf_title(title: str) -> bool:
+    """Return True when *title* looks like a real document title, not a paper number.
+
+    PDF metadata frequently contains the NBER working paper number, a DOI suffix,
+    or a bare filename — none of which are useful source titles.  Reject:
+      * Pure numbers (NBER paper numbers like "35589")
+      * Very short strings (< 5 chars)
+      * Strings that are all non-word characters
+    """
+    cleaned = (title or "").strip()
+    if len(cleaned) < 5:
+        return False
+    # Pure digits / paper numbers like "35589" or "2606.16852"
+    return not re.fullmatch(r"[\d.]+", cleaned)
+
+
+def _extract_title_from_first_page(doc) -> str | None:
+    """Scan the first page text for a plausible article title.
+
+    Looks at the first few non-empty lines and picks the first one that looks
+    like a title (longer than 10 chars, not a page header/number).
+    """
+    if not doc or len(doc) == 0:
+        return None
+    try:
+        text = doc[0].get_text("text")
+    except Exception:
+        return None
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    for line in lines[:10]:
+        # Skip page numbers, headers, copyright notices
+        if len(line) < 10:
+            continue
+        if re.fullmatch(r"[\d.]+", line):
+            continue
+        if line.lower().startswith(("copyright", "doi:", "http", "www.")):
+            continue
+        # Found a plausible title
+        return line[:200]
+    return None
