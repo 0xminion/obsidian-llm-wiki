@@ -18,6 +18,7 @@ from contextlib import suppress
 from hashlib import sha256
 from pathlib import Path
 
+from obsidian_llm_wiki.core.generated_paths import checked_generated_path
 from obsidian_llm_wiki.core.models import (
     ConceptNote,
     SourceSynthesis,
@@ -50,7 +51,7 @@ def synthesis_cache_dir(cache_root: Path) -> Path:
 
     ``cache_root`` is typically ``config.llmwiki_dir``.
     """
-    return cache_root / "cache"
+    return checked_generated_path(cache_root / "cache")
 
 
 def synthesis_cache_path(cache_root: Path, source_file: str) -> Path:
@@ -66,7 +67,7 @@ def synthesis_cache_path(cache_root: Path, source_file: str) -> Path:
     candidate = f"{filename}.json"
     if len(candidate.encode("utf-8")) > _MAX_CACHE_FILENAME_BYTES:
         candidate = f"sha256-{sha256(filename.encode('utf-8')).hexdigest()}.json"
-    return synthesis_cache_dir(cache_root) / candidate
+    return checked_generated_path(synthesis_cache_dir(cache_root) / candidate, cache_root)
 
 
 def save_synthesis(
@@ -129,6 +130,7 @@ def load_all_cached_syntheses(cache_root: Path) -> dict[str, SourceSynthesis]:
 
     result: dict[str, SourceSynthesis] = {}
     for f in sorted(cache_dir.glob("*.json")):
+        checked_generated_path(f, cache_root)
         if f.name == "_resynthesis_overlay.json":
             continue
         fallback_source_file = f.stem  # e.g. "article.md.json" → "article.md"
@@ -183,7 +185,9 @@ def delete_cached_synthesis(cache_root: Path, source_file: str) -> None:
 
 
 def _overlay_path(cache_root: Path) -> Path:
-    return synthesis_cache_dir(cache_root) / "_resynthesis_overlay.json"
+    return checked_generated_path(
+        synthesis_cache_dir(cache_root) / "_resynthesis_overlay.json", cache_root,
+    )
 
 
 def load_resynthesis_overlay(cache_root: Path) -> dict[str, ConceptNote]:

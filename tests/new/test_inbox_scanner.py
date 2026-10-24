@@ -87,8 +87,8 @@ def test_scan_inbox_skips_non_url_extensions(tmp_path: Path):
     assert urls == ["https://example.com/yes"]
 
 
-def test_scan_inbox_skips_unreadable_files(tmp_path: Path):
-    """Unreadable .url files (OSError) are silently skipped."""
+def test_scan_inbox_reports_unreadable_files(tmp_path: Path):
+    """Inventory I/O failures must not turn into a successful partial plan."""
     inbox = tmp_path / "00-Inbox"
     inbox.mkdir()
     (inbox / "good.url").write_text("https://example.com/ok\n", encoding="utf-8")
@@ -102,9 +102,9 @@ def test_scan_inbox_skips_unreadable_files(tmp_path: Path):
     try:
         if os.geteuid() == 0:
             pytest.skip("Running as root — permissions are bypassed")
-        urls = _scan_inbox_urls(config)
-        # The unreadable file should be skipped, the good one returned.
-        assert urls == ["https://example.com/ok"]
+        # Previously this silently dropped the unreadable source and reported success.
+        with pytest.raises(OSError, match="Cannot read inbox record"):
+            _scan_inbox_urls(config)
     finally:
         # Restore permissions for cleanup.
         unreadable.chmod(0o644)

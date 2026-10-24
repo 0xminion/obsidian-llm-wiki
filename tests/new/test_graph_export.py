@@ -166,9 +166,11 @@ def test_export_graph_json_bidirectional_detection(tmp_path: Path):
     data = json.loads(output.read_text(encoding="utf-8"))
     rel_edges = [e for e in data["edges"] if e["relation"] != "contains"]
     # bitcoin↔mining: bitcoin has enables→mining, mining has related_to→bitcoin
-    # So the edge should be bidirectional=True
+    # Different relation types are separate directed facts, not symmetric.
     bidir_edges = [e for e in rel_edges if e.get("bidirectional")]
-    assert len(bidir_edges) >= 1
+    assert not bidir_edges
+    assert any(e["relation"] == "enables" for e in rel_edges)
+    assert any(e["relation"] == "related_to" for e in rel_edges)
 
 
 # ── Mermaid export ───────────────────────────────────────────────────────

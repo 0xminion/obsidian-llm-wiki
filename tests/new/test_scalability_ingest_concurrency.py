@@ -4,6 +4,7 @@ import threading
 import time
 from pathlib import Path
 
+import pytest
 from typer.testing import CliRunner
 
 from obsidian_llm_wiki.cli import app
@@ -144,7 +145,8 @@ def test_ingest_backfill_retries_a_transient_source_read_failure(
 
     monkeypatch.setattr(Path, "read_text", flaky_read_text)
     with VaultRegistry(tmp_path / ".llmwiki") as registry:
-        _backfill_ingest_index(registry, sources_dir)
+        with pytest.raises(OSError, match="transient read failure"):
+            _backfill_ingest_index(registry, sources_dir)
         assert not registry.ingest_backfill_complete()
         _backfill_ingest_index(registry, sources_dir)
         assert registry.ingest_backfill_complete()

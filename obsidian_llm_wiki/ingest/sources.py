@@ -31,6 +31,7 @@ _MAX_SOURCE_METADATA_ITEMS = 32
 _MAX_ALIAS_CHARS = 160
 _MAX_SOURCE_TYPE_CHARS = 64
 _SOURCE_METADATA_FILES = frozenset({"failed_urls.md", "index.md"})
+_SOURCE_INDEX_SHARD = re.compile(r"index-b[0-9a-f]{2}-[0-9]{3,}\.md\Z")
 
 
 @dataclass(frozen=True)
@@ -171,6 +172,28 @@ def load_source_file(path: Path) -> SourceDoc | None:
     )
 
 
+def _discover_source_paths(sources_dir: Path) -> list[Path]:
+    """Validate the inventory's resolved boundary before any source body read.
+
+    Check directory symlinks too, even though source discovery is not recursive.
+    Contained links remain valid and retain their source filename identity.
+    """
+    root = sources_dir.resolve()
+    paths: list[Path] = []
+    # Unlike glob, iterdir propagates permission and I/O errors. A partial
+    # inventory must never become an authoritative deletion list.
+    for path in sorted(sources_dir.iterdir()):
+        if (path.is_symlink() or path.suffix == ".md") and not path.resolve().is_relative_to(root):
+            raise ValueError(f"Source path escapes {sources_dir}: {path}")
+        if (
+            path.suffix == ".md"
+            and path.name not in _SOURCE_METADATA_FILES
+            and not _SOURCE_INDEX_SHARD.fullmatch(path.name)
+        ):
+            paths.append(path)
+    return paths
+
+
 def load_sources_from_dir(sources_dir: Path) -> dict[str, SourceDoc]:
     """Load all ``*.md`` files from ``sources_dir`` into a dict keyed by filename.
 
@@ -179,12 +202,7 @@ def load_sources_from_dir(sources_dir: Path) -> dict[str, SourceDoc]:
     if not sources_dir.is_dir():
         return {}
     result: dict[str, SourceDoc] = {}
-    for f in sorted(sources_dir.glob("*.md")):
-        # Never process the failed URL ledger or index files as sources —
-        # they are pipeline metadata, not extracted content. Processing
-        # them pollutes the vault with concepts about error handling.
-        if f.name in _SOURCE_METADATA_FILES:
-            continue
+    for f in _discover_source_paths(sources_dir):
         doc = load_source_file(f)
         if doc is not None:
             result[f.name] = doc
@@ -204,15 +222,17 @@ def load_sources_incremental(
     source is read with a stable before/after signature so the pipeline never
     commits a signature for bytes different from those it synthesized.
     """
-    if not sources_dir.is_dir():
+    try:
+        paths = _discover_source_paths(sources_dir)
+    except FileNotFoundError:
+        if registry.source_filenames():
+            raise OSError(f"Source directory is missing: {sources_dir}") from None
         return IncrementalSourceLoad({}, set(), {})
     indexed = registry.source_file_states()
     sources: dict[str, SourceDoc] = {}
     unchanged: set[str] = set()
     signatures: dict[str, tuple[int, int]] = {}
-    for path in sorted(sources_dir.glob("*.md")):
-        if path.name in _SOURCE_METADATA_FILES:
-            continue
+    for path in paths:
         stat = path.stat()
         signature = (stat.st_mtime_ns, stat.st_size)
         indexed_state = indexed.get(path.name)
@@ -223,8 +243,9 @@ def load_sources_incremental(
             continue
         doc, signature = _load_source_with_stable_stat(path)
         signatures[path.name] = signature
-        if doc is not None:
-            sources[path.name] = doc
+        if doc is None:
+            raise OSError(f"Source is empty or unreadable; refusing partial build: {path}")
+        sources[path.name] = doc
     return IncrementalSourceLoad(sources, unchanged, signatures)
 
 

@@ -32,7 +32,7 @@ def check_clipping(path: Path, config: Config) -> tuple[bool, SourceDoc | None]:
     if len(body_stripped) < config.clipping_min_body_chars:
         return False, None
 
-    url = meta.get("source_url") or meta.get("url") or ""
+    url = _metadata_text(meta.get("source_url")) or _metadata_text(meta.get("url"))
     return True, SourceDoc(title=title, content=body_stripped, url=url)
 
 
@@ -53,19 +53,26 @@ def collect_clippings(config: Config) -> list[tuple[Path, SourceDoc]]:
     return passed
 
 
+def _metadata_text(value: object) -> str:
+    """YAML permits non-string scalars and collections; do not call strip on them."""
+    if isinstance(value, (str, int, float)) and not isinstance(value, bool):
+        return " ".join(str(value).replace("\x00", "").split())
+    return ""
+
+
 def _extract_title(meta: dict, body: str) -> str:
     """Extract a title from frontmatter or body."""
     import re
 
-    title = (meta.get("title") or "").strip()
+    title = _metadata_text(meta.get("title"))
     if title:
         return title
 
-    source = (meta.get("source") or "").strip()
+    source = _metadata_text(meta.get("source"))
     if source:
         return source
 
-    source_url = (meta.get("source_url") or meta.get("url") or "").strip()
+    source_url = _metadata_text(meta.get("source_url")) or _metadata_text(meta.get("url"))
     if source_url:
         derived = _title_from_url(source_url)
         if derived:

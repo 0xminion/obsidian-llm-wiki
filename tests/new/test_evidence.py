@@ -258,11 +258,16 @@ async def test_pipeline_re_resolves_quote_with_changed_source_hash(tmp_path, mon
         return json.dumps(
             {
                 "source_title": "Article",
+                "source_summary": "A supported sentence appears in the article.",
                 "concepts": [
                     {
                         "title": "Concept",
                         "slug": "concept",
-                        "summary": "Summary",
+                        "summary": "A supported sentence appears in the article.",
+                        "sections": [{
+                            "heading": "Content",
+                            "prose": "The article contains a supported sentence.",
+                        }],
                         "claims": [{"text": "Claim", "quote": "Supported sentence."}],
                     }
                 ],

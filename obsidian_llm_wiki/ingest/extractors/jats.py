@@ -14,7 +14,7 @@ import httpx
 from defusedxml import ElementTree as DET  # noqa: N814
 
 from obsidian_llm_wiki.core.models import SourceDoc
-from obsidian_llm_wiki.ingest.extractors import register_extractor
+from obsidian_llm_wiki.ingest.extractors import ExtractorNotApplicableError, register_extractor
 from obsidian_llm_wiki.ingest.http_headers import BROWSER_HEADERS
 from obsidian_llm_wiki.ingest.proxy import make_client_kwargs
 from obsidian_llm_wiki.ingest.url_safety import stream_with_validated_redirects
@@ -185,6 +185,9 @@ def extract_jats(raw_url: str) -> SourceDoc:
             raw_url, parse_exc,
         )
         return _salvage_html_body(raw_url, xml_text)
+
+    if _strip_ns(root.tag).casefold() in {"rss", "feed", "urlset", "sitemapindex"}:
+        raise ExtractorNotApplicableError("Feed/sitemap XML is not a JATS article")
 
     # ── Extract title ─────────────────────────────────────────────
     title = _find_jats_title(root)

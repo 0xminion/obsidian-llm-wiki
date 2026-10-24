@@ -26,6 +26,7 @@ import logging
 import math
 import re
 from collections.abc import Mapping, Sequence
+from copy import deepcopy
 
 from obsidian_llm_wiki.core.models import (
     ConceptNote,
@@ -47,13 +48,16 @@ __all__ = [
 
 logger = logging.getLogger("obswiki.synth.dedupe")
 
+# Only genuine schema inverses and symmetric relations belong here. In
+# particular, component_of/part_of point in the same direction; variant_of is
+# asymmetric. Their reverse navigation edges fall back to related_to.
 _INVERSE_RELATIONS = {
     "depends_on": "prerequisite_of",
     "prerequisite_of": "depends_on",
-    "component_of": "part_of",
-    "part_of": "component_of",
-    "variant_of": "variant_of",
     "contrasts_with": "contrasts_with",
+    "complements": "complements",
+    "competes_with": "competes_with",
+    "equivalent_to": "equivalent_to",
     "related_to": "related_to",
 }
 
@@ -82,7 +86,7 @@ def normalise_tags(tags: list[str]) -> list[str]:
     result: list[str] = []
     for tag in tags:
         t = tag.strip().lower().replace(" ", "-").replace("_", "-")
-        t = re.sub(r"[^a-z0-9-]", "", t)
+        t = "".join(char for char in t if char.isalnum() or char == "-")
         t = re.sub(r"-+", "-", t).strip("-")
         if not t:
             continue
@@ -124,7 +128,7 @@ def merge_concepts(concepts: list[ConceptNote]) -> list[ConceptNote]:
     """
     by_slug: dict[str, ConceptNote] = {}
 
-    for concept in concepts:
+    for concept in deepcopy(concepts):
         # Ensure slug is set.
         if not concept.slug:
             concept.slug = slugify(concept.title)
@@ -172,7 +176,7 @@ def merge_bundle(sources: list[SourceSynthesis]) -> SynthesisBundle:
             existing = all_maps.get(moc.slug)
             if existing is None:
                 moc.tags = normalise_tags(moc.tags)
-                all_maps[moc.slug] = moc
+                all_maps[moc.slug] = deepcopy(moc)
             else:
                 # Merge concept slugs.
                 existing_slugs = set(existing.concept_slugs)
@@ -204,16 +208,27 @@ def propagate_backlinks(bundle: SynthesisBundle) -> None:
 
     This pass walks all concepts in the bundle and for every forward
     edge A→B, ensures B has a reverse edge B→A with its semantic inverse
-    type (or ``related_to`` when the schema has no inverse). It also enriches MoC
-    concept lists: if a concept in a MoC links to a concept in another
-    MoC, the target concept's MoCs are checked for reciprocal links.
+    type (or ``related_to`` when the schema has no inverse). An existing
+    reverse link wins regardless of relation; multiple forward relations use
+    the first encountered inverse. Existing edge order is preserved.
 
-    This is a pure data operation — no LLM needed. It runs in O(E)
-    where E is the total number of edges.
+    Target membership is indexed once and updated on append, so the pass
+    takes O(V + E) time and space even for sparse stars and high-degree hubs.
+    Self edges are removed; outside-bundle links are left unchanged.
     """
     concept_map: dict[str, ConceptNote] = {c.slug: c for c in bundle.concepts}
     if not concept_map:
         return
+
+    # Index targets rather than (target, relation): existing reverse relations
+    # are authoritative and must not be overwritten or supplemented here.
+    related_targets: dict[str, set[str]] = {}
+    for concept in bundle.concepts:
+        targets = {link.slug for link in concept.related or []}
+        if concept.slug in targets:
+            concept.related[:] = [link for link in concept.related if link.slug != concept.slug]
+            targets.discard(concept.slug)
+        related_targets[concept.slug] = targets
 
     added = 0
 
@@ -223,12 +238,7 @@ def propagate_backlinks(bundle: SynthesisBundle) -> None:
             if target is None:
                 continue  # Link points outside the bundle
 
-            # Check if target already has a link back to this concept
-            existing_back = any(
-                r.slug == concept.slug
-                for r in (target.related or [])
-            )
-            if existing_back:
+            if concept.slug in related_targets[target.slug]:
                 continue
 
             # Add reverse link
@@ -243,6 +253,7 @@ def propagate_backlinks(bundle: SynthesisBundle) -> None:
                     display=concept.title,
                 )
             )
+            related_targets[target.slug].add(concept.slug)
             added += 1
 
     if added:
@@ -323,8 +334,13 @@ def semantic_dedupe_concepts(
     embedding_options: dict[str, object] | None = None,
     new_slugs: set[str] | None = None,
     candidate_slugs_by_slug: Mapping[str, Sequence[str]] | None = None,
+    confirmed_merges: Mapping[str, str] | None = None,
 ) -> None:
-    """Merge same-language concepts with high embedding cosine similarity.
+    """Merge only explicitly identical concepts, never on cosine/title alone.
+
+    Identity requires a shared nonempty canonical_id or an explicit
+    ``confirmed_merges`` victim-to-survivor mapping. Similarity is only a
+    candidate-ranking signal, not permission to destroy a distinct note.
 
     For every pair of concepts in the *same language* whose cosine similarity
     exceeds ``threshold``, the lower-confidence concept is merged into the
@@ -349,6 +365,7 @@ def semantic_dedupe_concepts(
 
     if not bundle.concepts or len(bundle.concepts) < 2:
         return
+
     if new_slugs is not None and not new_slugs:
         logger.info("Semantic dedup: no new concepts this run — skipping")
         return
@@ -429,7 +446,14 @@ def semantic_dedupe_concepts(
 
             ca = concept_map[slug_a]
             cb = concept_map[slug_b]
-            if cb.confidence > ca.confidence or (
+            approved = confirmed_merges or {}
+            if approved.get(slug_a) == slug_b:
+                survivor, victim = slug_b, slug_a
+            elif approved.get(slug_b) == slug_a:
+                survivor, victim = slug_a, slug_b
+            elif not ca.canonical_id or ca.canonical_id != cb.canonical_id:
+                continue
+            elif cb.confidence > ca.confidence or (
                 cb.confidence == ca.confidence and slug_b < slug_a
             ):
                 survivor, victim = slug_b, slug_a
@@ -477,6 +501,7 @@ def semantic_dedupe_concepts(
         for link in concept.related:
             if link.slug in merge_map:
                 link.slug = merge_map[link.slug]
+        _clean_merged_references(concept, merge_map)
 
     # Remap source-local concept slugs too. Entry pages build their wikilinks
     # from bundle.sources[*].concepts, and the pipeline persists state.json
@@ -496,16 +521,34 @@ def semantic_dedupe_concepts(
             for link in concept.related:
                 if link.slug in merge_map:
                     link.slug = merge_map[link.slug]
+            _clean_merged_references(concept, merge_map)
             if concept.slug in seen_source_slugs:
                 continue  # two of this source's concepts merged into one
             seen_source_slugs.add(concept.slug)
             remapped_concepts.append(concept)
         synthesis.concepts = remapped_concepts
+        for moc in synthesis.maps:
+            moc.concept_slugs = list(dict.fromkeys(
+                merge_map.get(slug, slug) for slug in moc.concept_slugs
+            ))
 
     logger.info(
         "Semantic dedup: merged %d concept(s), %d remaining",
         len(merged_slugs), len(bundle.concepts),
     )
+
+
+def _clean_merged_references(concept: ConceptNote, merge_map: Mapping[str, str]) -> None:
+    for claim in concept.claims:
+        claim.concept_slug = merge_map.get(claim.concept_slug, claim.concept_slug) or concept.slug
+    seen: set[tuple[str, str]] = set()
+    related = []
+    for link in concept.related:
+        key = (link.slug, link.relation)
+        if link.slug != concept.slug and key not in seen:
+            seen.add(key)
+            related.append(link)
+    concept.related = related
 
 
 def _merge_into(survivor: ConceptNote, victim: ConceptNote) -> None:

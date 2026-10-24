@@ -10,10 +10,12 @@ using the new package's models and render helpers — no cross-package imports.
 
 from __future__ import annotations
 
+import json
 import logging
 from pathlib import Path
 
-from obsidian_llm_wiki.core.models import WikiState
+from obsidian_llm_wiki.core.generated_paths import checked_generated_path
+from obsidian_llm_wiki.core.models import WikiState, _is_safe_slug
 from obsidian_llm_wiki.render.obsidian import (
     atomic_write,
     build_frontmatter,
@@ -96,8 +98,17 @@ def orphan_page(concepts_dir: Path, slug: str, reason: str) -> bool:
     Returns ``True`` if the page was updated, ``False`` if it was already
     orphaned or the file doesn't exist.
     """
+    if not _is_safe_slug(slug):
+        logger.warning("Refusing unsafe orphan identity: %r", slug)
+        return False
     page_path = concepts_dir / f"{slug}.md"
-    if not page_path.exists():
+    bundle_dir = concepts_dir.parent
+    try:
+        checked_generated_path(page_path, bundle_dir)
+    except ValueError:
+        logger.warning("Refusing unsafe orphan path: %s", page_path)
+        return False
+    if not page_path.is_file():
         return False
 
     raw = safe_read_file(page_path)
@@ -110,5 +121,39 @@ def orphan_page(concepts_dir: Path, slug: str, reason: str) -> bool:
     meta["orphaned_reason"] = reason
 
     new_content = build_frontmatter(meta) + "\n" + body
-    atomic_write(page_path, new_content)
+    from obsidian_llm_wiki.render import obsidian as renderer
+
+    # Orphan metadata is a program mutation, not a user edit. Advance ownership
+    # only if the exact previous bytes were already trusted and unreviewed.
+    # Human/unknown notes keep their prior trust state, even though we annotate
+    # their lifecycle metadata and preserve a recoverable backup.
+    transaction = renderer._ACTIVE_RENDER_TRANSACTION.get()
+    own_transaction = transaction is None
+    token = None
+    if own_transaction:
+        transaction = renderer._RenderTransaction(bundle_dir, lazy=True)
+        token = renderer._ACTIVE_RENDER_TRANSACTION.set(transaction)
+    try:
+        trusted = not renderer._page_is_protected(page_path, raw, bundle_dir)
+        transaction.before_change(page_path)
+        renderer._backup_generated_page(page_path, bundle_dir)
+        checked_generated_path(page_path, bundle_dir)
+        atomic_write(page_path, new_content)
+        transaction.record_write(page_path, new_content)
+        if trusted:
+            renderer._remember_generated_page(page_path, new_content, bundle_dir)
+            if own_transaction:
+                renderer._write_generated_artifact(
+                    bundle_dir / ".llmwiki" / "render-page-hashes.json",
+                    json.dumps(transaction.page_hashes, sort_keys=True), bundle_dir,
+                )
+    except BaseException:
+        if own_transaction:
+            transaction.rollback()
+        raise
+    finally:
+        if token is not None:
+            renderer._ACTIVE_RENDER_TRANSACTION.reset(token)
+    if own_transaction:
+        transaction.commit()
     return True

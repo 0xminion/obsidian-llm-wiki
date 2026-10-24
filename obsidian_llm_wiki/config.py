@@ -14,6 +14,14 @@ from pathlib import Path
 
 from dotenv import dotenv_values
 
+from obsidian_llm_wiki.core.generated_paths import checked_generated_path
+
+
+def _bounded_int(key: str, value: int, minimum: int, maximum: int) -> None:
+    """Reject unsafe numeric configuration before allocating workers/buffers."""
+    if type(value) is not int or not minimum <= value <= maximum:
+        raise ValueError(f"{key} must be an integer between {minimum} and {maximum}")
+
 
 @dataclass
 class LLMProviderConfig:
@@ -41,6 +49,11 @@ class LLMProviderConfig:
     api_key: str | None = None
     timeout_ms: int = 1_800_000  # 30 minutes
     context_window: int = 256_000  # 256K tokens for cloud models (e.g. gemma4:31b-cloud)
+
+    def __post_init__(self) -> None:
+        _bounded_int("LLM_TIMEOUT_MS", self.timeout_ms, 1, 86_400_000)
+        # Zero keeps the historical behavior: use the provider's context default.
+        _bounded_int("LLM_CONTEXT_WINDOW", self.context_window, 0, 10_000_000)
 
 
 @dataclass
@@ -154,6 +167,47 @@ class Config:
     # ── Derived paths (lazy) ──────────────────────
     _vault: Path | None = field(default=None, repr=False)
 
+    def __post_init__(self) -> None:
+        # Fail fast rather than hanging a zero-capacity semaphore or repeatedly
+        # slicing a chunk by zero. Caps are resource guards, not tuning defaults.
+        bounds = {
+            "max_source_chars": (1, 100_000_000),
+            "min_source_chars": (0, 100_000_000),
+            "chunk_size": (1, 10_000_000),
+            "compile_concurrency": (1, 256),
+            "request_min_interval_ms": (0, 3_600_000),
+            "candidate_limit": (1, 1_000_000),
+            "candidate_char_budget": (1, 100_000_000),
+            "ann_candidate_pool": (1, 1_000_000),
+            "evidence_window_chars": (1, 100_000_000),
+            "evidence_context_paragraphs": (0, 10_000),
+            "index_shard_size": (1, 1_000_000),
+            "report_shard_size": (1, 1_000_000),
+            "graph_shard_size": (1, 1_000_000),
+            "graph_monolith_threshold": (0, 1_000_000),
+            "concept_min_body_chars": (0, 100_000_000),
+            "entry_min_body_chars": (0, 100_000_000),
+            "clipping_min_body_chars": (0, 100_000_000),
+            "retry_count": (1, 10),
+            "retry_base_ms": (0, 3_600_000),
+            "retry_multiplier": (1, 10),
+            "max_document_bytes": (1, 1_000_000_000),
+            "max_document_candidates": (1, 10_000),
+            "parser_timeout_seconds": (1, 86_400),
+            "max_parser_stdout_bytes": (1, 100_000_000),
+            "max_parser_stderr_bytes": (1, 100_000_000),
+            "max_html_bytes": (1, 1_000_000_000),
+        }
+        for name, (minimum, maximum) in bounds.items():
+            _bounded_int(name.upper(), getattr(self, name), minimum, maximum)
+        for name in (
+            "similarity_dedup_threshold", "cross_lingual_threshold", "moc_assignment_threshold",
+        ):
+            value = getattr(self, name)
+            # The range comparison also rejects NaN and infinities.
+            if type(value) not in (int, float) or not 0 <= value <= 1:
+                raise ValueError(f"{name.upper()} must be a finite number between 0 and 1")
+
     # ── Path properties ──────────────────────────────
 
     @property
@@ -166,7 +220,7 @@ class Config:
     @property
     def wiki_dir(self) -> Path:
         """The OKF/Obsidian bundle directory."""
-        return self.vault / "04-Wiki"
+        return checked_generated_path(self.vault / "04-Wiki", self.vault)
 
     @property
     def bundle_dir(self) -> Path:
@@ -175,50 +229,50 @@ class Config:
 
     @property
     def sources_dir(self) -> Path:
-        return self.wiki_dir / "sources"
+        return checked_generated_path(self.wiki_dir / "sources", self.vault)
 
     @property
     def entries_dir(self) -> Path:
-        return self.wiki_dir / "entries"
+        return checked_generated_path(self.wiki_dir / "entries", self.vault)
 
     @property
     def concepts_dir(self) -> Path:
-        return self.wiki_dir / "concepts"
+        return checked_generated_path(self.wiki_dir / "concepts", self.vault)
 
     @property
     def mocs_dir(self) -> Path:
-        return self.wiki_dir / "mocs"
+        return checked_generated_path(self.wiki_dir / "mocs", self.vault)
 
     @property
     def clippings_dir(self) -> Path:
-        return self.vault / "02-Clippings"
+        return checked_generated_path(self.vault / "02-Clippings", self.vault)
 
     @property
     def annotations_dir(self) -> Path:
         """Manual notes and annotations directory."""
-        return self.vault / "03-Raw-Annotations"
+        return checked_generated_path(self.vault / "03-Raw-Annotations", self.vault)
 
     @property
     def queries_dir(self) -> Path:
         """Saved query results and analyses directory."""
-        return self.vault / "05-Queries"
+        return checked_generated_path(self.vault / "05-Queries", self.vault)
 
     @property
     def llmwiki_dir(self) -> Path:
         """Internal pipeline state directory."""
-        return self.wiki_dir / ".llmwiki"
+        return checked_generated_path(self.wiki_dir / ".llmwiki", self.vault)
 
     @property
     def state_file(self) -> Path:
-        return self.llmwiki_dir / "state.json"
+        return checked_generated_path(self.llmwiki_dir / "state.json", self.vault)
 
     @property
     def lock_file(self) -> Path:
-        return self.llmwiki_dir / "lock"
+        return checked_generated_path(self.llmwiki_dir / "lock", self.vault)
 
     @property
     def candidates_dir(self) -> Path:
-        return self.llmwiki_dir / "candidates"
+        return checked_generated_path(self.llmwiki_dir / "candidates", self.vault)
 
 
 def _dotenv_mapping(path: Path) -> dict[str, str]:
@@ -232,10 +286,10 @@ def _dotenv_mapping(path: Path) -> dict[str, str]:
 
 def _config_environment(env_file: str | None, overrides: dict[str, str]) -> dict[str, str]:
     """Merge process, base, vault, and explicit config without global mutation."""
-    environment = dict(os.environ)
+    environment = _model_aliases(dict(os.environ))
     base_file = Path(env_file) if env_file else Path.cwd() / ".env"
     if base_file.is_file():
-        environment.update(_dotenv_mapping(base_file))
+        environment.update(_model_aliases(_dotenv_mapping(base_file)))
 
     # Resolve the vault selector before loading vault-specific settings. For
     # implicit discovery, the caller's process VAULT_PATH outranks CWD .env.
@@ -250,14 +304,33 @@ def _config_environment(env_file: str | None, overrides: dict[str, str]) -> dict
     if vault_dir:
         vault_file = Path(vault_dir).expanduser() / ".env"
         if vault_file.is_file() and vault_file != base_file:
-            environment.update(_dotenv_mapping(vault_file))
+            environment.update(_model_aliases(_dotenv_mapping(vault_file)))
 
     # Implicit discovery must respect explicit process configuration. An
     # explicitly supplied env_file keeps its established file-wins semantics.
     if env_file is None:
-        environment.update(os.environ)
-    environment.update(overrides)
+        environment.update(_model_aliases(dict(os.environ)))
+    environment.update(_model_aliases(overrides))
     return environment
+
+
+def _model_aliases(values: dict[str, str]) -> dict[str, str]:
+    """Normalize task names per layer, preserving established source precedence.
+
+    The documented LLM_* spelling wins over its legacy alias in the same
+    layer, including blank values (which explicitly disable a task override).
+    A higher-priority layer wins regardless of which spelling it uses.
+    """
+    values = dict(values)
+    for canonical, legacy in (
+        ("LLM_INGEST_MODEL", "INGEST_MODEL"),
+        ("LLM_MAINTENANCE_MODEL", "MAINTENANCE_MODEL"),
+        ("LLM_QUERY_MODEL", "QUERY_MODEL"),
+        ("LLM_EXPAND_MODEL", "PASS2_MODEL"),
+    ):
+        if canonical not in values and legacy in values:
+            values[canonical] = values[legacy]
+    return values
 
 
 def load_config(env_file: str | None = None, **overrides: str) -> Config:
@@ -269,10 +342,10 @@ def load_config(env_file: str | None = None, **overrides: str) -> Config:
         provider=get("LLM_PROVIDER", "ollama"),
         host=get("LLM_HOST", "http://localhost:11434"),
         model=get("LLM_MODEL", "gemma3:27b"),
-        ingest_model=_optional_model_env("INGEST_MODEL", env),
-        maintenance_model=_optional_model_env("MAINTENANCE_MODEL", env),
-        query_model=_optional_model_env("QUERY_MODEL", env),
-        expand_model=_optional_model_env("PASS2_MODEL", env),
+        ingest_model=_optional_model_env("LLM_INGEST_MODEL", env),
+        maintenance_model=_optional_model_env("LLM_MAINTENANCE_MODEL", env),
+        query_model=_optional_model_env("LLM_QUERY_MODEL", env),
+        expand_model=_optional_model_env("LLM_EXPAND_MODEL", env),
         api_key=get("LLM_API_KEY"),
         timeout_ms=_int_env("LLM_TIMEOUT_MS", 1_800_000, env),
         context_window=_int_env("LLM_CONTEXT_WINDOW", 256_000, env),

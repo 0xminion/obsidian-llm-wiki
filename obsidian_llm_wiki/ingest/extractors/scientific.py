@@ -16,6 +16,7 @@ from urllib.parse import urljoin, urlparse
 
 import httpx
 
+from obsidian_llm_wiki.config import load_config
 from obsidian_llm_wiki.core.models import SourceDoc, SourceProvenance
 from obsidian_llm_wiki.ingest.extractors import register_extractor
 from obsidian_llm_wiki.ingest.http_headers import BROWSER_HEADERS, DEFAULT_TIMEOUT
@@ -97,21 +98,23 @@ def arxiv_paper_id(url: str) -> str | None:
 
 def _fetch_public_html(url: str, timeout: int) -> str:
     """Fetch a public document without cookies, credentials, or browser bypasses."""
-    with httpx.Client(
-        timeout=timeout,
-        follow_redirects=False,
-        trust_env=False,
-        headers=BROWSER_HEADERS,
-    ) as client:
-        from obsidian_llm_wiki.ingest.url_safety import get_with_validated_redirects
-        response = get_with_validated_redirects(client, url)
-    response.raise_for_status()
-    resolved_url = str(getattr(response, "url", ""))
-    if resolved_url.startswith(("http://", "https://")) and not _same_official_site(
-        resolved_url, url
+    from obsidian_llm_wiki.ingest.url_safety import stream_with_validated_redirects
+    from obsidian_llm_wiki.ingest.web import _read_bounded_html
+
+    with (
+        httpx.Client(
+            timeout=timeout,
+            follow_redirects=False,
+            trust_env=False,
+            headers=BROWSER_HEADERS,
+        ) as client,
+        stream_with_validated_redirects(client, url) as response,
     ):
-        raise RuntimeError("public document redirected off the official site")
-    html = response.text
+        response.raise_for_status()
+        resolved_url = str(response.url)
+        if not _same_official_site(resolved_url, url):
+            raise RuntimeError("public document redirected off the official site")
+        html = _read_bounded_html(response, load_config().max_html_bytes)
     if len(html.strip()) < _MIN_DOCUMENT_CHARS:
         raise RuntimeError(f"public HTML response was too short ({len(html)} chars)")
     return html
@@ -283,7 +286,8 @@ def extract_discovered_scientific_document(
     ranked_candidates = sorted(
         enumerate(candidates), key=lambda item: (0 if item[1][0] == "html" else 1, item[0])
     )
-    for _, (kind, document_url) in ranked_candidates:
+    maximum = max(0, load_config().max_document_candidates)
+    for _, (kind, document_url) in ranked_candidates[:maximum]:
         try:
             if kind == "html":
                 html = _fetch_public_html(document_url, timeout)

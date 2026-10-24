@@ -27,6 +27,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from obsidian_llm_wiki.config import Config
+from obsidian_llm_wiki.core.generated_paths import checked_generated_path
 from obsidian_llm_wiki.core.registry import VaultRegistry
 
 logger = logging.getLogger("obswiki.core.metrics")
@@ -114,9 +116,12 @@ class MetricsCollector:
     """
 
     def __init__(self, vault_path: str | Path) -> None:
-        self.vault_path = Path(vault_path).resolve()
-        self.llmwiki_dir = self.vault_path / "04-Wiki" / ".llmwiki"
-        self.metrics_file = self.llmwiki_dir / "metrics.json"
+        config = Config(vault_path=str(vault_path))
+        self.vault_path = config.vault
+        self.llmwiki_dir = config.llmwiki_dir
+        self.metrics_file = checked_generated_path(
+            self.llmwiki_dir / "metrics.json", self.vault_path,
+        )
         self._metrics = RunMetrics()
         self._start_time: float = 0.0
 
@@ -221,14 +226,16 @@ class MetricsCollector:
         Appends the current run to a ``runs`` list, keeping history.
         Also writes ``latest`` key for backward-compatible single-run access.
         """
-        self.llmwiki_dir.mkdir(parents=True, exist_ok=True)
+        # Recheck at use time: a collector may outlive a replaced directory.
+        checked_generated_path(self.llmwiki_dir, self.vault_path)
+        checked_generated_path(self.metrics_file, self.vault_path)
         current_run = self._to_dict()
         with VaultRegistry(self.llmwiki_dir) as registry:
             registry.upsert_metric_run(current_run)
 
         # Load existing metrics to preserve history.
         existing: dict[str, Any] = {}
-        if self.metrics_file.exists():
+        if checked_generated_path(self.metrics_file, self.vault_path).exists():
             try:
                 existing = json.loads(
                     self.metrics_file.read_text(encoding="utf-8")
@@ -251,7 +258,7 @@ class MetricsCollector:
         from obsidian_llm_wiki.render.obsidian import atomic_write
 
         atomic_write(
-            self.metrics_file,
+            checked_generated_path(self.metrics_file, self.vault_path),
             json.dumps(output, indent=2, ensure_ascii=False),
         )
         logger.debug("Metrics saved to %s", self.metrics_file)
@@ -299,9 +306,8 @@ def load_metrics(vault_path: str | Path) -> dict[str, Any] | None:
         The dict is the latest run's data (backward-compatible with callers
         that expect a flat run dict). Use ``load_all_metrics`` for full history.
     """
-    metrics_file = (
-        Path(vault_path).resolve() / "04-Wiki" / ".llmwiki" / "metrics.json"
-    )
+    config = Config(vault_path=str(vault_path))
+    metrics_file = checked_generated_path(config.llmwiki_dir / "metrics.json", config.vault)
     if not metrics_file.exists():
         return None
     try:
@@ -325,9 +331,8 @@ def load_all_metrics(vault_path: str | Path) -> list[dict[str, Any]]:
     Returns:
         List of run metric dicts, oldest first. Empty list if no metrics.
     """
-    metrics_file = (
-        Path(vault_path).resolve() / "04-Wiki" / ".llmwiki" / "metrics.json"
-    )
+    config = Config(vault_path=str(vault_path))
+    metrics_file = checked_generated_path(config.llmwiki_dir / "metrics.json", config.vault)
     if not metrics_file.exists():
         return []
     try:

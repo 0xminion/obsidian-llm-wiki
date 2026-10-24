@@ -61,14 +61,14 @@ def test_parse_single_no_json():
     assert parse_single_source_synthesis("just text, no json") is None
 
 
-def test_parse_single_array_takes_first():
+def test_parse_single_rejects_multi_source_array():
     response = json.dumps([
         {"source_title": "First", "source_summary": "S1"},
         {"source_title": "Second", "source_summary": "S2"},
     ])
     synth = parse_single_source_synthesis(response)
-    assert synth is not None
-    assert synth.source_title == "First"
+    # Silently selecting one source discards additional model output.
+    assert synth is None
 
 
 def test_parse_single_repairs_invalid_latex_double_escape():
@@ -83,7 +83,7 @@ def test_parse_single_repairs_invalid_latex_double_escape():
     assert "epsilon" in synth.source_summary
 
 
-def test_parse_single_repairs_truncated_nested_json():
+def test_parse_single_rejects_truncated_nested_json():
     response = (
         '{"source_title":"Paper","source_summary":"Summary",'
         '"concepts":[{"title":"Concept","slug":"concept","summary":"Body"}'
@@ -91,8 +91,8 @@ def test_parse_single_repairs_truncated_nested_json():
 
     synth = parse_single_source_synthesis(response)
 
-    assert synth is not None
-    assert synth.concepts[0].slug == "concept"
+    # Accepting an invented closing delimiter silently loses unknown content.
+    assert synth is None
 
 
 # ── parse_synthesis_response ─────────────────────────────────────────────

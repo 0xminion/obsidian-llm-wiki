@@ -70,6 +70,8 @@ def test_render_rollback_preserves_concurrent_manual_edit(tmp_path: Path):
     page = tmp_path / "concepts" / "topic.md"
     page.parent.mkdir()
     page.write_text("before-render", encoding="utf-8")
+    from obsidian_llm_wiki.render.obsidian import _remember_generated_page
+    _remember_generated_page(page, "before-render", tmp_path)
     transaction = _RenderTransaction(tmp_path)
     token = _ACTIVE_RENDER_TRANSACTION.set(transaction)
     try:

@@ -325,7 +325,8 @@ def test_failed_resume_keeps_marker_for_another_retry(tmp_path, monkeypatch) -> 
         ["ingest", str(tmp_path), "--resume", "--skip-synthesis", "--parallel", "0", "--json"],
     )
 
-    assert result.exit_code == 0, result.output
+    # A retry that still fails must report failure while preserving its marker.
+    assert result.exit_code == 1, result.output
     assert store.read_resume_marker() == [
         {"source": "https://example.test/a", "source_kind": "url", "status": "cancelled"}
     ]
@@ -366,7 +367,8 @@ def test_resume_preserves_clipping_kind_and_removes_each_success(tmp_path, monke
         ["ingest", str(tmp_path), "--resume", "--skip-synthesis", "--parallel", "0"],
     )
 
-    assert result.exit_code == 0, result.output
+    # Successful partial work is durable, but the remaining URL failure is nonzero.
+    assert result.exit_code == 1, result.output
     assert attempts == ["https://example.test/retry"]
     assert (config.sources_dir / "saved.md").exists()
     assert store.read_resume_marker() == [

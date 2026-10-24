@@ -12,7 +12,6 @@ from obsidian_llm_wiki.core.models import (
     MapOfContent,
     SourceDoc,
     SynthesisBundle,
-    normalize_slug,
     source_synthesis_from_dict,
 )
 from obsidian_llm_wiki.render.obsidian import render_vault
@@ -64,8 +63,10 @@ def test_parser_regenerates_unsafe_concept_moc_and_relation_slugs(unsafe_slug: s
     moc = synthesis.maps[0]
     assert concept.slug == "safe-concept"
     assert moc.slug == "safe-map"
-    assert concept.related[0].slug == normalize_slug(unsafe_slug)
-    assert moc.concept_slugs == [normalize_slug(unsafe_slug)]
+    # References follow the concept's safe identity, not an independently
+    # normalized dangling "untitled" target.
+    assert concept.related[0].slug == concept.slug
+    assert moc.concept_slugs == [concept.slug]
     assert all(
         _is_safe_slug(slug)
         for slug in (concept.slug, moc.slug, concept.related[0].slug, moc.concept_slugs[0])

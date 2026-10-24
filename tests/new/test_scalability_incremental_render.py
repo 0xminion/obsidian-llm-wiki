@@ -84,7 +84,7 @@ def test_unchanged_pages_keep_their_inodes_across_render_timestamps(
     render_vault(bundle_dir, bundle, sources)
     tracked = [
         bundle_dir / "sources" / "incremental.md",
-        bundle_dir / "entries" / "incremental-source.md",
+        bundle_dir / "entries" / "incremental.md",
         bundle_dir / "concepts" / "concept-0.md",
         bundle_dir / "mocs" / "scale-map.md",
     ]
@@ -231,7 +231,7 @@ def test_render_manifest_batch_rolls_back_when_a_later_manifest_fails(
     assert "Changed source body." in source_path.read_text(encoding="utf-8")
 
 
-def test_force_render_rebuilds_manifest_clean_page_after_manual_unreview(
+def test_force_render_preserves_unreviewed_user_edits(
     tmp_path: Path,
 ) -> None:
     bundle_dir = tmp_path / "04-Wiki"
@@ -261,7 +261,7 @@ def test_force_render_rebuilds_manifest_clean_page_after_manual_unreview(
         forced_body = concept_path.read_text(encoding="utf-8")
 
     assert "Manual unreviewed body." in skipped_body
-    assert "Manual unreviewed body." not in forced_body
+    assert "Manual unreviewed body." in forced_body
 
 
 def test_large_graph_export_writes_bounded_shards_and_manifest(tmp_path: Path) -> None:

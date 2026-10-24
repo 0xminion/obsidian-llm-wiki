@@ -21,6 +21,16 @@ from obsidian_llm_wiki.core.task_models import resolve_task_model
 logger = logging.getLogger("obswiki.providers.llm")
 
 
+def _response_text(message: Any, provider: str) -> str:
+    """Require usable text; never mistake a refusal/tool result for a completion."""
+    if not isinstance(message, dict) or message.get("refusal"):
+        raise ValueError(f"{provider} response contained no usable message")
+    content = message.get("content")
+    if not isinstance(content, str) or not content.strip():
+        raise ValueError(f"{provider} response contained no usable text")
+    return content
+
+
 def _endpoint_url(host: str, suffix: str) -> str:
     """Build a request/diagnostic URL without propagating URL credentials.
 
@@ -40,7 +50,12 @@ def _endpoint_url(host: str, suffix: str) -> str:
     except ValueError:
         port = None
     netloc = f"{hostname}:{port}" if port is not None else hostname
-    path = f"{parsed.path.rstrip('/')}{suffix}"
+    base_path = parsed.path.rstrip("/")
+    # Accept both server roots and conventional OpenAI SDK base URLs ending
+    # in /v1 (including proxy prefixes), for chat and model discovery alike.
+    if suffix.startswith("/v1/") and base_path.endswith("/v1"):
+        suffix = suffix[len("/v1"):]
+    path = f"{base_path}{suffix}"
     return urlunsplit((parsed.scheme, netloc, path, "", ""))
 
 
@@ -83,9 +98,8 @@ class OllamaClient(LLMClient):
         # Ollama uses a model-specific default (often as low as 128 or 4096),
         # which truncates large synthesis JSON responses mid-object. For a
         # 200K-char source, the synthesis JSON can easily exceed 20K tokens.
-        # Set num_predict to -1 (unlimited) so the model generates until it
-        # naturally stops — the timeout is the real safety net.
-        options: dict[str, Any] = kwargs.pop("options", {})
+        # Keep the caller's options immutable across retries and reused calls.
+        options: dict[str, Any] = dict(kwargs.pop("options", {}) or {})
         num_ctx = kwargs.pop("num_ctx", None)
         if num_ctx is None and self.config.context_window:
             num_ctx = self.config.context_window
@@ -103,7 +117,11 @@ class OllamaClient(LLMClient):
             resp = client.post(url, json=body)
             resp.raise_for_status()
             data = resp.json()
-        return data["message"]["content"]
+        if not isinstance(data, dict) or data.get("error"):
+            raise ValueError("Ollama response was not a chat completion")
+        if data.get("done", True) is not True or data.get("done_reason", "stop") != "stop":
+            raise ValueError("Ollama response was incomplete or truncated")
+        return _response_text(data.get("message"), "Ollama")
 
 
 # ── OpenAI-compatible ───────────────────────────────────────────────────
@@ -124,15 +142,34 @@ class OpenAICompatibleClient(LLMClient):
 
     def chat(self, system: str, user: str, **kwargs: Any) -> str:
         url = _endpoint_url(self.config.host, "/v1/chat/completions")
+        # Synthesis uses Ollama's native schema/options contract. Translate only
+        # portable settings; num_ctx and other Ollama runtime knobs have no
+        # OpenAI equivalent. Explicit OpenAI kwargs always win.
+        options = kwargs.pop("options", {}) or {}
+        kwargs.pop("num_ctx", None)
+        output_format = kwargs.pop("format", None)
+        if "response_format" not in kwargs:
+            if isinstance(output_format, dict):
+                kwargs["response_format"] = {
+                    "type": "json_schema",
+                    "json_schema": {"name": "response", "schema": output_format},
+                }
+            elif output_format == "json":
+                kwargs["response_format"] = {"type": "json_object"}
+        for key in ("temperature", "top_p", "seed", "stop"):
+            if key in options:
+                kwargs.setdefault(key, options[key])
+        if "max_tokens" not in kwargs and "max_completion_tokens" not in kwargs:
+            # Ollama's negative unlimited/context-fill sentinels are not valid
+            # OpenAI token limits. Retain the bounded default for those values.
+            limit = options.get("num_predict", 16_384)
+            kwargs["max_tokens"] = limit if limit > 0 else 16_384
         body: dict[str, Any] = {
             "model": kwargs.pop("model", self.config.model),
             "messages": [
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
             ],
-            "max_tokens": kwargs.pop(
-                "max_tokens", 16_384,
-            ),
             "stream": False,
         }
         body.update(kwargs)
@@ -140,10 +177,19 @@ class OpenAICompatibleClient(LLMClient):
             resp = client.post(url, json=body, headers=self._headers())
             resp.raise_for_status()
             data = resp.json()
+        if not isinstance(data, dict) or data.get("error"):
+            raise ValueError("OpenAI-compatible response was not a chat completion")
         choices = data.get("choices", [])
-        if not choices:
+        if not isinstance(choices, list) or not choices:
             raise ValueError("OpenAI-compatible response contained no choices")
-        return choices[0]["message"]["content"]
+        choice = choices[0]
+        if not isinstance(choice, dict):
+            raise ValueError("OpenAI-compatible response contained an invalid choice")
+        # Older compatible servers may omit finish_reason, but an explicit
+        # non-stop reason must never turn partial (even valid JSON) into success.
+        if choice.get("finish_reason", "stop") != "stop":
+            raise ValueError("OpenAI-compatible response was incomplete or truncated")
+        return _response_text(choice.get("message"), "OpenAI-compatible")
 
 
 # ── Factory ─────────────────────────────────────────────────────────────
@@ -382,9 +428,10 @@ def call_llm(
             except Exception:
                 if attempt == max_retries - 1:
                     raise
-                delay = (
+                delay = min(
+                    3_600_000,
                     getattr(config, "retry_base_ms", 1000)
-                    * (getattr(config, "retry_multiplier", 4) ** attempt)
+                    * (getattr(config, "retry_multiplier", 4) ** attempt),
                 ) / 1000.0
                 logger.warning(
                     "LLM call attempt %d/%d failed. Retrying in %.1fs…",
@@ -402,9 +449,10 @@ def call_llm(
         except Exception:
             if attempt == max_retries - 1:
                 raise
-            delay = (
+            delay = min(
+                3_600_000,
                 getattr(config, "retry_base_ms", 1000)
-                * (getattr(config, "retry_multiplier", 4) ** attempt)
+                * (getattr(config, "retry_multiplier", 4) ** attempt),
             ) / 1000.0
             logger.warning(
                 "LLM call attempt %d/%d failed. Retrying in %.1fs…",

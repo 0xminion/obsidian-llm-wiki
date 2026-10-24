@@ -8,6 +8,7 @@ pre-fix code.
 from __future__ import annotations
 
 import threading
+from contextlib import nullcontext
 from unittest import mock
 
 import httpx
@@ -115,14 +116,14 @@ def test_html_landing_page_reaches_citation_discovery(monkeypatch, tmp_path):
         def __exit__(self, *_args):
             return None
 
-        def get(self, url, **_kwargs):
+        def stream(self, _method, url, **_kwargs):
             assert url == landing
-            return httpx.Response(
+            return nullcontext(httpx.Response(
                 200,
                 headers={"content-type": "text/html"},
                 text=landing_html,
                 request=httpx.Request("GET", url),
-            )
+            ))
 
     document = tmp_path / "42.pdf"
     document.write_bytes(b"%PDF-1.4 body")

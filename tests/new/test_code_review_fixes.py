@@ -225,9 +225,10 @@ class TestMermaidLabelEscaping:
         # which is invalid Mermaid
         lines = [
             line for line in content.splitlines()
-            if "concept_quotes" in line or "concept-quotes" in line
+            if "Concept with" in line
         ]
         assert lines  # Should have at least one line for this concept
+        assert '#quot;quotes#quot;' in lines[0]
 
 
 # ── 5. Graph export circular references ──────────────────────────────────
@@ -273,8 +274,8 @@ class TestGraphExportCircularReferences:
 
         data = json.loads(output.read_text())
         rel_edges = [e for e in data["edges"] if e["relation"] != "contains"]
-        # Self-edge should be present
-        assert any(e["source"] == "self" and e["target"] == "self" for e in rel_edges)
+        # Tautological self-relations are omitted from the canonical graph.
+        assert not rel_edges
 
 
 # ── 6. Metrics history preservation ─────────────────────────────────────

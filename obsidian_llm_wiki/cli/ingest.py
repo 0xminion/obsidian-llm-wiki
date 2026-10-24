@@ -8,13 +8,14 @@ import inspect
 import json
 import logging
 import os
-import shutil
 import signal
 import threading
 import uuid
 from collections.abc import Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
+from contextvars import copy_context
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from functools import wraps
 from pathlib import Path
@@ -29,7 +30,13 @@ from obsidian_llm_wiki.core.lock import acquire_lock, release_lock
 from obsidian_llm_wiki.core.models import SourceDoc
 from obsidian_llm_wiki.core.operations import OperationRecord, OperationStatus, OperationStore
 from obsidian_llm_wiki.core.registry import VaultRegistry
-from obsidian_llm_wiki.ingest.sources import load_sources_incremental
+from obsidian_llm_wiki.ingest.runtime import extraction_policy
+from obsidian_llm_wiki.ingest.sources import (
+    _SOURCE_INDEX_SHARD,
+    _SOURCE_METADATA_FILES,
+    _discover_source_paths,
+    load_sources_incremental,
+)
 from obsidian_llm_wiki.render.frontmatter import parse_frontmatter
 from obsidian_llm_wiki.render.obsidian import atomic_write, slugify
 
@@ -153,7 +160,7 @@ class _BoundedURLExtractor:
                 url = next(self._urls)
             except StopIteration:
                 return
-            self._active[url] = self._executor.submit(_extract_direct, url)
+            self._active[url] = self._executor.submit(copy_context().run, _extract_direct, url)
 
 
 @contextmanager
@@ -212,6 +219,49 @@ def _emit(json_output: bool, event: dict[str, Any], text: str = "") -> None:
         typer.echo(text)
 
 
+@dataclass
+class _IngestOutcome:
+    """Keep source and pipeline failures visible at every terminal return."""
+
+    run_id: str
+    mode: str
+    json_output: bool
+    succeeded: int = 0
+    extraction_errors: list[str] = field(default_factory=list)
+    synthesis_errors: list[str] = field(default_factory=list)
+    inventory_errors: list[str] = field(default_factory=list)
+
+    def finish(self, sources: int, text: str = "", **details: Any) -> None:
+        errors = self.extraction_errors + self.synthesis_errors + self.inventory_errors
+        has_success = self.succeeded or details.get("compiled", 0)
+        event = "partial_failure" if has_success and errors else "failed" if errors else "completed"
+        if errors:
+            text = (
+                f"\n❌ {event.replace('_', ' ').capitalize()}: {len(errors)} failure(s) "
+                f"({len(self.extraction_errors)} extraction, "
+                f"{len(self.synthesis_errors)} synthesis, "
+                f"{len(self.inventory_errors)} inventory)."
+                + "".join(f"\n   - {error}" for error in errors)
+            )
+            if self.mode == "preview":
+                text += "\n   Preview — no files written."
+        _emit(
+            self.json_output,
+            {
+                "type": "run", "event": event, "run_id": self.run_id, "mode": self.mode,
+                "sources": sources, "succeeded": self.succeeded,
+                "extraction_failures": len(self.extraction_errors),
+                "synthesis_failures": len(self.synthesis_errors),
+                "inventory_failures": len(self.inventory_errors),
+                "failure_count": len(errors), "errors": errors,
+                **details,
+            },
+            text,
+        )
+        if errors:
+            raise typer.Exit(code=1)
+
+
 def _can_retry_with_residential_proxy(url: str) -> bool:
     """Return whether proxy fallback is permitted for this public source."""
     hostname = (urlparse(url).hostname or "").casefold()
@@ -231,6 +281,12 @@ def _reserve_collision_safe_path(
     for index in range(0, 101):
         suffix = "" if index == 0 else f"-{index}"
         candidate = sources_dir / f"{stem}{suffix}.md"
+        # Allocation must agree with the source loader's metadata exclusions.
+        if (
+            candidate.name in _SOURCE_METADATA_FILES
+            or _SOURCE_INDEX_SHARD.fullmatch(candidate.name)
+        ):
+            continue
         try:
             fd = os.open(candidate, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
         except FileExistsError:
@@ -253,6 +309,15 @@ def _collision_safe_path(sources_dir: Path, source: SourceDoc) -> Path:
     raise RuntimeError(f"Too many source filename collisions for {source.title!r}")
 
 
+def _ingest_source_paths(sources_dir: Path) -> list[Path]:
+    """Use the loader's complete validated inventory, including before backfill."""
+    try:
+        return _discover_source_paths(sources_dir)
+    except FileNotFoundError:
+        # A new vault need not have a sources directory yet.
+        return []
+
+
 def _content_hash_matches_existing(
     sources_dir: Path,
     content: str,
@@ -264,54 +329,54 @@ def _content_hash_matches_existing(
     both same-URL re-extraction and different-URL-same-content duplicates.
     """
     target_hash = hashlib.sha256(content.strip().encode("utf-8")).hexdigest()
-    if not sources_dir.is_dir():
-        return None
-    for existing in sources_dir.glob("*.md"):
-        if existing.name in {"failed_urls.md", "index.md"}:
-            continue
-        try:
-            raw = existing.read_text(encoding="utf-8")
-            _, body = parse_frontmatter(raw)
-            # Strip the leading title heading so two sources with different
-            # titles but identical body content are recognized as duplicates.
-            body_stripped = body.strip()
-            for prefix in ("# ",):
-                if body_stripped.startswith(prefix):
-                    first_newline = body_stripped.find("\n")
-                    if first_newline > 0:
-                        body_stripped = body_stripped[first_newline + 1 :].strip()
-            from obsidian_llm_wiki.core.state import hash_content
+    for existing in _ingest_source_paths(sources_dir):
+        raw = existing.read_text(encoding="utf-8")
+        _, body = parse_frontmatter(raw)
+        # Strip the leading title heading so two sources with different
+        # titles but identical body content are recognized as duplicates.
+        body_stripped = _dedupe_body(body)
+        from obsidian_llm_wiki.core.state import hash_content
 
-            if hash_content(body_stripped) == target_hash:
-                return existing
-        except OSError:
-            continue
+        if hash_content(body_stripped) == target_hash:
+            return existing
     return None
 
 
-def _backfill_ingest_index(registry: VaultRegistry, sources_dir: Path) -> None:
+def _dedupe_body(body: str) -> str:
+    """Use the same rendered-body identity for ingest, migration and validation."""
+    body = body.strip()
+    if body.startswith("# "):
+        return body.partition("\n")[2].strip()
+    return body
+
+
+def _indexed_source_path(
+    sources_dir: Path, filename: str, *, source_paths: set[Path]
+) -> Path | None:
+    """Treat an ingest-index filename as untrusted persisted metadata."""
+    from obsidian_llm_wiki.core.source_files import source_file_path
+
+    try:
+        resolved = source_file_path(sources_dir, filename)
+        path = sources_dir / filename
+        return path if path in source_paths and resolved.is_file() else None
+    except (OSError, ValueError):
+        return None
+
+
+def _backfill_ingest_index(
+    registry: VaultRegistry, sources_dir: Path, *, source_paths: list[Path] | None = None
+) -> None:
     """Scan legacy source files once, then use indexed duplicate lookups."""
+    if source_paths is None:
+        source_paths = _ingest_source_paths(sources_dir)
     if registry.ingest_backfill_complete():
-        return
-    if not sources_dir.is_dir():
-        registry.mark_ingest_backfill_complete()
         return
     from obsidian_llm_wiki.core.state import hash_content
 
-    read_failed = False
-    for existing in sorted(sources_dir.glob("*.md")):
-        if existing.name in {"failed_urls.md", "index.md"}:
-            continue
-        try:
-            metadata, body = parse_frontmatter(existing.read_text(encoding="utf-8"))
-        except OSError:
-            read_failed = True
-            continue
-        body_stripped = body.strip()
-        if body_stripped.startswith("# "):
-            first_newline = body_stripped.find("\n")
-            if first_newline > 0:
-                body_stripped = body_stripped[first_newline + 1:].strip()
+    for existing in source_paths:
+        metadata, body = parse_frontmatter(existing.read_text(encoding="utf-8"))
+        body_stripped = _dedupe_body(body)
         requested_url = str(metadata.get("url", ""))
         registry.upsert_ingest_hash(
             requested_url=requested_url or f"legacy:{existing.name}",
@@ -319,8 +384,7 @@ def _backfill_ingest_index(registry: VaultRegistry, sources_dir: Path) -> None:
             content_hash=hash_content(body_stripped),
             output_file=existing.name,
         )
-    if not read_failed:
-        registry.mark_ingest_backfill_complete()
+    registry.mark_ingest_backfill_complete()
 
 
 def _archive_clipping(clipping_path: Path, config: Any) -> Path | None:
@@ -328,22 +392,32 @@ def _archive_clipping(clipping_path: Path, config: Any) -> Path | None:
 
     Returns the destination path, or None if the move failed.
     """
-    archive_dir = config.clippings_dir / "processed"
-    archive_dir.mkdir(parents=True, exist_ok=True)
-    dest = archive_dir / clipping_path.name
-    if dest.exists():
-        # Collision in archive — append a short suffix.
-        stem = clipping_path.stem
-        for i in range(1, 100):
-            candidate = archive_dir / f"{stem}-{i}.md"
-            if not candidate.exists():
-                dest = candidate
-                break
-    try:
-        shutil.move(str(clipping_path), str(dest))
-        return dest
-    except OSError:
+    return _archive_without_overwrite(clipping_path, config.clippings_dir / "processed")
+
+
+def _archive_without_overwrite(path: Path, archive_dir: Path) -> Path | None:
+    """Atomically claim an archive name; retain the input if archiving fails.
+
+    Both directories normally share a vault filesystem. Hard-link + unlink
+    avoids rename's replace-existing semantics. On cross-device paths, retain
+    the queued original rather than risking an overwrite or incomplete copy.
+    """
+    if path.is_symlink() or archive_dir.is_symlink():
         return None
+    try:
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        for index in range(100):
+            suffix = f"-{index}" if index else ""
+            destination = archive_dir / f"{path.stem}{suffix}{path.suffix}"
+            try:
+                os.link(path, destination, follow_symlinks=False)
+            except FileExistsError:
+                continue
+            path.unlink()
+            return destination
+    except OSError as exc:
+        logger.warning("Could not archive %s: %s", path, exc)
+    return None
 
 
 def _operation_for_source(
@@ -425,10 +499,16 @@ def ingest(
     resume: bool = typer.Option(
         False, "--resume", help="Retry sources from the last cancellation marker"
     ),
+    refresh: bool = typer.Option(
+        False, "--refresh", help="Re-extract known URLs; back up changed source revisions"
+    ),
     skip_synthesis: bool = typer.Option(
         False,
         "--skip-synthesis",
         help="Only extract sources; skip LLM synthesis and rendering",
+    ),
+    model: str | None = typer.Option(
+        None, "--model", "-m", help="Override the default and ingest LLM model for this run"
     ),
 ) -> None:
     """Ingest URLs and clippings, then synthesise + render the vault.
@@ -445,44 +525,54 @@ def ingest(
     plan_mode = plan or dry_run
     if plan_mode and preview:
         raise typer.BadParameter("--plan cannot be combined with --preview or --dry-run")
+    if resume and (plan_mode or preview):
+        raise typer.BadParameter("--resume cannot be combined with --plan, --dry-run or --preview")
 
     preview_mode = preview
     vault_path, config = resolve_vault(vault)
     if parallel:
-        os.environ["COMPILE_CONCURRENCY"] = str(parallel)
-        config = _reload_config_with_concurrency(vault_path, parallel)
+        config = replace(config, compile_concurrency=parallel)
+    if model:
+        config = replace(config, llm=replace(config.llm, model=model, ingest_model=model))
 
-    store = OperationStore(config.llmwiki_dir)
-    requested_urls = list(dict.fromkeys(urls or []))
-    resume_sources = store.read_resume_marker() if resume else []
-    interrupted_operations = store.interrupted_ingest_operations() if resume else []
-    if interrupted_operations:
-        resumed_keys = {
-            (item["source_kind"], item["source"]) for item in resume_sources
-        }
-        for operation in interrupted_operations:
-            key = (operation.source_kind, operation.source)
-            if key not in resumed_keys:
-                resume_sources.append(
-                    {
-                        "source": operation.source,
-                        "source_kind": operation.source_kind,
-                        "status": operation.status.value,
-                    }
-                )
-                resumed_keys.add(key)
-        with VaultRegistry(config.llmwiki_dir) as registry:
-            for previous_run_id in {
-                operation.run_id for operation in interrupted_operations if operation.run_id
-            }:
-                registry.release_dirty_worker(previous_run_id)
     run_id = _run_id()
     mode = "plan" if plan_mode else "preview" if preview_mode else "ingest"
+    outcome = _IngestOutcome(run_id, mode, json_output)
     _emit(
         json_output,
         {"type": "run", "event": "started", "run_id": run_id, "mode": mode},
-        f"📂 Vault: {vault_path}\n🤖 Model: {config.llm.model}",
+        f"📂 Vault: {vault_path}\n🤖 Model: {config.llm.ingest_model or config.llm.model}",
     )
+    try:
+        from obsidian_llm_wiki.core.generated_paths import checked_metadata_directory
+
+        # Resume readers precede SQLite; validate before they touch marker/lock
+        # files and keep rejection within the terminal NDJSON error boundary.
+        checked_metadata_directory(config.llmwiki_dir, config.vault)
+        store = OperationStore(config.llmwiki_dir)
+        requested_urls = list(dict.fromkeys(urls or []))
+        resume_sources = store.read_resume_marker() if resume else []
+        interrupted_operations = store.interrupted_ingest_operations() if resume else []
+        if interrupted_operations:
+            resumed_keys = {(item["source_kind"], item["source"]) for item in resume_sources}
+            for operation in interrupted_operations:
+                key = (operation.source_kind, operation.source)
+                if key not in resumed_keys:
+                    resume_sources.append({
+                        "source": operation.source,
+                        "source_kind": operation.source_kind,
+                        "status": operation.status.value,
+                    })
+                    resumed_keys.add(key)
+            with VaultRegistry(config.llmwiki_dir) as registry:
+                for previous_run_id in {
+                    operation.run_id for operation in interrupted_operations if operation.run_id
+                }:
+                    registry.release_dirty_worker(previous_run_id)
+    except (OSError, ValueError) as exc:
+        outcome.inventory_errors.append(f"Metadata inventory failed: {exc}")
+        outcome.finish(0)
+        return
 
     # ── Collect clippings ──────────────────────────────────────────────
     from obsidian_llm_wiki.ingest.clippings import collect_clippings
@@ -491,13 +581,23 @@ def ingest(
     # The 00-Inbox directory is the URL queue: each .url file contains
     # one URL on the first line. These are merged with explicit --url
     # args and deduplicated.
-    inbox_urls = _scan_inbox_urls(config)
-    inbox_url_paths = _inbox_url_paths(config)
+    try:
+        # Validate every existing source before backfill, indexed duplicate/
+        # refresh reads, or any extraction. Never trust the backfill marker as
+        # evidence that today's inventory is still contained.
+        source_inventory = _ingest_source_paths(config.sources_dir)
+        source_paths = set(source_inventory)
+        inbox_urls = _scan_inbox_urls(config)
+        inbox_url_paths = _inbox_url_paths(config)
+        clipping_sources = collect_clippings(config)
+    except (OSError, ValueError) as exc:
+        outcome.inventory_errors.append(f"Source inventory failed: {exc}")
+        outcome.finish(0)
+        return
     if inbox_urls and not json_output:
         typer.echo(f"📥 Found {len(inbox_urls)} URL(s) in 00-Inbox/")
     all_urls = list(dict.fromkeys([*requested_urls, *inbox_urls]))
 
-    clipping_sources = collect_clippings(config)
     clipping_by_path = {str(path): source for path, source in clipping_sources}
     planned: list[_PlannedSource]
     if resume:
@@ -553,10 +653,18 @@ def ingest(
         return
 
     if not preview_mode:
-        with VaultRegistry(config.llmwiki_dir) as ingest_registry:
-            _backfill_ingest_index(ingest_registry, config.sources_dir)
+        try:
+            with VaultRegistry(config.llmwiki_dir) as ingest_registry:
+                _backfill_ingest_index(
+                    ingest_registry, config.sources_dir, source_paths=source_inventory
+                )
+        except (OSError, ValueError) as exc:
+            outcome.inventory_errors.append(f"Source inventory failed during backfill: {exc}")
+            outcome.finish(0)
+            return
 
     known_url_duplicates: dict[str, tuple[Path, str, int]] = {}
+    refresh_targets: dict[str, tuple[Path, str, dict[str, Any]]] = {}
     if not preview_mode:
         with VaultRegistry(config.llmwiki_dir) as ingest_registry:
             for source_kind, identifier, _source, _resuming in planned:
@@ -567,11 +675,26 @@ def ingest(
                 )
                 if match is None:
                     continue
-                path = config.sources_dir / match.output_file
-                if not path.is_file():
+                path = _indexed_source_path(
+                    config.sources_dir, match.output_file, source_paths=source_paths
+                )
+                if path is None:
                     continue
-                raw = path.read_text(encoding="utf-8")
+                try:
+                    raw = path.read_text(encoding="utf-8")
+                except (OSError, UnicodeError) as exc:
+                    outcome.inventory_errors.append(f"Source inventory failed for {path}: {exc}")
+                    outcome.finish(0)
+                    return
                 metadata, body = parse_frontmatter(raw)
+                if refresh:
+                    refresh_targets[identifier] = (path, raw, metadata)
+                    continue
+                current_hash = hashlib.sha256(_dedupe_body(body).encode("utf-8")).hexdigest()
+                if current_hash != match.content_hash:
+                    # A human edit or refreshed shared page invalidates the
+                    # old URL alias as well as its cached content identity.
+                    continue
                 known_url_duplicates[identifier] = (
                     path,
                     str(metadata.get("title", path.stem)),
@@ -587,9 +710,11 @@ def ingest(
         for source_kind, identifier, _source, _resuming in planned
         if source_kind == "url" and identifier not in known_url_duplicates
     ]
-    with _cooperative_sigint(cancellation), _BoundedURLExtractor(
-        planned_urls, config, parallel
-    ) as url_extractor:
+    with (
+        extraction_policy(allow_writes=not preview_mode),
+        _cooperative_sigint(cancellation),
+        _BoundedURLExtractor(planned_urls, config, parallel) as url_extractor,
+    ):
         for index, (source_kind, identifier, clipped_source, resuming_source) in enumerate(
             planned
         ):
@@ -660,9 +785,11 @@ def ingest(
                         ),
                         f"   ⏭ {duplicate_title[:60]} — already indexed",
                     )
+                    outcome.succeeded += 1
                     continue
                 if source_kind == "clipping":
-                    assert clipped_source is not None
+                    if clipped_source is None:
+                        raise OSError(f"Clipping is missing or unreadable: {identifier}")
                     source = clipped_source
                 else:
                     source = url_extractor.extract(identifier)
@@ -681,20 +808,51 @@ def ingest(
                     # different-URL-same-content duplicates.
                     from obsidian_llm_wiki.core.state import hash_content
 
-                    content_hash = hash_content(source.content.strip())
+                    _, incoming_body = parse_frontmatter(render_source_page(source))
+                    incoming_text = _dedupe_body(incoming_body)
+                    content_hash = hash_content(incoming_text)
                     with VaultRegistry(config.llmwiki_dir) as ingest_registry:
                         duplicate = ingest_registry.find_ingest_duplicate(
                             requested_url=identifier if source_kind == "url" else "",
                             content_hash=content_hash,
                         )
                     dup_path = (
-                        config.sources_dir / duplicate.output_file
+                        _indexed_source_path(
+                            config.sources_dir, duplicate.output_file, source_paths=source_paths
+                        )
                         if duplicate is not None
                         else None
                     )
                     if dup_path is not None and not dup_path.is_file():
                         dup_path = None
                     if dup_path is not None:
+                        # The indexed file may have been edited since ingestion.
+                        # Verify just this candidate, never discard evidence on
+                        # the strength of a stale hash or file existence alone.
+                        try:
+                            _, existing_body = parse_frontmatter(
+                                dup_path.read_text(encoding="utf-8")
+                            )
+                            existing_text = _dedupe_body(existing_body)
+                            if existing_text != incoming_text:
+                                dup_path = None
+                        except (OSError, UnicodeError):
+                            dup_path = None
+                    refresh_target = refresh_targets.get(identifier)
+                    replacing = False
+                    if refresh_target is not None:
+                        target, previous_text, previous_meta = refresh_target
+                        # A dedup alias does not own another URL's evidence page.
+                        from obsidian_llm_wiki.ingest.sources import load_source_file
+
+                        previous_source = load_source_file(target)
+                        replacing = previous_meta.get("url") == (source.url or identifier) or (
+                            previous_source is not None
+                            and previous_source.provenance.requested_url == identifier
+                        )
+                    # Explicit refresh of an owned source also refreshes metadata:
+                    # equal body text must not discard a title/provenance revision.
+                    if dup_path is not None and not replacing:
                         with VaultRegistry(config.llmwiki_dir) as ingest_registry:
                             ingest_registry.upsert_ingest_hash(
                                 requested_url=identifier,
@@ -742,19 +900,41 @@ def ingest(
                                     processed_clipping_paths.append(archive_dest)
                         elif source_kind == "url":
                             _archive_inbox_url_files(inbox_url_paths.pop(identifier, []), config)
+                        outcome.succeeded += 1
                         continue
 
-                    filepath = _reserve_collision_safe_path(
-                        config.sources_dir,
-                        source,
-                        preferred_stem=Path(identifier).stem if source_kind == "clipping" else None,
-                    )
+                    if replacing:
+                        from obsidian_llm_wiki.core.backups import backup_file
+                        from obsidian_llm_wiki.core.review import is_reviewed_page
+
+                        assert refresh_target is not None
+                        target, previous_text, _previous_meta = refresh_target
+                        if is_reviewed_page(previous_text):
+                            raise RuntimeError("Refusing to refresh a reviewed source")
+                        if truncated:
+                            raise RuntimeError(
+                                "Refusing to replace source with truncated extraction"
+                            )
+                        if target.read_text(encoding="utf-8") != previous_text:
+                            raise RuntimeError("Source changed during refresh; retry after editing")
+                        backup_file(target, config.llmwiki_dir / "backups")
+                        filepath = target
+                    else:
+                        filepath = _reserve_collision_safe_path(
+                            config.sources_dir,
+                            source,
+                            preferred_stem=(
+                                Path(identifier).stem if source_kind == "clipping" else None
+                            ),
+                        )
                     try:
                         atomic_write(filepath, render_source_page(source))
                     except BaseException:
-                        filepath.unlink(missing_ok=True)
+                        if not replacing:
+                            filepath.unlink(missing_ok=True)
                         raise
                     output_file = filepath.name
+                    source_paths.add(filepath)
                     with VaultRegistry(config.llmwiki_dir) as ingest_registry:
                         ingest_registry.upsert_ingest_hash(
                             requested_url=identifier,
@@ -788,6 +968,7 @@ def ingest(
                     elif source_kind == "url":
                         _archive_inbox_url_files(inbox_url_paths.pop(identifier, []), config)
                 new_count += 1
+                outcome.succeeded += 1
                 _emit(
                     json_output,
                     _source_event(
@@ -823,7 +1004,8 @@ def ingest(
                 )
                 raise typer.Exit(code=130) from None
             except Exception as exc:
-                error = str(exc)
+                error = str(exc) or type(exc).__name__
+                outcome.extraction_errors.append(f"{source_kind}:{identifier}: {error}")
                 if record is not None:
                     store.transition(record, OperationStatus.FAILED, error=error)
                 if queue_id is not None:
@@ -847,6 +1029,13 @@ def ingest(
                     f"   ❌ {identifier}: {error}",
                 )
 
+    # A cooperative SIGINT during the final source has no next loop iteration
+    # at which to stop. Preserve that completed source, but never report success
+    # or start synthesis after cancellation.
+    if cancellation.cancelled:
+        _cancel_remaining(store, run_id, [], json_output, persist=False)
+        raise typer.Exit(code=130)
+
     # Report archived clippings.
     if processed_clipping_paths and not json_output:
         typer.echo(
@@ -863,62 +1052,41 @@ def ingest(
         )
 
     if preview_mode:
-        _emit(
-            json_output,
-            {
-                "type": "run",
-                "event": "completed",
-                "run_id": run_id,
-                "mode": mode,
-                "sources": new_count,
-            },
+        outcome.finish(
+            new_count,
             "\n   🔍 Preview complete — no files written.",
         )
         return
 
-    if new_count == 0 and not failed_urls:
-        _emit(
-            json_output,
-            {
-                "type": "run",
-                "event": "completed",
-                "run_id": run_id,
-                "mode": mode,
-                "sources": 0,
-            },
+    # Known URLs still need the pipeline: a prior extraction can have succeeded
+    # while synthesis failed, or source metadata/cache compatibility changed.
+    if not planned:
+        outcome.finish(
+            0,
             "\n⚠ No new sources to ingest.\n"
             "   Tip: Use --url to add URLs or add .md files to 02-Clippings/",
         )
         return
 
     if skip_synthesis:
-        _emit(
-            json_output,
-            {
-                "type": "run",
-                "event": "completed",
-                "run_id": run_id,
-                "mode": mode,
-                "sources": new_count,
-                "synthesis": "skipped",
-            },
+        outcome.finish(
+            new_count,
             "\n   ⏭ Skipping synthesis (--skip-synthesis)",
+            synthesis="skipped",
         )
         return
 
-    with VaultRegistry(config.llmwiki_dir) as source_registry:
-        source_load = load_sources_incremental(config.sources_dir, source_registry)
+    try:
+        with VaultRegistry(config.llmwiki_dir) as source_registry:
+            source_load = load_sources_incremental(config.sources_dir, source_registry)
+    except (OSError, ValueError) as exc:
+        outcome.inventory_errors.append(f"Source inventory failed; no synthesis performed: {exc}")
+        outcome.finish(new_count)
+        return
     full_corpus = source_load.sources
     if not full_corpus:
-        _emit(
-            json_output,
-            {
-                "type": "run",
-                "event": "completed",
-                "run_id": run_id,
-                "mode": mode,
-                "sources": new_count,
-            },
+        outcome.finish(
+            new_count,
             "\n⚠ No source files found in sources/.",
         )
         return
@@ -952,22 +1120,15 @@ def ingest(
             "\n   ⏹ Cancelled during synthesis; extracted sources remain durable.",
         )
         raise typer.Exit(code=130) from None
+    except Exception as exc:
+        outcome.synthesis_errors.append(f"Pipeline failed: {str(exc) or type(exc).__name__}")
+        outcome.finish(new_count)
+        return
 
-    if json_output:
-        _emit(
-            True,
-            {
-                "type": "run",
-                "event": "completed",
-                "run_id": run_id,
-                "mode": mode,
-                "sources": new_count,
-                "compiled": result.compiled,
-                "errors": result.errors,
-            },
-        )
-    else:
-        print_result_summary(result)
+    outcome.synthesis_errors.extend(result.errors)
+    if not json_output:
+        print_result_summary(result, additional_errors=outcome.extraction_errors)
+    outcome.finish(new_count, compiled=result.compiled)
 
 
 def _cancel_remaining(
@@ -1041,18 +1202,6 @@ def _update_failed_ledger(sources_dir: Path, new_failures: list[tuple[str, str]]
     return ledger_path
 
 
-def _reload_config_with_concurrency(vault_path: Path, parallel: int):
-    """Reload config with concurrency override."""
-    from obsidian_llm_wiki.config import load_config
-
-    env_file = str(vault_path / ".env") if (vault_path / ".env").exists() else None
-    return load_config(
-        env_file=env_file,
-        VAULT_PATH=str(vault_path),
-        COMPILE_CONCURRENCY=str(parallel),
-    )
-
-
 def _scan_inbox_urls(config: Any) -> list[str]:
     """Scan 00-Inbox/ for .url files and return the URLs they contain.
 
@@ -1073,7 +1222,10 @@ def _scan_inbox_urls(config: Any) -> list[str]:
                 if url and url.startswith(("http://", "https://")):
                     urls.append(url)
                     break
-        except OSError:
+        except OSError as exc:
+            raise OSError(f"Cannot read inbox record {f}: {exc}") from exc
+        except UnicodeError as exc:
+            logger.warning("Skipping unreadable inbox record %s: %s", f, exc)
             continue
 
     return urls
@@ -1097,7 +1249,9 @@ def _inbox_url_paths(config: Any) -> dict[str, list[Path]]:
                 ),
                 "",
             )
-        except OSError:
+        except OSError as exc:
+            raise OSError(f"Cannot read inbox record {path}: {exc}") from exc
+        except UnicodeError:
             continue
         if url:
             paths.setdefault(url, []).append(path)
@@ -1109,21 +1263,11 @@ def _archive_inbox_url_files(paths: list[Path], config: Any) -> list[Path]:
     if not paths:
         return []
     archive_dir = config.vault / "00-Inbox" / "processed"
-    archive_dir.mkdir(parents=True, exist_ok=True)
     archived: list[Path] = []
     for path in paths:
         if not path.is_file():
             continue
-        destination = archive_dir / path.name
-        if destination.exists():
-            for index in range(1, 100):
-                candidate = archive_dir / f"{path.stem}-{index}{path.suffix}"
-                if not candidate.exists():
-                    destination = candidate
-                    break
-        try:
-            shutil.move(str(path), str(destination))
-        except OSError:
-            continue
-        archived.append(destination)
+        destination = _archive_without_overwrite(path, archive_dir)
+        if destination is not None:
+            archived.append(destination)
     return archived

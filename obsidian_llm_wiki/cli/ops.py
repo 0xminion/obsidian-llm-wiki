@@ -1,7 +1,7 @@
 """``olw metrics`` and ``olw recompile`` CLI commands.
 
 Metrics: reads the latest metrics.json and prints a summary.
-Recompile: manually retries a single failed source with truncation-based retry.
+Recompile: manually retries a single failed source without truncating input.
 """
 
 from __future__ import annotations
@@ -40,8 +40,8 @@ def recompile(
 ) -> None:
     """Manually retry a single failed source file.
 
-    Loads the source from sources/, runs synthesis with truncation-based
-    retry (full → 50K → 20K), and caches the result.
+    Loads the source from sources/, retries synthesis of the complete input,
+    and caches the result. Run build afterwards to render the updated cache.
 
     Examples:
         olw recompile ~/MyVault my-article.md
@@ -50,14 +50,21 @@ def recompile(
 
     print(f"📂 Vault: {vault_path}")
     print(f"📄 Source: {source_file}")
-    print(f"🤖 Model: {config.llm.model}")
-    print("\n🔄 Recompiling with truncation-based retry...")
+    print(f"🤖 Model: {config.llm.ingest_model or config.llm.model}")
+    print("\n🔄 Recompiling with complete-source retry...")
 
     from obsidian_llm_wiki.core.pipeline import recompile_single_source
 
-    result = asyncio.run(recompile_single_source(vault_path, source_file, config))
+    try:
+        result = asyncio.run(recompile_single_source(vault_path, source_file, config))
+    except KeyboardInterrupt:
+        typer.echo("Recompile cancelled.", err=True)
+        raise typer.Exit(code=130) from None
+    except Exception as exc:
+        typer.echo(f"Recompile failed: {str(exc) or type(exc).__name__}", err=True)
+        raise typer.Exit(code=1) from exc
 
-    if result.compiled > 0:
+    if result.compiled > 0 and not result.errors:
         print(f"\n✅ Recompiled: {result.compiled} source, "
               f"{len(result.concepts)} concepts")
     else:
@@ -66,3 +73,5 @@ def recompile(
         print(f"   Errors: {len(result.errors)}")
         for err in result.errors[:10]:
             print(f"     - {err}")
+    if result.errors or result.compiled == 0:
+        raise typer.Exit(code=1)
