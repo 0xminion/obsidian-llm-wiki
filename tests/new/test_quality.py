@@ -268,12 +268,11 @@ async def test_quality_synthesize_source_empty_concepts():
 
 
 @pytest.mark.asyncio
-async def test_quality_synthesize_source_pass2_failure_sets_low_confidence():
-    """Pass-2 failure (None or exception) sets confidence=0.3 on skeleton concept.
+async def test_quality_synthesize_source_pass2_failure_rejects_partial_completion():
+    """A known failed expansion cannot be cached/hash-stamped as completed.
 
-    Regression test for the trade-size-scale-effect bug: a skeleton concept
-    whose Pass-2 expansion returned None was shipped at confidence=1.0
-    with zero body content.
+    Low confidence alone is insufficient: a completed-source status would
+    prevent automatic retry and permanently retain the failed skeleton.
     """
     source = SourceDoc(
         title="Test Source",
@@ -330,33 +329,7 @@ async def test_quality_synthesize_source_pass2_failure_sets_low_confidence():
             existing_concepts=[],
         )
 
-    assert result is not None
-    assert len(result.concepts) == 3
-
-    good = next(c for c in result.concepts if c.slug == "good-concept")
-    null_c = next(c for c in result.concepts if c.slug == "null-concept")
-    error_c = next(c for c in result.concepts if c.slug == "error-concept")
-
-    # Good expansion stays at confidence 1.0
-    assert good.confidence == 1.0
-    assert _concept_body_chars(good) >= 800
-
-    # Failed expansions get gradient confidence (body=0 → 0.1, the floor)
-    from obsidian_llm_wiki.synth.quality import gradient_confidence
-    expected_conf = gradient_confidence(0, 800)
-    assert null_c.confidence == pytest.approx(expected_conf), (
-        f"Expected {expected_conf} for None expansion, got {null_c.confidence}"
-    )
-    assert error_c.confidence == pytest.approx(expected_conf), (
-        f"Expected {expected_conf} for exception expansion, got {error_c.confidence}"
-    )
-    # Both should be below 1.0 since body is 0
-    assert null_c.confidence < 1.0
-    assert error_c.confidence < 1.0
-
-    # Failed expansions have no body (skeleton only)
-    assert _concept_body_chars(null_c) == 0
-    assert _concept_body_chars(error_c) == 0
+    assert result is None
 
 
 @pytest.mark.asyncio
@@ -419,8 +392,8 @@ async def test_pipeline_dispatches_to_two_pass():
 # ── Deeper concept prompt tests ──────────────────────────────────────────
 
 
-def test_build_expand_prompt_asks_for_500_to_800_words():
-    """The expand prompt asks for 500-800 words (not the old 300)."""
+def test_build_expand_prompt_scales_depth_to_source_evidence():
+    """Fixed minimum length encourages invented detail for concise sources."""
     prompt = build_expand_prompt(
         concept_title="Test",
         concept_slug="test",
@@ -429,12 +402,12 @@ def test_build_expand_prompt_asks_for_500_to_800_words():
         source_content="Body text. " * 50,
         all_concepts=[{"slug": "test", "title": "Test"}],
     )
-    assert "500-800 words" in prompt
+    assert "only as much substantive content as this source supports" in prompt
     assert "300 words" not in prompt
 
 
-def test_build_expand_prompt_requires_at_least_3_sections():
-    """The expand prompt asks for at least 3 distinct sections."""
+def test_build_expand_prompt_allows_one_substantive_section():
+    """Section count follows evidence, not a minimum-padding target."""
     prompt = build_expand_prompt(
         concept_title="Test",
         concept_slug="test",
@@ -443,7 +416,7 @@ def test_build_expand_prompt_requires_at_least_3_sections():
         source_content="Body text. " * 50,
         all_concepts=[{"slug": "test", "title": "Test"}],
     )
-    assert "at least 3 distinct sections" in prompt
+    assert "a single concise section is valid" in prompt
 
 
 # ── Pass 2 model override tests ──────────────────────────────────────────

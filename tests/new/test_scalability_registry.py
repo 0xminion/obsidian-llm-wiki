@@ -186,6 +186,9 @@ def test_canonical_concept_payload_aggregates_all_current_source_owners(
 
     with VaultRegistry(tmp_path / ".llmwiki") as registry:
         registry.upsert_synthesis("one.md", source_one, synthesis_one, versions)
+        # Different definitions require explicit reuse of a known stable ID;
+        # a shared title/slug alone is not evidence of equivalence.
+        synthesis_two.concepts[0].canonical_id = synthesis_one.concepts[0].canonical_id
         registry.upsert_synthesis("two.md", source_two, synthesis_two, versions)
         row = registry.connection.execute(
             "SELECT payload_json FROM concept WHERE slug='shared'"

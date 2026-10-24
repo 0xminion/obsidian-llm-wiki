@@ -22,12 +22,13 @@ def _response(claim: str) -> str:
     return json.dumps(
         {
             "source_title": "Deployment guidance",
-            "source_summary": "A source about deployment timing.",
+            "source_summary": claim,
             "concepts": [
                 {
                     "title": "Deployment window",
                     "slug": "deployment-window",
-                    "summary": "Guidance for a deployment window.",
+                    "summary": claim,
+                    "sections": [{"heading": "Guidance", "points": [claim]}],
                     "claims": [
                         {
                             "text": claim,
@@ -56,7 +57,7 @@ async def test_changed_source_creates_reviewable_record_visible_to_health_and_fi
     monkeypatch.setattr(llm, "acall_llm", synthesize_initial)
     initial = await run_pipeline(
         vault,
-        {source_name: SourceDoc(title="Deployment", content="Original source.")},
+        {source_name: SourceDoc(title="Deployment", content="Deploy on Friday.")},
         config,
     )
     assert initial.errors == []
@@ -67,7 +68,7 @@ async def test_changed_source_creates_reviewable_record_visible_to_health_and_fi
     monkeypatch.setattr(llm, "acall_llm", synthesize_changed)
     changed = await run_pipeline(
         vault,
-        {source_name: SourceDoc(title="Deployment", content="Revised source.")},
+        {source_name: SourceDoc(title="Deployment", content="Do not deploy on Friday.")},
         config,
     )
     assert changed.errors == []

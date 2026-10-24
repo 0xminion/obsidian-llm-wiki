@@ -44,6 +44,8 @@ def _write_md(path: Path, body: str = "", *, reviewed: bool = False,
         fm_lines.append("")
         fm_lines.append(body)
     path.write_text("\n".join(fm_lines) + "\n", encoding="utf-8")
+    # This helper seeds a known generated page, not an unmanaged user note.
+    obsidian._remember_generated_page(path, path.read_text(), path.parent.parent)
 
 
 # ── P0: Stale file cleanup ──────────────────────────────────────────────

@@ -68,8 +68,8 @@ function urlArguments(urls: string[] | undefined): string[] {
   return (urls ?? []).flatMap((url) => ["--url", url]);
 }
 
-function toText(chunk: DataChunk): string {
-  return typeof chunk === "string" ? chunk : new TextDecoder().decode(chunk);
+function toText(chunk: DataChunk, decoder: TextDecoder): string {
+  return typeof chunk === "string" ? chunk : decoder.decode(chunk, { stream: true });
 }
 
 /**
@@ -93,6 +93,8 @@ export class CliClient {
     let settled = false;
     let stdoutBuffer = "";
     let stderrBuffer = "";
+    const stdoutDecoder = new TextDecoder();
+    const stderrDecoder = new TextDecoder();
     let resolveCompleted: (result: CliRunResult) => void = () => undefined;
     const completed = new Promise<CliRunResult>((resolve) => {
       resolveCompleted = resolve;
@@ -132,11 +134,11 @@ export class CliClient {
     };
 
     child.stdout?.on("data", (chunk) => {
-      stdoutBuffer += toText(chunk);
+      stdoutBuffer += toText(chunk, stdoutDecoder);
       drainStdout();
     });
     child.stderr?.on("data", (chunk) => {
-      stderrBuffer += toText(chunk);
+      stderrBuffer += toText(chunk, stderrDecoder);
       drainStderr();
     });
     child.on("error", (error) => {
@@ -144,6 +146,8 @@ export class CliClient {
       finish({ exitCode: null, signal: null, cancelled });
     });
     child.on("close", (exitCode, signal) => {
+      stdoutBuffer += stdoutDecoder.decode();
+      stderrBuffer += stderrDecoder.decode();
       drainStdout(true);
       drainStderr(true);
       finish({ exitCode, signal, cancelled });

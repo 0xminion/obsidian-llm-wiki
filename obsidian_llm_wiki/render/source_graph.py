@@ -22,6 +22,7 @@ from itertools import islice
 from pathlib import Path
 from typing import Any
 
+from obsidian_llm_wiki.core.generated_paths import checked_generated_path, is_graph_shard_basename
 from obsidian_llm_wiki.core.models import SynthesisBundle
 
 logger = logging.getLogger("obswiki.render.source_graph")
@@ -60,6 +61,7 @@ def export_source_dependency_graph(
         List of file paths written.
     """
     written: list[str] = []
+    checked_generated_path(output_dir, output_dir.parent)
     output_dir.mkdir(parents=True, exist_ok=True)
     from obsidian_llm_wiki.render.obsidian import _write_generated_artifact
 
@@ -137,110 +139,48 @@ def _mermaid_safe_label(text: str) -> str:
 
 
 def build_source_dependency_dict(bundle: SynthesisBundle) -> dict[str, Any]:
-    """Build the source→concept dependency graph as a dict.
-
-    Structure::
-
-        {
-          "metadata": {"source_count", "concept_count", "edge_count"},
-          "nodes": {
-            "sources": [{"id", "label", "source_file", "concept_count"}],
-            "concepts": [{"id", "label", "confidence"}],
-          },
-          "edges": [{"source", "target", "type": "contributed_to"}]
-        }
-    """
-    # Collect which sources contributed to which concepts.
-    # Each SourceSynthesis has source_title/source_file + a list of concepts.
-    source_nodes: list[dict[str, Any]] = []
-    concept_node_set: dict[str, dict[str, Any]] = {}
-    edges: list[dict[str, Any]] = []
-
-    canonical_slugs = {concept.slug for concept in bundle.concepts}
+    """Canonical source/concept identities and validated contribution edges."""
+    from obsidian_llm_wiki.render.graph_export import _graph_ids
+    ids = _graph_ids(bundle)
+    canonical = {c.slug: c for c in bundle.concepts}
+    source_nodes = []
+    concepts = {}
+    edges = []
     for synthesis in bundle.sources:
-        raw_id = synthesis.source_file or synthesis.source_title
-        if not raw_id:
+        raw = synthesis.source_file or synthesis.source_title
+        if not raw:
             continue
-        source_id = _slugify_source_id(raw_id)
-        concept_slugs = [c.slug for c in synthesis.concepts if c.slug in canonical_slugs]
-        source_nodes.append({
-            "id": source_id,
-            "label": synthesis.source_title or raw_id,
-            "source_file": synthesis.source_file or "",
-            "concept_count": len(concept_slugs),
-        })
-        for concept in synthesis.concepts:
-            if concept.slug not in canonical_slugs:
-                continue
-            if concept.slug not in concept_node_set:
-                concept_node_set[concept.slug] = {
-                    "id": concept.slug,
-                    "label": concept.title,
-                    "confidence": concept.confidence,
-                }
-            edges.append({
-                "source": source_id,
-                "target": concept.slug,
-                "type": "contributed_to",
-            })
-
-    return {
-        "metadata": {
-            "source_count": len(source_nodes),
-            "concept_count": len(concept_node_set),
-            "edge_count": len(edges),
-        },
-        "nodes": {
-            "sources": source_nodes,
-            "concepts": list(concept_node_set.values()),
-        },
-        "edges": edges,
-    }
+        source_id = ids[("source", raw)]
+        slugs = list(dict.fromkeys(c.slug for c in synthesis.concepts if c.slug in canonical))
+        source_nodes.append({"id": source_id, "label": synthesis.source_title or raw,
+                             "source_file": synthesis.source_file, "concept_count": len(slugs)})
+        for slug in slugs:
+            concept = canonical[slug]
+            cid = ids[("concept", slug)]
+            concepts[cid] = {"id": cid, "label": concept.title, "confidence": concept.confidence}
+            edges.append({"source": source_id, "target": cid, "type": "contributed_to"})
+    return {"metadata": {"source_count": len(source_nodes), "concept_count": len(concepts),
+                         "edge_count": len(edges)},
+            "nodes": {"sources": source_nodes, "concepts": list(concepts.values())},
+            "edges": edges}
 
 
 def build_source_dependency_mermaid(bundle: SynthesisBundle) -> str:
-    """Build a Mermaid diagram of source→concept contributions.
-
-    Filters edges to concepts present in the canonical bundle and suppresses
-    stale source-local concepts.
-    """
-    lines: list[str] = ["graph LR"]
-    canonical_slugs = {concept.slug for concept in bundle.concepts}
-
-    # Source nodes as a subgraph.
-    source_ids: list[str] = []
-    for synthesis in bundle.sources:
-        raw_id = synthesis.source_file or synthesis.source_title
-        if not raw_id:
-            continue
-        sid = _mermaid_safe_id(_slugify_source_id(raw_id))
-        label = _mermaid_safe_label(synthesis.source_title or raw_id)
-        lines.append(f'  {sid}[("{label}")]')
-        source_ids.append(sid)
-
-    # Concept nodes.
-    for concept in bundle.concepts:
-        cid = _mermaid_safe_id(concept.slug)
-        label = _mermaid_safe_label(concept.title)
-        lines.append(f'  {cid}["{label}"]')
-
-    # Edges: source → contributed_to → concept.
-    seen: set[tuple[str, str]] = set()
-    for synthesis in bundle.sources:
-        raw_id = synthesis.source_file or synthesis.source_title
-        if not raw_id:
-            continue
-        sid = _mermaid_safe_id(_slugify_source_id(raw_id))
-        for concept in synthesis.concepts:
-            cid = _mermaid_safe_id(concept.slug)
-            if concept.slug not in canonical_slugs:
-                continue
-            key = (sid, cid)
-            if key in seen:
-                continue
-            seen.add(key)
-            lines.append(f"  {sid} -->|contributed_to| {cid}")
-
+    """Bounded, escaped source graph with IDs shared with JSON."""
+    from obsidian_llm_wiki.render.graph_export import _mermaid_safe_id, _mermaid_safe_label
+    if len(bundle.sources) + len(bundle.concepts) > 120:
+        return 'graph LR\n  summary["Source graph exceeds 120 nodes; use JSON export"]\n'
+    graph = build_source_dependency_dict(bundle)
+    if len(graph["edges"]) > 240:
+        return 'graph LR\n  summary["Source graph exceeds 240 edges; use JSON export"]\n'
+    lines = ["graph LR"]
+    for node in graph["nodes"]["sources"]:
+        lines.append(f'  {_mermaid_safe_id(node["id"])}[("{_mermaid_safe_label(node["label"])}")]')
+    for node in graph["nodes"]["concepts"]:
+        lines.append(f'  {_mermaid_safe_id(node["id"])}["{_mermaid_safe_label(node["label"])}"]')
+    for edge in graph["edges"]:
+        sid, cid = (_mermaid_safe_id(edge[key]) for key in ("source", "target"))
+        lines.append(f'  {sid} -->|contributed_to| {cid}')
     return "\n".join(lines) + "\n"
 
 
@@ -269,6 +209,7 @@ def _export_sharded_source_graph(
         return int.from_bytes(digest, "big") % 64
 
     output_dir = output_path.parent / f"{output_path.stem}-shards"
+    checked_generated_path(output_dir, bundle_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     written: list[str] = []
     keep: set[Path] = set()
@@ -352,6 +293,7 @@ def _previous_source_graph_shards(output_path: Path) -> set[Path]:
     """Load prior shard paths from the manifest, with one legacy fallback scan."""
     output_dir = output_path.parent / f"{output_path.stem}-shards"
     manifest_path = output_dir / "manifest.json"
+    checked_generated_path(manifest_path, output_path.parent.parent)
     if manifest_path.is_file():
         try:
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -368,8 +310,9 @@ def _previous_source_graph_shards(output_path: Path) -> set[Path]:
             return {
                 output_dir / str(record["path"])
                 for record in records
-                if isinstance(record.get("path"), str)
+                if is_graph_shard_basename(record.get("path"))
             } | {manifest_path}
     if not output_dir.is_dir():
         return set()
-    return set(output_dir.glob("*.json"))
+    return {path for path in output_dir.glob("*.json")
+            if path.name == "manifest.json" or is_graph_shard_basename(path.name)}

@@ -196,7 +196,7 @@ async def test_golden_pipeline_end_to_end(tmp_path: Path):
     assert "## Claims" in body
     assert "Self-attention complexity is O(n^2)" in body
     assert "## Related Concepts" not in body
-    assert "## Cross-References / 关联图谱" in body
+    assert "## Cross-References" in body
     assert "[[multi-head-attention|" in body
     assert "[[positional-encoding|" in body
 
@@ -247,8 +247,8 @@ async def test_golden_pipeline_incremental_skip(tmp_path: Path):
     sources = {
         "test.md": SourceDoc(
             title="Test",
-            content="This is a test document with enough content to pass the length gate. "
-            * 3,
+            content="An unchanged source reuses its cached synthesis. "
+            "This avoids another model request when the source hash is unchanged. " * 3,
         ),
     }
 
@@ -258,8 +258,14 @@ async def test_golden_pipeline_incremental_skip(tmp_path: Path):
         new_callable=AsyncMock,
         return_value=json.dumps({
             "source_title": "Test",
-            "source_summary": "Summary",
-            "concepts": [{"title": "C", "slug": "c", "summary": "S"}],
+            "source_summary": "Unchanged sources reuse cached synthesis.",
+            "concepts": [{
+                "title": "Cache reuse", "slug": "c",
+                "summary": "Unchanged sources avoid another model request.",
+                "sections": [{
+                    "heading": "Reuse", "prose": "An unchanged source hash permits cached synthesis reuse.",
+                }],
+            }],
         }),
     ):
         result1 = await run_pipeline(vault, sources, config, force=True)

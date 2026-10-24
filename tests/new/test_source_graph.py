@@ -115,8 +115,9 @@ def test_build_source_dependency_mermaid_has_edges():
 
 def test_build_source_dependency_mermaid_has_source_nodes():
     mmd = build_source_dependency_mermaid(_make_bundle())
-    assert "source_a" in mmd
-    assert "source_b" in mmd
+    from obsidian_llm_wiki.render.graph_export import _mermaid_safe_id
+    assert _mermaid_safe_id("source-a") in mmd
+    assert _mermaid_safe_id("source-b") in mmd
 
 
 # ── File export ──────────────────────────────────────────────────────────

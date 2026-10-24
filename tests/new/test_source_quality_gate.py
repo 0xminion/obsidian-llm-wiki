@@ -136,6 +136,7 @@ def test_bilingual_alias_keeps_canonical_slug_and_source_links() -> None:
 
     normalize_bilingual_titles_and_slugs(bundle)
 
-    assert canonical.title == "Transformer Architecture (变换器架构)"
+    assert canonical.title == "Transformer Architecture"
+    assert canonical.aliases == ["变换器架构"]
     assert canonical.slug == "transformer-architecture"
     assert source_local.slug == "transformer-architecture"

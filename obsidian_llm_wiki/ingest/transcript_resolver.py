@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import re
+import tempfile
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -24,6 +25,7 @@ import httpx
 
 from obsidian_llm_wiki.ingest.http_headers import BROWSER_HEADERS, DEFAULT_TIMEOUT
 from obsidian_llm_wiki.ingest.proxy import make_client_kwargs
+from obsidian_llm_wiki.ingest.runtime import writes_allowed
 from obsidian_llm_wiki.ingest.url_safety import stream_with_validated_redirects
 
 logger = logging.getLogger("obswiki.ingest.transcript_resolver")
@@ -97,7 +99,7 @@ def load_transcript_cache(identity: str) -> TranscriptResult | None:
 
 def save_transcript_cache(identity: str, result: TranscriptResult) -> None:
     """Persist a usable transcript and immutable provenance for re-use."""
-    if not identity or len(result.text.strip()) < _MIN_TRANSCRIPT_CHARS:
+    if not writes_allowed() or not identity or len(result.text.strip()) < _MIN_TRANSCRIPT_CHARS:
         return
 
     cache_path = _cache_dir() / f"{_cache_key(identity)}.json"
@@ -107,12 +109,16 @@ def save_transcript_cache(identity: str, result: TranscriptResult) -> None:
         "identity": identity,
         "acquired_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
-    tmp_path = cache_path.with_suffix(".tmp")
-    tmp_path.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-    tmp_path.replace(cache_path)
+    fd, temporary = tempfile.mkstemp(dir=cache_path.parent, prefix=".transcript-", suffix=".tmp")
+    tmp_path = Path(temporary)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
+        tmp_path.replace(cache_path)
+    finally:
+        tmp_path.unlink(missing_ok=True)
 
 
 def _strip_timed_transcript(text: str) -> str:

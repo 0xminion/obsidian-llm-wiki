@@ -13,7 +13,7 @@ from obsidian_llm_wiki.ingest.extractors import register_extractor
 logger = logging.getLogger("obswiki.ingest.extractors.pdf")
 
 try:
-    import fitz  # pymupdf  # type: ignore[import-untyped]
+    import pymupdf as fitz  # type: ignore[import-untyped]
 
     _DEPS_AVAILABLE = True
 except ImportError:

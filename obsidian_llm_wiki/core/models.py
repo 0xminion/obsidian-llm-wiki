@@ -13,6 +13,7 @@ independently inventing its own tags and summaries.
 
 from __future__ import annotations
 
+import math
 import re
 import unicodedata
 from dataclasses import dataclass, field
@@ -66,6 +67,7 @@ class RelationType(StrEnum):
     DEPENDS_ON = "depends_on"
     CONTRASTS_WITH = "contrasts_with"
     RELATED_TO = "related_to"
+    EQUIVALENT_TO = "equivalent_to"
     PREREQUISITE_OF = "prerequisite_of"
     EXAMPLE_OF = "example_of"
     COMPONENT_OF = "component_of"
@@ -73,6 +75,11 @@ class RelationType(StrEnum):
     ENABLES = "enables"
     PART_OF = "part_of"
     EXPLAINS = "explains"
+    COMPLEMENTS = "complements"
+    SUPERSEDES = "supersedes"
+    EVOLVES_INTO = "evolves_into"
+    MEASURES = "measures"
+    COMPETES_WITH = "competes_with"
 
 
 #: Valid relation values (for normalisation).
@@ -98,11 +105,15 @@ def _is_safe_slug(value: object) -> bool:
 
 
 def _regenerate_slug(value: object) -> str:
-    """Produce a bounded ASCII slug from arbitrary untrusted text."""
+    """Produce a bounded Unicode identifier without path syntax or controls."""
     if not isinstance(value, str):
         return ""
-    ascii_value = unicodedata.normalize("NFKD", value).encode("ascii", "ignore").decode()
-    cleaned = re.sub(r"[^a-z0-9]+", "-", ascii_value.lower())
+    normalized = unicodedata.normalize("NFKD", value).casefold()
+    cleaned = "".join(
+        char if char.isalnum() else "-"
+        for char in normalized if not unicodedata.combining(char)
+    )
+    cleaned = re.sub(r"-+", "-", cleaned)
     return cleaned.strip("-_")[:_MAX_SLUG_LENGTH].rstrip("-_")
 
 
@@ -417,21 +428,70 @@ def _claim_from_dict(data: dict[str, Any]) -> Claim:
     )
 
 
+def _validate_collections(
+    data: dict[str, Any],
+    *,
+    strings: tuple[str, ...] = (),
+    objects: tuple[str, ...] = (),
+) -> None:
+    """Reject malformed arrays rather than dropping data or iterating strings.
+
+    Missing optional arrays are valid; explicit null/scalars and malformed
+    members are not. ValueError is shared by parser and cache read boundaries.
+    """
+    for field_name, member_type in [
+        *((name, str) for name in strings),
+        *((name, dict) for name in objects),
+    ]:
+        if field_name not in data:
+            continue
+        value = data[field_name]
+        if not isinstance(value, list) or any(
+            not isinstance(item, member_type) for item in value
+        ):
+            raise ValueError(f"{field_name} must be an array of {member_type.__name__}")
+
+
 def source_synthesis_from_dict(data: dict[str, Any]) -> SourceSynthesis:
     """Build a SourceSynthesis from a raw dict (LLM JSON output).
 
-    Tolerant of missing/extra keys.  Validates required fields.
+    Tolerant of missing/extra keys; validates collection shapes. Acceptance
+    of completed output is separate from conversion of intermediate skeletons.
     """
+    _validate_collections(
+        data, strings=("source_tags", "tags", "key_points", "open_questions"),
+        objects=("concepts", "maps"),
+    )
     concepts = [
         _concept_from_dict(c)
         for c in data.get("concepts", [])
         if isinstance(c, dict)
     ]
+    # Resolve local references through the very same normalization mapping.
+    # Independently normalizing an invalid reference loses the concept's title
+    # fallback and used to turn valid links into the literal "untitled".
+    slug_map: dict[str, str] = {}
+    for raw, concept in zip(data.get("concepts", []), concepts, strict=True):
+        original = _string(raw.get("slug", ""))
+        if original:
+            previous = slug_map.get(original)
+            if previous is not None and previous != concept.slug:
+                raise ValueError(f"ambiguous concept slug {original!r}")
+            slug_map[original] = concept.slug
+    for raw, concept in zip(data.get("concepts", []), concepts, strict=True):
+        for raw_link, link in zip(raw.get("related", []), concept.related, strict=True):
+            link.slug = slug_map.get(_string(raw_link.get("slug", "")), link.slug)
+        for claim in concept.claims:
+            claim.concept_slug = slug_map.get(claim.concept_slug, claim.concept_slug)
     maps = [
         _moc_from_dict(m)
         for m in data.get("maps", [])
         if isinstance(m, dict)
     ]
+    for raw, moc in zip(data.get("maps", []), maps, strict=True):
+        moc.concept_slugs = [
+            slug_map.get(slug, normalize_slug(slug)) for slug in raw.get("concept_slugs", [])
+        ]
     return SourceSynthesis(
         source_title=_string(data.get("source_title", data.get("title", ""))),
         source_summary=_string(data.get("source_summary", data.get("summary", ""))),
@@ -447,6 +507,11 @@ def source_synthesis_from_dict(data: dict[str, Any]) -> SourceSynthesis:
 
 def _concept_from_dict(data: dict[str, Any]) -> ConceptNote:
     """Build a ConceptNote from a raw dict."""
+    _validate_collections(
+        data, strings=("tags", "aliases"), objects=("sections", "claims", "related"),
+    )
+    for section in data.get("sections", []):
+        _validate_collections(section, strings=("points",))
     sections = [
         BodySection(
             heading=_string(s.get("heading", "")),
@@ -471,12 +536,19 @@ def _concept_from_dict(data: dict[str, Any]) -> ConceptNote:
         for r in data.get("related", [])
         if isinstance(r, dict)
     ]
-    # confidence may be non-numeric from the LLM (e.g. "high", null).
-    # Guard with try/except to avoid losing the entire source on one bad field.
+    # Missing confidence retains the legacy default; an explicitly malformed
+    # value must never be converted to certainty or cached as NaN/Infinity.
+    raw_confidence = data.get("confidence", 1.0)
     try:
-        confidence = float(data.get("confidence", 1.0))
-    except (TypeError, ValueError):
-        confidence = 1.0
+        confidence = float(raw_confidence)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("confidence must be a finite number between 0 and 1") from exc
+    if (
+        isinstance(raw_confidence, bool)
+        or not math.isfinite(confidence)
+        or not 0 <= confidence <= 1
+    ):
+        raise ValueError("confidence must be a finite number between 0 and 1")
     return ConceptNote(
         title=_string(data.get("title", "")),
         slug=normalize_slug(data.get("slug", ""), data.get("title", "")),
@@ -495,6 +567,7 @@ def _concept_from_dict(data: dict[str, Any]) -> ConceptNote:
 
 def _moc_from_dict(data: dict[str, Any]) -> MapOfContent:
     """Build a MapOfContent from a raw dict."""
+    _validate_collections(data, strings=("tags", "concept_slugs"))
     return MapOfContent(
         title=_string(data.get("title", "")),
         slug=normalize_slug(data.get("slug", ""), data.get("title", "")),

@@ -95,6 +95,8 @@ def _run_liteparse(command: list[str], config: Config) -> tuple[int, bytes, byte
     finally:
         stdout.join()
         stderr.join()
+    if stdout.overflowed:
+        raise RuntimeError(f"LiteParse stdout exceeded {config.max_parser_stdout_bytes} bytes")
     return returncode, stdout.value, stderr.value
 
 
@@ -105,6 +107,7 @@ class _BoundedPipe:
         self._stream = stream
         self._limit = max(0, limit)
         self._buffer = bytearray()
+        self.overflowed = False
         self._thread = threading.Thread(target=self._drain, daemon=True)
 
     def start(self) -> None:
@@ -120,6 +123,8 @@ class _BoundedPipe:
     def _drain(self) -> None:
         while chunk := self._stream.read(65_536):
             remaining = self._limit - len(self._buffer)
+            if len(chunk) > remaining:
+                self.overflowed = True
             if remaining > 0:
                 self._buffer.extend(chunk[:remaining])
 

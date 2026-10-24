@@ -1,5 +1,7 @@
 # Knowledge Engine Hardening Implementation Plan
 
+> **Historical plan — not active instructions.** Commands, counts, and acceptance intentions below are preserved in their original context, not asserted as present verification. Use the [active documentation index](../README.md) and [migration/recovery guide](../migration.md) before operating on a vault.
+
 > **For Hermes:** Execute in staged batches. Every code task adds targeted tests before integration; run `scripts/run_tests.sh` only if this repository provides it, otherwise activate `.venv` and run `python -m pytest tests/ -q` plus `ruff check obsidian_llm_wiki tests`.
 
 **Goal:** Make the compiler provenance-rich, safe for scientific/document ingestion, graph-aware at query time, maintainable by humans, and operable through CLI JSON plus a thin local Obsidian bridge.

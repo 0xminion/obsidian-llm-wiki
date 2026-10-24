@@ -1,4 +1,4 @@
-"""Tests for core/lock.py — PID-based compile lock.
+"""Tests for core/lock.py — advisory compile lock with legacy PID metadata.
 
 Covers: acquire on fresh lock, fail when PID alive, reclaim stale lock,
 release by owning PID only.
@@ -10,7 +10,18 @@ import os
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 from obsidian_llm_wiki.core.lock import acquire_lock, release_lock
+
+
+@pytest.fixture(autouse=True)
+def _release_test_locks(tmp_path):
+    # Locks now own live descriptors; callers must release successful acquires.
+    yield
+    for lock in tmp_path.rglob("*.lock"):
+        release_lock(lock)
+
 
 # ── acquire_lock ─────────────────────────────────────────────────────────
 
@@ -26,7 +37,7 @@ def test_acquire_lock_fresh(tmp_path: Path):
 
 def test_acquire_lock_idempotent_same_pid(tmp_path: Path):
     """Re-acquiring when the lock already holds *our* PID should fail
-    (the lock is held — even by us, O_EXCL prevents re-create)."""
+    (the lock is held — even by us, acquisition is not reentrant)."""
     lock = tmp_path / "compile.lock"
     assert acquire_lock(lock) is True
     # Second acquire should fail because the file exists and the PID is alive.

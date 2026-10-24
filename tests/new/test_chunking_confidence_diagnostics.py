@@ -427,7 +427,9 @@ async def test_quality_synthesize_source_chunking_large_content():
     assert set(moc.concept_slugs) == {"concept-a", "concept-b", "concept-c"}
 
 
-async def _mock_expand_simple(config, concept, source, all_concepts, source_lang="", rationale=""):
+async def _mock_expand_simple(
+    config, concept, source, all_concepts, source_lang="", rationale="", **_kwargs,
+):
     """Simple mock for _expand_one_concept that returns a fat concept."""
     return ConceptNote(
         title=concept.title,

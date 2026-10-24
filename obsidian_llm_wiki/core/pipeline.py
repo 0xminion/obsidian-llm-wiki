@@ -29,6 +29,7 @@ import json
 import logging
 import time
 from collections.abc import Callable
+from contextlib import suppress
 from dataclasses import asdict, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -47,6 +48,7 @@ from obsidian_llm_wiki.core.contradictions import (
     SourceRevision,
 )
 from obsidian_llm_wiki.core.evidence import resolve_synthesis_evidence
+from obsidian_llm_wiki.core.identity_policy import apply_equivalences, load_equivalences
 from obsidian_llm_wiki.core.lock import acquire_lock, release_lock
 from obsidian_llm_wiki.core.metrics import MetricsCollector
 from obsidian_llm_wiki.core.models import (
@@ -55,13 +57,9 @@ from obsidian_llm_wiki.core.models import (
     SourceDoc,
     SourceSynthesis,
     SynthesisBundle,
-    WikiState,
     source_synthesis_to_dict,
 )
-from obsidian_llm_wiki.core.orphan import (
-    find_exclusively_owned_concepts,
-    mark_orphaned_concepts,
-)
+from obsidian_llm_wiki.core.orphan import orphan_page
 from obsidian_llm_wiki.core.registry import (
     AnnSearchResult,
     ArtifactVersions,
@@ -77,7 +75,6 @@ from obsidian_llm_wiki.core.schema import (
     load_schema_policy,
     select_synthesis_granularity,
 )
-from obsidian_llm_wiki.core.source_content import bound_source_content
 from obsidian_llm_wiki.core.source_files import source_file_path, validate_source_filename
 from obsidian_llm_wiki.core.state import (
     hash_content,
@@ -92,6 +89,11 @@ from obsidian_llm_wiki.synth.dedupe import merge_bundle
 from obsidian_llm_wiki.synth.parser import parse_single_source_synthesis
 from obsidian_llm_wiki.synth.prompts import build_synthesis_prompt
 from obsidian_llm_wiki.synth.retrieval import ConceptRetriever
+from obsidian_llm_wiki.synth.validation import (
+    SynthesisValidationError,
+    validate_local_identities,
+    validate_synthesis,
+)
 
 logger = logging.getLogger("obswiki.core.pipeline")
 
@@ -112,7 +114,7 @@ _SYNTHESIS_NUM_PREDICT = 16_384
 _SYNTHESIS_TEMPERATURE = 0
 _SYNTHESIS_PARSE_ATTEMPTS = 2
 _EXTRACTOR_VERSION = "extract-v2"
-_PROMPT_VERSION = "synthesis-v2"
+_PROMPT_VERSION = "synthesis-v3"
 _SYNTHESIS_SCHEMA_VERSION = "synthesis-schema-v2"
 _SYNTHESIS_RESPONSE_SCHEMA = {
     "type": "object",
@@ -225,6 +227,34 @@ async def _retry_chunk_synthesis(synthesize, filename: str, chunk_index: int, ch
     return None
 
 
+async def _maintain_pipeline_leases(
+    registry: VaultRegistry, worker_id: str, errors: list[str], *, interval: float = 30,
+) -> None:
+    """Keep claims alive while slow asynchronous inference is running."""
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            registry.renew_dirty_worker(worker_id)
+        except Exception as exc:
+            errors.append(f"queue: lease heartbeat failed: {exc}")
+            logger.error("Lease heartbeat failed: %s", exc)
+            return
+
+
+def _preflight_pipeline_paths(vault: Path, config: Config) -> None:
+    """Check metadata before policy reads, locks, SQLite or error metrics."""
+    from obsidian_llm_wiki.core.generated_paths import (
+        checked_generated_path,
+        checked_metadata_directory,
+    )
+
+    if config.vault != vault:
+        raise ValueError("Pipeline vault does not match Config.vault")
+    checked_metadata_directory(config.llmwiki_dir, config.vault)
+    # The policy loader also accepts this historical fallback location.
+    checked_generated_path(vault / ".llmwiki" / "schema.yaml", config.vault)
+
+
 async def run_pipeline(
     vault_path: str | Path,
     sources: dict[str, SourceDoc],
@@ -233,6 +263,7 @@ async def run_pipeline(
     force: bool = False,
     unchanged_filenames: set[str] | None = None,
     source_file_signatures: dict[str, tuple[int, int]] | None = None,
+    refresh_render: bool = False,
 ) -> CompileResult:
     """Run the full synthesis + render pipeline.
 
@@ -245,6 +276,8 @@ async def run_pipeline(
             their committed ``mtime_ns``/size signature is unchanged.
         source_file_signatures: Discovery signatures committed only after a
             successful render.
+        refresh_render: Reconcile generated output even with an unchanged
+            input checkpoint, without forcing new LLM requests.
 
     Returns:
         CompileResult with counts and any errors.
@@ -262,6 +295,8 @@ async def run_pipeline(
         env_file = str(vault / ".env") if (vault / ".env").exists() else None
         config = load_config(env_file=env_file, VAULT_PATH=str(vault))
 
+    _preflight_pipeline_paths(vault, config)
+
     # Policy is vault-level configuration, so read it once per compilation and
     # pass the same sanitized object to every source synthesis task.
     schema_policy = load_schema_policy(vault)
@@ -269,35 +304,64 @@ async def run_pipeline(
     bundle_dir = config.wiki_dir
     bundle_dir.mkdir(parents=True, exist_ok=True)
 
+    # Construct metrics before acquiring a descriptor: validation may raise.
+    metrics = MetricsCollector(vault)
+    metrics.start_run()
+    # Keep the lexical path for cleanup even if a child is later replaced.
+    lock_file = config.lock_file
     # ── Acquire lock ───────────────────────────────────────────────────
-    if not acquire_lock(config.lock_file):
+    if not acquire_lock(lock_file):
         result.errors.append("lock: another compilation is running")
         return result
 
-    # ── Initialise metrics collector ──────────────────────────────────
-    metrics = MetricsCollector(vault)
-    metrics.start_run()
     registry: VaultRegistry | None = None
+    pipeline_worker_id = f"pipeline:{uuid4().hex}"
+    heartbeat: asyncio.Task | None = None
 
     try:
         registry = VaultRegistry(config.llmwiki_dir)
+        # The exclusive compile lock proves every previous pipeline owner stopped.
+        registry.release_abandoned_pipeline_workers()
+        heartbeat = asyncio.create_task(_maintain_pipeline_leases(
+            registry, pipeline_worker_id, result.errors,
+        ))
         versions = _artifact_versions_for_config(config, schema_policy)
-        pipeline_worker_id = f"pipeline:{uuid4().hex}"
+
         registry.migrate_legacy(
             ArtifactVersions("legacy", "legacy", "legacy", "legacy")
         )
-        # ── Read state ─────────────────────────────────────────────────
-        state = read_state(config.state_file)
-
-        # ── Detect deleted sources and orphan their concepts ───────────
         live_filenames = set(sources.keys())
-        state_filenames = set(state.sources.keys()) | registry.source_filenames()
+        indexed_filenames = registry.source_filenames()
+        equivalences = load_equivalences(config.llmwiki_dir / "equivalences.json")
+        checkpoint = _pipeline_checkpoint(config, versions, equivalences)
+        if (
+            not force
+            and not refresh_render
+            and indexed_filenames == live_filenames
+            and trusted_unchanged == live_filenames
+            and registry.get_pipeline_checkpoint() == checkpoint
+            and all(registry.synthesis_versions_current(f, versions) for f in live_filenames)
+        ):
+            result.skipped = len(live_filenames)
+            return result
+        # Invalidate before any work: interruption or partial failure must never
+        # leave an apparently complete checkpoint for the next invocation.
+        registry.set_pipeline_checkpoint("")
+        state = read_state(config.state_file)
+        state_filenames = set(state.sources) | indexed_filenames
         deleted_filenames = state_filenames - live_filenames
-        protected_stale_paths = {
-            f"concepts/{slug}.md"
-            for filename in deleted_filenames
-            for slug in find_exclusively_owned_concepts(filename, state)
+        # Compare the entire deletion set against surviving owners once. Per-
+        # source checks both cost O(deleted * corpus) and miss shared concepts
+        # whose owners are all deleted in the same transaction.
+        surviving_concepts = {
+            slug for filename, entry in state.sources.items()
+            if filename not in deleted_filenames for slug in entry.concepts
         }
+        orphaned_slugs = {
+            slug for filename, entry in state.sources.items()
+            if filename in deleted_filenames for slug in entry.concepts
+        } - surviving_concepts
+        protected_stale_paths = {f"concepts/{slug}.md" for slug in orphaned_slugs}
 
         # ── Load cached syntheses for unchanged sources ────────────────
         cached_syntheses = registry.load_syntheses(live_filenames)
@@ -305,7 +369,10 @@ async def run_pipeline(
         # the old identity while pages used the new slug. Migrate cached items
         # before they participate in dedup, prompts, or state updates.
         for filename, synthesis in cached_syntheses.items():
-            if _normalize_and_assign_synthesis_identity(synthesis, registry):
+            identity_changed = _normalize_and_assign_synthesis_identity(synthesis, registry)
+            # Identity-only repairs cannot certify output from an older prompt,
+            # model, or schema. Keep its old version until synthesis succeeds.
+            if identity_changed and registry.synthesis_versions_current(filename, versions):
                 save_synthesis(
                     synthesis,
                     config.llmwiki_dir,
@@ -316,9 +383,13 @@ async def run_pipeline(
 
         # ── Classify sources: compile vs reuse cache ───────────────────
         to_compile: dict[str, SourceDoc] = {}
-        all_syntheses_by_file: dict[str, SourceSynthesis] = {}
+        # Retain every live source's last committed synthesis until a replacement
+        # succeeds. Forced/version-triggered retries and validation failures are
+        # not source deletions and must never erase previously published notes.
+        all_syntheses_by_file: dict[str, SourceSynthesis] = dict(cached_syntheses)
         changed_sources: dict[str, tuple[str, SourceSynthesis | None]] = {}
         skipped_filenames: set[str] = set()
+        metadata_updated_filenames: set[str] = set()
         # Source Markdown is pipeline input, not a derived artifact. Never
         # rewrite an existing source page during rendering: doing so can erase
         # a concurrent human edit and makes the observed pre-read signature
@@ -354,24 +425,10 @@ async def run_pipeline(
                 source = loaded_source
                 sources[filename] = loaded_source
 
-            # Source length gate (B3 fix).
-            content_len = len(source.content.encode("utf-8"))
-            if content_len < config.min_source_chars:
-                result.errors.append(
-                    f"source:{filename}: too short ({content_len} < "
-                    f"{config.min_source_chars} bytes)"
-                )
+            input_error = _source_input_error(source, config)
+            if input_error:
+                result.errors.append(f"source:{filename}: {input_error}")
                 continue
-            source, truncated = bound_source_content(source, config.max_source_chars)
-            if truncated:
-                logger.warning(
-                    "Source '%s' is %d UTF-8 bytes — exceeds max_source_chars (%d), "
-                    "truncating to safety cap. Sources above chunk_size (%d) "
-                    "will be chunked during two-pass synthesis.",
-                    filename, content_len, config.max_source_chars,
-                    config.chunk_size,
-                )
-                sources[filename] = source
 
             current_hash = hash_content(source.content)
             prev = state.sources.get(filename)
@@ -383,6 +440,9 @@ async def run_pipeline(
                 and registry.synthesis_is_current(filename, source.content, versions)
             )
             if unchanged and cache is not None:
+                if cache.source_title != source.title:
+                    cache.source_title = source.title
+                    metadata_updated_filenames.add(filename)
                 all_syntheses_by_file[filename] = cache
                 result.skipped += 1
                 skipped_filenames.add(filename)
@@ -433,24 +493,12 @@ async def run_pipeline(
             embedding_model=config.embedding_model if config.embeddings_enabled else "",
         )
         synthesis_queue_ids: dict[str, int] = {}
-        unclaimed_filenames: list[str] = []
-        for filename in to_compile:
-            queue_id = registry.enqueue_dirty(
-                "source",
-                filename,
-                "synthesis_retry",
-                {"versions": versions.as_dict()},
+        for filename, source in to_compile.items():
+            synthesis_queue_ids[filename] = registry.enqueue_dirty(
+                "source", filename, "synthesis_retry",
+                {"versions": versions.as_dict(), "input_hash": hash_content(source.content)},
+                reset_retry=force,
             )
-            if registry.start_dirty(queue_id, worker_id=pipeline_worker_id):
-                synthesis_queue_ids[filename] = queue_id
-            else:
-                unclaimed_filenames.append(filename)
-                result.errors.append(f"queue:{filename}: active lease is owned by another worker")
-        for filename in unclaimed_filenames:
-            to_compile.pop(filename)
-            previous = changed_sources.get(filename, ("", None))[1]
-            if previous is not None:
-                all_syntheses_by_file[filename] = previous
 
         if to_compile:
             logger.info("Synthesising %d source(s)...", len(to_compile))
@@ -473,6 +521,13 @@ async def run_pipeline(
                     except StopIteration:
                         return
                     try:
+                        if not registry.start_dirty(
+                            synthesis_queue_ids[filename], worker_id=pipeline_worker_id
+                        ):
+                            raise RuntimeError(
+                                "queue: retry is not due or a live worker owns the claim; "
+                                "retry after backoff or use --force to reset pending retries"
+                            )
                         query_vector = None
                         if candidate_embedder_fn is not None:
                             query_vector = await asyncio.to_thread(
@@ -583,28 +638,15 @@ async def run_pipeline(
         else:
             filenames_done = []
 
-        if not all_syntheses_by_file:
-            if result.errors:
-                logger.error("No syntheses available (%d errors).", len(result.errors))
-            # Run the renderer with an empty bundle so obsolete generated pages
-            # are pruned after the final source is removed.
-            written = render_vault(
-                bundle_dir,
-                SynthesisBundle(),
-                {},
-                config=config,
-                cross_lingual_links={},
-                render_registry=registry,
-                force_render=force,
-                preserve_source_filenames=preserved_source_filenames,
-            )
-            result.pages.extend(written)
-            # Persist state even when no syntheses (e.g. all sources deleted).
-            write_state(config.state_file, state)
-            return result
+        # Empty corpora use the same render/commit path as nonempty ones.
+        # Returning early here used to bypass deletion bookkeeping and orphan
+        # protection when the last source disappeared.
 
         # ── Merge: full corpus dedup ───────────────────────────────────
-        all_syntheses = list(all_syntheses_by_file.values())
+        # Canonical aggregates use filename order, not cached/new arrival order.
+        all_syntheses = [
+            all_syntheses_by_file[filename] for filename in sorted(all_syntheses_by_file)
+        ]
         for synthesis in all_syntheses:
             _normalize_and_assign_synthesis_identity(synthesis, registry)
         bundle = merge_bundle(all_syntheses)
@@ -992,6 +1034,15 @@ async def run_pipeline(
         )
 
         # ── Render: full corpus deterministic markdown ─────────────────
+        confirmed_pairs, equivalence_errors = apply_equivalences(bundle, equivalences)
+        result.errors.extend(equivalence_errors)
+        by_slug = {concept.slug: concept for concept in bundle.concepts}
+        for left, right in confirmed_pairs:
+            # 1.0 here marks a human assertion, not a measured cosine score.
+            for source_slug, target_slug in ((left, right), (right, left)):
+                targets = cross_lingual_links.setdefault(source_slug, [])
+                if not any(target == target_slug for target, _, _ in targets):
+                    targets.append((target_slug, 1.0, by_slug[target_slug].title))
         logger.info(
             "Rendering %d concepts, %d MOCs from %d sources...",
             len(bundle.concepts), len(bundle.maps), len(all_syntheses),
@@ -1009,9 +1060,10 @@ async def run_pipeline(
             config=config,
             cross_lingual_links=cross_lingual_links,
             render_registry=registry,
-            force_render=force,
+            force_render=force or refresh_render,
             preserve_source_filenames=preserved_source_filenames,
             protected_stale_paths=protected_stale_paths,
+            confirmed_cross_lingual_pairs=confirmed_pairs,
         )
         result.pages.extend(written)
         result.concepts = bundle.concepts
@@ -1019,19 +1071,14 @@ async def run_pipeline(
         # Deletions are destructive registry/cache mutations. Apply them only
         # after rendering has committed so a late render failure leaves the
         # complete pre-run source state available for a clean retry.
+        orphan_reason = "Source owners deleted: " + ", ".join(sorted(deleted_filenames))[:512]
+        for slug in sorted(orphaned_slugs):
+            orphan_page(config.concepts_dir, slug, orphan_reason)
         for filename in deleted_filenames:
-            orphaned = mark_orphaned_concepts(
-                config.concepts_dir, filename, state
-            )
             delete_cached_synthesis(config.llmwiki_dir, filename)
             registry.delete_source(filename)
             remove_source_state(state, filename)
             result.deleted += 1
-            if orphaned:
-                logger.info(
-                    "Deleted source '%s' orphaned %d concept(s): %s",
-                    filename, len(orphaned), ", ".join(orphaned),
-                )
 
         # ── Record rendering metrics ───────────────────────────────────
         render_time = time.monotonic() - render_start
@@ -1055,23 +1102,32 @@ async def run_pipeline(
             for synthesis in bundle.sources
             if synthesis.source_file
         }
-        persisted_source_files = set(filenames_done) | canonicalized_source_files
+        persisted_source_files = (
+            set(filenames_done) | canonicalized_source_files | metadata_updated_filenames
+        )
         for filename in sorted(persisted_source_files):
             synthesis = source_syntheses_after_normalization.get(filename)
             if synthesis is not None:
                 if filename in filenames_done:
                     source = sources.get(filename) or _source_from_synthesis(synthesis)
+                    if not registry.complete_dirty(
+                        synthesis_queue_ids[filename], worker_id=pipeline_worker_id
+                    ):
+                        raise RuntimeError(f"Lost synthesis lease before commit: {filename}")
                     registry.upsert_synthesis(
                         filename,
                         source,
                         synthesis,
                         versions,
                     )
-                    registry.complete_dirty(
-                        synthesis_queue_ids[filename], worker_id=pipeline_worker_id
-                    )
+
                 else:
                     registry.update_synthesis(filename, synthesis, versions)
+                if filename in metadata_updated_filenames:
+                    save_synthesis(
+                        synthesis, config.llmwiki_dir, filename,
+                        artifact_versions=versions.as_dict(),
+                    )
         registry.prune_cross_lingual_links()
 
         # ── Update state for compiled sources ─────────────────────────
@@ -1130,15 +1186,30 @@ async def run_pipeline(
             result.compiled, result.skipped, result.deleted,
             len(bundle.concepts), len(bundle.maps), len(result.errors),
         )
+        if not result.errors:
+            registry.set_pipeline_checkpoint(checkpoint)
         return result
 
     finally:
-        # ── Persist metrics ─────────────────────────────────────────────
-        metrics.finish_run()
-        metrics.save()
-        if registry is not None:
-            registry.close()
-        release_lock(config.lock_file)
+        # Cleanup is unconditional even if metrics persistence fails. Release
+        # unfinished claims so a normal exception/cancellation can retry now,
+        # rather than waiting for a lease that no worker still owns.
+        try:
+            if heartbeat is not None:
+                heartbeat.cancel()
+                with suppress(asyncio.CancelledError):
+                    await heartbeat
+            metrics.finish_run()
+            metrics.save()
+        finally:
+            try:
+                if registry is not None:
+                    try:
+                        registry.release_dirty_worker(pipeline_worker_id)
+                    finally:
+                        registry.close()
+            finally:
+                release_lock(lock_file)
 
 
 async def _synthesize_source(
@@ -1156,12 +1227,12 @@ async def _synthesize_source(
     ``config.synthesis_mode == "two_pass"``; otherwise uses the default
     single-pass synthesis.
 
-    Language is always detected from source content (not config.output_language)
-    so that Chinese sources stay Chinese, English stays English, etc.
+    Preserve source language unless the user explicitly requests translation
+    through config.output_language.
     """
     # Detect language and choose detail once per source — used by both single
     # and two-pass paths, while the vault-level policy is shared across sources.
-    source_lang = _detect_source_language(source.content, filename)
+    source_lang = config.output_language or _detect_source_language(source.content, filename)
     granularity = select_synthesis_granularity(
         source.content,
         source.source_type,
@@ -1182,7 +1253,7 @@ async def _synthesize_source(
             # retry even when extraction already established the source title.
             synth.source_title = source.title
             synth.source_file = filename
-            if source_lang and not synth.language:
+            if source_lang:
                 synth.language = source_lang
             resolve_synthesis_evidence(synth, source, filename)
         return synth
@@ -1195,7 +1266,7 @@ async def _synthesize_source(
     content_len = len(source.content)
 
     if content_len > chunk_size:
-        from obsidian_llm_wiki.synth.quality import chunk_content, merge_skeletons
+        from obsidian_llm_wiki.synth.quality import _bounded_map, chunk_content, merge_skeletons
 
         chunks = chunk_content(source.content, chunk_size)
         logger.info(
@@ -1223,19 +1294,20 @@ async def _synthesize_source(
                 config,
                 request_limiter=request_limiter,
             )
-            return parse_single_source_synthesis(chunk_response)
+            parsed = parse_single_source_synthesis(chunk_response)
+            if parsed is not None:
+                validate_synthesis(parsed, chunk_source, filename)
+            return parsed
 
-        chunk_synths = await asyncio.gather(
-            *(
-                _retry_chunk_synthesis(
-                    lambda chunk=chunk: _synth_chunk_once(chunk),
-                    filename,
-                    index,
-                    len(chunks),
-                )
-                for index, chunk in enumerate(chunks, start=1)
-            ),
-            return_exceptions=True,
+        async def _synth_chunk(item: tuple[int, str]):
+            index, chunk = item
+            return await _retry_chunk_synthesis(
+                lambda: _synth_chunk_once(chunk), filename, index, len(chunks),
+            )
+
+        chunk_synths = await _bounded_map(
+            list(enumerate(chunks, start=1)), _synth_chunk,
+            max_workers=config.compile_concurrency,
         )
         failures = [s for s in chunk_synths if s is None or isinstance(s, BaseException)]
         if failures:
@@ -1257,10 +1329,9 @@ async def _synthesize_source(
             synthesis.source_tags = dedupe_tags(synthesis.source_tags)
             synthesis.key_points = dedupe_statements(synthesis.key_points)
             synthesis.open_questions = dedupe_statements(synthesis.open_questions)
-            if not synthesis.source_title:
-                synthesis.source_title = source.title
+            synthesis.source_title = source.title
             synthesis.source_file = filename
-            if source_lang and not synthesis.language:
+            if source_lang:
                 synthesis.language = source_lang
             resolve_synthesis_evidence(synthesis, source, filename)
         return synthesis
@@ -1301,7 +1372,7 @@ async def _synthesize_source(
     synthesis.source_title = source.title
     synthesis.source_file = filename
 
-    if source_lang and not synthesis.language:
+    if source_lang:
         synthesis.language = source_lang
 
     resolve_synthesis_evidence(synthesis, source, filename)
@@ -1325,6 +1396,7 @@ async def _synthesize_with_retry(
     A parser failure retries the *same* complete source once because model
     sampling can still produce an invalid semantic payload despite JSON mode.
     """
+    validation_failure = ""
     for attempt in range(_SYNTHESIS_PARSE_ATTEMPTS):
 
         synth_start = time.monotonic()
@@ -1355,6 +1427,14 @@ async def _synthesize_with_retry(
         synth_time = time.monotonic() - synth_start
 
         if synth is not None:
+            try:
+                validate_synthesis(synth, source, filename)
+            except SynthesisValidationError as exc:
+                validation_failure = str(exc)
+                logger.warning("Rejected synthesis for '%s': %s", filename, exc)
+                synth = None
+
+        if synth is not None:
             if metrics:
                 metrics.record_synthesis(
                     source_file=filename,
@@ -1370,7 +1450,7 @@ async def _synthesize_with_retry(
                 source_file=filename,
                 pass1_time=synth_time,
                 success=False,
-                error_type="no_output",
+                error_type="invalid_synthesis" if validation_failure else "no_output",
             )
         logger.warning(
             "Synthesis produced no output for '%s' on attempt %d of %d",
@@ -1383,6 +1463,8 @@ async def _synthesize_with_retry(
         "Content length: %d chars.",
         filename, _SYNTHESIS_PARSE_ATTEMPTS, len(source.content),
     )
+    if validation_failure:
+        raise SynthesisValidationError(validation_failure)
     return None
 
 
@@ -1393,8 +1475,8 @@ async def recompile_single_source(
 ) -> CompileResult:
     """Manually retry a single failed source file.
 
-    Loads the source from the vault's sources/ directory, runs synthesis
-    with truncation-based retry, and caches the result.
+    Loads one source, retries the complete input, and caches the result.
+    A subsequent build renders it; the registry checkpoint is invalidated.
 
     Args:
         vault_path: Path to the Obsidian vault root.
@@ -1410,6 +1492,8 @@ async def recompile_single_source(
     if config is None:
         env_file = str(vault / ".env") if (vault / ".env").exists() else None
         config = load_config(env_file=env_file, VAULT_PATH=str(vault))
+
+    _preflight_pipeline_paths(vault, config)
 
     # Policy is vault-level configuration, so read it once per compilation and
     # pass the same sanitized object to every source synthesis task.
@@ -1440,28 +1524,18 @@ async def recompile_single_source(
         result.errors.append(f"source:{source_file}: empty or unreadable")
         return result
 
-    source, truncated = bound_source_content(source, config.max_source_chars)
-    if truncated:
-        logger.warning(
-            "Source '%s' exceeds max_source_chars (%d); truncating before recompile.",
-            source_file,
-            config.max_source_chars,
-        )
-
-    if len(source.content) < config.min_source_chars:
-        result.errors.append(
-            f"source:{source_file}: too short ({len(source.content)} < "
-            f"{config.min_source_chars} chars)"
-        )
-        return result
-
-    # Acquire lock
-    if not acquire_lock(config.lock_file):
-        result.errors.append("lock: another compilation is running")
+    input_error = _source_input_error(source, config)
+    if input_error:
+        result.errors.append(f"source:{source_file}: {input_error}")
         return result
 
     metrics = MetricsCollector(vault)
     metrics.start_run()
+    lock_file = config.lock_file
+    # Acquire lock
+    if not acquire_lock(lock_file):
+        result.errors.append("lock: another compilation is running")
+        return result
 
     try:
         state = read_state(config.state_file)
@@ -1524,7 +1598,7 @@ async def recompile_single_source(
 
             if synth is None:
                 result.errors.append(
-                    f"synth:{source_file}: permanent failure (all truncation levels)"
+                    f"synth:{source_file}: failure after complete-source retries"
                 )
                 return result
 
@@ -1555,9 +1629,44 @@ async def recompile_single_source(
         return result
 
     finally:
-        metrics.finish_run()
-        metrics.save()
-        release_lock(config.lock_file)
+        try:
+            metrics.finish_run()
+            metrics.save()
+        finally:
+            release_lock(lock_file)
+
+
+def _pipeline_checkpoint(
+    config: Config, versions: ArtifactVersions,
+    equivalences: tuple[tuple[str, str], ...] = (),
+) -> str:
+    """Fingerprint all non-secret build settings, including derived views."""
+    settings = asdict(config)
+    settings.pop("_vault", None)
+    settings.pop("llm", None)  # effective synthesis model is in artifact versions
+    for key in list(settings):
+        if any(word in key for word in ("key", "secret", "proxy", "cookies")):
+            settings.pop(key)
+    return hash_content(json.dumps(
+        {"pipeline": "integrity-v2", "versions": versions.as_dict(),
+         "settings": settings, "equivalences": equivalences},
+        sort_keys=True, default=str,
+    ))
+
+
+def _source_input_error(source: SourceDoc, config: Config) -> str:
+    """Reject known incomplete input rather than publish a complete-looking prefix."""
+    size = len(source.content.encode("utf-8"))
+    if size < config.min_source_chars:
+        return f"too short ({size} < {config.min_source_chars} bytes)"
+    if size > config.max_source_chars or any(
+        "truncated" in diagnostic.casefold() for diagnostic in source.provenance.diagnostics
+    ):
+        return (
+            "incomplete extraction: source exceeds the byte cap or was truncated; "
+            "increase MAX_SOURCE_CHARS if appropriate and re-extract the complete source"
+        )
+    return ""
 
 
 def _detect_source_language(content: str, filename: str) -> str:
@@ -1576,6 +1685,7 @@ def _normalize_and_assign_synthesis_identity(
     registry: VaultRegistry,
 ) -> bool:
     """Normalize identities and report only durable, post-canonical changes."""
+    validate_local_identities(synthesis)
     before = source_synthesis_to_dict(synthesis)
     _normalize_synthesis_identity(synthesis)
     registry.assign_canonical_ids(synthesis)
@@ -1583,7 +1693,7 @@ def _normalize_and_assign_synthesis_identity(
 
 
 def _normalize_synthesis_identity(synthesis: SourceSynthesis) -> bool:
-    """Persist English-first bilingual slugs and dedupe model-returned duplicates."""
+    """Normalize safe identities and dedupe model-returned duplicates."""
     from obsidian_llm_wiki.render.bilingual import normalize_bilingual_titles_and_slugs
     from obsidian_llm_wiki.synth.dedupe import merge_concepts
 
@@ -1605,24 +1715,6 @@ def _normalize_synthesis_identity(synthesis: SourceSynthesis) -> bool:
         tuple((moc.title, moc.slug, tuple(moc.concept_slugs)) for moc in synthesis.maps),
     )
     return before != after
-
-
-def _existing_concept_slugs(
-    state: WikiState,
-    cached_syntheses: dict[str, SourceSynthesis] | None = None,
-) -> list[str]:
-    """Extract all known concept slugs from state + cached syntheses.
-
-    Includes concepts from cached syntheses (unchanged sources) so the
-    LLM knows the full existing corpus for dedup.
-    """
-    slugs: set[str] = set()
-    for src_state in state.sources.values():
-        slugs.update(src_state.concepts)
-    if cached_syntheses:
-        for synth in cached_syntheses.values():
-            slugs.update(c.slug for c in synth.concepts)
-    return sorted(slugs)
 
 
 def _ann_concept_candidates(

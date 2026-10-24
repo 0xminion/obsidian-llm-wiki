@@ -13,7 +13,7 @@ from obsidian_llm_wiki.core.models import (
 from obsidian_llm_wiki.render.obsidian import _write_generated_page, render_vault
 
 
-def test_render_vault_preserves_reviewed_concept_body_and_makes_backup(tmp_path):
+def test_render_vault_preserves_reviewed_concept_without_rewriting(tmp_path):
     concept_path = tmp_path / "concepts" / "alpha.md"
     concept_path.parent.mkdir(parents=True)
     concept_path.write_text(
@@ -30,7 +30,7 @@ def test_render_vault_preserves_reviewed_concept_body_and_makes_backup(tmp_path)
     assert "reviewed: true" in rendered
     assert "# Curated Alpha\n\nHuman body." in rendered
     assert "Generated replacement" not in rendered
-    assert list((tmp_path / ".llmwiki" / "backups").rglob("*.bak"))
+    assert not list((tmp_path / ".llmwiki" / "backups").rglob("*.bak"))
 
 
 def _complete_bundle() -> tuple[SynthesisBundle, dict[str, SourceDoc]]:
@@ -67,6 +67,8 @@ def test_render_vault_backs_up_every_changed_unreviewed_generated_page(tmp_path)
     for path, content in originals.items():
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")
+        from obsidian_llm_wiki.render.obsidian import _remember_generated_page
+        _remember_generated_page(path, content, tmp_path)
 
     render_vault(tmp_path, bundle, sources)
 
@@ -94,7 +96,7 @@ def test_render_vault_preserves_reviewed_root_and_directory_index_bodies(tmp_pat
         rendered = path.read_text(encoding="utf-8")
         assert "reviewed: true" in rendered
         assert "# Curated Index\n\nHuman body." in rendered
-        assert len(list_backups(path, backups_root)) == 1
+        assert len(list_backups(path, backups_root)) == 0
 
 
 def test_generated_page_byte_identical_noop_skips_backup_and_overwrite(tmp_path):

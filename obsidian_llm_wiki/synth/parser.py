@@ -65,7 +65,7 @@ def parse_synthesis_response(response: str) -> SynthesisBundle:
             errors.append(f"source {i}: expected object, got {type(item).__name__}")
             continue
         try:
-            sources.append(source_synthesis_from_dict(item))
+            sources.append(_parse_source_payload(item))
         except Exception as exc:
             errors.append(f"source {i}: {exc}")
 
@@ -85,7 +85,7 @@ def parse_single_source_synthesis(response: str) -> SourceSynthesis | None:
         return None
 
     if isinstance(data, list):
-        data = data[0] if data else None
+        data = data[0] if len(data) == 1 else None
     if not isinstance(data, dict):
         return None
 
@@ -95,7 +95,18 @@ def parse_single_source_synthesis(response: str) -> SourceSynthesis | None:
     # the intended LaTeX arrows as Unicode arrows before parsing.
     data = _sanitize_latex_artifacts(data)
 
-    return source_synthesis_from_dict(data)
+    try:
+        return _parse_source_payload(data)
+    except (ValueError, TypeError, AttributeError) as exc:
+        logger.warning("Invalid synthesis payload: %s", exc)
+        return None
+
+
+def _parse_source_payload(data: dict[str, Any]) -> SourceSynthesis:
+    synthesis = source_synthesis_from_dict(data)
+    if not synthesis.source_summary.strip():
+        raise ValueError("source_summary must be nonblank")
+    return synthesis
 
 
 def _sanitize_latex_artifacts(data: Any) -> Any:
@@ -205,18 +216,10 @@ def _extract_json(text: str) -> list[Any] | dict[str, Any] | None:
     # Fast path: already valid JSON.
     try:
         return json.loads(text)
+    except RecursionError:
+        return None
     except json.JSONDecodeError:
         pass
-
-    # Local models commonly emit LaTeX commands such as ``\epsilon`` without
-    # JSON-escaping the backslash, or stop while closing the final object.
-    # Repair only these mechanical serialization failures before extracting.
-    repaired = _repair_json_response(text)
-    if repaired != text:
-        try:
-            return json.loads(repaired)
-        except json.JSONDecodeError:
-            pass
 
     # Find the first '[' or '{' that begins a JSON block.
     start = _find_json_start(text)
@@ -230,13 +233,15 @@ def _extract_json(text: str) -> list[Any] | dict[str, Any] | None:
     try:
         value, _end = json.JSONDecoder().raw_decode(text)
         return value
+    except RecursionError:
+        return None
     except json.JSONDecodeError:
         pass
 
     # ── Repair common LLM JSON issues ──────────────────────────────────
 
     # 1. Trailing commas before } or ] (common LLM output error).
-    repaired = re.sub(r",\s*([}\]])", r"\1", text)
+    repaired = _remove_trailing_commas(text)
     if repaired != text:
         try:
             value, _end = json.JSONDecoder().raw_decode(repaired)
@@ -244,126 +249,18 @@ def _extract_json(text: str) -> list[Any] | dict[str, Any] | None:
         except json.JSONDecodeError:
             pass
 
-    # 2. Truncated JSON — the LLM hit the output token limit mid-object.
-    #    Attempt to close incomplete JSON by counting open brackets/braces
-    #    and appending the needed closers.  This is a best-effort recovery
-    #    that salvage partially-truncated synthesis output.
-    repaired = _repair_truncated_json(text)
-    if repaired and repaired != text:
-        try:
-            value = json.loads(repaired)
-            logger.info(
-                "Recovered truncated JSON (%d → %d chars)", len(text), len(repaired),
-            )
-            return value
-        except json.JSONDecodeError:
-            pass
-
+    # Never close strings/containers or discard unfinished fields: missing
+    # delimiters can mean lost claims, caveats, or entire chunks. Retry instead.
     logger.warning("Could not parse JSON from response (first 200 chars): %s", text[:200])
     return None
 
 
-def _repair_truncated_json(text: str) -> str | None:
-    """Attempt to close truncated JSON by appending missing brackets/braces.
-
-    The LLM sometimes hits the output token limit mid-object, producing
-    valid JSON up to a point and then nothing.  This function counts
-    open delimiters (ignoring those inside strings) and appends the
-    needed closers.  It also strips trailing partial key-value pairs
-    that were cut mid-string.
-    """
-    if not text or text[0] not in "{[":
-        return None
-
-    # First pass: count depth and detect if we're inside a string
-    depth_brace = 0
-    depth_bracket = 0
-    in_string = False
-    escape = False
-    last_complete_pos = 0  # position after the last , or complete value
-
-    for pos, char in enumerate(text):
-        if escape:
-            escape = False
-            continue
-        if char == "\\":
-            escape = True
-            continue
-        if char == '"':
-            in_string = not in_string
-            continue
-        if in_string:
-            continue
-        if char == "{":
-            depth_brace += 1
-        elif char == "}":
-            depth_brace -= 1
-        elif char == "[":
-            depth_bracket += 1
-        elif char == "]":
-            depth_bracket -= 1
-        elif char == ",":
-            # Record position after the comma — a valid break point
-            last_complete_pos = pos
-
-    if depth_brace == 0 and depth_bracket == 0:
-        return None  # Not truncated
-
-    # If we're inside a string, truncate to the last comma (which is a
-    # safe break point).  Otherwise, try to use the last comma position.
-    candidate = text[:last_complete_pos].rstrip()
-    if candidate.endswith(","):
-        candidate = candidate[:-1]
-
-    # Re-count depth on the stripped version, tracking open order
-    depth_brace = 0
-    depth_bracket = 0
-    in_string = False
-    escape = False
-    open_stack: list[str] = []  # track order of opens for correct closing
-    for char in candidate:
-        if escape:
-            escape = False
-            continue
-        if char == "\\":
-            escape = True
-            continue
-        if char == '"':
-            in_string = not in_string
-            continue
-        if in_string:
-            continue
-        if char == "{":
-            depth_brace += 1
-            open_stack.append("}")
-        elif char == "}":
-            depth_brace -= 1
-            if open_stack and open_stack[-1] == "}":
-                open_stack.pop()
-        elif char == "[":
-            depth_bracket += 1
-            open_stack.append("]")
-        elif char == "]":
-            depth_bracket -= 1
-            if open_stack and open_stack[-1] == "]":
-                open_stack.pop()
-
-    # Append closers in reverse order of opening (stack order)
-    closers = "".join(reversed(open_stack))
-    if closers:
-        return candidate + closers
-    return None
-
-
-def _repair_json_response(text: str) -> str:
-    """Repair invalid escapes and missing final JSON delimiters conservatively."""
-    # JSON allows only these escapes. Preserve valid sequences and double every
-    # other backslash so LaTex-like ``\epsilon`` remains literal text.
-    repaired = re.sub(r"\\(?![\"\\/bfnrtu])", r"\\\\", text)
-    stack: list[str] = []
+def _remove_trailing_commas(text: str) -> str:
+    """Repair delimiters only outside strings, preserving exact quote text."""
+    result: list[str] = []
     in_string = False
     escaped = False
-    for char in repaired:
+    for index, char in enumerate(text):
         if in_string:
             if escaped:
                 escaped = False
@@ -371,19 +268,16 @@ def _repair_json_response(text: str) -> str:
                 escaped = True
             elif char == '"':
                 in_string = False
-            continue
-        if char == '"':
+        elif char == '"':
             in_string = True
-        elif char == "{":
-            stack.append("}")
-        elif char == "[":
-            stack.append("]")
-        elif char in "}]" and stack and char == stack[-1]:
-            stack.pop()
-
-    if in_string:
-        repaired += '"'
-    return repaired + "".join(reversed(stack))
+        elif char == ",":
+            following = index + 1
+            while following < len(text) and text[following].isspace():
+                following += 1
+            if following < len(text) and text[following] in "}]":
+                continue
+        result.append(char)
+    return "".join(result)
 
 
 def _find_json_start(text: str) -> int:

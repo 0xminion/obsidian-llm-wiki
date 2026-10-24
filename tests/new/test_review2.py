@@ -97,8 +97,8 @@ def test_moc_cross_ref_diagram_unidirectional():
 # ── render/obsidian.py: MoC cross-refs with no inter-concept relations ──────
 
 
-def test_moc_cross_ref_diagram_no_inter_concept_relations_shows_placeholder():
-    """MoC with ≥2 concepts but no inter-concept relations shows placeholder message."""
+def test_moc_cross_ref_diagram_no_relations_omits_empty_section():
+    """A lack of relationships is not a reason to publish a placeholder."""
     from obsidian_llm_wiki.core.models import MapOfContent
     from obsidian_llm_wiki.render.obsidian import render_moc_page
 
@@ -112,10 +112,9 @@ def test_moc_cross_ref_diagram_no_inter_concept_relations_shows_placeholder():
     page = render_moc_page(
         moc, all_concepts={"concept-a": a, "concept-b": b},
     )
-    # Section heading must always be present for structural consistency
-    assert "## Cross-References / 关联图谱" in page
-    # Placeholder message must appear
-    assert "No cross-references available yet" in page
+    # Empty generated sections are omitted, never padded with placeholder prose.
+    assert "## Cross-References" not in page
+    assert "No cross-references available yet" not in page
     # No code block (since there's no diagram to render)
     assert "```text" not in page
 
@@ -141,7 +140,7 @@ def test_moc_cross_ref_diagram_with_relations_still_works():
     page = render_moc_page(
         moc, all_concepts={"concept-a": a, "concept-b": b},
     )
-    assert "## Cross-References / 关联图谱" in page
+    assert "## Cross-References" in page
     assert "```text" in page
     assert "↔" in page
     # Placeholder should NOT appear when relations exist
@@ -162,7 +161,7 @@ def test_moc_cross_ref_diagram_single_concept_no_section():
     page = render_moc_page(
         moc, all_concepts={"concept-a": a},
     )
-    assert "## Cross-References / 关联图谱" not in page
+    assert "## Cross-References" not in page
     assert "No cross-references available yet" not in page
 
 
@@ -182,14 +181,14 @@ def test_render_moc_page_with_cross_lingual_links():
     page = render_moc_page(
         moc, all_concepts={"concept-a": a, "concept-b": _make_concept("concept-b", "概念B")},
         cross_lingual_links=xling,
+        confirmed_cross_lingual_pairs={("concept-a", "concept-b")},
     )
     # Cross-lingual links should NOT be a separate section. They must appear
     # before cross-references, otherwise Markdown nests them under the wrong
     # heading even though the page happens to contain both strings.
     assert "Cross-Lingual Links" not in page
-    concept_b_index = page.index("concept-b")
-    cross_ref_index = page.index("## Cross-References / 关联图谱")
-    assert concept_b_index < cross_ref_index
+    assert page.index("concept-b") > page.index("## Concepts")
+    assert "## Cross-References" not in page  # no asserted relationship
     assert moc.concept_slugs == ["concept-a", "concept-b"]
 
 
@@ -216,16 +215,16 @@ def test_render_vault_remaps_embedding_links_after_bilingual_slug_normalization(
         chinese.slug: [(english.slug, 0.84, english.title)],
     }
 
-    render_vault(tmp_path, bundle, {}, cross_lingual_links=links)
+    render_vault(tmp_path, bundle, {}, cross_lingual_links=links,
+                 confirmed_cross_lingual_pairs={(english.slug, chinese.slug)})
 
-    normalized_chinese_slug = "da-yuyan-moxing-大语言模型"
+    normalized_chinese_slug = "da-yuyan-moxing"
     page = (tmp_path / "mocs" / "language-ai.md").read_text(encoding="utf-8")
     # Rendering works on a defensive bundle copy: the page receives the
     # normalized/augmented member but a caller can retry with its original data.
-    assert normalized_chinese_slug not in moc.concept_slugs
-    assert page.index(f"[[{normalized_chinese_slug}]]") < page.index(
-        "## Cross-References / 关联图谱"
-    )
+    assert moc.concept_slugs == [english.slug]
+    assert page.index(f"[[{normalized_chinese_slug}]]") > page.index("## Concepts")
+    assert "## Cross-References" not in page
 
 
 # ── render/obsidian.py: render_source_page deduplication ───────────────────
@@ -396,8 +395,8 @@ def test_extract_web_all_layers_fail():
 # ── render/obsidian.py: deterministic bilingual title normalization ──────────
 
 
-def test_render_vault_normalizes_chinese_titles_and_slugs(tmp_path):
-    """Chinese-derived titles become English-first bilingual with bilingual filenames."""
+def test_render_vault_preserves_chinese_titles_and_safe_slugs(tmp_path):
+    """Aliases do not authorize translation, title rewriting, or filename churn."""
     from obsidian_llm_wiki.core.models import (
         ConceptNote,
         MapOfContent,
@@ -429,22 +428,22 @@ def test_render_vault_normalizes_chinese_titles_and_slugs(tmp_path):
 
     render_vault(tmp_path, bundle, {})
 
-    concept_path = tmp_path / "concepts" / "proof-of-family-侨批与家族量证明.md"
+    concept_path = tmp_path / "concepts" / "qiaopi-proof-of-family.md"
     assert concept_path.exists()
     concept_text = concept_path.read_text()
-    assert "title: Proof of Family (侨批与家族量证明)" in concept_text
-    assert "# Proof of Family (侨批与家族量证明)" in concept_text
+    assert "title: 侨批与家族量证明" in concept_text
+    assert "# 侨批与家族量证明" in concept_text
 
-    moc_path = tmp_path / "mocs" / "evolution-of-trust-and-settlement-信用与结算的演化图谱.md"
+    moc_path = tmp_path / "mocs" / "evolution-of-trust-and-settlement.md"
     assert moc_path.exists()
     moc_text = moc_path.read_text()
-    assert "title: Evolution of Trust and Settlement (信用与结算的演化图谱)" in moc_text
-    assert "## Concepts / 概念" in moc_text
-    assert "[[proof-of-family-侨批与家族量证明" in moc_text
+    assert "title: 信用与结算的演化图谱" in moc_text
+    assert "## 概念" in moc_text
+    assert "[[qiaopi-proof-of-family]]" in moc_text
 
     entry_files = list((tmp_path / "entries").glob("*.md"))
     assert any(
-        "proof-of-family" in f.name and "被套过的人还可以买谁" in f.name
+        "被套过的人还可以买谁" in f.name and "proof-of-family" not in f.name
         for f in entry_files
     )
 

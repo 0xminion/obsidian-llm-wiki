@@ -236,6 +236,12 @@ class OperationStore:
     @contextmanager
     def _locked(self, *, write: bool) -> Iterator[None]:
         """Lock vault history without making read-only CLI modes write state."""
+        from obsidian_llm_wiki.core.generated_paths import checked_generated_path
+
+        # Operation history/resume can run before a registry is opened. Guard
+        # these read-side paths here as well, not only in registry preflight.
+        for path in (self.llmwiki_dir, self.lock_path, self.path, self.resume_path):
+            checked_generated_path(path)
         lock_file = None
         if write:
             self.llmwiki_dir.mkdir(parents=True, exist_ok=True)

@@ -17,9 +17,13 @@ def _single_response() -> str:
     return json.dumps(
         {
             "source_title": "Source",
-            "source_summary": "Summary",
+            "source_summary": "Chunking bounds request size.",
             "concepts": [
-                {"title": "Concept", "slug": "concept", "summary": "Summary"}
+                {
+                    "title": "Chunking", "slug": "concept",
+                    "summary": "Chunking bounds request size.",
+                    "sections": [{"heading": "Evidence", "prose": "Chunking bounds request size."}],
+                }
             ],
         }
     )
@@ -77,8 +81,12 @@ async def test_single_pass_loads_policy_once_and_applies_per_source_granularity(
     monkeypatch.setattr(llm, "acall_llm", fake_acall)
     config = Config(vault_path=str(tmp_path), min_source_chars=1, retry_count=1)
     sources = {
-        "social.md": SourceDoc(title="Social", content="x" * 20_001, source_type="tweet"),
-        "paper.md": SourceDoc(title="Paper", content="x" * 4_001, source_type="paper"),
+        "social.md": SourceDoc(
+            title="Social", content="Chunking bounds request size. " * 800, source_type="tweet",
+        ),
+        "paper.md": SourceDoc(
+            title="Paper", content="Chunking bounds request size. " * 200, source_type="paper",
+        ),
     }
 
     result = await pipeline.run_pipeline(tmp_path, sources, config, force=True)

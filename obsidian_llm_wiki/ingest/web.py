@@ -449,7 +449,18 @@ def _extract_trafilatura(url: str, timeout: int) -> SourceDoc:
     if not title or _is_bad_title(title):
         title = ""
 
-    return SourceDoc(title=title or url, content=extracted.strip(), url=url)
+    from obsidian_llm_wiki.ingest.provenance import stamp_source
+
+    resolved_url = str(resp.url)
+    return stamp_source(
+        SourceDoc(title=title or url, content=extracted.strip(), url=resolved_url),
+        requested_url=url,
+        resolved_url=resolved_url,
+        extracted_url=resolved_url,
+        extractor="trafilatura",
+        content_type=resp.headers.get("content-type", "").split(";", 1)[0],
+        document_format="html",
+    )
 
 
 def _extract_wayback(url: str, timeout: int) -> SourceDoc:

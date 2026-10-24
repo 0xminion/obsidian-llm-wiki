@@ -260,6 +260,7 @@ def extract_generic_podcast(raw_url: str) -> SourceDoc:
     lambda parsed, raw: (
         parsed.scheme.lower() in ("http", "https")
         and bool(parsed.hostname)
+        and not _is_rss_feed(raw)
         # Don't shadow known specialist domains that are tried after us.
         and parsed.hostname.lower() not in (
             "x.com", "twitter.com", "www.x.com", "www.twitter.com",

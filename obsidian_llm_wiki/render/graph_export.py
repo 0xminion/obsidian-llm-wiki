@@ -30,6 +30,7 @@ from itertools import islice
 from pathlib import Path
 from typing import Any
 
+from obsidian_llm_wiki.core.generated_paths import checked_generated_path, is_graph_shard_basename
 from obsidian_llm_wiki.core.models import SynthesisBundle
 
 logger = logging.getLogger("obswiki.render.graph_export")
@@ -49,7 +50,7 @@ def export_graph_json(bundle: SynthesisBundle, output_path: Path) -> bool:
     compatible with Obsidian's graph view and D3.js force-directed layouts.
     """
     graph = _build_graph_dict(bundle)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
+    checked_generated_path(output_path, output_path.parent.parent)
     from obsidian_llm_wiki.render.obsidian import _write_generated_artifact
 
     changed = _write_generated_artifact(
@@ -75,7 +76,7 @@ def export_graph_mermaid(bundle: SynthesisBundle, output_path: Path) -> bool:
     via ```mermaid code blocks.
     """
     mermaid = _build_mermaid(bundle)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
+    checked_generated_path(output_path, output_path.parent.parent)
     from obsidian_llm_wiki.render.obsidian import _write_generated_artifact
 
     changed = _write_generated_artifact(
@@ -98,6 +99,7 @@ def export_graph(
     """
     if shard_size < 1 or monolith_threshold < 1:
         raise ValueError("graph shard limits must be positive")
+    checked_generated_path(output_dir, output_dir.parent)
     output_dir.mkdir(parents=True, exist_ok=True)
     stale_shards = _previous_graph_shards(output_dir)
     total_nodes = len(bundle.concepts) + len(bundle.maps) + len(bundle.sources)
@@ -121,75 +123,51 @@ def export_graph(
 
 
 def _iter_graph_nodes(bundle: SynthesisBundle) -> Iterator[dict[str, Any]]:
-    concept_to_moc = {
-        slug: moc.slug for moc in bundle.maps for slug in moc.concept_slugs
-    }
+    ids = _graph_ids(bundle)
+    live = {c.slug for c in bundle.concepts}
+    concept_to_moc = {slug: ids[("moc", moc.slug)] for moc in bundle.maps
+                      for slug in moc.concept_slugs if slug in live}
     for concept in sorted(bundle.concepts, key=lambda item: item.slug):
-        yield {
-            "id": concept.slug,
-            "label": concept.title,
-            "type": "concept",
-            "tags": list(concept.tags),
-            "confidence": concept.confidence,
-            "moc": concept_to_moc.get(concept.slug, ""),
-        }
+        yield {"id": ids[("concept", concept.slug)], "label": concept.title,
+               "type": "concept", "tags": list(concept.tags),
+               "confidence": concept.confidence, "moc": concept_to_moc.get(concept.slug, "")}
     for moc in sorted(bundle.maps, key=lambda item: item.slug):
-        yield {
-            "id": moc.slug,
-            "label": moc.title,
-            "type": "moc",
-            "tags": list(moc.tags),
-            "confidence": 1.0,
-            "moc": "",
-            "concept_count": len(moc.concept_slugs),
-        }
-    for source in sorted(
-        bundle.sources, key=lambda item: item.source_file or item.source_title
-    ):
-        raw_id = source.source_file or source.source_title
-        yield {
-            "id": _slugify_source_id(raw_id),
-            "label": source.source_title,
-            "type": "source",
-            "tags": list(source.source_tags),
-            "confidence": 1.0,
-            "moc": "",
-        }
+        yield {"id": ids[("moc", moc.slug)], "label": moc.title, "type": "moc",
+               "tags": list(moc.tags), "confidence": 1.0, "moc": "",
+               "concept_count": len(set(moc.concept_slugs) & live)}
+    for source in sorted(bundle.sources, key=lambda item: item.source_file or item.source_title):
+        raw = source.source_file or source.source_title
+        yield {"id": ids[("source", raw)], "label": source.source_title,
+               "type": "source", "tags": list(source.source_tags), "confidence": 1.0, "moc": ""}
 
 
 def _iter_graph_edges(bundle: SynthesisBundle) -> Iterator[dict[str, Any]]:
+    ids = _graph_ids(bundle)
     concept_by_slug = {concept.slug: concept for concept in bundle.concepts}
+    symmetric = {"related_to", "contrasts_with", "complements", "competes_with", "equivalent_to"}
+    # A sparse hub has many incoming edges. Scanning its adjacency for each
+    # reverse lookup makes that linear-size graph quadratic to export.
+    edge_keys = {(concept.slug, link.slug, link.relation)
+                 for concept in bundle.concepts for link in concept.related}
     for concept in sorted(bundle.concepts, key=lambda item: item.slug):
         local_seen: set[tuple[str, str]] = set()
         for link in concept.related:
             local_key = (link.slug, link.relation)
-            if local_key in local_seen:
+            target = concept_by_slug.get(link.slug)
+            if not target or link.slug == concept.slug or local_key in local_seen:
                 continue
             local_seen.add(local_key)
-            target = concept_by_slug.get(link.slug)
-            has_reverse = bool(
-                target
-                and any(
-                    reverse.slug == concept.slug and reverse.relation == link.relation
-                    for reverse in target.related
-                )
-            )
+            has_reverse = link.relation in symmetric and (
+                link.slug, concept.slug, link.relation
+            ) in edge_keys
             if has_reverse and concept.slug > link.slug:
                 continue
-            yield {
-                "source": concept.slug,
-                "target": link.slug,
-                "relation": link.relation,
-                "bidirectional": has_reverse,
-            }
+            yield {"source": ids[("concept", concept.slug)], "target": ids[("concept", link.slug)],
+                   "relation": link.relation, "bidirectional": has_reverse}
     for moc in sorted(bundle.maps, key=lambda item: item.slug):
-        for slug in sorted(set(moc.concept_slugs)):
-            yield {
-                "source": moc.slug,
-                "target": slug,
-                "relation": "contains",
-                "bidirectional": False,
-            }
+        for slug in sorted(set(moc.concept_slugs) & concept_by_slug.keys()):
+            yield {"source": ids[("moc", moc.slug)], "target": ids[("concept", slug)],
+                   "relation": "contains", "bidirectional": False}
 
 
 def _chunks(items: Iterator[dict[str, Any]], size: int) -> Iterator[list[dict[str, Any]]]:
@@ -215,6 +193,7 @@ def _export_sharded_graph(
     )
 
     graph_dir = output_dir / "graph"
+    checked_generated_path(graph_dir, output_dir.parent)
     graph_dir.mkdir(parents=True, exist_ok=True)
     written: list[str] = []
     keep: set[Path] = set()
@@ -293,6 +272,7 @@ def _previous_graph_shards(output_dir: Path) -> set[Path]:
     """Read the previous manifest; glob only once for legacy migration."""
     graph_dir = output_dir / "graph"
     manifest_path = graph_dir / "manifest.json"
+    checked_generated_path(manifest_path, output_dir.parent)
     if manifest_path.is_file():
         try:
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -309,11 +289,12 @@ def _previous_graph_shards(output_dir: Path) -> set[Path]:
             return {
                 graph_dir / str(record["path"])
                 for record in records
-                if isinstance(record.get("path"), str)
+                if is_graph_shard_basename(record.get("path"))
             } | {manifest_path}
     if not graph_dir.is_dir():
         return set()
-    return set(graph_dir.glob("*.json"))
+    return {path for path in graph_dir.glob("*.json")
+            if path.name == "manifest.json" or is_graph_shard_basename(path.name)}
 
 
 def _remove_stale_shards(
@@ -344,177 +325,64 @@ def _slugify_source_id(raw_id: str) -> str:
     return slugify(raw_id.removesuffix(".md"))
 
 
+def _graph_ids(bundle: SynthesisBundle) -> dict[tuple[str, str], str]:
+    """Keep legacy IDs when unique; qualify every collision by type/identity."""
+    records = [("concept", c.slug, c.slug) for c in bundle.concepts]
+    records += [("moc", m.slug, m.slug) for m in bundle.maps]
+    records += [("source", s.source_file or s.source_title,
+                 _slugify_source_id(s.source_file or s.source_title)) for s in bundle.sources]
+    counts: dict[str, int] = {}
+    for _kind, _raw, base in records:
+        counts[base] = counts.get(base, 0) + 1
+    return {(kind, raw): base if counts[base] == 1 else f"{kind}:{raw}"
+            for kind, raw, base in records}
+
+
 def _mermaid_safe_id(slug: str) -> str:
-    """Convert a slug to a Mermaid-safe node identifier."""
-    return slug.replace("-", "_")
+    """Stable bounded IDs, including keywords, punctuation and Unicode."""
+    return "n_" + hashlib.sha256(slug.encode("utf-8")).hexdigest()
 
 
 def _mermaid_safe_label(text: str) -> str:
-    """Escape a label for Mermaid node display."""
-    # Replace characters that break Mermaid syntax.
-    text = text.replace('"', "'")
-    # Brackets break subgraph/node syntax — replace with angle brackets.
-    text = text.replace("[", "‹").replace("]", "›")
+    """Quote-safe Mermaid entity text; labels cannot inject diagram syntax."""
+    text = " ".join(str(text).split())[:240]
+    for old, new in (("#", "#35;"), ("&", "#38;"), ('"', "#quot;"),
+                     ("<", "#60;"), (">", "#62;"), ("|", "#124;"),
+                     ("[", "#91;"), ("]", "#93;")):
+        text = text.replace(old, new)
     return text
 
 
 def _build_graph_dict(bundle: SynthesisBundle) -> dict[str, Any]:
-    """Build the graph dict from a SynthesisBundle."""
-    # Build MoC lookup: concept_slug → moc_slug
-    concept_to_moc: dict[str, str] = {}
-    for moc in bundle.maps:
-        for slug in moc.concept_slugs:
-            concept_to_moc[slug] = moc.slug
-
-    # Nodes: concepts
-    nodes: list[dict[str, Any]] = []
-    for concept in bundle.concepts:
-        nodes.append({
-            "id": concept.slug,
-            "label": concept.title,
-            "type": "concept",
-            "tags": list(concept.tags),
-            "confidence": concept.confidence,
-            "moc": concept_to_moc.get(concept.slug, ""),
-        })
-
-    # Nodes: MoCs
-    for moc in bundle.maps:
-        nodes.append({
-            "id": moc.slug,
-            "label": moc.title,
-            "type": "moc",
-            "tags": list(moc.tags),
-            "confidence": 1.0,
-            "moc": "",
-        })
-
-    # Nodes: sources — slugify the ID for consistency with wikilinks.
-    for source in bundle.sources:
-        raw_id = source.source_file or source.source_title
-        source_slug = _slugify_source_id(raw_id)
-        nodes.append({
-            "id": source_slug,
-            "label": source.source_title,
-            "type": "source",
-            "tags": list(source.source_tags),
-            "confidence": 1.0,
-            "moc": "",
-        })
-
-    # Edges: concept-to-concept (from related links).
-    # Index lookups keep this O(concepts + edges) — a linear concept scan per
-    # edge and a linear edge rescan per duplicate would make large corpora
-    # quadratic.
-    concept_by_slug = {c.slug: c for c in bundle.concepts}
-    edges: list[dict[str, Any]] = []
-    edge_by_key: dict[tuple[str, str, str], dict[str, Any]] = {}
-
-    for concept in bundle.concepts:
-        for link in concept.related:
-            edge_key = (concept.slug, link.slug, link.relation)
-            reverse_key = (link.slug, concept.slug, link.relation)
-            if edge_key in edge_by_key:
-                continue
-            existing_reverse = edge_by_key.get(reverse_key)
-            if existing_reverse is not None:
-                # Edge already added in the other direction — mark it.
-                existing_reverse["bidirectional"] = True
-                continue
-
-            # Check if reverse edge exists.
-            target_concept = concept_by_slug.get(link.slug)
-            has_reverse = False
-            if target_concept:
-                has_reverse = any(
-                    r.slug == concept.slug for r in target_concept.related
-                )
-
-            edge = {
-                "source": concept.slug,
-                "target": link.slug,
-                "relation": link.relation,
-                "bidirectional": has_reverse,
-            }
-            edges.append(edge)
-            edge_by_key[edge_key] = edge
-
-    # Edges: MoC-to-concept (membership)
-    for moc in bundle.maps:
-        for slug in moc.concept_slugs:
-            edges.append({
-                "source": moc.slug,
-                "target": slug,
-                "relation": "contains",
-                "bidirectional": False,
-            })
-
-    # MoC metadata
-    mocs: list[dict[str, Any]] = [
-        {
-            "id": moc.slug,
-            "label": moc.title,
-            "concept_count": len(moc.concept_slugs),
-        }
-        for moc in bundle.maps
-    ]
-
-    return {
-        "nodes": nodes,
-        "edges": edges,
-        "mocs": mocs,
-    }
+    """The same validated graph records in both monolithic and sharded mode."""
+    nodes = list(_iter_graph_nodes(bundle))
+    return {"nodes": nodes, "edges": list(_iter_graph_edges(bundle)),
+            "mocs": [{"id": n["id"], "label": n["label"], "concept_count": n["concept_count"]}
+                     for n in nodes if n["type"] == "moc"]}
 
 
 def _build_mermaid(bundle: SynthesisBundle) -> str:
-    """Build a Mermaid graph diagram from a SynthesisBundle."""
-    lines: list[str] = ["graph LR"]
-    concept_by_slug = {c.slug: c for c in bundle.concepts}
-
-    # MoC nodes with subgraph grouping
+    """Bounded escaped diagram over the same validated graph as JSON."""
+    if len(bundle.concepts) + len(bundle.maps) + len(bundle.sources) > 120:
+        return 'graph LR\n  summary["Graph exceeds 120 nodes; use JSON export"]\n'
+    graph = _build_graph_dict(bundle)
+    if len(graph["edges"]) > 240:
+        return 'graph LR\n  summary["Graph exceeds 240 edges; use JSON export"]\n'
+    ids = _graph_ids(bundle)
+    lines = ["graph LR"]
     for moc in bundle.maps:
-        moc_id = _mermaid_safe_id(moc.slug)
-        moc_label = _mermaid_safe_label(moc.title)
-        lines.append(f"  subgraph {moc_id}[{moc_label}]")
-
-        for slug in moc.concept_slugs:
-            concept = concept_by_slug.get(slug)
-            if concept:
-                label = _mermaid_safe_label(concept.title)
-                lines.append(f'    {_mermaid_safe_id(slug)}["{label}"]')
-            else:
-                lines.append(f"    {_mermaid_safe_id(slug)}[{_mermaid_safe_label(slug)}]")
-
-        lines.append("  end")
-
-    # Orphan concepts (not in any MoC) as standalone nodes
-    moced_slugs: set[str] = set()
-    for moc in bundle.maps:
-        moced_slugs.update(moc.concept_slugs)
-
-    for concept in bundle.concepts:
-        if concept.slug not in moced_slugs:
-            label = _mermaid_safe_label(concept.title)
-            lines.append(f'  {_mermaid_safe_id(concept.slug)}["{label}"]')
-
-    # Edges
-    seen_edges: set[tuple[str, str]] = set()
-    for concept in bundle.concepts:
-        for link in concept.related:
-            source_id = _mermaid_safe_id(concept.slug)
-            target_id = _mermaid_safe_id(link.slug)
-            edge_key = (source_id, target_id)
-            reverse_key = (target_id, source_id)
-
-            if edge_key in seen_edges or reverse_key in seen_edges:
-                continue
-            seen_edges.add(edge_key)
-
-            relation = link.relation or "related_to"
-            # Mermaid edge with label
-            if relation in ("related_to",):
-                lines.append(f"  {source_id} --- {target_id}")
-            else:
-                lines.append(f'  {source_id} -->|{relation}| {target_id}')
-
+        mid = _mermaid_safe_id(ids[("moc", moc.slug)])
+        lines.extend([f'  subgraph group_{mid}["{_mermaid_safe_label(moc.title)}"]',
+                      f'    {mid}["{_mermaid_safe_label(moc.title)}"]', "  end"])
+    for node in graph["nodes"]:
+        if node["type"] != "moc":
+            nid = _mermaid_safe_id(node["id"])
+            lines.append(f'  {nid}["{_mermaid_safe_label(node["label"])}"]')
+    for edge in graph["edges"]:
+        source_id, target_id = (_mermaid_safe_id(edge[key]) for key in ("source", "target"))
+        if edge["relation"] == "related_to":
+            lines.append(f"  {source_id} --- {target_id}")
+        else:
+            label = _mermaid_safe_label(edge["relation"])
+            lines.append(f'  {source_id} -->|"{label}"| {target_id}')
     return "\n".join(lines) + "\n"

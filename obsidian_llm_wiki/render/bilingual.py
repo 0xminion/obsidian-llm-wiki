@@ -1,8 +1,7 @@
-"""Bilingual (English/Chinese) title normalization and slug management.
+"""Source-language-preserving slug management and legacy presentation helpers.
 
-Extracted from render/obsidian.py for modularity. Handles the deterministic
-normalization of Chinese-derived titles into English-first bilingual format,
-slug remapping, and MoC heading bilingual detection.
+The active pipeline normalizes unsafe filenames without inventing translated
+titles. English-first utilities remain callable only for explicit legacy users.
 """
 
 from __future__ import annotations
@@ -13,6 +12,7 @@ from obsidian_llm_wiki.core.models import (
     ConceptNote,
     MapOfContent,
     SynthesisBundle,
+    normalize_slug,
 )
 from obsidian_llm_wiki.render.frontmatter import slugify
 
@@ -133,7 +133,7 @@ def ensure_english_first_bilingual(
 
 def _bilingual_slug(english_first_title: str) -> str:
     """Filename-safe slug that keeps both English and Chinese title parts."""
-    return slugify(english_first_title)
+    return normalize_slug(slugify(english_first_title), english_first_title)
 
 
 def english_side(title: str) -> str:
@@ -149,90 +149,40 @@ def english_side(title: str) -> str:
 
 
 def normalize_bilingual_titles_and_slugs(bundle: SynthesisBundle) -> dict[str, str]:
-    """Normalize Chinese-derived titles/slugs and return old-to-new slug mappings."""
-    slug_map: dict[str, str] = {}
+    """Normalize unsafe paths, never translate or reorder source-language titles.
 
-    # Concepts: normalize title and slug, then remap all relationship targets.
-    for concept in bundle.concepts:
-        if is_chinese(concept.title):
+    The historical public name remains for import compatibility. Explicit
+    bilingual titles and aliases are retained verbatim; safe existing slugs do
+    not change merely because the display title contains Chinese.
+    """
+    slug_map: dict[str, str] = {}
+    groups = [bundle.concepts, *(source.concepts for source in bundle.sources)]
+    for concepts in groups:
+        for concept in concepts:
             old_slug = concept.slug
-            concept.title = ensure_english_first_bilingual(
-                concept.title,
-                slug=concept.slug,
-                aliases=concept.aliases,
-            )
-            concept.slug = _bilingual_slug(concept.title)
+            concept.slug = normalize_slug(old_slug, concept.title)
             if old_slug and old_slug != concept.slug:
                 slug_map[old_slug] = concept.slug
-        else:
-            chinese = chinese_alias(concept.aliases)
-            if chinese:
-                concept.title = f"{concept.title} ({chinese})"
-
     canonical_slug_by_id = {
         concept.canonical_id: concept.slug
-        for concept in bundle.concepts
-        if concept.canonical_id
+        for concept in bundle.concepts if concept.canonical_id
     }
-
-    # Source-local concept objects may not be the same instances.
     for synthesis in bundle.sources:
         for concept in synthesis.concepts:
-            canonical_slug = canonical_slug_by_id.get(concept.canonical_id)
-            if canonical_slug:
-                concept.slug = canonical_slug
-                continue
-            if concept.slug in slug_map:
-                concept.slug = slug_map[concept.slug]
-            if is_chinese(concept.title):
-                concept.title = ensure_english_first_bilingual(
-                    concept.title,
-                    slug=concept.slug,
-                    aliases=concept.aliases,
-                )
-                concept.slug = _bilingual_slug(concept.title)
-
-    def remap_links(concepts: list[ConceptNote]) -> None:
+            canonical = canonical_slug_by_id.get(concept.canonical_id)
+            if canonical and canonical != concept.slug:
+                slug_map[concept.slug] = canonical
+                concept.slug = canonical
+    for concepts in groups:
         for concept in concepts:
             for link in concept.related:
-                if link.slug in slug_map:
-                    link.slug = slug_map[link.slug]
-
-    remap_links(bundle.concepts)
-    for synthesis in bundle.sources:
-        remap_links(synthesis.concepts)
-
-    # MoCs: normalize titles/slugs and remap concept references.
-    for moc in bundle.maps:
-        moc.concept_slugs = [slug_map.get(s, s) for s in moc.concept_slugs]
-        if is_chinese(moc.title):
-            moc.title = ensure_english_first_bilingual(moc.title, slug=moc.slug)
-            moc.slug = _bilingual_slug(moc.title)
-
-    for synthesis in bundle.sources:
-        for moc in synthesis.maps:
-            moc.concept_slugs = [slug_map.get(s, s) for s in moc.concept_slugs]
-            if is_chinese(moc.title):
-                moc.title = ensure_english_first_bilingual(moc.title, slug=moc.slug)
-                moc.slug = _bilingual_slug(moc.title)
-
-    # Entries from Chinese sources
-    for synthesis in bundle.sources:
-        if not is_chinese(synthesis.source_title):
-            continue
-        existing = split_bilingual_title(synthesis.source_title)
-        if existing:
-            english, chinese = existing
-            synthesis.source_title = f"{english} ({chinese})"
-            continue
-        concept_titles = [
-            english_side(concept.title) or title_from_slug(concept.slug)
-            for concept in synthesis.concepts[:2]
-            if concept.slug
-        ]
-        english = " and ".join(concept_titles) if concept_titles else "Chinese Source"
-        synthesis.source_title = f"{english} ({synthesis.source_title})"
-
+                link.slug = slug_map.get(link.slug, link.slug)
+            for claim in concept.claims:
+                claim.concept_slug = slug_map.get(claim.concept_slug, claim.concept_slug)
+    for mocs in [bundle.maps, *(source.maps for source in bundle.sources)]:
+        for moc in mocs:
+            moc.slug = normalize_slug(moc.slug, moc.title)
+            moc.concept_slugs = [slug_map.get(slug, slug) for slug in moc.concept_slugs]
     return slug_map
 
 

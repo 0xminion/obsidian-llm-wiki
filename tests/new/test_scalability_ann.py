@@ -123,6 +123,7 @@ def test_semantic_operations_inspect_only_supplied_ann_candidates() -> None:
         embeddings_cache=embeddings,
         new_slugs={"alpha"},
         candidate_slugs_by_slug={"alpha": ["alpha-duplicate"]},
+        confirmed_merges={"alpha-duplicate": "alpha"},
     )
 
     assert {concept.slug for concept in bundle.concepts} == {"alpha", "excluded"}

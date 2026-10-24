@@ -115,17 +115,21 @@ def personalized_pagerank(
     personalization = _normalize_seeds(paths, seeds)
     scores = dict(personalization)
     for _ in range(iterations):
-        next_scores = {path: (1.0 - damping) * personalization[path] for path in paths}
+        # Sum dangling mass once. Redistributing it inside the source loop
+        # turns sparse graphs into O(pages**2) work per iteration.
+        dangling_mass = damping * sum(
+            scores[path] for path in paths if not graph.outbound[path]
+        )
+        next_scores = {
+            path: (1.0 - damping + dangling_mass) * personalization[path]
+            for path in paths
+        }
         for source in paths:
             targets = graph.outbound[source]
             if targets:
                 contribution = damping * scores[source] / len(targets)
                 for target in targets:
                     next_scores[target] += contribution
-            else:
-                contribution = damping * scores[source]
-                for target in paths:
-                    next_scores[target] += contribution * personalization[target]
         scores = next_scores
     return MappingProxyType(scores)
 

@@ -672,13 +672,27 @@ def _dispatch_remote_connectors(raw_url: str):
 def _stamp_extracted_source(source: SourceDoc, raw_url: str, extractor: str) -> SourceDoc:
     """Attach baseline immutable provenance at the public extractor boundary.
 
-    Also runs the extraction quality gate.  When the gate fails, a WARNING
-    is logged and the reason is appended to provenance diagnostics.
-    Extraction is never failed — the source is still returned.
+    Also runs the extraction quality gate. Generic/deep-search sources fail
+    closed; legitimate short specialist content retains a diagnostic. Explicit
+    access-control shells and our own unavailable-transcript placeholders never
+    become source evidence, regardless of specialist length exceptions.
     """
     from obsidian_llm_wiki.ingest.provenance import stamp_source
 
-    # Run the quality gate (diagnostic only — never fails extraction).
+    if raw_url.startswith(("http://", "https://")):
+        restricted_title = source.title.strip().casefold().rstrip(".!") in {
+            "access denied", "403 forbidden", "forbidden", "just a moment",
+            "attention required", "sign in", "log in", "login required",
+            "javascript is not available",
+        }
+        placeholder = (
+            "Note: Full transcript unavailable" in source.content
+            and "Only video metadata was extracted." in source.content
+        )
+        if restricted_title or placeholder:
+            raise RuntimeError("Extraction unavailable: restricted page or transcript placeholder")
+
+    # Preserve diagnostics for legitimate short specialist sources.
     passed, reason = _check_extraction_quality(source)
     if not passed:
         logger.warning(

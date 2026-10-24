@@ -36,6 +36,7 @@ from typing import Any
 import httpx
 
 from obsidian_llm_wiki.ingest.proxy import make_client_kwargs
+from obsidian_llm_wiki.ingest.runtime import writes_allowed
 
 logger = logging.getLogger("obswiki.ingest.supadata_utils")
 
@@ -116,6 +117,8 @@ def _load_usage() -> dict[str, Any]:
 
 def _save_usage(data: dict[str, Any]) -> None:
     """Persist usage data to disk."""
+    if not writes_allowed():
+        return
     usage_file = _get_usage_file()
     usage_file.parent.mkdir(parents=True, exist_ok=True)
     usage_file.write_text(

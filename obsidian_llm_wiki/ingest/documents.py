@@ -24,7 +24,6 @@ from obsidian_llm_wiki.ingest.liteparse import parse_document
 from obsidian_llm_wiki.ingest.provenance import stamp_source
 from obsidian_llm_wiki.ingest.proxy import make_client_kwargs
 from obsidian_llm_wiki.ingest.url_safety import (
-    get_with_validated_redirects,
     stream_with_validated_redirects,
     validate_remote_url,
 )
@@ -121,17 +120,20 @@ def extract_discovered_document(
 ) -> SourceDoc:
     """Discover and parse bounded same-site document candidates from a landing page."""
     cfg = config or load_config()
+    from obsidian_llm_wiki.ingest.web import _read_bounded_html
+
     with httpx.Client(
         **make_client_kwargs(timeout=timeout, follow_redirects=False), headers=BROWSER_HEADERS
     ) as client:
         try:
-            response = get_with_validated_redirects(client, page_url)
-            response.raise_for_status()
+            with stream_with_validated_redirects(client, page_url) as response:
+                response.raise_for_status()
+                html = _read_bounded_html(response, cfg.max_html_bytes)
         except Exception as exc:
             raise DocumentError(f"Could not retrieve document landing page {page_url}") from exc
 
         candidates = document_candidates(
-            response.text, page_url, max_candidates=cfg.max_document_candidates
+            html, page_url, max_candidates=cfg.max_document_candidates
         )
 
     if not candidates:
@@ -270,6 +272,13 @@ def _parse_local_document(path: Path, *, source_url: str, config: Config) -> Sou
         from obsidian_llm_wiki.ingest.extractors.pdf import _extract_local_pdf
 
         return _extract_local_pdf(str(path), source_url=source_url, config=config)
+    if path.suffix.lower() == ".docx":
+        from obsidian_llm_wiki.ingest.extractors import docx
+
+        if docx._DEPS_AVAILABLE:
+            source = docx.extract_docx(str(path))
+            source.url = source_url
+            return source
     return parse_document(path, source_url=source_url, config=config)
 
 

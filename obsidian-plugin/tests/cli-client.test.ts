@@ -70,6 +70,20 @@ test("reports malformed output without dropping subsequent structured events", a
   ]);
 });
 
+test("preserves UTF-8 characters split between byte chunks", async () => {
+  const child = new FakeChildProcess();
+  const received: any[] = [];
+  const client = new CliClient({ spawn: () => child });
+  const run = client.start({ operation: "health", vaultPath: "/vault" }, event => received.push(event));
+  const bytes = Buffer.from('{"answer":"知识"}\n');
+  const split = bytes.indexOf(Buffer.from("知")) + 1;
+  child.stdout.emit("data", bytes.subarray(0, split));
+  child.stdout.emit("data", bytes.subarray(split));
+  child.emit("close", 0, null);
+  await run.completed;
+  assert.equal(received[0].event.answer, "知识");
+});
+
 test("cancels a running CLI process exactly once", () => {
   const child = new FakeChildProcess();
   const client = new CliClient({ spawn: () => child });

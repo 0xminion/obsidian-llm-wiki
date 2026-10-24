@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from pathlib import Path
 from unittest.mock import patch
 
@@ -235,9 +236,9 @@ def test_discovered_document_keeps_landing_candidate_redirect_and_download_prove
         def __exit__(self, *_args) -> None:
             return None
 
-        def get(self, url: str, **_kwargs: object) -> httpx.Response:
+        def stream(self, _method: str, url: str, **_kwargs: object):
             assert url == landing_url
-            return landing_response
+            return nullcontext(landing_response)
 
     def parse(path: Path, *, source_url: str, config: Config) -> SourceDoc:
         assert path == document_path

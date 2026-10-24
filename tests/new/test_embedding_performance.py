@@ -343,7 +343,8 @@ def test_dedup_new_concept_merges_with_existing():
         "obsidian_llm_wiki.synth.dedupe._embed_concept",
         side_effect=lambda c, cache, opts: embeddings.get(c.slug),
     ):
-        semantic_dedupe_concepts(bundle, threshold=0.85, new_slugs={"new"})
+        semantic_dedupe_concepts(bundle, threshold=0.85, new_slugs={"new"},
+                                 confirmed_merges={"new": "existing"})
 
     # "new" should have been merged into "existing" (higher confidence)
     remaining = [c.slug for c in bundle.concepts]

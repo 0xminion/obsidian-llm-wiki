@@ -7,8 +7,8 @@ instead of the default single-shot synthesis:
   (title, slug, rationale) without writing body content.
 
   **Pass 2 — Expand:** For each concept, a focused LLM call sends the source
-  excerpt + the full concept list and asks the model to write a deep section
-  (500-800 words minimum, at least 3 sections) with specific evidence.
+  excerpt + the full concept list and asks for source-specific explanations
+  with evidence. Depth follows available material, never a word-count quota.
 
   **Quality gate:** After expansion, any concept whose total body chars
   fall below ``config.concept_min_body_chars`` gets a gradient confidence
@@ -45,7 +45,10 @@ from obsidian_llm_wiki.core.request_limiter import AsyncRequestLimiter
 from obsidian_llm_wiki.core.schema import Granularity, SchemaPolicy, format_schema_guidance
 from obsidian_llm_wiki.core.text_quality import dedupe_statements, dedupe_tags
 from obsidian_llm_wiki.synth.evidence_windows import build_evidence_window
+from obsidian_llm_wiki.synth.language import get_language_instruction
 from obsidian_llm_wiki.synth.parser import parse_single_source_synthesis
+from obsidian_llm_wiki.synth.prompts import SOURCE_FAITHFULNESS_RULES
+from obsidian_llm_wiki.synth.validation import SynthesisValidationError, validate_source_summary
 
 logger = logging.getLogger("obswiki.synth.quality")
 
@@ -105,7 +108,7 @@ async def _bounded_map(
                 return
             try:
                 results[index] = await worker(item)
-            except BaseException as exc:
+            except Exception as exc:
                 results[index] = exc
 
     await asyncio.gather(
@@ -550,18 +553,18 @@ def gradient_confidence(body_chars: int, concept_min_body_chars: int) -> float:
 
 _EXTRACT_SCHEMA: dict[str, Any] = {
     "source_title": "string — title of the source",
-    "source_summary": "string — 2-3 sentence high-level overview",
-    "source_tags": ["string — 2-4 lowercase tags"],
-    "key_points": ["string — key findings (80+ chars each)"],
+    "source_summary": "string — concise source-specific overview",
+    "source_tags": ["string — relevant lowercase tags"],
+    "key_points": ["string — source-supported non-redundant findings; concise is valid"],
     "open_questions": ["string — unanswered questions"],
     "language": "string — ISO 639-1 code",
     "concepts": [
         {
-            "title": "string — concise title (3-8 words)",
+            "title": "string — concise descriptive title",
             "slug": "string — filename-safe slug",
-            "summary": "string — 1-2 sentence summary",
-            "tags": ["string — 2-4 lowercase tags"],
-            "rationale": "string — why this concept matters in the source (50+ chars)",
+            "summary": "string — concise source-grounded summary",
+            "tags": ["string — relevant lowercase tags"],
+            "rationale": "string — why this concept matters in this source",
         }
     ],
     "maps": [
@@ -569,10 +572,10 @@ _EXTRACT_SCHEMA: dict[str, Any] = {
             "title": "string — MOC title",
             "slug": "string — slug",
             "summary": (
-                "string — 3-5 sentences of insightful synthesis. "
+                "string — source-grounded synthesis of this grouping. "
                 "Explain the key tension or question, how the concepts "
                 "interact, and why this grouping matters. "
-                "Do NOT write a generic one-liner."
+                "Do not use generic filler."
             ),
             "tags": ["string"],
             "concept_slugs": ["string — slugs grouped under this MOC"],
@@ -596,7 +599,10 @@ def build_extract_prompt(
         else "(none yet — this is the first source)"
     )
     schema_json = json.dumps(_EXTRACT_SCHEMA, indent=2, ensure_ascii=False)
-    lang_instruction = f"\nWrite all content in **{language}**." if language else ""
+    lang_instruction = (
+        f"\nOutput language: **{language}**. {get_language_instruction(language)}"
+        if language else ""
+    )
     schema_guidance = format_schema_guidance(schema_policy, granularity)
 
     return f"""You are a knowledge extraction engine.  Analyse the source document \
@@ -606,14 +612,14 @@ no code fences:
 {schema_json}
 
 Rules:
-* Identify 3-8 distinct, meaningful concepts.
+* Identify only distinct concepts with substantive source support; zero concepts is valid.
 * Each concept needs a slug (lowercase, hyphens, no spaces).
 * Each concept needs a rationale explaining why it matters in THIS source.
 * Do NOT write concept body content — just identify and summarise.
-* Create 1-3 MOCs grouping related concepts. Each MOC summary must be \
-3-5 sentences of insightful synthesis — NOT a generic one-liner. Explain \
-the key tension, how the concepts interact, and why this grouping matters.
-* Tags must be lowercase, 2-4 per concept.{lang_instruction}
+* Create MOCs only for meaningful groups of at least two supported concepts.
+Explain their actual relationship; an empty maps list is valid.
+* Tags must be relevant and lowercase.
+{SOURCE_FAITHFULNESS_RULES}{lang_instruction}
 {schema_guidance}
 
 --- EXISTING CONCEPT INDEX ---
@@ -633,7 +639,7 @@ Now produce the JSON extraction."""
 _EXPAND_SCHEMA: dict[str, Any] = {
     "title": "string — concept title",
     "slug": "string — concept slug",
-    "summary": "string — 1-2 sentence summary",
+    "summary": "string — concise source-grounded summary",
     "sections": [
         {
             "heading": "string — section heading",
@@ -684,7 +690,10 @@ def build_expand_prompt(
         for c in all_concepts
         if c.get("slug") != concept_slug
     )
-    lang_instruction = f"\nWrite all content in **{language}**." if language else ""
+    lang_instruction = (
+        f"\nOutput language: **{language}**. {get_language_instruction(language)}"
+        if language else ""
+    )
     schema_guidance = format_schema_guidance(schema_policy, granularity)
 
     return f"""You are a knowledge synthesis engine.  Write a deep, evidence-backed \
@@ -695,16 +704,15 @@ Return ONLY a JSON object matching this schema — no prose, no code fences:
 {schema_json}
 
 Rules:
-* Write at least 500-800 words of substantive content across sections.
-* Produce at least 3 distinct sections, each covering a different facet \
-of the concept (e.g. definition, mechanism, evidence, implications, \
-comparison, limitations).
+* Write only as much substantive content as this source supports.
+* Use distinct sections for the supported facets; a single concise section is valid.
 * Use specific evidence, statistics, quotes, or examples from the source.
 * Every claim must be grounded in the source — cite where it appears.
 * Link to other concepts from this source using their slugs.
-* Do NOT repeat what the source says verbatim — synthesise and explain.
+* Synthesise and explain in body text; preserve claim quotes verbatim.
 * Sections must have substantive points OR prose — never both empty.\
 {lang_instruction}
+{SOURCE_FAITHFULNESS_RULES}
 {schema_guidance}
 
 {RELATIONSHIP_FEWSHOT}
@@ -859,7 +867,7 @@ async def quality_synthesize_source(
                 source.title,
                 chunk_content,
                 existing_concepts=existing_concepts,
-                language=source_lang or config.output_language,
+                language=config.output_language or source_lang,
                 schema_policy=schema_policy,
                 granularity=granularity,
             )
@@ -902,6 +910,16 @@ async def quality_synthesize_source(
                     f"chunk {chunk_idx}/{len(chunks)}: unparseable response"
                 )
                 continue
+            # Skeletons legitimately lack body sections, but every chunk must
+            # have a usable summary before merge keeps only the first one.
+            try:
+                validate_source_summary(
+                    chunk_skeleton.source_summary,
+                    SourceDoc(title=source.title, content=chunks[chunk_idx - 1]),
+                )
+            except SynthesisValidationError as exc:
+                chunk_errors.append(f"chunk {chunk_idx}/{len(chunks)}: {exc}")
+                continue
             skeletons.append(chunk_skeleton)
             # Extract rationales from each chunk's JSON
             try:
@@ -931,7 +949,7 @@ async def quality_synthesize_source(
             source.title,
             source.content,
             existing_concepts=existing_concepts,
-            language=source_lang or config.output_language,
+            language=config.output_language or source_lang,
             schema_policy=schema_policy,
             granularity=granularity,
         )
@@ -956,6 +974,7 @@ async def quality_synthesize_source(
         if skeleton is None:
             logger.warning("Pass 1 produced no parseable JSON for '%s'", filename)
             return None
+        validate_source_summary(skeleton.source_summary, source)
 
         # Extract rationales from Pass 1 JSON
         rationales: dict[str, str] = {}
@@ -974,6 +993,7 @@ async def quality_synthesize_source(
     if not skeleton.source_title:
         skeleton.source_title = source.title
     skeleton.source_file = filename
+    skeleton.language = config.output_language or source_lang
 
     if not skeleton.concepts:
         logger.warning("Pass 1 extracted no concepts for '%s'", filename)
@@ -1080,6 +1100,10 @@ async def quality_synthesize_source(
             "Pass 2 done for '%s': %d concepts expanded, %d failure(s) with diagnostics: %s",
             filename, len(skeleton.concepts), len(diagnostics), diagnostics,
         )
+        # A failed expansion is incomplete work even if pass 1 happened to
+        # include a body. Return failure so the boundary retries the source;
+        # lowering confidence must not authorize cache/state success.
+        return None
     else:
         logger.info(
             "Pass 2 done for '%s': %d concepts expanded",
@@ -1250,7 +1274,7 @@ async def _expand_one_concept(
         source_title=source.title,
         source_content=evidence.text,
         all_concepts=all_concepts,
-        language=source_lang or config.output_language,
+        language=config.output_language or source_lang,
         schema_policy=schema_policy,
         granularity=granularity,
     )
@@ -1388,7 +1412,15 @@ def _parse_concept_json(response: str) -> dict[str, Any] | None:
     data = _extract_json(response)
     if not isinstance(data, dict):
         return None
-    return _sanitize_latex_artifacts(data)
+    from obsidian_llm_wiki.core.models import _concept_from_dict, concept_note_to_dict
+
+    try:
+        # Share collection validation and scalar handling with single-pass JSON.
+        concept = _concept_from_dict(_sanitize_latex_artifacts(data))
+        return concept_note_to_dict(concept)
+    except (ValueError, TypeError, AttributeError, RecursionError) as exc:
+        logger.warning("Invalid concept expansion: %s", exc)
+        return None
 
 
 def _build_concept_from_expand(data: dict[str, Any], fallback_slug: str) -> ConceptNote:
@@ -1513,7 +1545,7 @@ Return JSON:
 {{
     "title": "{concept.title}",
     "slug": "{concept.slug}",
-    "summary": "Updated 1-2 sentence summary",
+    "summary": "Updated concise source-grounded summary",
     "tags": ["tag1", "tag2"],
     "sections": [
         {{"heading": "Section Name", "points": ["point1", "point2"], "prose": ""}}

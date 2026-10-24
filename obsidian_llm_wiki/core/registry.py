@@ -13,13 +13,14 @@ import math
 import re
 import sqlite3
 import struct
+import time
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from itertools import islice
 from pathlib import Path
 from types import TracebackType
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import urlsplit, urlunsplit
 
 from obsidian_llm_wiki.core.models import (
     ConceptNote,
@@ -43,7 +44,7 @@ __all__ = [
     "VaultRegistry",
 ]
 
-_SCHEMA_VERSION = 4
+_SCHEMA_VERSION = 6
 _LSH_TABLES = 8
 _LSH_BITS = 12
 _LSH_SPARSITY = 8
@@ -144,6 +145,11 @@ CREATE VIRTUAL TABLE IF NOT EXISTS concept_fts USING fts5(
     tokenize = 'unicode61 remove_diacritics 2'
 );
 
+CREATE TABLE IF NOT EXISTS concept_fts_identity (
+    concept_id TEXT PRIMARY KEY REFERENCES concept(id) ON DELETE CASCADE,
+    fts_rowid INTEGER NOT NULL UNIQUE
+);
+
 CREATE TABLE IF NOT EXISTS moc (
     id TEXT PRIMARY KEY,
     slug TEXT NOT NULL UNIQUE,
@@ -172,6 +178,8 @@ CREATE TABLE IF NOT EXISTS membership_source (
 );
 CREATE INDEX IF NOT EXISTS membership_source_moc_idx
     ON membership_source(moc_id);
+CREATE INDEX IF NOT EXISTS membership_source_concept_idx
+    ON membership_source(concept_id);
 
 CREATE TABLE IF NOT EXISTS membership (
     moc_id TEXT NOT NULL REFERENCES moc(id) ON DELETE CASCADE,
@@ -206,6 +214,8 @@ CREATE TABLE IF NOT EXISTS ann_bucket (
 );
 CREATE INDEX IF NOT EXISTS ann_bucket_lookup_idx
     ON ann_bucket(entity_kind, model_id, dimensions, table_id, bucket);
+CREATE INDEX IF NOT EXISTS ann_bucket_entity_idx
+    ON ann_bucket(entity_kind, entity_id, model_id);
 
 CREATE TABLE IF NOT EXISTS dirty_queue (
     id INTEGER PRIMARY KEY,
@@ -218,7 +228,10 @@ CREATE TABLE IF NOT EXISTS dirty_queue (
     next_attempt_at TEXT NOT NULL,
     claimed_by TEXT NOT NULL DEFAULT '',
     lease_expires_at TEXT NOT NULL DEFAULT '',
+    lease_token TEXT NOT NULL DEFAULT '',
     error TEXT NOT NULL DEFAULT '',
+    pending_payload_json TEXT,
+    pending_next_attempt_at TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -383,13 +396,16 @@ def _normalize_url(url: str) -> str:
     host = (parts.hostname or "").casefold()
     if not scheme or not host:
         return url.strip()
+    if ":" in host:
+        host = f"[{host}]"
     port = parts.port
     if port is not None and not (
         (scheme == "http" and port == 80) or (scheme == "https" and port == 443)
     ):
         host = f"{host}:{port}"
-    query = urlencode(sorted(parse_qsl(parts.query, keep_blank_values=True)), doseq=True)
-    return urlunsplit((scheme, host, parts.path or "/", query, ""))
+    # Query syntax is origin-defined: repeated-value order and '+' vs '%20'
+    # are not universally interchangeable. Normalize transport identity only.
+    return urlunsplit((scheme, host, parts.path or "/", parts.query, ""))
 
 
 @dataclass(frozen=True)
@@ -539,14 +555,42 @@ class VaultRegistry:
     """Own the vault-local SQLite registry and its transactional schema."""
 
     def __init__(self, llmwiki_dir: str | Path) -> None:
-        self.llmwiki_dir = Path(llmwiki_dir)
-        self.llmwiki_dir.mkdir(parents=True, exist_ok=True)
+        from obsidian_llm_wiki.core.generated_paths import (
+            checked_generated_path,
+            checked_metadata_directory,
+        )
+
+        self.llmwiki_dir = checked_metadata_directory(Path(llmwiki_dir))
         self.path = self.llmwiki_dir / "registry.db"
+        # SQLite may read, create, recover or unlink sidecars during connect or
+        # WAL negotiation. Reject the entire family before even creating dirs.
+        for suffix in ("", "-wal", "-shm", "-journal"):
+            checked_generated_path(self.path.with_name(self.path.name + suffix))
+        self.llmwiki_dir.mkdir(parents=True, exist_ok=True)
         self.connection = sqlite3.connect(self.path, timeout=30)
         self.connection.row_factory = sqlite3.Row
         self.connection.execute("PRAGMA foreign_keys = ON")
         self.connection.execute("PRAGMA busy_timeout = 30000")
-        self.connection.execute("PRAGMA journal_mode = WAL")
+        # Concurrent first opens can fail the rollback->WAL lock upgrade
+        # immediately even with busy_timeout set. Retry this negotiation only,
+        # with bounded backoff; unrelated I/O/schema failures must surface.
+        deadline = time.monotonic() + 30
+        try:
+            for attempt in range(8):
+                try:
+                    self.connection.execute("PRAGMA journal_mode = WAL")
+                    break
+                except sqlite3.OperationalError as exc:
+                    code = getattr(exc, "sqlite_errorcode", 0) & 0xFF
+                    remaining = deadline - time.monotonic()
+                    if code not in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
+                        raise
+                    if attempt == 7 or remaining <= 0:
+                        raise
+                    time.sleep(min(0.01 * (2 ** attempt), remaining))
+        except BaseException:
+            self.connection.close()
+            raise
         self.connection.execute("PRAGMA synchronous = NORMAL")
         previous_version = 0
         meta_exists = self.connection.execute(
@@ -569,15 +613,35 @@ class VaultRegistry:
                         f"({previous_version} > {_SCHEMA_VERSION})"
                     )
         self.connection.executescript(_SCHEMA)
-        dirty_columns = {
-            str(row[1])
-            for row in self.connection.execute("PRAGMA table_info(dirty_queue)")
-        }
-        if "lease_expires_at" not in dirty_columns:
-            self.connection.execute(
-                "ALTER TABLE dirty_queue "
-                "ADD COLUMN lease_expires_at TEXT NOT NULL DEFAULT ''"
-            )
+        # Serialize column discovery with ALTER for concurrent first opens.
+        with self.connection:
+            self.connection.execute("BEGIN IMMEDIATE")
+            dirty_columns = {
+                str(row[1])
+                for row in self.connection.execute("PRAGMA table_info(dirty_queue)")
+            }
+            for name, definition in (
+                ("lease_expires_at", "TEXT NOT NULL DEFAULT ''"),
+                ("lease_token", "TEXT NOT NULL DEFAULT ''"),
+                ("pending_payload_json", "TEXT"),
+                ("pending_next_attempt_at", "TEXT NOT NULL DEFAULT ''"),
+            ):
+                if name not in dirty_columns:
+                    self.connection.execute(
+                        f"ALTER TABLE dirty_queue ADD COLUMN {name} {definition}"
+                    )
+        if previous_version < 5:
+            with self.connection:
+                self.connection.execute(
+                    "INSERT OR REPLACE INTO concept_fts_identity(concept_id, fts_rowid) "
+                    "SELECT concept_id, MAX(rowid) FROM concept_fts "
+                    "WHERE concept_id IN (SELECT id FROM concept) GROUP BY concept_id"
+                )
+                self.connection.execute(
+                    "DELETE FROM concept_fts WHERE rowid NOT IN "
+                    "(SELECT fts_rowid FROM concept_fts_identity)"
+                )
+                self._set_meta_unlocked("pipeline_checkpoint", "")
         if previous_version < 3:
             self._backfill_entity_sources()
         self._migrate_legacy_operations()
@@ -805,15 +869,40 @@ class VaultRegistry:
         return operations
 
     def release_dirty_worker(self, worker_id: str) -> int:
-        """Release leases from a proven-dead ingest run during explicit resume."""
+        """Release all leases for a proven-dead/stopped worker, preserving successors.
+
+        Administrative recovery only: the caller must ensure this worker cannot
+        still publish results, and must not reuse its ID for a live worker.
+        """
+        return self._release_dirty_workers(worker_id)
+
+    def release_abandoned_pipeline_workers(self) -> int:
+        """Reclaim old pipeline claims AFTER acquiring the exclusive compile lock.
+
+        Call before starting any claims in the new compile run. Possession of
+        that lock, not lease age, proves previous pipeline workers are stopped.
+        The case-sensitive SQL prefix deliberately excludes ingest workers.
+        """
+        return self._release_dirty_workers(None)
+
+    def _release_dirty_workers(self, worker_id: str | None) -> int:
+        predicate = "claimed_by=?" if worker_id is not None else "claimed_by GLOB 'pipeline:*'"
+        parameters = (_now(), worker_id) if worker_id is not None else (_now(),)
         with self.connection:
             cursor = self.connection.execute(
-                """
+                f"""
                 UPDATE dirty_queue
-                SET state='pending', claimed_by='', lease_expires_at='', updated_at=?
-                WHERE state='running' AND claimed_by=?
+                SET state='pending', claimed_by='', lease_expires_at='', lease_token='',
+                    updated_at=?,
+                    payload_json=COALESCE(pending_payload_json, payload_json),
+                    next_attempt_at=CASE WHEN pending_payload_json IS NULL
+                        THEN next_attempt_at ELSE pending_next_attempt_at END,
+                    attempts=CASE WHEN pending_payload_json IS NULL THEN attempts ELSE 0 END,
+                    error=CASE WHEN pending_payload_json IS NULL THEN error ELSE '' END,
+                    pending_payload_json=NULL, pending_next_attempt_at=''
+                WHERE state='running' AND {predicate}
                 """,
-                (_now(), worker_id),
+                parameters,
             )
         return cursor.rowcount
 
@@ -972,6 +1061,7 @@ class VaultRegistry:
         now: str,
     ) -> None:
         """Persist one synthesis and rebuild its canonical ownership rows."""
+        self._set_meta_unlocked("pipeline_checkpoint", "")
         synthesis.source_file = filename
         payload = json.dumps(
             source_synthesis_to_dict(synthesis),
@@ -1017,6 +1107,8 @@ class VaultRegistry:
                 (source_id,),
             )
         }
+        touched_concept_ids.update(concept.canonical_id for concept in synthesis.concepts)
+        previous_member_inputs = self._moc_member_inputs(touched_concept_ids)
         self.connection.execute(
             "DELETE FROM membership_source WHERE source_id=?", (source_id,)
         )
@@ -1035,32 +1127,92 @@ class VaultRegistry:
                 "SELECT moc_id FROM moc_source WHERE source_id=?", (source_id,)
             )
         )
-        self._rebuild_moc_memberships(touched_moc_ids)
+        touched_moc_ids.update(self._mocs_referencing_concepts(touched_concept_ids))
         self._cleanup_unreferenced_entities(
             concept_ids=touched_concept_ids,
             moc_ids=touched_moc_ids,
         )
         self._rebuild_concept_aggregates(touched_concept_ids, versions, now)
+        current_member_inputs = self._moc_member_inputs(touched_concept_ids)
+        changed_members = {
+            cid for cid in touched_concept_ids
+            if previous_member_inputs.get(cid) != current_member_inputs.get(cid)
+        }
+        self._rebuild_moc_aggregates(touched_moc_ids, now, changed_members)
 
     def _assign_canonical_ids(self, synthesis: SourceSynthesis) -> None:
         """Resolve model-provided IDs only when they already exist locally."""
         slug_map: dict[str, str] = {}
+        reservations = getattr(self, "_concept_reservations", None)
+        if reservations is None:
+            reservations = self._concept_reservations = {}
+
+        def definition_key(title: str, summary: str) -> str:
+            text = "\x1f".join(" ".join(value.casefold().split()) for value in (title, summary))
+            return hashlib.sha256(text.encode()).hexdigest()
+
+        def existing_identity(slug: str):
+            row = self.connection.execute(
+                "SELECT id, slug, title, summary FROM concept WHERE slug=?", (slug,)
+            ).fetchone()
+            if row is not None:
+                owned = self.connection.execute(
+                    "SELECT 1 FROM concept_source cs JOIN source s ON s.id=cs.source_id "
+                    "WHERE cs.concept_id=? AND s.filename=?",
+                    (row[0], synthesis.source_file),
+                ).fetchone() is not None
+                return str(row[0]), str(row[1]), definition_key(str(row[2]), str(row[3])), owned
+            pending = reservations.get(slug)
+            if pending is not None:
+                identity, fingerprint, owner = pending
+                return identity, slug, fingerprint, owner == synthesis.source_file
+            return None
+
         for concept in synthesis.concepts:
             original_slug = concept.slug
+            fingerprint = definition_key(concept.title, concept.summary)
             row = None
             if concept.canonical_id:
                 row = self.connection.execute(
                     "SELECT id, slug FROM concept WHERE id=?", (concept.canonical_id,)
                 ).fetchone()
+            if row is None and synthesis.source_file:
+                # Revisions keep a previously disambiguated source-owned note.
+                # Look only through this source's indexed ownership, not the vault.
+                owned_rows = self.connection.execute(
+                    "SELECT c.id, c.slug, c.title FROM concept c "
+                    "JOIN concept_source cs ON cs.concept_id=c.id "
+                    "JOIN source s ON s.id=cs.source_id WHERE s.filename=?",
+                    (synthesis.source_file,),
+                ).fetchall()
+                matches = [
+                    candidate for candidate in owned_rows
+                    if " ".join(str(candidate[2]).casefold().split())
+                    == " ".join(concept.title.casefold().split())
+                ]
+                if len(matches) == 1:
+                    row = matches[0]
             if row is None:
-                row = self.connection.execute(
-                    "SELECT id, slug FROM concept WHERE slug=?", (concept.slug,)
-                ).fetchone()
+                candidate = existing_identity(concept.slug)
+                if candidate is not None and candidate[2] != fingerprint and not candidate[3]:
+                    # Equal titles can still be homonyms (Python the language vs
+                    # the snake). Only exact definitions or prior source ownership
+                    # permit implicit reuse. Semantic reuse must name a known ID.
+                    suffix = fingerprint[:16]
+                    concept.slug = f"{original_slug[:80 - len(suffix) - 1]}-{suffix}"
+                    candidate = existing_identity(concept.slug)
+                    if candidate is not None and candidate[2] != fingerprint and not candidate[3]:
+                        raise ValueError(f"Ambiguous canonical identity for {original_slug!r}")
+                if candidate is not None:
+                    row = candidate[:2]
             if row is not None:
                 concept.canonical_id = str(row[0])
                 concept.slug = str(row[1])
             else:
                 concept.canonical_id = self._stable_id("concept", concept.slug)
+            reservations.setdefault(
+                concept.slug, (concept.canonical_id, fingerprint, synthesis.source_file)
+            )
             slug_map[original_slug] = concept.slug
 
         for concept in synthesis.concepts:
@@ -1092,6 +1244,55 @@ class VaultRegistry:
             existing.confidence = max(existing.confidence, concept.confidence)
             existing.is_new = existing.is_new and concept.is_new
         synthesis.concepts = list(concepts_by_slug.values())
+        self._assign_moc_identities(synthesis)
+
+    def _assign_moc_identities(self, synthesis: SourceSynthesis) -> None:
+        """Reuse topic labels only with ownership or shared canonical members."""
+        from obsidian_llm_wiki.synth.language import detect_language
+
+        reservations = getattr(self, "_moc_reservations", None)
+        if reservations is None:
+            reservations = self._moc_reservations = {}
+        owned = self.connection.execute(
+            "SELECT m.slug, m.title FROM moc m JOIN moc_source ms ON ms.moc_id=m.id "
+            "JOIN source s ON s.id=ms.source_id WHERE s.filename=?",
+            (synthesis.source_file,),
+        ).fetchall() if synthesis.source_file else []
+
+        def lookup(slug: str):
+            row = self.connection.execute(
+                "SELECT id, title, summary FROM moc WHERE slug=?", (slug,)
+            ).fetchone()
+            if row is None:
+                return reservations.get(slug)
+            members = {
+                str(member[0]) for member in self.connection.execute(
+                    "SELECT c.slug FROM membership mb JOIN concept c ON c.id=mb.concept_id "
+                    "WHERE mb.moc_id=?", (row[0],),
+                )
+            }
+            return (" ".join(str(row[1]).casefold().split()),
+                    detect_language(str(row[2]) or str(row[1])), members, "")
+
+        for moc in synthesis.maps:
+            title_key = " ".join(moc.title.casefold().split())
+            language = detect_language(moc.summary or moc.title)
+            members = set(moc.concept_slugs)
+            previous_owned = [str(row[0]) for row in owned
+                              if " ".join(str(row[1]).casefold().split()) == title_key]
+            if len(previous_owned) == 1:
+                moc.slug = previous_owned[0]
+            else:
+                candidate = lookup(moc.slug)
+                if candidate is not None and not (
+                    candidate[0] == title_key and candidate[1] == language
+                    and (bool(members & candidate[2])
+                         or bool(synthesis.source_file and candidate[3] == synthesis.source_file))
+                ):
+                    material = f"{synthesis.source_file}\x1f{moc.slug}\x1f{title_key}\x1f{language}"
+                    suffix = hashlib.sha256(material.encode()).hexdigest()[:16]
+                    moc.slug = f"{moc.slug[:80 - len(suffix) - 1]}-{suffix}"
+            reservations.setdefault(moc.slug, (title_key, language, members, synthesis.source_file))
 
     def assign_canonical_ids(self, synthesis: SourceSynthesis) -> None:
         """Populate trusted stable IDs without persisting synthesis state."""
@@ -1101,6 +1302,25 @@ class VaultRegistry:
     def _stable_id(kind: str, slug: str) -> str:
         digest = hashlib.sha256(f"{kind}\x00{slug}".encode()).hexdigest()[:24]
         return f"{kind}-{digest}"
+
+    def _replace_concept_fts_unlocked(self, concept: ConceptNote) -> None:
+        """Replace a document by indexed FTS rowid, never scan UNINDEXED IDs."""
+        self.connection.execute(
+            "DELETE FROM concept_fts WHERE rowid=("
+            "SELECT fts_rowid FROM concept_fts_identity WHERE concept_id=?)",
+            (concept.canonical_id,),
+        )
+        cursor = self.connection.execute(
+            "INSERT INTO concept_fts(concept_id, slug, title, aliases, tags, summary) "
+            "VALUES(?, ?, ?, ?, ?, ?)",
+            (concept.canonical_id, concept.slug, concept.title,
+             " ".join(concept.aliases), " ".join(concept.tags), concept.summary),
+        )
+        self.connection.execute(
+            "INSERT INTO concept_fts_identity(concept_id, fts_rowid) VALUES(?, ?) "
+            "ON CONFLICT(concept_id) DO UPDATE SET fts_rowid=excluded.fts_rowid",
+            (concept.canonical_id, cursor.lastrowid),
+        )
 
     def _upsert_synthesis_entities(
         self,
@@ -1159,23 +1379,7 @@ class VaultRegistry:
                         """,
                         (normalized, concept.canonical_id),
                     )
-            self.connection.execute(
-                "DELETE FROM concept_fts WHERE concept_id=?", (concept.canonical_id,)
-            )
-            self.connection.execute(
-                """
-                INSERT INTO concept_fts(concept_id, slug, title, aliases, tags, summary)
-                VALUES(?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    concept.canonical_id,
-                    concept.slug,
-                    concept.title,
-                    " ".join(concept.aliases),
-                    " ".join(concept.tags),
-                    concept.summary,
-                ),
-            )
+            self._replace_concept_fts_unlocked(concept)
             self.connection.execute(
                 "INSERT OR IGNORE INTO concept_source(source_id, concept_id) VALUES(?, ?)",
                 (source_id, concept.canonical_id),
@@ -1191,14 +1395,7 @@ class VaultRegistry:
                     content_hash, updated_at
                 )
                 VALUES(?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(id) DO UPDATE SET
-                    slug=excluded.slug,
-                    title=excluded.title,
-                    summary=excluded.summary,
-                    tags_json=excluded.tags_json,
-                    payload_json=excluded.payload_json,
-                    content_hash=excluded.content_hash,
-                    updated_at=excluded.updated_at
+                ON CONFLICT(id) DO NOTHING
                 """,
                 (
                     moc_id,
@@ -1232,16 +1429,22 @@ class VaultRegistry:
     def _rebuild_concept_aggregates(
         self,
         concept_ids: set[str],
-        versions: ArtifactVersions,
+        versions: ArtifactVersions | None,
         now: str,
     ) -> None:
-        """Rebuild canonical concept payloads from every current source owner."""
+        """Rebuild only touched aggregates from current source-owned payloads.
+
+        Deletions have no new artifact version: retain the deterministic first
+        surviving owner's version rather than attributing it to the deleted one.
+        The caller owns the transaction, including aliases and FTS replacement.
+        """
         from obsidian_llm_wiki.synth.dedupe import merge_concepts
 
         for concept_id in sorted(concept_ids):
             rows = self.connection.execute(
                 """
-                SELECT synthesis.payload_json
+                SELECT synthesis.payload_json, synthesis.prompt_version,
+                       synthesis.schema_version, synthesis.model_id
                 FROM concept_source
                 JOIN source ON source.id=concept_source.source_id
                 JOIN synthesis ON synthesis.source_id=source.id
@@ -1295,9 +1498,9 @@ class VaultRegistry:
                     json.dumps(merged.tags, ensure_ascii=False, separators=(",", ":")),
                     payload_json,
                     _content_hash(payload_json),
-                    versions.prompt,
-                    versions.schema,
-                    versions.synthesis_model,
+                    versions.prompt if versions is not None else rows[0][1],
+                    versions.schema if versions is not None else rows[0][2],
+                    versions.synthesis_model if versions is not None else rows[0][3],
                     now,
                     concept_id,
                 ),
@@ -1316,23 +1519,167 @@ class VaultRegistry:
                         """,
                         (normalized, concept_id),
                     )
-            self.connection.execute(
-                "DELETE FROM concept_fts WHERE concept_id=?", (concept_id,)
+            self._replace_concept_fts_unlocked(merged)
+            # Embeddings are keyed by canonical ID but derived only from title
+            # and summary. Keep vectors already computed from the surviving
+            # bundle; remove stale model variants and their ANN entries together.
+            embedding_hash = _content_hash(f"{merged.title}\n{merged.summary}")
+            stale_models = self.connection.execute(
+                "SELECT model_id FROM embedding WHERE entity_kind='concept' "
+                "AND entity_id=? AND input_hash<>?",
+                (concept_id, embedding_hash),
+            ).fetchall()
+            for (model_id,) in stale_models:
+                self.connection.execute(
+                    "DELETE FROM ann_bucket WHERE entity_kind='concept' "
+                    "AND entity_id=? AND model_id=?",
+                    (concept_id, model_id),
+                )
+                self.connection.execute(
+                    "DELETE FROM embedding WHERE entity_kind='concept' "
+                    "AND entity_id=? AND model_id=?",
+                    (concept_id, model_id),
+                )
+
+    def _moc_member_inputs(self, concept_ids: set[str]) -> dict[str, tuple[str, str]]:
+        """Snapshot indexed vector inputs before source upserts overwrite them."""
+        return {
+            concept_id: (str(row[0]), str(row[1]))
+            for concept_id in sorted(concept_ids)
+            for row in self.connection.execute(
+                "SELECT title, summary FROM concept WHERE id=?", (concept_id,),
             )
-            self.connection.execute(
-                """
-                INSERT INTO concept_fts(concept_id, slug, title, aliases, tags, summary)
-                VALUES(?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    concept_id,
-                    merged.slug,
-                    merged.title,
-                    " ".join(merged.aliases),
-                    " ".join(merged.tags),
-                    merged.summary,
-                ),
+        }
+
+    def _mocs_referencing_concepts(self, concept_ids: set[str]) -> set[str]:
+        """Follow the reverse membership index before concept deletion cascades."""
+        return {
+            str(row[0]) for concept_id in sorted(concept_ids)
+            for row in self.connection.execute(
+                "SELECT moc_id FROM membership WHERE concept_id=?", (concept_id,),
             )
+        }
+
+    def _rebuild_moc_aggregates(
+        self, moc_ids: set[str], now: str, changed_members: set[str] | None = None,
+    ) -> None:
+        """Project touched MoCs from indexed owners, in render's first-owner order.
+
+        Filename order, not insertion/last-writer order, selects prose and tags.
+        Union live members in that order and retain each owner's local positions.
+        Never write the aggregate back into a source's synthesis contribution.
+        The caller owns the transaction, including membership replacement.
+        """
+        from obsidian_llm_wiki.synth.dedupe import normalise_tags
+
+        owners: dict[int, SourceSynthesis] = {}
+        for moc_id in sorted(moc_ids):
+            rows = self.connection.execute(
+                "SELECT source.id, synthesis.payload_json FROM moc_source "
+                "JOIN source ON source.id=moc_source.source_id "
+                "JOIN synthesis ON synthesis.source_id=source.id "
+                "WHERE moc_source.moc_id=? AND synthesis.status='ready' "
+                "ORDER BY source.filename", (moc_id,),
+            ).fetchall()
+            contributions = []
+            for source_id, payload in rows:
+                if source_id not in owners:
+                    owners[source_id] = source_synthesis_from_dict(json.loads(payload))
+                contributions.extend(
+                    (source_id, moc) for moc in owners[source_id].maps
+                    if self._stable_id("moc", moc.slug) == moc_id
+                )
+            if not contributions:
+                continue
+            # These are freshly decoded objects, never caller-owned syntheses.
+            merged = contributions[0][1]
+            payload = moc_to_dict(merged)
+            payload["tags"] = normalise_tags(merged.tags)
+            members: dict[str, str] = {}
+            self.connection.execute("DELETE FROM membership_source WHERE moc_id=?", (moc_id,))
+            for source_id, moc in contributions:
+                for position, slug in enumerate(moc.concept_slugs):
+                    row = self.connection.execute(
+                        "SELECT id FROM concept WHERE slug=?", (slug,),
+                    ).fetchone()
+                    if row is None:
+                        continue
+                    members.setdefault(slug, str(row[0]))
+                    self.connection.execute(
+                        "INSERT OR IGNORE INTO membership_source("
+                        "source_id, moc_id, concept_id, position) "
+                        "VALUES(?, ?, ?, ?)", (source_id, moc_id, row[0], position),
+                    )
+            payload["concept_slugs"] = list(members)
+            payload_json = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+            self.connection.execute(
+                "UPDATE moc SET title=?, summary=?, tags_json=?, payload_json=?, "
+                "content_hash=?, updated_at=? "
+                "WHERE id=? AND payload_json<>?",
+                (merged.title, merged.summary,
+                 json.dumps(payload["tags"], ensure_ascii=False, separators=(",", ":")),
+                 payload_json, _content_hash(payload_json), now, moc_id, payload_json),
+            )
+            self.connection.execute("DELETE FROM membership WHERE moc_id=?", (moc_id,))
+            self.connection.executemany(
+                "INSERT INTO membership(moc_id, concept_id, position) VALUES(?, ?, ?)",
+                [(moc_id, concept_id, position)
+                 for position, concept_id in enumerate(members.values())],
+            )
+            # MoC vectors are member centroids, keyed by slug (not canonical ID).
+            # The pipeline may have persisted a fresh post-change centroid before
+            # committing the owners. Keep that vector and its ANN rows intact.
+            centroid_hash = _content_hash("\x1f".join(sorted(members)))
+            centroids = self.connection.execute(
+                "SELECT * FROM embedding WHERE entity_kind='moc' AND entity_id=?",
+                (merged.slug,),
+            ).fetchall()
+            member_inputs_changed = bool(set(members.values()) & (changed_members or set()))
+            for centroid in centroids:
+                if centroid["input_hash"] == centroid_hash and (
+                    not member_inputs_changed
+                    or self._moc_centroid_is_current(centroid, members.values())
+                ):
+                    continue
+                for table in ("ann_bucket", "embedding"):
+                    self.connection.execute(
+                        f"DELETE FROM {table} WHERE entity_kind='moc' "
+                        "AND entity_id=? AND model_id=?",
+                        (merged.slug, centroid["model_id"]),
+                    )
+
+    def _moc_centroid_is_current(self, centroid: sqlite3.Row, member_ids: Iterable[str]) -> bool:
+        """A membership hash alone cannot validate changed member definitions.
+
+        Preserve a freshly computed centroid only when current same-model,
+        same-version member vectors prove its value; otherwise recompute later.
+        """
+        schema = str(centroid["schema_version"])
+        if not schema.startswith("moc-centroid-v2:"):
+            return False
+        member_schema = schema.replace("moc-centroid-v2:", "concept-embedding-v2:", 1)
+        dimensions = int(centroid["dimensions"])
+        vectors = []
+        for concept_id in member_ids:
+            row = self.connection.execute(
+                "SELECT e.vector, e.dimensions, e.input_hash, c.title, c.summary, e.schema_version "
+                "FROM embedding e JOIN concept c ON c.id=e.entity_id "
+                "WHERE e.entity_kind='concept' AND e.entity_id=? AND e.model_id=?",
+                (concept_id, centroid["model_id"]),
+            ).fetchone()
+            if (row is None or row[1] != dimensions or row[5] != member_schema
+                    or row[2] != _content_hash(f"{row[3]}\n{row[4]}")
+                    or len(row[0]) != dimensions * 4):
+                return False
+            vectors.append(struct.unpack(f"<{dimensions}f", row[0]))
+        if not vectors or len(centroid["vector"]) != dimensions * 4:
+            return False
+        actual = struct.unpack(f"<{dimensions}f", centroid["vector"])
+        return all(
+            math.isclose(value, sum(vector[index] for vector in vectors) / len(vectors),
+                         rel_tol=1e-6, abs_tol=1e-7)
+            for index, value in enumerate(actual)
+        )
 
     def _rebuild_moc_memberships(self, moc_ids: set[str]) -> None:
         ordered = sorted(moc_ids)
@@ -1395,7 +1742,8 @@ class VaultRegistry:
                     (concept_id,),
                 )
                 self.connection.execute(
-                    "DELETE FROM concept_fts WHERE concept_id=?", (concept_id,)
+                    "DELETE FROM concept_fts WHERE rowid=(SELECT fts_rowid "
+                    "FROM concept_fts_identity WHERE concept_id=?)", (concept_id,)
                 )
                 self.connection.execute("DELETE FROM concept WHERE id=?", (concept_id,))
             return
@@ -1427,7 +1775,8 @@ class VaultRegistry:
             f"AND entity_id IN ({stale_concepts})"
         )
         self.connection.execute(
-            f"DELETE FROM concept_fts WHERE concept_id IN ({stale_concepts})"
+            "DELETE FROM concept_fts WHERE rowid IN (SELECT fts_rowid "
+            f"FROM concept_fts_identity WHERE concept_id IN ({stale_concepts}))"
         )
         self.connection.execute(
             f"DELETE FROM concept WHERE id IN ({stale_concepts})"
@@ -1537,7 +1886,9 @@ class VaultRegistry:
                        SELECT source_version.metadata_json
                        FROM source_version
                        WHERE source_version.source_id=source.id
-                       ORDER BY source_version.id DESC LIMIT 1
+                         AND source_version.content_hash=source.content_hash
+                         AND source_version.extractor_version=source.extractor_version
+                       LIMIT 1
                    ), '{}') AS metadata_json
             FROM source
             JOIN source_file_state ON source_file_state.source_id=source.id
@@ -1600,6 +1951,7 @@ class VaultRegistry:
         )
         content_hash = _content_hash(source.content)
         with self.connection:
+            self._set_meta_unlocked("pipeline_checkpoint", "")
             self.connection.execute(
                 """
                 UPDATE source SET title=?, canonical_url=?, updated_at=?
@@ -1668,6 +2020,7 @@ class VaultRegistry:
     def delete_source(self, filename: str) -> None:
         """Delete one source and its versioned synthesis rows transactionally."""
         with self.connection:
+            self._set_meta_unlocked("pipeline_checkpoint", "")
             moc_ids = {
                 str(row[0])
                 for row in self.connection.execute(
@@ -1692,12 +2045,21 @@ class VaultRegistry:
                     (filename,),
                 )
             }
+            moc_ids.update(self._mocs_referencing_concepts(concept_ids))
+            previous_member_inputs = self._moc_member_inputs(concept_ids)
             self.connection.execute("DELETE FROM source WHERE filename=?", (filename,))
-            self._rebuild_moc_memberships(moc_ids)
             self._cleanup_unreferenced_entities(
                 concept_ids=concept_ids,
                 moc_ids=moc_ids,
             )
+            now = _now()
+            self._rebuild_concept_aggregates(concept_ids, None, now)
+            current_member_inputs = self._moc_member_inputs(concept_ids)
+            changed_members = {
+                cid for cid in concept_ids
+                if previous_member_inputs.get(cid) != current_member_inputs.get(cid)
+            }
+            self._rebuild_moc_aggregates(moc_ids, now, changed_members)
 
     def render_diff(
         self,
@@ -1998,6 +2360,22 @@ class VaultRegistry:
             "SELECT value FROM meta WHERE key='maintenance_snapshot_complete'"
         ).fetchone()
         return bool(row and str(row["value"]) == "1")
+
+    def get_pipeline_checkpoint(self) -> str:
+        """Return the last successful pipeline/config fingerprint, or no checkpoint."""
+        row = self.connection.execute(
+            "SELECT value FROM meta WHERE key='pipeline_checkpoint'"
+        ).fetchone()
+        return str(row[0]) if row is not None else ""
+
+    def set_pipeline_checkpoint(self, value: str) -> None:
+        """Publish only after render/state/signatures commit under the compile lock.
+
+        Source mutations invalidate this marker in their own transactions. The
+        caller remains responsible for matching file signatures and versions.
+        """
+        with self.connection:
+            self._set_meta_unlocked("pipeline_checkpoint", value)
 
     def _set_meta_unlocked(self, key: str, value: str) -> None:
         self.connection.execute(
@@ -2625,8 +3003,16 @@ class VaultRegistry:
         payload: dict[str, object] | None = None,
         *,
         next_attempt_at: str | None = None,
+        reset_retry: bool = False,
     ) -> int:
-        """Insert one deduplicated pending work item and return its ID."""
+        """Coalesce an invalidation without erasing an existing retry schedule.
+
+        A running payload is immutable. Invalidations during its lease coalesce
+        into a durable successor slot, promoted when that claim is retired.
+        ``next_attempt_at`` schedules new work. Only ``reset_retry=True`` resets
+        an existing retry's due time, attempts and error. It cannot steal a
+        running claim; there it resets only the successor's due time.
+        """
         now = _now()
         with self.connection:
             self.connection.execute(
@@ -2638,8 +3024,21 @@ class VaultRegistry:
                 ON CONFLICT(entity_type, entity_id, reason)
                     WHERE state IN ('pending', 'running')
                 DO UPDATE SET
-                    payload_json=excluded.payload_json,
-                    next_attempt_at=excluded.next_attempt_at,
+                    payload_json=CASE WHEN dirty_queue.state='running'
+                        THEN dirty_queue.payload_json ELSE excluded.payload_json END,
+                    pending_payload_json=CASE WHEN dirty_queue.state='running'
+                        THEN excluded.payload_json ELSE NULL END,
+                    pending_next_attempt_at=CASE WHEN dirty_queue.state='running'
+                        THEN CASE WHEN ? OR dirty_queue.pending_payload_json IS NULL
+                            THEN excluded.next_attempt_at
+                            ELSE dirty_queue.pending_next_attempt_at END
+                        ELSE '' END,
+                    next_attempt_at=CASE WHEN ? AND dirty_queue.state='pending'
+                        THEN excluded.next_attempt_at ELSE dirty_queue.next_attempt_at END,
+                    attempts=CASE WHEN ? AND dirty_queue.state='pending'
+                        THEN 0 ELSE dirty_queue.attempts END,
+                    error=CASE WHEN ? AND dirty_queue.state='pending'
+                        THEN '' ELSE dirty_queue.error END,
                     updated_at=excluded.updated_at
                 """,
                 (
@@ -2650,6 +3049,10 @@ class VaultRegistry:
                     next_attempt_at or now,
                     now,
                     now,
+                    reset_retry,
+                    reset_retry,
+                    reset_retry,
+                    reset_retry,
                 ),
             )
             row = self.connection.execute(
@@ -2663,8 +3066,14 @@ class VaultRegistry:
         assert row is not None
         return int(row[0])
 
-    def claim_dirty(self, *, limit: int, worker_id: str) -> list[DirtyRecord]:
-        """Atomically claim at most ``limit`` due items for one worker."""
+    def claim_dirty(
+        self, *, limit: int, worker_id: str, lease_token: str = ""
+    ) -> list[DirtyRecord]:
+        """Atomically claim at most ``limit`` due items for one worker.
+
+        Use a unique worker ID for each claim lifecycle, or supply a fresh
+        ``lease_token`` and echo it to complete/fail when reusing a worker ID.
+        """
         if limit <= 0:
             return []
         now = _now()
@@ -2675,59 +3084,95 @@ class VaultRegistry:
             rows = self.connection.execute(
                 """
                 UPDATE dirty_queue
-                SET state='running', attempts=attempts+1, claimed_by=?,
-                    lease_expires_at=?, updated_at=?
+                SET state='running',
+                    attempts=CASE WHEN pending_payload_json IS NULL THEN attempts+1 ELSE 1 END,
+                    payload_json=COALESCE(pending_payload_json, payload_json),
+                    next_attempt_at=CASE WHEN pending_payload_json IS NULL
+                        THEN next_attempt_at ELSE pending_next_attempt_at END,
+                    error=CASE WHEN pending_payload_json IS NULL THEN error ELSE '' END,
+                    pending_payload_json=NULL, pending_next_attempt_at='', claimed_by=?,
+                    lease_expires_at=?, lease_token=?, updated_at=?
                 WHERE id IN (
                     SELECT id FROM dirty_queue
                     WHERE (state='pending' AND next_attempt_at <= ?)
                        OR (state='running' AND lease_expires_at != ''
-                           AND lease_expires_at <= ?)
+                           AND lease_expires_at <= ?
+                           AND (pending_payload_json IS NULL OR pending_next_attempt_at <= ?))
                     ORDER BY next_attempt_at, id
                     LIMIT ?
                 )
                 RETURNING id, entity_type, entity_id, reason, state, attempts,
                           next_attempt_at, payload_json, error
                 """,
-                (worker_id, lease_expires_at, now, now, now, limit),
+                (worker_id, lease_expires_at, lease_token, now, now, now, now, limit),
             ).fetchall()
         return sorted(self._dirty_records(rows), key=lambda record: record.id)
 
-    def start_dirty(self, record_id: int, *, worker_id: str) -> bool:
-        """Claim a known item owned by an external sequential work plan."""
+    def start_dirty(self, record_id: int, *, worker_id: str, lease_token: str = "") -> bool:
+        """Claim a known item; worker/token uniqueness follows :meth:`claim_dirty`."""
         now = datetime.now(UTC)
         with self.connection:
             cursor = self.connection.execute(
                 """
                 UPDATE dirty_queue
-                SET state='running', attempts=attempts+1, claimed_by=?,
-                    lease_expires_at=?, updated_at=?
+                SET state='running',
+                    attempts=CASE WHEN pending_payload_json IS NULL THEN attempts+1 ELSE 1 END,
+                    payload_json=COALESCE(pending_payload_json, payload_json),
+                    next_attempt_at=CASE WHEN pending_payload_json IS NULL
+                        THEN next_attempt_at ELSE pending_next_attempt_at END,
+                    error=CASE WHEN pending_payload_json IS NULL THEN error ELSE '' END,
+                    pending_payload_json=NULL, pending_next_attempt_at='', claimed_by=?,
+                    lease_expires_at=?, lease_token=?, updated_at=?
                 WHERE id=? AND (
                     (state='pending' AND next_attempt_at<=?)
-                    OR (state='running' AND lease_expires_at<=?)
+                    OR (state='running' AND lease_expires_at!='' AND lease_expires_at<=?
+                        AND (pending_payload_json IS NULL OR pending_next_attempt_at<=?))
                 )
                 """,
                 (
                     worker_id,
                     (now + timedelta(seconds=_DIRTY_LEASE_SECONDS)).isoformat(),
+                    lease_token,
                     now.isoformat(),
                     record_id,
+                    now.isoformat(),
                     now.isoformat(),
                     now.isoformat(),
                 ),
             )
         return cursor.rowcount == 1
 
-    def complete_dirty(self, record_id: int, *, worker_id: str) -> bool:
+    def renew_dirty_worker(self, worker_id: str) -> int:
+        """Extend only still-live claims owned by this unique worker lifecycle."""
+        now = datetime.now(UTC)
+        with self.connection:
+            cursor = self.connection.execute(
+                "UPDATE dirty_queue SET lease_expires_at=?, updated_at=? "
+                "WHERE state='running' AND claimed_by=? AND lease_expires_at>?",
+                ((now + timedelta(seconds=_DIRTY_LEASE_SECONDS)).isoformat(),
+                 now.isoformat(), worker_id, now.isoformat()),
+            )
+        return cursor.rowcount
+
+    def complete_dirty(self, record_id: int, *, worker_id: str, lease_token: str = "") -> bool:
         """Complete an item only while the caller still owns its lease."""
+        now = _now()
         with self.connection:
             cursor = self.connection.execute(
                 """
                 UPDATE dirty_queue
-                SET state='completed', claimed_by='', lease_expires_at='',
-                    error='', updated_at=?
+                SET state=CASE WHEN pending_payload_json IS NULL
+                        THEN 'completed' ELSE 'pending' END,
+                    payload_json=COALESCE(pending_payload_json, payload_json),
+                    next_attempt_at=CASE WHEN pending_payload_json IS NULL
+                        THEN next_attempt_at ELSE pending_next_attempt_at END,
+                    attempts=CASE WHEN pending_payload_json IS NULL THEN attempts ELSE 0 END,
+                    pending_payload_json=NULL, pending_next_attempt_at='',
+                    claimed_by='', lease_expires_at='', lease_token='', error='', updated_at=?
                 WHERE id=? AND state='running' AND claimed_by=?
+                    AND lease_expires_at>? AND lease_token=?
                 """,
-                (_now(), record_id, worker_id),
+                (now, record_id, worker_id, now, lease_token),
             )
             if cursor.rowcount == 1:
                 self._prune_completed_dirty_unlocked()
@@ -2757,15 +3202,18 @@ class VaultRegistry:
         *,
         worker_id: str,
         next_attempt_at: str | None = None,
+        lease_token: str = "",
     ) -> bool:
         """Return a failed claim to the retry queue with bounded diagnostics."""
+        now = _now()
         if next_attempt_at is None:
             row = self.connection.execute(
                 """
                 SELECT attempts FROM dirty_queue
                 WHERE id=? AND state='running' AND claimed_by=?
+                    AND lease_expires_at>? AND lease_token=?
                 """,
-                (record_id, worker_id),
+                (record_id, worker_id, now, lease_token),
             ).fetchone()
             if row is None:
                 return False
@@ -2779,11 +3227,17 @@ class VaultRegistry:
             cursor = self.connection.execute(
                 """
                 UPDATE dirty_queue
-                SET state='pending', claimed_by='', lease_expires_at='',
-                    error=?, next_attempt_at=?, updated_at=?
+                SET state='pending', claimed_by='', lease_expires_at='', lease_token='',
+                    error=CASE WHEN pending_payload_json IS NULL THEN ? ELSE '' END,
+                    next_attempt_at=CASE WHEN pending_payload_json IS NULL
+                        THEN ? ELSE pending_next_attempt_at END,
+                    attempts=CASE WHEN pending_payload_json IS NULL THEN attempts ELSE 0 END,
+                    payload_json=COALESCE(pending_payload_json, payload_json),
+                    pending_payload_json=NULL, pending_next_attempt_at='', updated_at=?
                 WHERE id=? AND state='running' AND claimed_by=?
+                    AND lease_expires_at>? AND lease_token=?
                 """,
-                (error[:1_000], next_attempt_at, _now(), record_id, worker_id),
+                (error[:1_000], next_attempt_at, now, record_id, worker_id, now, lease_token),
             )
         return cursor.rowcount == 1
 

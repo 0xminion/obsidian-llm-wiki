@@ -1,15 +1,11 @@
 """Language detection and routing for multilingual synthesis.
 
-Architecture:
-- Source language is detected from source content and set in the synthesis JSON.
-- en (English) sources → all concepts/entries/MoCs rendered in English.
-- zh (Chinese) sources → all concepts/entries/MoCs rendered in Chinese (no translation).
-- other languages → source stays in native language, concepts/entries/MoCs
-  are prompted to be rendered in both native language AND translated to English
-  (for cross-lingual linking and searchability).
+Explicit output-language configuration takes precedence over source detection.
+Otherwise, synthesis follows the detected source language. No language triggers
+English-first translated titles or bilingual output implicitly. Verbatim evidence
+quotes stay in their original language. Detection is heuristic, not a guarantee.
 
-The ``language`` field is set on SourceSynthesis and carried through rendering.
-Prompts receive it and add the appropriate language instruction.
+The effective ``language`` is carried by SourceSynthesis through rendering.
 """
 
 from __future__ import annotations
@@ -117,18 +113,10 @@ LANGUAGE_INSTRUCTIONS: dict[str, str] = {
     "en": (
         "Write all summaries, content, and titles in English."
     ),
-    # Chinese: everything in Chinese (no translation), but titles include
-    # English first then Chinese for cross-lingual discoverability
+    # Chinese means Chinese content, not translated labels over English stubs.
     "zh": (
-        "Write all summaries, content, and section body text in Chinese (中文). "
-        "Do NOT translate Chinese terms to English — keep them in their original Chinese form. "
-        "However, for all concept titles, entry titles, and MoC titles, "
-        "use a bilingual format: English title first, then Chinese title in parentheses, "
-        "e.g. 'Redefinition of Liquidity (流动性的重新定义)'. "
-        "For MoC section headings (## Concepts, ## 关联图谱), use bilingual headings: "
-        "'## Concepts / 概念', '## Key Findings / 关键发现'. "
-        "The slug should be English (lowercase, hyphens). "
-        "The body content stays in Chinese."
+        "Write all summaries, content, section bodies, and titles in Chinese (中文). "
+        "Do NOT translate Chinese titles to English unless explicitly requested."
     ),
     # Japanese
     "ja": (
@@ -179,4 +167,9 @@ def get_language_instruction(lang: str) -> str:
 
     For 'other' languages not in the map, returns a neutral instruction.
     """
-    return LANGUAGE_INSTRUCTIONS.get(lang, "")
+    if lang in LANGUAGE_INSTRUCTIONS:
+        return LANGUAGE_INSTRUCTIONS[lang]
+    name = language_name(lang)
+    if lang and name != lang.upper():
+        return f"Write all summaries, content, and titles in {name}."
+    return ""

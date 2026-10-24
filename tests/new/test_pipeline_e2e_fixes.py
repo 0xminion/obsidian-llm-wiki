@@ -249,15 +249,25 @@ def test_chunk_gate_is_config_chunk_size(monkeypatch):
 
     async def counting_llm(prompt, messages, config, **_kwargs):
         prompts_seen.append(prompt)
+        concept = {
+            "title": "Bounded requests", "slug": "bounded-requests",
+            "summary": "Small chunks bound request size.",
+            "sections": [{"heading": "Mechanism", "prose": "Chunking bounds the request size."}],
+        }
+        if _kwargs.get("task") == "expand":
+            return json.dumps(concept)
         return json.dumps({
             "source_title": "T",
-            "concepts": [{"title": "Alpha", "slug": "alpha", "summary": "s"}],
+            "source_summary": "Small chunks bound request size.",
+            "concepts": [concept],
             "maps": [],
         })
 
-    # 300 chars > chunk_size 100 (and far below the old 40K gate) → must chunk.
+    # Above chunk_size 100 and far below the old 40K gate: must chunk.
     with mock.patch("obsidian_llm_wiki.providers.llm.acall_llm", counting_llm):
-        source = SourceDoc(title="T", content="word " * 60, source_file="t.md")
+        source = SourceDoc(
+            title="T", content="Small chunks bound request size. " * 10, source_file="t.md",
+        )
         result = asyncio.run(
             quality.quality_synthesize_source(cfg, "t.md", source, []),
         )
@@ -326,7 +336,11 @@ def test_merge_victim_is_never_reused_as_survivor(monkeypatch):
         sims={("x-concept", "y-concept"): 0.95, ("x-concept", "w-concept"): 0.95},
     )
 
-    dedupe.semantic_dedupe_concepts(bundle, threshold=0.85)
+    dedupe.semantic_dedupe_concepts(
+        bundle, threshold=0.85,
+        confirmed_merges={"w-concept": "x-concept", "x-concept": "y-concept",
+                          "a-concept": "b-concept", "b-concept": "c-concept"},
+    )
 
     surviving = {c.slug for c in bundle.concepts}
     # Deterministic traversal merges W into X, then X into Y. The flattened
@@ -349,7 +363,11 @@ def test_merge_map_chains_are_flattened(monkeypatch):
         sims={("a-concept", "b-concept"): 0.95, ("b-concept", "c-concept"): 0.95},
     )
 
-    dedupe.semantic_dedupe_concepts(bundle, threshold=0.85)
+    dedupe.semantic_dedupe_concepts(
+        bundle, threshold=0.85,
+        confirmed_merges={"w-concept": "x-concept", "x-concept": "y-concept",
+                          "a-concept": "b-concept", "b-concept": "c-concept"},
+    )
 
     surviving = {con.slug for con in bundle.concepts}
     assert surviving == {"c-concept"}
@@ -368,7 +386,11 @@ def test_source_local_concept_slugs_are_remapped(monkeypatch):
         sims={("x-concept", "y-concept"): 0.95},
     )
 
-    dedupe.semantic_dedupe_concepts(bundle, threshold=0.85)
+    dedupe.semantic_dedupe_concepts(
+        bundle, threshold=0.85,
+        confirmed_merges={"w-concept": "x-concept", "x-concept": "y-concept",
+                          "a-concept": "b-concept", "b-concept": "c-concept"},
+    )
 
     surviving = {c.slug for c in bundle.concepts}
     assert surviving == {"y-concept"}

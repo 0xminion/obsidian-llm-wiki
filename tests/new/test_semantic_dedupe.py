@@ -64,7 +64,8 @@ def test_semantic_dedupe_merges_high_similarity_pairs():
         "obsidian_llm_wiki.synth.language.detect_language",
         return_value="en",
     ):
-        semantic_dedupe_concepts(bundle, threshold=0.85)
+        semantic_dedupe_concepts(bundle, threshold=0.85,
+                                 confirmed_merges={"bitcoin-protocol": "bitcoin"})
 
     # c1 (higher confidence) should survive, c2 merged into c1.
     assert len(bundle.concepts) == 1
@@ -93,7 +94,8 @@ def test_semantic_dedupe_does_not_merge_different_languages():
         "obsidian_llm_wiki.synth.language.detect_language",
         side_effect=lambda text: "zh" if "比特币" in text else "en",
     ):
-        semantic_dedupe_concepts(bundle, threshold=0.85)
+        semantic_dedupe_concepts(bundle, threshold=0.85,
+                                 confirmed_merges={"bitcoin-protocol": "bitcoin"})
 
     assert len(bundle.concepts) == 2  # Not merged
 
@@ -132,7 +134,8 @@ def test_semantic_dedupe_updates_concept_links():
         "obsidian_llm_wiki.synth.language.detect_language",
         return_value="en",
     ):
-        semantic_dedupe_concepts(bundle, threshold=0.85)
+        semantic_dedupe_concepts(bundle, threshold=0.85,
+                                 confirmed_merges={"bitcoin-protocol": "bitcoin"})
 
     # c3's link to bitcoin-protocol should now point to bitcoin.
     mining = next(c for c in bundle.concepts if c.slug == "mining")
@@ -161,7 +164,8 @@ def test_semantic_dedupe_below_threshold_no_merge():
         "obsidian_llm_wiki.synth.language.detect_language",
         return_value="en",
     ):
-        semantic_dedupe_concepts(bundle, threshold=0.85)
+        semantic_dedupe_concepts(bundle, threshold=0.85,
+                                 confirmed_merges={"bitcoin-protocol": "bitcoin"})
 
     assert len(bundle.concepts) == 2  # Not merged
 
