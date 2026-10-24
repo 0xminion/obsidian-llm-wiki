@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import re
 
 from typer.testing import CliRunner
 
@@ -207,7 +208,9 @@ def test_resume_cannot_mutate_state_in_read_only_modes(tmp_path, monkeypatch):
     for flag in ("--plan", "--preview"):
         result = _invoke(monkeypatch, config, "--resume", flag)
         assert result.exit_code == 2
-        assert "--resume" in result.output
+        # Rich can split a flag across ANSI spans when CI forces color.
+        visible_output = re.sub(r"\x1b\[[0-9;]*m", "", result.output)
+        assert "--resume" in visible_output
         assert list(tmp_path.iterdir()) == []
 
 

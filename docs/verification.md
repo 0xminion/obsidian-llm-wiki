@@ -159,6 +159,8 @@ Each environment was installed from `uv.lock` with `dev,pdf,docx,liteparse,youtu
 
 Command shape: `PATH="ENV/bin:$PATH" ENV/bin/python -m pytest tests/ -q --tb=short --basetemp=ISOLATED_SCRATCH --junitxml=RECEIPT`. Exact commands were executed from the checkout. Counts overlap across interpreters; they are not additional unique tests. Ruff for `obsidian_llm_wiki tests scripts benchmarks`, `git diff --check`, and `uv lock --check` passed.
 
+The first GitHub CI run reached the whole suite but failed one test on all Python versions because forced ANSI color split `--resume` across formatting spans. The command's exit status and read-only behavior were correct. `FORCE_COLOR=1` reproduced the assertion failure locally; the test now strips SGR formatting before checking the visible message, preserving its exit-code and no-mutation assertions. The affected module then passed with forced color. No runtime or CI configuration changed for this correction. Remote CI receipts are linked from draft PR [#22](https://github.com/0xminion/obsidian-llm-wiki/pull/22).
+
 An earlier 3.11 run exposed a genuine WAL-negotiation race despite SQLite's busy timeout. The fix retries only BUSY/LOCKED errors during WAL negotiation, with bounded attempts/deadline, and closes the connection on terminal failure. The independent 3.11 startup/error matrix and five fresh concurrent-migration reruns passed before this final complete matrix.
 
 ### Independent closure
