@@ -115,6 +115,7 @@ class BridgeSettingsTab extends PluginSettingTab {
 export default class ObsidianLlmWikiBridge extends Plugin {
   settings: BridgeSettings = { ...DEFAULT_SETTINGS };
   private activeRun: CliRun | null = null;
+  private startingRun = false;
   private readonly history: string[] = [];
 
   async onload(): Promise<void> {
@@ -215,17 +216,19 @@ export default class ObsidianLlmWikiBridge extends Plugin {
   }
 
   private async run(request: CliRequest): Promise<void> {
-    if (this.activeRun) {
+    if (this.activeRun || this.startingRun) {
       new Notice("An OLW CLI run is already active. Cancel it before starting another.");
       return;
     }
 
-    await this.showHistory();
-    this.record(`$ ${this.settings.executable} ${request.operation} — started`);
+    this.startingRun = true;
     try {
+      await this.showHistory();
+      this.record(`$ ${this.settings.executable} ${request.operation} — started`);
       const client = new CliClient({ executable: this.settings.executable });
       const run = client.start(request, (event) => this.recordEvent(event));
       this.activeRun = run;
+      this.startingRun = false;
       const result = await run.completed;
       const outcome = result.cancelled
         ? "cancelled"
@@ -239,6 +242,7 @@ export default class ObsidianLlmWikiBridge extends Plugin {
       this.record(`${request.operation} failed to start: ${message}`);
       new Notice(`OLW failed to start: ${message}`);
     } finally {
+      this.startingRun = false;
       this.activeRun = null;
       this.refreshHistoryViews();
     }
