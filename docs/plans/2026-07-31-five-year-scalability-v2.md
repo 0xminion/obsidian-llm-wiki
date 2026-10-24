@@ -1,5 +1,7 @@
 # Five-Year Vault Scalability v2 Implementation Plan
 
+> **Historical plan — not active instructions or a capacity guarantee.** Baseline results and targets below belong to this plan's original context. Use the [active documentation index](../README.md), especially [scaling](../scaling.md) and [migration/recovery](../migration.md), for current behavior. Retained as design/delivery history.
+
 ## Objective
 
 Implement the roadmap in `docs/scalability-roadmap.md` for a steady-state vault of

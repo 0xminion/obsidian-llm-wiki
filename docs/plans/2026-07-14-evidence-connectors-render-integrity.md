@@ -1,5 +1,7 @@
 # Evidence, Connectors, and Render Integrity Plan
 
+> **Historical plan — not active instructions.** The tasks and guarantees below are design intent, not a current execution receipt. See [implementation](../implementation.md), [data model](../data-model.md), and [migration/recovery](../migration.md) for current behavior and limitations.
+
 > **For Hermes:** Execute with focused TDD and an independent post-implementation review.
 
 **Goal:** Add verified claim-level evidence and a stable source-connector boundary while correcting render rollback defects for reviewed pages and caller-owned bundles.

@@ -1,5 +1,7 @@
 # Five-Year Scalability Roadmap
 
+> **Historical design record — not active operating instructions.** The completion claims, schema versions, and capacity gates below reflect the earlier roadmap, not current end-to-end certification. Changed builds still perform corpus-wide work. Use [current scaling limits and proposals](scaling.md), [implementation](implementation.md), and [migration/recovery](migration.md) instead. This record is retained for design history.
+
 ## Scope and conclusion
 
 This document defines and tracks a target vault of **5,000 sources, 50,000 concepts, and 20,000 MoCs**. The v2 runtime implements the required storage, bounded retrieval, ANN candidate generation, path-incremental rendering, sharded derived artifacts, and incremental maintenance model.
