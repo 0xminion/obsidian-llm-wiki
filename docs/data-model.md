@@ -176,8 +176,8 @@ These are independent numbers/labels, not a single “version 3” contract:
 | v6 queue migration | Adds lease-token fencing and durable successor payload/due-time fields; preserves a running payload while newer invalidations wait. |
 | Portable synthesis cache envelope | `_CACHE_ARTIFACT_SCHEMA_VERSION = 2`. |
 | Extraction artifact label | `extract-v2`. This invalidates compatibility; `build` does not itself re-download a URL. |
-| Synthesis schema label | `synthesis-schema-v2`. |
-| Prompt compatibility | `synthesis-v3:<effective-settings hash>`; includes model routing, language, synthesis mode, candidate/evidence/chunk settings, and schema policy. |
+| Synthesis schema label | `synthesis-schema-v3`: closed, fully specified nested structured-output objects. |
+| Prompt compatibility | `synthesis-v4:<effective-settings hash>`; includes model routing, language, synthesis mode, candidate/evidence/chunk settings, and schema policy. |
 | Rendering fingerprint | `render-v4` inside renderer fingerprint calculation. |
 | Pipeline checkpoint | `integrity-v2` plus artifact versions, selected non-secret build settings, and normalized human equivalence pairs. |
 

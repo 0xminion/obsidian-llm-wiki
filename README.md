@@ -35,6 +35,8 @@ python -m pip install -e '.[pdf,docx,youtube,liteparse]'
 
 Remote transcript services need separate credentials. Installing extras does not guarantee access to a site, a transcript, OCR quality, or complete full text. See [extraction boundaries](docs/implementation.md#extraction-and-admission).
 
+The [50-URL live-source audit](docs/live-source-audit.md) records real article, X, PDF/document, YouTube and podcast failures and fixes. Podcast ingestion requires an actual transcript, not a show description. Public Drive file viewers are supported only when they advertise a matching anonymous download; private files and confirmation pages remain failures. Strict provider schemas are separate from semantic/evidence acceptance.
+
 ## What is incremental—and what is not
 
 - **Source synthesis is cache-aware.** Unchanged successful syntheses are reused. Failed replacements retain last-good knowledge rather than being treated as source deletion.
