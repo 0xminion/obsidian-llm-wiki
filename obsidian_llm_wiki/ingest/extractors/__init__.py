@@ -421,18 +421,70 @@ def _deep_search_fallback(
 # ── Extraction quality gate ────────────────────────────────────────────
 
 
+def _is_x_article_preview(content: str) -> bool:
+    """Recognize article-card bodies independently of any title diagnostic."""
+    lowered = content.casefold()
+    return (
+        "https://x.com/i/article/" in lowered
+        or "https://twitter.com/i/article/" in lowered
+    ) and ("article\n" in lowered or "article\r\n" in lowered)
+
+
+def _has_body_after_abstract(content: str, abstract_level: int | None = None) -> bool:
+    """Require prose under a body heading; outlines/bibliographies are not bodies.
+
+    This is a conservative structural guard, not proof of semantic completeness.
+    Unknown section names are allowed so subject-specific headings still work.
+    """
+    # PDF/trafilatura output often has no Markdown heading markers. Recognize
+    # conventional standalone section labels without treating arbitrary prose
+    # or numbered bibliography entries as new body sections.
+    plain_heading = (
+        r"(?im)^(?:(?:\d+(?:\.\d+)*\.?|[一二三四五六七八九十]+、)[ \t]*)?"
+        r"(?:introduction|background|methods?|materials and methods|results|discussion|"
+        r"conclusions?|references|bibliography|keywords|abstract|"
+        r"摘要|引言|绪论|方法|结果|讨论|结论|参考文献|关键词)[ \t]*[:：]?[ \t]*$"
+    )
+    content = re.sub(plain_heading, lambda match: "## " + match.group(0), content)
+    headings = list(re.finditer(r"(?m)^#{1,6}[ \t]+(.+?)\s*$", content))
+    body_chars = 0
+    skipped_section_level = abstract_level
+    for index, heading in enumerate(headings):
+        level = len(heading.group(0)) - len(heading.group(0).lstrip("#"))
+        if skipped_section_level is not None and level > skipped_section_level:
+            continue  # Nested Methods/Results can still be inside the abstract.
+        skipped_section_level = None
+        name = heading.group(1).strip(" *#_:：").casefold()
+        name = re.sub(r"^(?:\d+(?:\.\d+)*[.\s\\]*|[一二三四五六七八九十]+、)", "", name)
+        if name in {"references", "bibliography", "参考文献", "recommended articles"}:
+            break
+        if name in {
+            "abstract", "摘要", "keywords", "关键词", "highlights", "outline",
+            "contents", "table of contents", "funding", "acknowledgements",
+            "acknowledgments", "declaration of competing interest", "metrics",
+            "credit authorship contribution statement",
+        }:
+            skipped_section_level = level
+            continue
+        end = headings[index + 1].start() if index + 1 < len(headings) else len(content)
+        section = content[heading.end():end]
+        # Link-only outline entries and empty headings do not establish a body.
+        prose = re.sub(r"(?m)^\s*(?:[-*]|\d+[.)])?\s*\[[^\n]+\]\([^\n]+\)\s*$", "", section)
+        body_chars += len(prose.strip())
+    return body_chars >= 80
+
+
 def _check_extraction_quality(source: SourceDoc) -> tuple[bool, str]:
     """Verify the extraction produced full content, not a stub or abstract.
 
     Returns ``(passed, reason)``.  When *passed* is ``False``, *reason*
-    describes the quality issue.  This is a diagnostic gate — it never
-    fails extraction.  Callers should log a WARNING and add the reason to
-    provenance diagnostics.
+    describes the quality issue. The pure check never raises; callers decide
+    whether a specialist short-source diagnostic or a hard rejection applies.
 
     Checks:
       1. Content < 500 chars → "too short, likely stub"
       2. Content contains the stub-fallback sentinel → "stub fallback"
-      3. Content has "Abstract:" but no "## Full Text" or body sections → "abstract only"
+      3. Abstract heading/label without substantive body sections → "abstract only"
       4. Content is mostly metadata (Title:/Channel:/Published:) → "metadata only"
     """
     content = source.content or ""
@@ -453,10 +505,7 @@ def _check_extraction_quality(source: SourceDoc) -> tuple[bool, str]:
     # preview. That is not the linked article; fail it instead of synthesizing
     # a plausible-looking graph from the login shell.
     lowered = content.casefold()
-    if (
-        "https://x.com/i/article/" in lowered
-        or "https://twitter.com/i/article/" in lowered
-    ) and ("article\n" in lowered or "article\r\n" in lowered):
+    if _is_x_article_preview(content):
         return (False, "X article preview stub")
 
     # Generic extractors can return a large navigation shell. Length is not
@@ -484,14 +533,16 @@ def _check_extraction_quality(source: SourceDoc) -> tuple[bool, str]:
         if marker in content:
             return (False, "stub fallback")
 
-    # 3. Abstract-only — has an abstract but no full-text or body sections.
-    if "Abstract:" in content:
-        has_full_text = "## Full Text" in content or "## Full text" in content
-        has_body_sections = bool(
-            re.search(r"^#{1,4}\s+\S", content, re.MULTILINE)
-        )
-        # Allow content that has body sections beyond the abstract.
-        if not has_full_text and not has_body_sections:
+    # 3. An abstract plus navigation/references is still not a full paper.
+    # Inspect actual sections AFTER the abstract, not title/outline headings.
+    abstract = re.search(
+        r"(?im)^(?:#{1,6}[ \t]+)?(?:\*\*)?(?:abstract|摘要)(?:\*\*)?[ \t]*(?::|：|$)",
+        content,
+    )
+    if abstract:
+        heading = re.match(r"#+", abstract.group(0))
+        level = len(heading.group(0)) if heading else None
+        if not _has_body_after_abstract(content[abstract.end():], level):
             return (False, "abstract only")
 
     # 4. Metadata-only — content is dominated by metadata fields.

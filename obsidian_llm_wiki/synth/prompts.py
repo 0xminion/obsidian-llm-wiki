@@ -49,6 +49,9 @@ those examples or relationships into the result unless this source supports them
 * Use only information supported by the supplied source. Preserve uncertainty,
 qualifications, negation, attribution, and disagreements; do not turn a proposal,
 correlation, or speculation into an established result.
+* Do not infer an actor's identity, contribution, or causal role
+from ownership, association, chronology, or a shared label; require explicit source support.
+Apply this to summaries, key points, bodies, and claims alike.
 * Do not pad content to meet a word, character, section, concept, or finding quota.
 A concise explanation is preferable to repetition or invented background.
 * Summaries and bodies must explain the source's actual findings and reasoning,
@@ -57,6 +60,16 @@ not just repeat or translate titles or say that the source covers a topic.
 even when the requested output language differs. If no supporting span exists,
 omit the claim rather than invent evidence. Quote occurrence alone is not proof
 that the quote supports the claim.
+* Copy each quote from the raw source text, not its rendered appearance. Preserve
+Markdown links (including URLs), emphasis markers, and citation markers within
+that span, plus capitalization, punctuation, and all whitespace, including
+PDF newlines, spaces, and tabs. Use JSON escapes such as \\n and \\t as needed;
+decoding the JSON string must reproduce the exact source span.
+Do not remove markup, change case, or normalize whitespace to make a quote readable.
+* Prefer a shorter, unique, contiguous exact span that still supports the entire claim,
+rather than reconstructing a readable sentence. Never join separate passages, skip intervening text, or add ellipses.
+If a span repeats, choose a uniquely identifying supporting span; otherwise omit the claim.
+Do not remove a supported claim merely to avoid copying its formatting.
 * Language instructions apply to all generated summaries, findings, and bodies,
 not only titles. With no requested language, preserve the source's language.
 * Empty optional lists are valid. Do not invent questions, concepts, relationships,

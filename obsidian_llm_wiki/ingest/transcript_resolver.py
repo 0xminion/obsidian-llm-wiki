@@ -10,7 +10,6 @@ extractor because it must acquire the media locally.
 from __future__ import annotations
 
 import hashlib
-import html
 import json
 import logging
 import os
@@ -18,6 +17,7 @@ import re
 import tempfile
 import time
 from dataclasses import asdict, dataclass
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
 
@@ -33,6 +33,11 @@ logger = logging.getLogger("obswiki.ingest.transcript_resolver")
 _ASSEMBLYAI_BASE_URL = "https://api.assemblyai.com/v2/transcript"
 _MIN_TRANSCRIPT_CHARS = 200
 _MAX_PUBLIC_TRANSCRIPT_BYTES = 10_000_000
+_PUBLIC_NORMALIZATION_VERSION = 2
+_PODCAST_ADMISSION_VERSION = 1
+_PUBLIC_PROVIDERS = frozenset({
+    "rss_podcast_transcript", "publisher_episode_page", "publisher_transcript_link",
+})
 
 __all__ = [
     "TranscriptResult",
@@ -55,6 +60,8 @@ class TranscriptResult:
     language: str = ""
     timed: bool = False
     speaker_labeled: bool = False
+    # Document identity, extracted before normalization; never inferred from speech.
+    document_title: str = ""
 
 
 def get_assemblyai_key() -> str:
@@ -84,6 +91,22 @@ def load_transcript_cache(identity: str) -> TranscriptResult | None:
     except (OSError, json.JSONDecodeError):
         return None
 
+    # Older public HTML normalization could silently delete literal '<' and
+    # subsequent prose. Reacquire those artifacts instead of serving corruption.
+    # Unaffected ASR caches remain reusable; this is not a blanket paid-ASR retry.
+    if (
+        payload.get("provider") == "rss_podcast_transcript"
+        and payload.get("normalization_version") != _PUBLIC_NORMALIZATION_VERSION
+    ):
+        return None
+    # Earlier public caches lack document identity and may contain a mismatched
+    # artifact or inline link padding. Normalization v2 alone cannot prove safe
+    # admission. Miss without mutation; unaffected ASR caches remain reusable.
+    if (
+        payload.get("provider") in _PUBLIC_PROVIDERS
+        and payload.get("podcast_admission_version") != _PODCAST_ADMISSION_VERSION
+    ):
+        return None
     text = str(payload.get("text", "")).strip()
     if len(text) < _MIN_TRANSCRIPT_CHARS:
         return None
@@ -94,6 +117,7 @@ def load_transcript_cache(identity: str) -> TranscriptResult | None:
         language=str(payload.get("language", "")),
         timed=bool(payload.get("timed", False)),
         speaker_labeled=bool(payload.get("speaker_labeled", False)),
+        document_title=str(payload.get("document_title", "")),
     )
 
 
@@ -107,6 +131,8 @@ def save_transcript_cache(identity: str, result: TranscriptResult) -> None:
     payload = {
         **asdict(result),
         "identity": identity,
+        "normalization_version": _PUBLIC_NORMALIZATION_VERSION,
+        "podcast_admission_version": _PODCAST_ADMISSION_VERSION,
         "acquired_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
     fd, temporary = tempfile.mkstemp(dir=cache_path.parent, prefix=".transcript-", suffix=".tmp")
@@ -121,9 +147,62 @@ def save_transcript_cache(identity: str, result: TranscriptResult) -> None:
         tmp_path.unlink(missing_ok=True)
 
 
+class _TranscriptDocumentParser(HTMLParser):
+    """Read actual document title/H1 elements without interpreting spoken prose."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.titles: list[str] = []
+        self.parts: list[str] = []
+        self.heading = ""
+        self.hidden = ""
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if self.hidden:
+            return
+        if tag in {"script", "style", "template", "noscript"}:
+            self.hidden = tag
+        elif tag in {"title", "h1"} and not self.heading:
+            self.heading = tag
+            self.parts = []
+
+    def handle_data(self, data: str) -> None:
+        if self.heading and not self.hidden:
+            self.parts.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if self.hidden:
+            if tag == self.hidden:
+                self.hidden = ""
+        elif tag == self.heading:
+            self.titles.append(" ".join("".join(self.parts).split()))
+            self.heading = ""
+
+
+class _TranscriptHTMLParser(HTMLParser):
+    """Decode character references as data, never as a second layer of markup."""
+
+    _BLOCK_TAGS = {"article", "div", "p", "section", "li", "br", "hr", "blockquote"}
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+
+    def handle_data(self, data: str) -> None:
+        self.parts.append(data)
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag in self._BLOCK_TAGS:
+            self.parts.append("\n")
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in self._BLOCK_TAGS:
+            self.parts.append("\n")
+
+
 def _strip_timed_transcript(text: str) -> str:
     """Normalize VTT/SRT/plain/HTML transcript content into readable markdown."""
-    cleaned = html.unescape(text).replace("\r\n", "\n")
+    cleaned = text.replace("\r\n", "\n")
     cleaned = re.sub(r"(?im)^WEBVTT[^\n]*\n", "", cleaned)
     cleaned = re.sub(r"(?m)^\d+\s*$", "", cleaned)
     cleaned = re.sub(
@@ -131,7 +210,13 @@ def _strip_timed_transcript(text: str) -> str:
         "",
         cleaned,
     )
-    cleaned = re.sub(r"<[^>]+>", " ", cleaned)
+    # WebVTT word timestamps are cue syntax, not HTML tags. Remove only this
+    # recognized syntax before parsing; escaped timestamp literals remain data.
+    cleaned = re.sub(r"<(?:\d{2,}:)?\d{2}:\d{2}[.,]\d{3}>", "", cleaned)
+    parser = _TranscriptHTMLParser()
+    parser.feed(cleaned)
+    parser.close()
+    cleaned = "".join(parser.parts)
     cleaned = re.sub(r"[ \t]+", " ", cleaned)
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
     return cleaned.strip()
@@ -201,6 +286,11 @@ def fetch_public_transcript(
         except (json.JSONDecodeError, ValueError):
             return None
 
+    # Parse structure before normalization merges headers and speech. The
+    # resulting title is evidence only: it never changes the transcript body.
+    document = _TranscriptDocumentParser()
+    document.feed(raw_text)
+    document.close()
     text = _strip_timed_transcript(raw_text)
     if len(text) < _MIN_TRANSCRIPT_CHARS:
         return None
@@ -211,6 +301,7 @@ def fetch_public_transcript(
         artifact_url=transcript_url,
         language=language,
         timed=timed,
+        document_title="\n".join(dict.fromkeys(document.titles)),
     )
 
 

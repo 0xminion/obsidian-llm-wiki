@@ -210,7 +210,7 @@ def render_sources_by_freshness_view(
     for title, retrieved, source_type, url, stem in source_info:
         display_retrieved = retrieved or "—"
         lines.append(
-            f"| [[{stem}|{title}]] | {display_retrieved} | {source_type} | {url} |"
+            f"| [[sources/{stem}|{title}]] | {display_retrieved} | {source_type} | {url} |"
         )
     lines.append("")
     return "\n".join(lines)
@@ -381,7 +381,7 @@ def render_dataview_views(
                 url = getattr(source, "url", "") or "—"
                 stem = filename.removesuffix(".md")
                 row = (
-                    f"| [[{stem}|{source.title}]] | {retrieved or '—'} | "
+                    f"| [[sources/{stem}|{source.title}]] | {retrieved or '—'} | "
                     f"{source_type} | {url} |"
                 )
                 source_rows.append((retrieved, stem, row))

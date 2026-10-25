@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from obsidian_llm_wiki.core.models import SourceDoc, SourceProvenance
 
 
@@ -273,7 +275,7 @@ def test_discovered_public_pdf_uses_existing_document_extractor() -> None:
 
 
 def test_ssrn_falls_to_semantic_scholar_when_no_public_document_is_available() -> None:
-    """SSRN does not bypass access controls after public document discovery fails."""
+    """An accessible abstract does not substitute for an unavailable full paper."""
     from obsidian_llm_wiki.ingest.web import extract_web
 
     ssrn_url = "https://papers.ssrn.com/sol3/papers.cfm?abstract_id=5910522"
@@ -285,6 +287,8 @@ def test_ssrn_falls_to_semantic_scholar_when_no_public_document_is_available() -
     unavailable = RuntimeError("landing page is inaccessible")
     with (
         patch("obsidian_llm_wiki.ingest.web._extract_defuddle_md", side_effect=unavailable),
+        patch("obsidian_llm_wiki.ingest.web._extract_liteparse_document", side_effect=unavailable),
+        patch("obsidian_llm_wiki.ingest.web._extract_wayback", side_effect=unavailable),
         patch("obsidian_llm_wiki.ingest.web._extract_trafilatura", side_effect=unavailable),
         patch("obsidian_llm_wiki.ingest.web._extract_defuddle", side_effect=unavailable),
         patch(
@@ -295,9 +299,9 @@ def test_ssrn_falls_to_semantic_scholar_when_no_public_document_is_available() -
             "obsidian_llm_wiki.ingest.alt_source.extract_via_semantic_scholar",
             return_value=abstract_source,
         ) as semantic_scholar,
+        pytest.raises(RuntimeError, match="semantic_scholar: Extraction quality gate failed"),
     ):
-        result = extract_web(ssrn_url, timeout=9)
+        extract_web(ssrn_url, timeout=9)
 
     discover_document.assert_called_once_with(ssrn_url, 9)
     semantic_scholar.assert_called_once_with(ssrn_url, 9)
-    assert result is abstract_source

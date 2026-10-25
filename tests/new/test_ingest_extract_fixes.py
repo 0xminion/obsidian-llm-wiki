@@ -235,8 +235,12 @@ def test_podcast_without_transcript_or_description_raises(monkeypatch):
         podcast._extract_podcast("https://podcasts.example/ep", platform="generic")
 
 
-def test_podcast_with_description_only_is_still_a_valid_source(monkeypatch):
-    """Metadata-only is fine *when there is real description text* to synthesize."""
+def test_podcast_with_description_only_requires_an_explicit_clipping(monkeypatch):
+    """Descriptions are incomplete episodes, even when long enough to synthesize.
+
+    Intentional contract change: automatic podcast ingestion requires a
+    transcript; a description can still be imported explicitly as a clipping.
+    """
     monkeypatch.setattr(
         podcast,
         "_fetch_defuddle_md_metadata",
@@ -247,10 +251,8 @@ def test_podcast_with_description_only_is_still_a_valid_source(monkeypatch):
     )
     monkeypatch.setattr(podcast, "load_transcript_cache", lambda _identity: None)
 
-    source = podcast._extract_podcast("https://podcasts.example/ep", platform="generic")
-
-    assert "## Episode Description" in source.content
-    assert _LONG_TEXT in source.content
+    with pytest.raises(RuntimeError, match="no transcript.*clipping"):
+        podcast._extract_podcast("https://podcasts.example/ep", platform="generic")
 
 
 # ── RSS item matching must not pick the wrong episode ─────────────────────

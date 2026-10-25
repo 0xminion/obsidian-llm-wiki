@@ -144,8 +144,12 @@ def test_extract_web_tries_document_fallback_before_trafilatura():
     """LiteParse document parsing is the first local fallback after hosted Defuddle."""
     from obsidian_llm_wiki.ingest import web
 
+    # This ordering fixture represents a usable document, not a short stub;
+    # extract_web now applies the public generic-web quality gate per candidate.
     expected = SourceDoc(
-        title="Parsed PDF", content="LiteParse text", url="https://example.com/page"
+        title="Parsed PDF",
+        content="LiteParse full document body with extracted evidence. " * 20,
+        url="https://example.com/page",
     )
     with (
         patch.object(web, "_extract_defuddle_md", side_effect=RuntimeError("hosted failure")),

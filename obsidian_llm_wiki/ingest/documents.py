@@ -7,13 +7,18 @@ must validate as that document before a parser is invoked.
 
 from __future__ import annotations
 
+import json
 import os
+import re
 import tempfile
+from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass
+from email.message import Message
 from html.parser import HTMLParser
 from pathlib import Path
-from urllib.parse import urljoin, urlparse
+from time import monotonic
+from urllib.parse import parse_qs, urljoin, urlparse
 
 import httpx
 
@@ -73,9 +78,177 @@ def is_document_path(value: str | Path) -> bool:
 
 
 def is_direct_document_url(value: str) -> bool:
-    """Whether *value* is an HTTP(S) URL that explicitly names a document."""
+    """Whether a URL routes to documents, including supported public file viewers.
+
+    The historical name is retained for registry callers. Only Drive's exact
+    file-viewer route is recognized here, never Google Docs editors or folders.
+    """
     parsed = urlparse(value)
-    return parsed.scheme in {"http", "https"} and is_document_path(value)
+    return parsed.scheme in {"http", "https"} and (
+        is_document_path(value) or bool(_drive_viewer_id(value))
+    )
+
+
+def _drive_https_url(value: str, host: str) -> bool:
+    """Reject alternate authorities and URL normalization tricks before fetching."""
+    parsed = urlparse(value)
+    return (
+        parsed.scheme == "https"
+        and parsed.netloc == host
+        and not parsed.params
+        and not parsed.fragment
+        and not any(ord(char) <= 32 or char == "\\" for char in value)
+    )
+
+
+def _drive_viewer_id(value: str) -> str:
+    if not _drive_https_url(value, "drive.google.com"):
+        return ""
+    parsed = urlparse(value)
+    match = re.fullmatch(r"/file/d/([A-Za-z0-9_-]{1,200})/view", parsed.path)
+    query = parse_qs(parsed.query, keep_blank_values=True)
+    if not match or set(query) - {"usp"} or any(len(v) != 1 for v in query.values()):
+        return ""
+    return match.group(1)
+
+
+def _is_drive_download(value: str, file_id: str) -> bool:
+    if not _drive_https_url(value, "drive.usercontent.google.com"):
+        return False
+    parsed = urlparse(value)
+    return parsed.path in {"/uc", "/download"} and parse_qs(
+        parsed.query, keep_blank_values=True
+    ) == {"id": [file_id], "export": ["download"]}
+
+
+def _remaining_drive_time(deadline: float) -> float:
+    remaining = deadline - monotonic()
+    if remaining <= 0:
+        raise DocumentError("Public Drive download exceeded its time budget")
+    return remaining
+
+
+def _drive_request_guard(
+    file_id: str, *, deadline: float, viewer: bool = False
+) -> Callable[[httpx.Request], None]:
+    def guard(request: httpx.Request) -> None:
+        remaining = _remaining_drive_time(deadline)
+        request.extensions["timeout"] = dict.fromkeys(
+            ("connect", "read", "write", "pool"), remaining
+        )
+        url = str(request.url)
+        allowed = _drive_viewer_id(url) == file_id if viewer else _is_drive_download(url, file_id)
+        if not allowed:
+            raise InvalidDocumentError("Drive redirect left the public file download route")
+        # This connector is intentionally anonymous, including between redirects.
+        for name in ("cookie", "authorization", "proxy-authorization"):
+            request.headers.pop(name, None)
+
+    return guard
+
+
+def extract_public_drive_document(
+    page_url: str, *, config: Config | None = None, timeout: int = 60
+) -> SourceDoc:
+    """Follow an explicitly advertised public download, without auth or confirmation.
+
+    Never synthesize a download URL from an ID. Missing links, private viewers,
+    confirmation pages and non-document downloads all fail closed.
+    """
+    file_id = _drive_viewer_id(page_url)
+    if not file_id:
+        raise InvalidDocumentError("Not a supported public Drive file viewer URL")
+    cfg = config or load_config()
+    deadline = monotonic() + timeout
+
+    with (
+        httpx.Client(
+            timeout=timeout,
+            follow_redirects=False,
+            trust_env=False,
+            headers=BROWSER_HEADERS,
+            event_hooks={
+                "request": [_drive_request_guard(file_id, deadline=deadline, viewer=True)]
+            },
+        ) as client,
+        stream_with_validated_redirects(client, page_url) as response,
+    ):
+        response.raise_for_status()
+        if _content_type(response.headers) != "text/html":
+            raise InvalidDocumentError("Drive viewer did not return HTML")
+        html = _read_drive_viewer(response, cfg.max_html_bytes, deadline)
+
+    parser = _DriveLinkParser(file_id)
+    parser.feed(html)
+    parser.close()
+    if parser.has_form:
+        raise InvalidDocumentError("Drive viewer requires a login or confirmation form")
+    if not parser.download_url:
+        raise InvalidDocumentError("No official public Drive download link found")
+    downloaded = download_document(
+        parser.download_url,
+        config=cfg,
+        timeout=timeout,
+        _drive_file_id=file_id,
+        _drive_deadline=deadline,
+    )
+    try:
+        source = _parse_local_document(downloaded.path, source_url=page_url, config=cfg)
+        source = _stamp_download_provenance(
+            source, downloaded, requested_url=page_url, extracted_url=parser.download_url
+        )
+        return stamp_source(source, requested_url=page_url, extractor="google-drive-public-viewer")
+    finally:
+        _remove_temp(downloaded.path)
+
+
+def _read_drive_viewer(response: httpx.Response, max_bytes: int, deadline: float) -> str:
+    declared_size = _content_length(response.headers)
+    if declared_size is not None and declared_size > max_bytes:
+        raise DocumentTooLargeError("Drive viewer Content-Length exceeds HTML byte limit")
+    body = bytearray()
+    for chunk in response.iter_bytes():
+        _remaining_drive_time(deadline)
+        if len(body) + len(chunk) > max_bytes:
+            raise DocumentTooLargeError("Drive viewer stream exceeded HTML byte limit")
+        body.extend(chunk)
+    _remaining_drive_time(deadline)
+    return body.decode("utf-8", errors="replace")
+
+
+class _DriveLinkParser(HTMLParser):
+    """Read links from markup or JSON strings without executing viewer scripts."""
+
+    def __init__(self, file_id: str) -> None:
+        super().__init__()
+        self.file_id = file_id
+        self.download_url = ""
+        self.in_script = False
+        self.has_form = False
+
+    def _candidate(self, value: str) -> None:
+        if not self.download_url and _is_drive_download(value, self.file_id):
+            self.download_url = value
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag == "a":
+            self._candidate(dict(attrs).get("href") or "")
+        elif tag == "script":
+            self.in_script = True
+        elif tag == "form":
+            self.has_form = True
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "script":
+            self.in_script = False
+
+    def handle_data(self, data: str) -> None:
+        if self.in_script and not self.download_url:
+            for match in re.finditer(r'"https:(?:[^"\\]|\\.)*"', data):
+                try:
+                    self._candidate(json.loads(match.group()))
+                except ValueError:
+                    continue
 
 
 def dispatch_document(
@@ -92,6 +265,8 @@ def dispatch_document(
     """
     cfg = config or load_config()
     raw = str(value)
+    if _drive_viewer_id(raw):
+        return extract_public_drive_document(raw, config=cfg)
     if urlparse(raw).scheme in {"http", "https"}:
         downloaded = download_document(raw, config=cfg)
         try:
@@ -132,9 +307,7 @@ def extract_discovered_document(
         except Exception as exc:
             raise DocumentError(f"Could not retrieve document landing page {page_url}") from exc
 
-        candidates = document_candidates(
-            html, page_url, max_candidates=cfg.max_document_candidates
-        )
+        candidates = document_candidates(html, page_url, max_candidates=cfg.max_document_candidates)
 
     if not candidates:
         raise DocumentError("No same-site document candidate found")
@@ -172,6 +345,8 @@ def download_document(
     config: Config | None = None,
     timeout: int = 60,
     required_host: str | None = None,
+    _drive_file_id: str | None = None,
+    _drive_deadline: float | None = None,
 ) -> DownloadedDocument:
     """Stream one remote binary document to a byte-bounded temporary file.
 
@@ -183,24 +358,36 @@ def download_document(
     validate_remote_url(url)
     expected_suffix = _suffix_from_url(url)
     temp_path: Path | None = None
+    client_kwargs = make_client_kwargs(timeout=timeout, follow_redirects=False)
+    if _drive_file_id:
+        if _drive_deadline is None:
+            _drive_deadline = monotonic() + timeout
+        client_kwargs = {
+            "timeout": timeout,
+            "follow_redirects": False,
+            "trust_env": False,
+            "event_hooks": {
+                "request": [_drive_request_guard(_drive_file_id, deadline=_drive_deadline)]
+            },
+        }
     try:
         with (
-            httpx.Client(
-                **make_client_kwargs(timeout=timeout, follow_redirects=False),
-                headers=BROWSER_HEADERS,
-            ) as client,
+            httpx.Client(**client_kwargs, headers=BROWSER_HEADERS) as client,
             stream_with_validated_redirects(client, url) as response,
         ):
             response.raise_for_status()
             resolved_url = str(response.url)
-            if (
-                required_host
-                and (urlparse(resolved_url).hostname or "").lower() != required_host
-            ):
+            if required_host and (urlparse(resolved_url).hostname or "").lower() != required_host:
                 raise InvalidDocumentError("Document redirect left the official site")
             content_type = _content_type(response.headers)
             mime_suffix = _CONTENT_TYPE_SUFFIXES.get(content_type)
             suffix = expected_suffix or mime_suffix
+            if _drive_file_id and not suffix:
+                # Use only a supported suffix; never use the supplied filename
+                # as a filesystem path. Signature and MIME checks still apply.
+                disposition = Message()
+                disposition["content-disposition"] = response.headers.get("content-disposition", "")
+                suffix = Path(disposition.get_filename() or "").suffix.lower()
             if suffix not in DOCUMENT_SUFFIXES:
                 raise InvalidDocumentError(
                     f"Unsupported document MIME {content_type or 'missing'} for {resolved_url}"
@@ -217,6 +404,8 @@ def download_document(
                 temp_path = Path(handle.name)
                 total = 0
                 for chunk in response.iter_bytes():
+                    if _drive_deadline is not None:
+                        _remaining_drive_time(_drive_deadline)
                     total += len(chunk)
                     if total > cfg.max_document_bytes:
                         raise DocumentTooLargeError(
@@ -224,6 +413,8 @@ def download_document(
                         )
                     handle.write(chunk)
 
+        if _drive_deadline is not None:
+            _remaining_drive_time(_drive_deadline)
         if temp_path is None or temp_path.stat().st_size == 0:
             raise InvalidDocumentError(f"Downloaded empty document from {url}")
         _validate_signature(temp_path, suffix)

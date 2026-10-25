@@ -7,8 +7,9 @@ Multi-layer strategy:
   4. defuddle CLI
   5. specialist and archive fallbacks
 
-Each layer runs only if the previous one fails. The SourceDoc always carries
-the full content — never truncated.
+Each layer runs only if the previous one fails extraction or the shared
+generic-web acceptance gate. Rejected candidates remain bounded diagnostics,
+not source evidence. The selected SourceDoc retains its URL and provenance.
 """
 
 from __future__ import annotations
@@ -18,6 +19,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+from dataclasses import replace
 from pathlib import Path
 
 import httpx
@@ -102,14 +104,19 @@ def extract_web(url: str, timeout: int = _TIMEOUT) -> SourceDoc:
       5. defuddle CLI — local defuddle fallback
       6. specialist and archive fallbacks
 
+    Every candidate must pass the same acceptance gate as public ``extract()``
+    before it can stop fallback selection. This also applies to specialist
+    candidates reached through this generic-web path. Earlier failures are
+    retained in the selected document's provenance, or the final exception.
+
     Raises:
         RuntimeError: When all strategies fail.
     """
     errors: list[str] = []
     scientific_preflight_attempted = False
 
-    # A short abstract is often a perfectly valid generic extraction, so known
-    # scholarly landing pages get their official public full-text links first.
+    # Known scholarly landing pages get their official public full-text links
+    # first, rather than spending generic extraction attempts on an abstract.
     # This narrow URL gate avoids adding a network request for ordinary blogs.
     if not _is_youtube_url(url):
         from obsidian_llm_wiki.ingest.extractors.scientific import (
@@ -120,32 +127,37 @@ def extract_web(url: str, timeout: int = _TIMEOUT) -> SourceDoc:
         if is_likely_scientific_landing_page(url):
             scientific_preflight_attempted = True
             try:
-                return extract_discovered_scientific_document(url, timeout)
+                return _accept_web_candidate(
+                    extract_discovered_scientific_document(url, timeout),
+                    url, "public_scientific_preflight", errors,
+                )
             except Exception as exc:
                 _record_error(errors, "public_scientific_preflight", exc)
 
     # Layer 1: defuddle.md web service (best markdown quality for articles/blogs)
     try:
-        return _extract_defuddle_md(url, timeout)
+        return _accept_web_candidate(_extract_defuddle_md(url, timeout), url, "defuddle.md", errors)
     except Exception as exc:
         _record_error(errors, "defuddle.md", exc)
 
     # Layer 2: LiteParse local document fallback. This is optional; a missing
     # CLI is recorded and the ordinary HTML fallbacks continue.
     try:
-        return _extract_liteparse_document(url, timeout)
+        return _accept_web_candidate(
+            _extract_liteparse_document(url, timeout), url, "liteparse", errors,
+        )
     except Exception as exc:
         _record_error(errors, "liteparse", exc)
 
     # Layer 3: trafilatura
     try:
-        return _extract_trafilatura(url, timeout)
+        return _accept_web_candidate(_extract_trafilatura(url, timeout), url, "trafilatura", errors)
     except Exception as exc:
         _record_error(errors, "trafilatura", exc)
 
     # Layer 4: defuddle CLI (no proxy — it has its own UA handling)
     try:
-        return _extract_defuddle(url, timeout)
+        return _accept_web_candidate(_extract_defuddle(url, timeout), url, "defuddle", errors)
     except Exception as exc:
         _record_error(errors, "defuddle", exc)
 
@@ -153,7 +165,10 @@ def extract_web(url: str, timeout: int = _TIMEOUT) -> SourceDoc:
     # repeating discovery when the preflight already tried the same landing.
     if not _is_youtube_url(url) and not scientific_preflight_attempted:
         try:
-            return extract_discovered_scientific_document(url, timeout)
+            return _accept_web_candidate(
+                extract_discovered_scientific_document(url, timeout),
+                url, "public_scientific_document", errors,
+            )
         except Exception as exc:
             _record_error(errors, "public_scientific_document", exc)
 
@@ -161,7 +176,9 @@ def extract_web(url: str, timeout: int = _TIMEOUT) -> SourceDoc:
     if _is_youtube_url(url):
         try:
             from obsidian_llm_wiki.ingest.alt_source import extract_via_invidious
-            return extract_via_invidious(url, timeout)
+            return _accept_web_candidate(
+                extract_via_invidious(url, timeout), url, "invidious", errors,
+            )
         except Exception as exc:
             _record_error(errors, "invidious", exc)
 
@@ -169,7 +186,9 @@ def extract_web(url: str, timeout: int = _TIMEOUT) -> SourceDoc:
     if _is_ssrn_url(url):
         try:
             from obsidian_llm_wiki.ingest.alt_source import extract_via_semantic_scholar
-            return extract_via_semantic_scholar(url, timeout)
+            return _accept_web_candidate(
+                extract_via_semantic_scholar(url, timeout), url, "semantic_scholar", errors,
+            )
         except Exception as exc:
             _record_error(errors, "semantic_scholar", exc)
 
@@ -177,19 +196,41 @@ def extract_web(url: str, timeout: int = _TIMEOUT) -> SourceDoc:
     if _is_journal_xml_url(url):
         try:
             from obsidian_llm_wiki.ingest.alt_source import extract_via_journal_page
-            return extract_via_journal_page(url, timeout)
+            return _accept_web_candidate(
+                extract_via_journal_page(url, timeout), url, "journal_direct", errors,
+            )
         except Exception as exc:
             _record_error(errors, "journal_direct", exc)
 
     # Layer 9: Wayback Machine
     try:
-        return _extract_wayback(url, timeout)
+        return _accept_web_candidate(_extract_wayback(url, timeout), url, "wayback", errors)
     except Exception as exc:
         _record_error(errors, "wayback", exc)
 
     raise RuntimeError(
         f"All extraction strategies failed for {url}:\n  " + "\n  ".join(errors)
     )
+
+
+def _accept_web_candidate(
+    source: SourceDoc, url: str, stage: str, errors: list[str],
+) -> SourceDoc:
+    """Admit a candidate before selecting it, retaining source-specific facts."""
+    # Runtime import avoids the registry -> web -> registry import cycle. Use
+    # the full boundary gate: quality alone misses explicit access-control titles.
+    from obsidian_llm_wiki.ingest.extractors import _stamp_extracted_source
+
+    accepted = _stamp_extracted_source(source, url, "generic_web")
+    # Keep the selected SourceDoc identity, as scientific selection does, while
+    # replacing only immutable provenance. Never mutate a rejected candidate.
+    # Prefer an existing actual extractor chain over a selection-strategy label.
+    source.provenance = replace(
+        accepted.provenance,
+        extractor_chain=source.provenance.extractor_chain or (stage,),
+        diagnostics=(*accepted.provenance.diagnostics, *errors),
+    )
+    return source
 
 
 def _extract_liteparse_document(url: str, timeout: int) -> SourceDoc:
@@ -375,28 +416,13 @@ def _extract_defuddle_md(url: str, timeout: int) -> SourceDoc:
     if not text or len(text) < 100:
         raise RuntimeError("defuddle.md returned empty content")
 
-    # Parse frontmatter
-    title = ""
-    content = text
-    if text.startswith("---"):
-        # Use partition to find the closing --- (handles --- in values better)
-        _, sep, rest = text[3:].partition("\n---\n")
-        if sep:
-            # Split on lines to extract frontmatter block
-            lines = text.split("\n")
-            fm_lines = []
-            found_close = False
-            for _i, line in enumerate(lines[1:], 1):  # skip first ---
-                if line.strip() == "---":
-                    found_close = True
-                    break
-                fm_lines.append(line)
-            if found_close:
-                fm_text = "\n".join(fm_lines)
-                content = "\n".join(lines[2 + len(fm_lines):]).lstrip()
-                for line in fm_text.split("\n"):
-                    if line.startswith("title:"):
-                        title = line[6:].strip().strip('"').strip("'")
+    # Reuse the canonical safe YAML parser. A closing delimiter at EOF is
+    # valid; strip()/partition("\n---\n") used to misread it as body text.
+    from obsidian_llm_wiki.render.frontmatter import parse_frontmatter
+
+    metadata, content = parse_frontmatter(text.replace("\r\n", "\n"))
+    raw_title = metadata.get("title", "")
+    title = raw_title.strip() if isinstance(raw_title, str) else ""
 
     if not title:
         for line in content.split("\n", 5):
@@ -413,7 +439,16 @@ def _extract_defuddle_md(url: str, timeout: int) -> SourceDoc:
     if not content or len(content.strip()) < 50:
         raise RuntimeError("defuddle.md content too short")
 
-    return SourceDoc(title=title, content=content.strip(), url=url)
+    from obsidian_llm_wiki.ingest.provenance import stamp_source
+
+    return stamp_source(
+        SourceDoc(title=title, content=content.strip(), url=url),
+        requested_url=url,
+        resolved_url=str(resp.url),
+        extracted_url=str(resp.url),
+        extractor="defuddle.md",
+        document_format="markdown",
+    )
 
 
 def _extract_trafilatura(url: str, timeout: int) -> SourceDoc:
@@ -487,7 +522,21 @@ def _extract_wayback(url: str, timeout: int) -> SourceDoc:
     if not content:
         raise RuntimeError("wayback produced empty content")
 
-    return SourceDoc(title=title or url, content=content, url=url)
+    from obsidian_llm_wiki.ingest.provenance import stamp_source
+
+    resolved_url = str(resp.url)
+    snapshot = re.search(r"/web/(\d{14})(?:[a-z_]+)?/", resolved_url)
+    diagnostics = (f"archived_snapshot: {snapshot.group(1)}",) if snapshot else ("archived_copy",)
+    return stamp_source(
+        SourceDoc(title=title or url, content=content, url=url),
+        requested_url=url,
+        resolved_url=resolved_url,
+        extracted_url=resolved_url,
+        extractor="wayback",
+        content_type=resp.headers.get("content-type", "").split(";", 1)[0],
+        document_format="html",
+        diagnostics=diagnostics,
+    )
 
 
 def _check_cloudflare(resp: httpx.Response, html: str) -> None:

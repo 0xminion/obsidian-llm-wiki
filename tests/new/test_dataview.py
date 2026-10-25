@@ -168,8 +168,8 @@ def test_sources_by_freshness_static_table():
     view = render_sources_by_freshness_view(sources, _make_bundle())
     assert "| Source | Retrieved |" in view
     # paper-b has a newer retrieved_at so it should appear first.
-    b_pos = view.index("[[paper-b|")
-    a_pos = view.index("[[paper-a|")
+    b_pos = view.index("[[sources/paper-b|")
+    a_pos = view.index("[[sources/paper-a|")
     assert b_pos < a_pos
 
 

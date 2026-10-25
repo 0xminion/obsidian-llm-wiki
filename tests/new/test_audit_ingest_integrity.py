@@ -152,7 +152,8 @@ def test_podcast_preview_does_not_write_transcript_cache(tmp_path, monkeypatch):
         monkeypatch,
         config,
         "--url",
-        "https://example.test/episode",
+        # Explicit episode route under the strengthened inline admission contract.
+        "https://example.test/episodes/42",
         "--preview",
         extractor=podcast._extract_podcast,
     )

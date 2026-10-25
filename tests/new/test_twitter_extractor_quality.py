@@ -36,5 +36,6 @@ def test_accepts_substantive_x_content(monkeypatch):
         content="A substantive argument about prediction-market market design. " * 8,
     )
     monkeypatch.setattr(twitter, "_extract_via_defuddle", lambda _url: source)
+    monkeypatch.setattr(twitter, "_extract_via_defuddle_md", lambda _url: None)
 
     assert extract_twitter("https://x.com/example/status/123") is source
