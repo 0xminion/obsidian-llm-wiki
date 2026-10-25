@@ -9,6 +9,8 @@
 - [Scaling](scaling.md): actual cost model, benchmark interpretation, proposed local dependency batches, and a separate million-note index/Obsidian working set.
 - [Audit issue ledger](audit-issues.md): severity, root cause, affected code, regression selectors, and fixed versus unresolved boundaries.
 - [Verification](verification.md): baseline, intermediate independent failures, scoped follow-up receipts, measured benchmarks, and a final acceptance section for the integrating reviewer.
+- [Live 50-URL audit](live-source-audit.md): real extraction corpus, content-loss and provider-schema fixes, changed podcast admission, refresh guidance, and verification limits.
+- [Podcast admission](podcast-admission.md): shared episode/artifact checks, conservative inline/link routing, cache admission version, and explicit refresh behavior.
 
 Source code and `olw COMMAND --help` define the available API/options. The active references distinguish read-only planning from migration, source-language preservation from explicit translation, and scoped regression results from final aggregate acceptance.
 

@@ -4,7 +4,7 @@ Extracts podcast episode transcripts and metadata via:
 1. defuddle.md for episode metadata (title, description, date)
 2. iTunes Lookup API → RSS feed → episode audio URL
 3. Supadata API for audio transcription (async job polling)
-4. Fallback to defuddle.md metadata only if no transcript available
+4. Fail if no transcript is available; descriptions are not complete episodes
 
 Supported platforms:
   - open.spotify.com/episode/*
@@ -23,8 +23,8 @@ import re
 import tempfile
 import time
 from contextlib import suppress
-from dataclasses import dataclass
-from urllib.parse import parse_qs, urlparse
+from dataclasses import dataclass, field
+from urllib.parse import parse_qs, unquote, urlparse
 
 import httpx
 from defusedxml import ElementTree
@@ -33,7 +33,13 @@ from obsidian_llm_wiki.core.models import SourceDoc
 from obsidian_llm_wiki.ingest.extractors import ExtractorNotApplicableError, register_extractor
 from obsidian_llm_wiki.ingest.http_headers import BROWSER_HEADERS, DEFAULT_TIMEOUT
 from obsidian_llm_wiki.ingest.podcast_index import discover_feed_urls
+from obsidian_llm_wiki.ingest.provenance import stamp_source
 from obsidian_llm_wiki.ingest.proxy import make_client_kwargs
+from obsidian_llm_wiki.ingest.publisher_transcripts import (
+    conflicting_episode_title,
+    fetch_labelled_transcript,
+    has_transcript_link,
+)
 from obsidian_llm_wiki.ingest.supadata_utils import (
     supadata_rate_limit,
     track_supadata_call,
@@ -55,6 +61,8 @@ from obsidian_llm_wiki.ingest.url_safety import (
 
 logger = logging.getLogger("obswiki.ingest.extractors.podcast")
 _MAX_RSS_BYTES = 50 * 1024 * 1024
+_TRANSCRIPT_HEADING = re.compile(r"(?im)^#{1,3}\s+(?:full\s+)?transcript\s*$")
+_EPISODE_PAGE_PATH = re.compile(r"/(?:episodes?|e)/[^/]+/?$|/episode-[^/]+/?$")
 
 __all__ = [
     "extract_spotify",
@@ -64,6 +72,10 @@ __all__ = [
     "validate_supadata_key",
     "validate_assemblyai_key",
 ]
+
+
+class _MissingPodcastTranscriptError(RuntimeError):
+    """An episode was found, but its description is not a complete transcript."""
 
 
 @dataclass(frozen=True)
@@ -76,6 +88,11 @@ class EpisodeAsset:
     transcript_type: str = ""
     transcript_language: str = ""
     guid: str = ""
+    notes: str = ""
+    language: str = ""
+    # Resolution diagnostics are not media fields. Preserve empty-asset equality
+    # for helper callers while carrying the rejection through discovery routes.
+    ambiguous: bool = field(default=False, compare=False)
 
 # ── Domain matching ─────────────────────────────────────────────────────
 
@@ -272,9 +289,10 @@ def extract_catch_all_podcast(raw_url: str) -> SourceDoc:
 
     Tries to discover a podcast RSS feed from the episode page metadata via
     Podcast Index / iTunes Search.  If the page doesn't look like a podcast
-    or no audio enclosure is found, the extractor disclaims the URL (raises
+    or no episode evidence is found, the extractor disclaims the URL (raises
     ``ExtractorNotApplicableError``) so the dispatcher falls through to
-    generic web extraction rather than failing closed.
+    generic web extraction. A resolved episode or description without a
+    transcript fails closed rather than publishing its show notes via web fallback.
 
     This extractor is registered last among specialists so that every known
     platform (Spotify, Apple, anchor.fm, direct RSS feeds, etc.) gets a chance
@@ -292,6 +310,8 @@ def extract_catch_all_podcast(raw_url: str) -> SourceDoc:
         )
     try:
         source = _extract_podcast(raw_url, platform="generic")
+    except _MissingPodcastTranscriptError:
+        raise
     except RuntimeError as exc:
         raise ExtractorNotApplicableError(
             f"catch-all podcast: no audio enclosure or episode description found for {raw_url}"
@@ -306,6 +326,9 @@ def extract_catch_all_podcast(raw_url: str) -> SourceDoc:
 @register_extractor(lambda _parsed, raw: _is_rss_feed(raw))
 def extract_podcast_rss(raw_url: str) -> SourceDoc:
     """Extract the most recent transcript-bearing episode from a public feed.
+
+    Use publisher item order. If no item advertises a transcript, retain the
+    first item for cache/ASR resolution; never substitute its description.
 
     The URL predicate cannot tell a podcast feed from a blog's Atom feed or an
     XML sitemap, so confirm from the body before claiming the URL. Disclaiming
@@ -339,24 +362,66 @@ def _extract_podcast(
       7. Local Whisper only as a final acquisition-dependent fallback
 
     Raises:
-        RuntimeError: When neither a transcript nor an episode description could
-            be acquired. Emitting a metadata-only placeholder instead would let a
-            content-free stub reach the synthesis stage as though it were a
-            real source.
+        RuntimeError: When no transcript could be acquired. Episode descriptions
+            are incomplete and must not reach synthesis as complete episodes.
+            Operators may explicitly import descriptions as separate clippings.
     """
     errors: list[str] = []
+
+    # Recheck the original route even when a catch-all retries a specialist.
+    # A show page cannot authorize an episode via its title or a warm cache.
+    parsed = urlparse(raw_url)
+    if _is_apple_podcast(parsed, raw_url):
+        platform = "apple"
+        episode_ids = parse_qs(parsed.query).get("i", [])
+        if len(episode_ids) != 1 or not re.search(r"/id\d+(?:/|$)", parsed.path):
+            raise _MissingPodcastTranscriptError(
+                "Podcast incomplete: no transcript for a show-only/ambiguous URL. "
+                f"Source: {raw_url}"
+            )
+    elif _is_spotify(parsed, raw_url):
+        platform = "spotify"
+        if not re.fullmatch(r"/(?:intl-[a-z-]+/)?episode/[^/]+/?", parsed.path):
+            raise _MissingPodcastTranscriptError(
+                f"Podcast incomplete: no transcript for a show-only URL. Source: {raw_url}"
+            )
 
     # Step 1: Get metadata via defuddle.md
     metadata = _fetch_defuddle_md_metadata(raw_url)
     title = metadata.get("title", "")
-    description = metadata.get("description", "")
     author = metadata.get("author", "")
     date = metadata.get("published", "")
 
     # Step 2: Resolve a canonical RSS episode. Spotify is cross-platform
     # discovered through iTunes/RSS; Apple already exposes its show identity.
     asset = _resolve_episode_asset(raw_url, platform, metadata, rss_text=rss_text)
-    title = title or asset.title
+    inline_claim = bool(_TRANSCRIPT_HEADING.search(metadata.get("body", "")))
+    if (
+        platform == "generic"
+        and (
+            not parsed.path.strip("/")
+            or (
+                re.search(r"/(?:show|shows)(?:/|$)", parsed.path)
+                and not _EPISODE_PAGE_PATH.search(parsed.path)
+            )
+        )
+        and (asset.title or inline_claim)
+    ):
+        raise _MissingPodcastTranscriptError(
+            f"Podcast incomplete: no transcript for a show-only page. Source: {raw_url}"
+        )
+    if asset.ambiguous:
+        raise _MissingPodcastTranscriptError(
+            "Podcast incomplete: no transcript with unambiguous episode identity. "
+            f"Source: {raw_url}"
+        )
+    if platform == "apple" and not asset.title:
+        raise _MissingPodcastTranscriptError(
+            "Podcast incomplete: no transcript with resolved Apple episode identity. "
+            f"Source: {raw_url}"
+        )
+    # A uniquely matched RSS item is authoritative, not storefront metadata.
+    title = asset.title or title
     audio_url = asset.audio_url
     # RSS GUIDs are only guaranteed unique within one feed. Pair with the
     # canonical enclosure URL to avoid cross-show cache collisions.
@@ -366,37 +431,52 @@ def _extract_podcast(
         else asset.guid or audio_url or raw_url
     )
 
-    # Step 3: Cache is authoritative for previously acquired transcripts.
-    transcript_result = load_transcript_cache(cache_identity)
+    def admit(candidate: TranscriptResult | None, *, persist: bool = True):
+        """All routes, including cache hits, share the publication boundary."""
+        candidate = _admit_podcast_transcript(candidate, asset, metadata, raw_url=raw_url)
+        if candidate is not None and persist:
+            save_transcript_cache(cache_identity, candidate)
+        return candidate
+
+    # Step 3: A cache hit is still subject to current episode admission.
+    transcript_result = admit(load_transcript_cache(cache_identity), persist=False)
     if transcript_result:
         logger.info("Transcript cache hit for %s", raw_url)
 
     # Step 4: Publisher-provided artifacts from Podcasting 2.0 RSS.
     if transcript_result is None and asset.transcript_url:
-        transcript_result = fetch_public_transcript(
+        transcript_result = admit(fetch_public_transcript(
             asset.transcript_url,
             mime_type=asset.transcript_type,
             language=asset.transcript_language,
-        )
-        if transcript_result:
-            save_transcript_cache(cache_identity, transcript_result)
+        ))
 
     # Step 4b: Some publishers expose a full transcript in the episode page
     # but omit the Podcasting 2.0 RSS tag. defuddle.md retains that body.
     if transcript_result is None:
-        transcript_result = _publisher_transcript_from_metadata(metadata, raw_url)
-        if transcript_result:
-            save_transcript_cache(cache_identity, transcript_result)
+        transcript_result = admit(_publisher_transcript_from_metadata(metadata, raw_url))
+
+    # Step 4c: Explicit links belong to the uniquely matched episode, not the
+    # show or a nearby search result. Never crawl arbitrary show-note URLs.
+    if transcript_result is None and asset.title:
+        notes = asset.notes
+        if _normalise_title(metadata.get("title", "")) == _normalise_title(asset.title):
+            notes += "\n" + "\n".join(
+                metadata.get(key, "") for key in ("description", "body")
+            )
+        transcript_result = admit(fetch_labelled_transcript(
+            notes,
+            episode_title=asset.title,
+            language=asset.language or metadata.get("language", ""),
+        ))
 
     # Step 5: AssemblyAI is the primary remote media provider. It fetches the
     # public RSS enclosure itself, so the pipeline host does not download it.
     if transcript_result is None and audio_url:
         assemblyai_key = get_assemblyai_key()
         if assemblyai_key:
-            transcript_result = assemblyai_transcribe_url(audio_url, assemblyai_key)
-            if transcript_result:
-                save_transcript_cache(cache_identity, transcript_result)
-            else:
+            transcript_result = admit(assemblyai_transcribe_url(audio_url, assemblyai_key))
+            if transcript_result is None:
                 errors.append("assemblyai: no transcript returned")
         else:
             logger.debug("No ASSEMBLYAI_API_KEY — skipping AssemblyAI")
@@ -408,12 +488,11 @@ def _extract_podcast(
         if supadata_key:
             transcript = _supadata_transcribe_audio(audio_url, supadata_key)
             if transcript:
-                transcript_result = TranscriptResult(
+                transcript_result = admit(TranscriptResult(
                     text=transcript,
                     provider="supadata_remote_url",
                     artifact_url=audio_url,
-                )
-                save_transcript_cache(cache_identity, transcript_result)
+                ))
             else:
                 errors.append("supadata: no transcript returned")
         else:
@@ -424,22 +503,28 @@ def _extract_podcast(
     if transcript_result is None and audio_url:
         whisper_transcript = _whisper_fallback_transcribe(audio_url)
         if whisper_transcript:
-            transcript_result = TranscriptResult(
+            transcript_result = admit(TranscriptResult(
                 text=whisper_transcript,
                 provider="local_faster_whisper",
                 artifact_url=audio_url,
-            )
-            save_transcript_cache(cache_identity, transcript_result)
+            ))
         else:
             errors.append("whisper: fallback unavailable or failed")
 
-    # Step 8: Build content. A source with neither a transcript nor a description
-    # carries no knowledge, so fail rather than emitting a placeholder — the
-    # caller's fallback chain and the operator both need to see this as a failure.
-    if transcript_result is None and not description:
-        raise RuntimeError(
-            f"Could not extract podcast content from {raw_url}: no transcript "
-            f"artifact and no episode description. Attempts: "
+    # Step 8: A description is not the episode, regardless of its length.
+    if transcript_result is None:
+        # Distinguish incomplete episode evidence from a catch-all discovery
+        # miss. Only the latter may disclaim and fall through to generic web.
+        error_type = (
+            _MissingPodcastTranscriptError
+            if audio_url or asset.transcript_url or inline_claim
+            or metadata.get("description", "").strip()
+            else RuntimeError
+        )
+        raise error_type(
+            "Podcast incomplete: no transcript. Supply a public transcript URL/file, "
+            "or manually import the description as a separate clipping. "
+            f"Source: {raw_url}. Attempts: "
             + ("; ".join(errors) if errors else "no audio URL resolved")
         )
 
@@ -450,29 +535,74 @@ def _extract_podcast(
         parts.append(f"Published: {date}")
     if audio_url:
         parts.append(f"Audio: {audio_url}")
-    if transcript_result:
-        parts.append("")
-        parts.append("## Transcript")
-        parts.append("")
-        parts.append(f"Transcript source: {transcript_result.provider}")
-        parts.append("")
-        parts.append(transcript_result.text)
-    else:
-        parts.append("")
-        parts.append("## Episode Description")
-        parts.append("")
-        parts.append(description)
+    parts.append("")
+    parts.append("## Transcript")
+    parts.append("")
+    parts.append(f"Transcript source: {transcript_result.provider}")
+    parts.append("")
+    parts.append(transcript_result.text)
 
-    return SourceDoc(
-        title=title or raw_url,
-        content="\n".join(parts).strip(),
-        url=raw_url,
+    return stamp_source(
+        SourceDoc(title=title or raw_url, content="\n".join(parts).strip(), url=raw_url),
+        requested_url=raw_url,
+        extractor=transcript_result.provider,
+        resolved_url=transcript_result.artifact_url,
+        extracted_url=transcript_result.artifact_url,
+        content_type=(
+            asset.transcript_type
+            if asset.transcript_url and transcript_result.artifact_url == asset.transcript_url
+            else ""
+        ),
     )
+
+
+def _admit_podcast_transcript(
+    result: TranscriptResult | None,
+    asset: EpisodeAsset,
+    metadata: dict[str, str],
+    *,
+    raw_url: str,
+) -> TranscriptResult | None:
+    """Reject inline content attributed to a different canonical episode.
+
+    The metadata title identifies the inline document, not the spoken body.
+    An RSS artifact/ASR result belongs to its matched item independently of
+    contradictory storefront metadata.
+    """
+    if result is None:
+        return None
+    if asset.title and conflicting_episode_title(result.document_title, asset.title):
+        return None
+    if result.provider == "publisher_episode_page" and has_transcript_link(result.text):
+        return None
+    if result.provider == "publisher_episode_page" and not asset.title:
+        # An RSS discovery miss is not itself permission. Preserve genuine
+        # no-feed inline pages only on explicit episode routes with a document
+        # title, never a home/show page or an unknown canonical Apple episode.
+        parsed = urlparse(raw_url)
+        document_title = metadata.get("title", "").strip()
+        if (
+            not document_title
+            or _normalise_title(result.document_title) != _normalise_title(document_title)
+            or _normalise_title(document_title) == _normalise_title(metadata.get("author", ""))
+            or not _EPISODE_PAGE_PATH.search(parsed.path)
+            or _is_apple_podcast(parsed, raw_url)
+        ):
+            return None
+    if result.provider == "publisher_episode_page" and asset.title:
+        document_title = result.document_title
+        titles = (
+            document_title,
+            _episode_title_without_suffix(document_title, metadata.get("author", "")),
+        )
+        if not any(_normalise_title(value) == _normalise_title(asset.title) for value in titles):
+            return None
+    return result
 
 
 # ── defuddle.md metadata ────────────────────────────────────────────────
 
-_FRONTMATTER_KEYS = frozenset(("title", "author", "published", "description"))
+_FRONTMATTER_KEYS = frozenset(("title", "author", "published", "description", "language"))
 
 
 def _fetch_defuddle_md_metadata(url: str) -> dict[str, str]:
@@ -525,19 +655,23 @@ def _publisher_transcript_from_metadata(
 ) -> TranscriptResult | None:
     """Use a publisher's explicit transcript section before generated ASR."""
     body = metadata.get("body", "")
-    heading = re.search(
-        r"(?im)^#{1,3}\s+(?:full\s+)?transcript\s*$",
-        body,
-    )
+    heading = _TRANSCRIPT_HEADING.search(body)
     if not heading:
         return None
-    transcript = body[heading.end():].strip()
-    if len(transcript) < 200:
+    # Only the section body belongs to this heading. A linked transcript plus
+    # a later sponsor section must not masquerade as a long inline transcript.
+    level = len(heading.group().split()[0])
+    transcript = re.split(
+        rf"(?m)^#{{1,{level}}}\s+", body[heading.end():], maxsplit=1,
+    )[0].strip()
+    if len(transcript) < 200 or has_transcript_link(transcript):
         return None
     return TranscriptResult(
         text=transcript,
         provider="publisher_episode_page",
         artifact_url=source_url,
+        language=metadata.get("language", ""),
+        document_title=metadata.get("title", ""),
     )
 
 
@@ -557,7 +691,7 @@ def _resolve_episode_asset(
     """
     if platform == "rss":
         feed = rss_text if rss_text is not None else _fetch_rss_text(raw_url)
-        return _find_episode_asset_in_rss(feed, allow_first=True)
+        return _find_episode_asset_in_rss(feed, allow_first=True, prefer_transcript=True)
     if platform == "apple":
         return _find_apple_episode_asset(
             raw_url,
@@ -569,7 +703,7 @@ def _resolve_episode_asset(
     by_podcast_index = _find_asset_via_podcast_index(
         metadata.get("title", ""), metadata.get("author", ""),
     )
-    if by_podcast_index.audio_url or by_podcast_index.transcript_url:
+    if by_podcast_index.ambiguous or by_podcast_index.audio_url or by_podcast_index.transcript_url:
         return by_podcast_index
     return _find_asset_via_itunes(
         metadata.get("title", ""), metadata.get("author", ""),
@@ -626,7 +760,50 @@ def _item_text(item, local_name: str) -> str:
 
 
 def _normalise_title(value: str) -> str:
-    return re.sub(r"[^\w\s]", "", value.lower()).strip()
+    # Keep word/number boundaries: "1-0" must not turn into "10".
+    return " ".join(re.sub(r"[^\w\s]", " ", value.casefold()).split())
+
+
+def _episode_title_without_suffix(value: str, show_title: str) -> str:
+    """Strip only known terminal platform labels and the feed's own show name.
+
+    Accept e.g. "Title - Podcast Episode - Spotify", "Title on Apple Podcasts",
+    and "Title - Show | Spotify". Never strip an arbitrary subtitle or prefix.
+    """
+    value = re.sub(
+        r"\s+(?:[-–—|]\s*(?:Podcast Episode\s*[-–—|]\s*)?"
+        r"(?:Spotify|Apple Podcasts|Podcast on Spotify)|on\s+(?:Spotify|Apple Podcasts))\s*$",
+        "", value, flags=re.IGNORECASE,
+    )
+    if show_title:
+        value = re.sub(
+            r"\s+[-–—|]\s*" + re.escape(show_title) + r"\s*$",
+            "", value, flags=re.IGNORECASE,
+        )
+    return value
+
+
+def _matches_episode_identity(field: str, episode_id: str) -> bool:
+    """Match an opaque ID or an explicit URL identity, never a substring.
+
+    URL identities are the final path segment or an episode-ID query value.
+    Hosts, fragments, unrelated query values, and pieces of opaque GUIDs do
+    not identify an episode.
+    """
+    if field == episode_id:
+        return True
+    try:
+        parsed = urlparse(field)
+    except ValueError:
+        return False
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        return False
+    if unquote(parsed.path.rstrip("/").rsplit("/", 1)[-1]) == episode_id:
+        return True
+    query = parse_qs(parsed.query)
+    return any(
+        episode_id in query.get(key, []) for key in ("i", "id", "episode", "episode_id")
+    )
 
 
 def _find_episode_asset_in_rss(
@@ -635,8 +812,15 @@ def _find_episode_asset_in_rss(
     episode_id: str = "",
     target_title: str = "",
     allow_first: bool = False,
+    prefer_transcript: bool = False,
 ) -> EpisodeAsset:
-    """Resolve one RSS item, including its Podcasting 2.0 transcript tag."""
+    """Rank unique identity, normalized exact title, then explicit suffix rules.
+
+    Ties at the strongest matching rank fail closed, including when a weaker
+    title could break the tie. Only direct-feed requests without an episode
+    selector may opt into the first item in publisher order. Direct RSS
+    extraction prefers the first advertised public transcript before ASR.
+    """
     if not rss_text:
         return EpisodeAsset()
     try:
@@ -644,8 +828,16 @@ def _find_episode_asset_in_rss(
     except (ElementTree.ParseError, ValueError):
         return EpisodeAsset()
 
+    channel = next((child for child in root if _local_name(child.tag) == "channel"), None)
+    show_title = _item_text(channel, "title") if channel is not None else ""
+    language = _item_text(channel, "language") if channel is not None else ""
     target_normalized = _normalise_title(target_title)
+    without_suffix = _normalise_title(_episode_title_without_suffix(target_title, show_title))
     fallback_item = None
+    transcript_item = None
+    id_matches = []
+    title_matches = []
+    suffix_matches = []
     for item in root.iter():
         if _local_name(item.tag) != "item":
             continue
@@ -653,6 +845,11 @@ def _find_episode_asset_in_rss(
         # False for a childless element and is deprecated outright.
         if fallback_item is None:
             fallback_item = item
+        if prefer_transcript and transcript_item is None and any(
+            _local_name(child.tag) == "transcript" and child.attrib.get("url")
+            for child in item.iter()
+        ):
+            transcript_item = item
         item_title = _item_text(item, "title")
         title_normalized = _normalise_title(item_title)
         # Match the episode ID against the identity fields only. Searching the
@@ -662,7 +859,7 @@ def _find_episode_asset_in_rss(
         id_match = bool(
             episode_id
             and any(
-                episode_id in field
+                _matches_episode_identity(field, episode_id)
                 for field in (_item_text(item, "guid"), _item_text(item, "link"))
                 if field
             )
@@ -670,16 +867,31 @@ def _find_episode_asset_in_rss(
         title_match = bool(
             target_normalized
             and title_normalized
-            and (
-                target_normalized in title_normalized
-                or title_normalized in target_normalized
-            )
+            and target_normalized == title_normalized
         )
-        if id_match or title_match:
-            return _episode_asset_from_item(item)
+        if id_match:
+            id_matches.append(item)
+        if title_match:
+            title_matches.append(item)
+        elif without_suffix and without_suffix == title_normalized:
+            suffix_matches.append(item)
 
-    if allow_first and fallback_item is not None:
-        return _episode_asset_from_item(fallback_item)
+    # Inspect the whole feed: a title hit must never hide a later identity hit.
+    matches = id_matches or title_matches or suffix_matches
+    if matches:
+        if len(matches) == 1:
+            return _episode_asset_from_item(matches[0], language=language)
+        logger.warning(
+            "Ambiguous podcast RSS episode: %d %s matches", len(matches),
+            "identity" if id_matches else "title",
+        )
+        return EpisodeAsset(ambiguous=True)
+
+    if allow_first and not episode_id and not target_title and fallback_item is not None:
+        return _episode_asset_from_item(
+            transcript_item if transcript_item is not None else fallback_item,
+            language=language,
+        )
     return EpisodeAsset()
 
 
@@ -702,6 +914,8 @@ def _find_asset_via_podcast_index(title: str, author: str = "") -> EpisodeAsset:
             asset = _find_episode_asset_in_rss(
                 _fetch_rss_text(feed.feed_url), target_title=title,
             )
+            if asset.ambiguous:
+                return asset
             if asset.audio_url or asset.transcript_url:
                 logger.info(
                     "Found canonical RSS episode '%s' via Podcast Index feed '%s'",
@@ -712,7 +926,7 @@ def _find_asset_via_podcast_index(title: str, author: str = "") -> EpisodeAsset:
     return EpisodeAsset()
 
 
-def _episode_asset_from_item(item) -> EpisodeAsset:
+def _episode_asset_from_item(item, *, language: str = "") -> EpisodeAsset:
     """Extract enclosure, GUID, and optional podcast:transcript attributes."""
     audio_url = ""
     transcript_url = ""
@@ -734,6 +948,8 @@ def _episode_asset_from_item(item) -> EpisodeAsset:
         transcript_type=transcript_type,
         transcript_language=transcript_language,
         guid=_item_text(item, "guid"),
+        notes="\n".join(_item_text(item, name) for name in ("description", "encoded", "summary")),
+        language=_item_text(item, "language") or language,
     )
 
 
@@ -746,7 +962,7 @@ def _find_apple_episode_asset(
 ) -> EpisodeAsset:
     """Resolve Apple through Podcast Index first, then exact iTunes lookup."""
     by_podcast_index = _find_asset_via_podcast_index(target_title, author)
-    if by_podcast_index.audio_url or by_podcast_index.transcript_url:
+    if by_podcast_index.ambiguous or by_podcast_index.audio_url or by_podcast_index.transcript_url:
         return by_podcast_index
 
     parsed = urlparse(url)
@@ -768,15 +984,11 @@ def _find_apple_episode_asset(
             results = response.json().get("results", [])
             feed_url = results[0].get("feedUrl", "") if results else ""
             rss_text = _fetch_rss_text(feed_url)
-            by_storefront_id = _find_episode_asset_in_rss(
-                rss_text, episode_id=episode_id,
+            # Apple storefront IDs may be absent from RSS. Resolve both ranks
+            # together so an ambiguous ID cannot be retried as a weaker title.
+            return _find_episode_asset_in_rss(
+                rss_text, episode_id=episode_id, target_title=target_title,
             )
-            if by_storefront_id.audio_url or by_storefront_id.transcript_url:
-                return by_storefront_id
-            # Apple storefront episode IDs are frequently absent from RSS GUIDs.
-            by_title = _find_episode_asset_in_rss(rss_text, target_title=target_title)
-            if by_title.audio_url or by_title.transcript_url:
-                return by_title
     except (httpx.HTTPError, ValueError) as exc:
         logger.debug("Apple iTunes RSS lookup failed: %s", exc)
 
@@ -807,6 +1019,8 @@ def _find_asset_via_itunes(title: str, author: str = "") -> EpisodeAsset:
                 _fetch_rss_text(result.get("feedUrl", "")),
                 target_title=title,
             )
+            if asset.ambiguous:
+                return asset
             if asset.audio_url or asset.transcript_url:
                 logger.info(
                     "Found cross-platform RSS episode '%s' via iTunes podcast '%s'",
@@ -824,14 +1038,15 @@ def _find_spotify_episode_asset(
     metadata: dict[str, str] | None = None,
 ) -> EpisodeAsset:
     """Resolve Spotify through Podcast Index, then iTunes, then canonical RSS."""
-    metadata = metadata or _fetch_defuddle_md_metadata(url)
+    if metadata is None:
+        metadata = _fetch_defuddle_md_metadata(url)
     title = metadata.get("title", "")
     author = metadata.get("author", "")
     if not title:
         return EpisodeAsset()
 
     by_podcast_index = _find_asset_via_podcast_index(title, author)
-    if by_podcast_index.audio_url or by_podcast_index.transcript_url:
+    if by_podcast_index.ambiguous or by_podcast_index.audio_url or by_podcast_index.transcript_url:
         return by_podcast_index
     return _find_asset_via_itunes(title, author)
 

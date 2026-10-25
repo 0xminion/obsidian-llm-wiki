@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from unittest.mock import patch
 
+import pytest
+
 from obsidian_llm_wiki.core.models import SourceDoc
 
 
@@ -98,7 +100,11 @@ def test_unavailable_public_candidates_fall_back_to_landing_extractor() -> None:
     landing_url = "https://journals.example.edu/article/10.1000/unavailable"
     fulltext_url = "https://journals.example.edu/article/full-text"
     landing_html = '<meta name="citation_fulltext_html_url" content="/article/full-text">'
-    landing_source = SourceDoc("Landing page", "Public landing-page fallback text.", landing_url)
+    # Model a usable body on the landing page, not a stub: web candidates now
+    # meet the same 500-character admission contract as public extract().
+    landing_source = SourceDoc(
+        "Landing page", "Public landing-page fallback body with study evidence. " * 20, landing_url,
+    )
 
     with (
         patch(
@@ -127,7 +133,7 @@ def test_offsite_citation_candidate_is_rejected() -> None:
 
 
 def test_ssrn_preflight_failure_preserves_semantic_scholar_fallthrough() -> None:
-    """SSRN remains eligible for its metadata fallback after public discovery fails."""
+    """SSRN tries its metadata fallback but does not publish it as full text."""
     from obsidian_llm_wiki.ingest import web
 
     ssrn_url = "https://papers.ssrn.com/sol3/papers.cfm?abstract_id=5910522"
@@ -147,14 +153,15 @@ def test_ssrn_preflight_failure_preserves_semantic_scholar_fallthrough() -> None
         patch.object(web, "_extract_liteparse_document", side_effect=unavailable),
         patch.object(web, "_extract_trafilatura", side_effect=unavailable),
         patch.object(web, "_extract_defuddle", side_effect=unavailable),
+        patch.object(web, "_extract_wayback", side_effect=unavailable),
         patch(
             "obsidian_llm_wiki.ingest.alt_source.extract_via_semantic_scholar",
             return_value=abstract_source,
         ) as semantic_scholar,
+        pytest.raises(RuntimeError, match="semantic_scholar: Extraction quality gate failed"),
     ):
-        result = web.extract_web(ssrn_url, timeout=14)
+        web.extract_web(ssrn_url, timeout=14)
 
-    assert result is abstract_source
     fetch_html.assert_called_once_with(ssrn_url, 14)
     semantic_scholar.assert_called_once_with(ssrn_url, 14)
 
@@ -164,7 +171,8 @@ def test_ordinary_blog_skips_scientific_preflight() -> None:
     from obsidian_llm_wiki.ingest import web
 
     blog_url = "https://blog.example.com/posts/ordinary-article"
-    expected = SourceDoc("Ordinary post", "Generic web content.", blog_url)
+    # This is a successful article fixture, so it must clear the shared gate.
+    expected = SourceDoc("Ordinary post", "Generic web article body and evidence. " * 20, blog_url)
     with (
         patch(
             "obsidian_llm_wiki.ingest.extractors.scientific.extract_discovered_scientific_document"

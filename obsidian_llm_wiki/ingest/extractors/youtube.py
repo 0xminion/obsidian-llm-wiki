@@ -13,8 +13,10 @@ Auth: Authorization header with API key
 
 from __future__ import annotations
 
+import html
 import logging
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -222,51 +224,69 @@ def _ytdlp_transcript(url: str) -> SourceDoc | None:
             _shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
+_CUE_TIMESTAMP = r"(?:\d{2,}:)?\d{2}:\d{2}[.,]\d{3}"
+_CUE_TIMING = re.compile(rf"^({_CUE_TIMESTAMP})\s+-->\s+({_CUE_TIMESTAMP})(?:\s.*)?$")
+_CUE_MARKUP = re.compile(
+    rf"</?(?:c|i|b|u|ruby|rt|v|lang|font)(?:\.[^\s<>/]+)*"
+    rf"(?:[ \t][^<>]*)?>|<{_CUE_TIMESTAMP}>"
+)
+
+
+def _subtitle_milliseconds(timestamp: str) -> int:
+    seconds, millis = timestamp.replace(",", ".").split(".")
+    total = 0
+    for part in seconds.split(":"):
+        total = total * 60 + int(part)
+    return total * 1000 + int(millis)
+
+
+def _without_rolling_overlap(previous: str, current: str) -> str:
+    """Remove only an exact suffix/prefix redisplay, not words elsewhere in a cue."""
+    old_words = previous.split()
+    matches = list(re.finditer(r"\S+", current))
+    new_words = [match.group() for match in matches]
+    for size in range(min(len(old_words), len(new_words)), 0, -1):
+        if old_words[-size:] == new_words[:size]:
+            return current[matches[size - 1].end():].lstrip()
+    return current
+
+
 def _parse_subtitle_file(path: str) -> str:
-    """Parse VTT/SRT subtitle file into plain text."""
-    with open(path, encoding="utf-8", errors="replace") as f:
+    """Parse VTT/SRT cues, retaining repeated speech at distinct times."""
+    with open(path, encoding="utf-8-sig", errors="replace") as f:
         raw = f.read()
 
-    lines = raw.split("\n")
     text_parts: list[str] = []
-    seen_lines: set[str] = set()
-
-    for line in lines:
-        line = line.strip()
-        # Skip VTT header
-        if line.startswith("WEBVTT"):
+    previous_text = ""
+    previous_start = previous_end = -1
+    previous_voices: list[str] = []
+    for block in re.split(r"\n[ \t]*\n", raw.strip()):
+        lines = block.splitlines()
+        if not lines or re.match(r"^(?:WEBVTT|NOTE|STYLE|REGION)(?:\s|$)", lines[0]):
             continue
-        # Skip timestamp lines (00:00:01.000 --> 00:00:05.000)
-        if "-->" in line:
+        # A cue has an optional identifier, a timing line, then payload. Numeric
+        # lines and words like NOTE inside the payload are speech, not metadata.
+        timing_index = 0 if _CUE_TIMING.fullmatch(lines[0]) else 1
+        if timing_index >= len(lines):
             continue
-        # Skip cue identifiers and numbers
-        if line.isdigit():
+        timing = _CUE_TIMING.fullmatch(lines[timing_index])
+        if not timing:
             continue
-        # Skip empty lines
-        if not line:
-            continue
-        # Skip VTT styling/positioning blocks (multi-line cues)
-        if line.startswith("NOTE") or line.startswith("STYLE") or line.startswith("REGION"):
-            continue
-        # Skip pure VTT tag lines like <c>, but NOT content with inline tags
-        if (
-            line.startswith("<")
-            and line.endswith(">")
-            and not any(
-                c.isalpha()
-                for c in line[1:-1]
-                if c not in "c/."
-            )
-        ):
-            continue
-
-        # Strip HTML tags from subtitle text
-        import re
-        clean = re.sub(r"<[^>]+>", "", line)
-        clean = clean.strip()
-        if clean and clean not in seen_lines:
-            seen_lines.add(clean)
-            text_parts.append(clean)
+        payload = " ".join(lines[timing_index + 1:])
+        # Recognize cue tags before decoding entities. An escaped <c> or a
+        # literal comparison (< 5) is text, not markup to strip a second time.
+        clean = html.unescape(_CUE_MARKUP.sub("", payload)).strip()
+        start, end = (_subtitle_milliseconds(value) for value in timing.groups())
+        voices = re.findall(r"<v(?:\.[^\s<>]+)*\s+([^<>]+)>", payload)
+        fresh = clean
+        # Only advancing, temporally overlapping displays from the same voice
+        # can roll up. Touching/gapped cues are new speech, even if identical.
+        if previous_start <= start < previous_end <= end and voices == previous_voices:
+            fresh = _without_rolling_overlap(previous_text, clean)
+        if fresh:
+            text_parts.append(fresh)
+        previous_text, previous_start, previous_end = clean, start, end
+        previous_voices = voices
 
     return " ".join(text_parts)
 

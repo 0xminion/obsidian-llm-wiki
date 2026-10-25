@@ -88,6 +88,9 @@ from obsidian_llm_wiki.render.obsidian import render_vault
 from obsidian_llm_wiki.synth.dedupe import merge_bundle
 from obsidian_llm_wiki.synth.parser import parse_single_source_synthesis
 from obsidian_llm_wiki.synth.prompts import build_synthesis_prompt
+from obsidian_llm_wiki.synth.response_schema import (
+    SYNTHESIS_RESPONSE_SCHEMA as _SYNTHESIS_RESPONSE_SCHEMA,
+)
 from obsidian_llm_wiki.synth.retrieval import ConceptRetriever
 from obsidian_llm_wiki.synth.validation import (
     SynthesisValidationError,
@@ -114,22 +117,8 @@ _SYNTHESIS_NUM_PREDICT = 16_384
 _SYNTHESIS_TEMPERATURE = 0
 _SYNTHESIS_PARSE_ATTEMPTS = 2
 _EXTRACTOR_VERSION = "extract-v2"
-_PROMPT_VERSION = "synthesis-v3"
-_SYNTHESIS_SCHEMA_VERSION = "synthesis-schema-v2"
-_SYNTHESIS_RESPONSE_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "source_title": {"type": "string"},
-        "source_summary": {"type": "string"},
-        "source_tags": {"type": "array", "items": {"type": "string"}},
-        "key_points": {"type": "array", "items": {"type": "string"}},
-        "open_questions": {"type": "array", "items": {"type": "string"}},
-        "language": {"type": "string"},
-        "concepts": {"type": "array", "items": {"type": "object"}},
-        "maps": {"type": "array", "items": {"type": "object"}},
-    },
-    "required": ["source_title", "source_summary", "concepts", "maps"],
-}
+_PROMPT_VERSION = "synthesis-v4"
+_SYNTHESIS_SCHEMA_VERSION = "synthesis-schema-v3"
 
 
 def _artifact_versions_for_config(
