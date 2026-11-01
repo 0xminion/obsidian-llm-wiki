@@ -82,6 +82,8 @@ class OllamaClient(LLMClient):
 
     def chat(self, system: str, user: str, **kwargs: Any) -> str:
         url = _endpoint_url(self.config.host, "/api/chat")
+        # OpenAI-only enforcement opt-in; Ollama keeps its native format contract.
+        kwargs.pop("strict_schema", None)
         body: dict[str, Any] = {
             "model": kwargs.pop("model", self.config.model),
             "messages": [
@@ -144,16 +146,20 @@ class OpenAICompatibleClient(LLMClient):
         url = _endpoint_url(self.config.host, "/v1/chat/completions")
         # Synthesis uses Ollama's native schema/options contract. Translate only
         # portable settings; num_ctx and other Ollama runtime knobs have no
-        # OpenAI equivalent. Explicit OpenAI kwargs always win.
+        # OpenAI equivalent. Explicit OpenAI kwargs always win. strict_schema is
+        # an opt-in for application-owned, closed schemas, not generic format=dict.
         options = kwargs.pop("options", {}) or {}
         kwargs.pop("num_ctx", None)
         output_format = kwargs.pop("format", None)
+        strict_schema = kwargs.pop("strict_schema", False)
         if "response_format" not in kwargs:
             if isinstance(output_format, dict):
                 kwargs["response_format"] = {
                     "type": "json_schema",
                     "json_schema": {"name": "response", "schema": output_format},
                 }
+                if strict_schema:
+                    kwargs["response_format"]["json_schema"]["strict"] = True
             elif output_format == "json":
                 kwargs["response_format"] = {"type": "json_object"}
         for key in ("temperature", "top_p", "seed", "stop"):

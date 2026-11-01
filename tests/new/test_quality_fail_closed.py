@@ -8,6 +8,7 @@ import pytest
 from obsidian_llm_wiki.config import Config
 from obsidian_llm_wiki.core.models import SourceDoc
 from obsidian_llm_wiki.synth.quality import quality_synthesize_source
+from tests.new.grounding_doubles import legacy_fixture_llm, producer_call_count, producer_prompts
 
 
 @pytest.mark.asyncio
@@ -59,10 +60,11 @@ async def test_parse_failure_retries_complete_source(invalid):
 
     content = "No benefit was observed. The sample was small."
     valid = json.dumps({"source_title": "Trial", "source_summary": content, "concepts": []})
+    responses = iter([invalid, valid])
     with patch(
         "obsidian_llm_wiki.providers.llm.acall_llm",
         new_callable=AsyncMock,
-        side_effect=[invalid, valid],
+        side_effect=legacy_fixture_llm(lambda *_args, **_kwargs: next(responses)),
     ) as llm:
         result = await _synthesize_with_retry(
             Config(min_source_chars=1),
@@ -72,5 +74,12 @@ async def test_parse_failure_retries_complete_source(invalid):
         )
     assert result is not None
     assert result.source_summary == content
-    assert llm.await_count == 2
-    assert all(content in call.args[0] for call in llm.call_args_list)
+    assert producer_call_count(llm) == 2
+    # Grounded prompts render the complete source as catalog spans.
+    from obsidian_llm_wiki.core.span_catalog import build_span_catalog
+
+    spans = build_span_catalog(content, "trial.md").spans
+    assert all(
+        all(f"⟦{span.id}⟧ {span.text}" in prompt for span in spans)
+        for prompt in producer_prompts(llm)
+    )

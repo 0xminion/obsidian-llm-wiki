@@ -16,6 +16,7 @@ from obsidian_llm_wiki.core.models import (
     source_synthesis_from_dict,
 )
 from obsidian_llm_wiki.synth.dedupe import merge_concepts
+from tests.new.grounding_doubles import legacy_fixture_llm
 
 
 def test_rendered_claim_evidence_has_numbered_marker_quote_and_clickable_source_link():
@@ -274,7 +275,7 @@ async def test_pipeline_re_resolves_quote_with_changed_source_hash(tmp_path, mon
             }
         )
 
-    monkeypatch.setattr(llm, "acall_llm", fake_acall)
+    monkeypatch.setattr(llm, "acall_llm", legacy_fixture_llm(fake_acall))
     config = Config(vault_path=str(tmp_path), min_source_chars=1, retry_count=1)
     filename = "article.md"
 

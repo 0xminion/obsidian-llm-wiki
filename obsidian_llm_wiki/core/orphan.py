@@ -108,6 +108,9 @@ def orphan_page(concepts_dir: Path, slug: str, reason: str) -> bool:
     except ValueError:
         logger.warning("Refusing unsafe orphan path: %s", page_path)
         return False
+    from obsidian_llm_wiki.core.publication_write_guard import require_domain_workspace
+
+    require_domain_workspace(page_path)
     if not page_path.is_file():
         return False
 

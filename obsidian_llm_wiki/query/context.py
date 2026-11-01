@@ -43,6 +43,8 @@ class ContextSection:
     path: str
     title: str
     snippet: str
+    publication_status: str = 'unverifiable'
+    source_statuses: tuple[tuple[str, str], ...] = ()
 
 
 def extract_snippet(markdown: str, query: str, *, max_chars: int = 800) -> str:
@@ -78,13 +80,15 @@ def build_context(
     sections: list[ContextSection] = []
     for candidate in candidates:
         page = graph.pages.get(candidate.path)
-        if page is None:
+        if page is None or not page.current_eligible:
             continue
         sections.append(
             ContextSection(
                 path=page.path,
                 title=page.title,
                 snippet=extract_snippet(page.body, query, max_chars=max_chars_per_page),
+                publication_status=page.publication_status,
+                source_statuses=page.source_statuses,
             )
         )
     return tuple(sections)

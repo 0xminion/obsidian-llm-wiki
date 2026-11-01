@@ -54,6 +54,8 @@ from obsidian_llm_wiki.synth.quality import (
     gradient_confidence,
     merge_skeletons,
 )
+from tests.new.grounding_doubles import legacy_fixture_llm
+from tests.new.immutable_semantic_helpers import published_root
 
 # ── Two-pass synthesis golden test ──────────────────────────────────────
 
@@ -163,6 +165,8 @@ async def test_two_pass_golden(tmp_path: Path):
         f"LLM_PROVIDER=ollama\n"
         f"LLM_MODEL=test-model\n"
         f"SYNTHESIS_MODE=two_pass\n"
+        # Two-pass still uses legacy quote evidence: only explicit unchecked mode.
+        f"GROUNDING_REVIEW=off\n"
     )
     config = load_config(env_file=str(vault / ".env"))
 
@@ -208,7 +212,7 @@ async def test_two_pass_golden(tmp_path: Path):
     assert len(result.errors) == 0
 
     # Verify concept pages exist with expanded content
-    bundle = vault / "04-Wiki"
+    bundle = published_root(config)
     assert (bundle / "concepts" / "information-aggregation.md").exists()
     assert (bundle / "concepts" / "prediction-market-accuracy.md").exists()
 
@@ -245,13 +249,12 @@ async def test_empty_concepts_golden(tmp_path: Path):
 
     with patch(
         "obsidian_llm_wiki.providers.llm.acall_llm",
-        new_callable=AsyncMock,
-        return_value=json.dumps({
+        side_effect=legacy_fixture_llm(json.dumps({
             "source_title": "Empty Source",
             "source_summary": "A source with no extractable concepts.",
             "concepts": [],
             "maps": [],
-        }),
+        })),
     ):
         from obsidian_llm_wiki.core.pipeline import run_pipeline
         result = await run_pipeline(vault, sources, config, force=True)

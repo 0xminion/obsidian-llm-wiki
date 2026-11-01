@@ -35,7 +35,6 @@ from obsidian_llm_wiki.ingest.sources import (
     _SOURCE_INDEX_SHARD,
     _SOURCE_METADATA_FILES,
     _discover_source_paths,
-    load_sources_incremental,
 )
 from obsidian_llm_wiki.render.frontmatter import parse_frontmatter
 from obsidian_llm_wiki.render.obsidian import atomic_write, slugify
@@ -388,11 +387,8 @@ def _backfill_ingest_index(
 
 
 def _archive_clipping(clipping_path: Path, config: Any) -> Path | None:
-    """Move a processed clipping to 02-Clippings/processed/, preserving its name.
-
-    Returns the destination path, or None if the move failed.
-    """
-    return _archive_without_overwrite(clipping_path, config.clippings_dir / "processed")
+    """Immutable mode retains queued human inputs; operational dedupe tracks success."""
+    return None
 
 
 def _archive_without_overwrite(path: Path, archive_dir: Path) -> Path | None:
@@ -454,13 +450,46 @@ def _serialize_ingest(func: Any) -> Any:
     @wraps(func)
     def wrapped(*args: Any, **kwargs: Any) -> Any:
         arguments = inspect.signature(func).bind_partial(*args, **kwargs).arguments
+        if arguments.get("refresh", False) and not any(
+            arguments.get(option, False) for option in ("plan", "dry_run", "preview")
+        ):
+            raise typer.BadParameter(
+                "Refusing --refresh: immutable ingestion cannot replace an editable source. "
+                "Use --preview, then save the reviewed revision as a new source filename."
+            )
         if any(arguments.get(option, False) for option in ("plan", "dry_run", "preview")):
             return func(*args, **kwargs)
         raw_vault = arguments.get("vault")
         if raw_vault is None:
             return func(*args, **kwargs)
         vault_path, _config = resolve_vault(str(raw_vault))
-        lock_file = vault_path / "04-Wiki" / ".llmwiki" / "ingest.lock"
+        from obsidian_llm_wiki.core.application import operational_directory
+
+        try:
+            from obsidian_llm_wiki.core.generated_paths import checked_generated_path
+
+            legacy_lock = checked_generated_path(_config.llmwiki_dir / 'ingest.lock', _config.vault)
+            if legacy_lock.exists():
+                raise RuntimeError(
+                    'another ingest process is already active or a legacy lock remains; '
+                    'stop the legacy writer and inspect its lock manually'
+                )
+            directory = operational_directory(_config)
+            if arguments.get('resume', False) and not (directory / 'registry.db').exists():
+                legacy = [checked_generated_path(_config.llmwiki_dir / name, _config.vault)
+                          for name in ('ingest-resume.json', 'operations.json', 'operations.lock')]
+                if any(path.exists() for path in legacy):
+                    raise RuntimeError(
+                        'legacy resume state requires explicit migration; inspect the '
+                        'old records read-only and re-run their URLs explicitly. '
+                        'No legacy files were changed.'
+                    )
+            lock_file = operational_directory(_config, create=True) / "ingest.lock"
+        except (OSError, ValueError, RuntimeError) as exc:
+            outcome = _IngestOutcome(_run_id(), "ingest", bool(arguments.get("json_output", False)))
+            outcome.inventory_errors.append(f"Refusing ingest before writes: {exc}")
+            outcome.finish(0)
+            return None
         if not acquire_lock(lock_file):
             raise typer.BadParameter(
                 "another ingest process is already active for this vault"
@@ -497,10 +526,10 @@ def ingest(
         False, "--json", help="Emit NDJSON lifecycle and per-source events"
     ),
     resume: bool = typer.Option(
-        False, "--resume", help="Retry sources from the last cancellation marker"
+        False, "--resume", help="Retry failed/interrupted extraction and resume publication"
     ),
     refresh: bool = typer.Option(
-        False, "--refresh", help="Re-extract known URLs; back up changed source revisions"
+        False, "--refresh", help="Preview re-extraction only; in-place refresh is refused"
     ),
     skip_synthesis: bool = typer.Option(
         False,
@@ -518,9 +547,8 @@ def ingest(
     unchanged. ``--json`` writes newline-delimited JSON events, one terminal
     source event per source, for tooling and the local Obsidian bridge.
 
-    Clippings from ``02-Clippings/`` are moved to ``02-Clippings/processed/``
-    after successful ingestion. Duplicate sources (same content hash) are
-    detected and skipped.
+    Human clippings and inbox records remain in place. Operational indexing
+    tracks processed inputs; duplicate sources are detected and skipped.
     """
     plan_mode = plan or dry_run
     if plan_mode and preview:
@@ -544,12 +572,14 @@ def ingest(
         f"📂 Vault: {vault_path}\n🤖 Model: {config.llm.ingest_model or config.llm.model}",
     )
     try:
-        from obsidian_llm_wiki.core.generated_paths import checked_metadata_directory
-
         # Resume readers precede SQLite; validate before they touch marker/lock
         # files and keep rejection within the terminal NDJSON error boundary.
-        checked_metadata_directory(config.llmwiki_dir, config.vault)
-        store = OperationStore(config.llmwiki_dir)
+        from obsidian_llm_wiki.core.application import operational_directory
+        from obsidian_llm_wiki.core.generated_paths import checked_metadata_directory
+
+        operations_dir = operational_directory(config)
+        checked_metadata_directory(operations_dir, config.vault)
+        store = OperationStore(operations_dir)
         requested_urls = list(dict.fromkeys(urls or []))
         resume_sources = store.read_resume_marker() if resume else []
         interrupted_operations = store.interrupted_ingest_operations() if resume else []
@@ -564,7 +594,7 @@ def ingest(
                         "status": operation.status.value,
                     })
                     resumed_keys.add(key)
-            with VaultRegistry(config.llmwiki_dir) as registry:
+            with VaultRegistry(operations_dir) as registry:
                 for previous_run_id in {
                     operation.run_id for operation in interrupted_operations if operation.run_id
                 }:
@@ -654,7 +684,7 @@ def ingest(
 
     if not preview_mode:
         try:
-            with VaultRegistry(config.llmwiki_dir) as ingest_registry:
+            with VaultRegistry(operations_dir) as ingest_registry:
                 _backfill_ingest_index(
                     ingest_registry, config.sources_dir, source_paths=source_inventory
                 )
@@ -666,7 +696,7 @@ def ingest(
     known_url_duplicates: dict[str, tuple[Path, str, int]] = {}
     refresh_targets: dict[str, tuple[Path, str, dict[str, Any]]] = {}
     if not preview_mode:
-        with VaultRegistry(config.llmwiki_dir) as ingest_registry:
+        with VaultRegistry(operations_dir) as ingest_registry:
             for source_kind, identifier, _source, _resuming in planned:
                 if source_kind != "url":
                     continue
@@ -740,12 +770,13 @@ def ingest(
                     resume=resuming_source,
                 )
                 store.transition(record, OperationStatus.RUNNING)
-                with VaultRegistry(config.llmwiki_dir) as ingest_registry:
+                with VaultRegistry(operations_dir) as ingest_registry:
                     queue_id = ingest_registry.enqueue_dirty(
                         "ingest",
                         identifier,
                         "requested",
                         {"source_kind": source_kind, "run_id": run_id},
+                        reset_retry=resuming_source,
                     )
                     queue_claimed = ingest_registry.start_dirty(
                         queue_id, worker_id=run_id
@@ -753,12 +784,13 @@ def ingest(
 
             try:
                 if not queue_claimed:
-                    raise RuntimeError("ingest queue item has an active lease")
+                    raise RuntimeError("ingest queue item has an active lease or retry backoff; "
+                                       "use --resume after the previous writer has stopped")
                 known_duplicate = known_url_duplicates.get(identifier)
                 if source_kind == "url" and known_duplicate is not None:
                     duplicate_path, duplicate_title, duplicate_size = known_duplicate
                     if queue_id is not None:
-                        with VaultRegistry(config.llmwiki_dir) as ingest_registry:
+                        with VaultRegistry(operations_dir) as ingest_registry:
                             ingest_registry.complete_dirty(queue_id, worker_id=run_id)
                     if record is not None:
                         store.transition(
@@ -794,6 +826,9 @@ def ingest(
                 else:
                     source = url_extractor.extract(identifier)
                 source, truncated = _bounded_source(source, config.max_source_chars)
+                if not json_output:
+                    for diagnostic in source.provenance.diagnostics:
+                        typer.echo(f"   ⚠ Extraction note: {diagnostic}")
                 size = len(source.content.encode("utf-8"))
                 output_file = ""
                 if not preview_mode:
@@ -811,7 +846,7 @@ def ingest(
                     _, incoming_body = parse_frontmatter(render_source_page(source))
                     incoming_text = _dedupe_body(incoming_body)
                     content_hash = hash_content(incoming_text)
-                    with VaultRegistry(config.llmwiki_dir) as ingest_registry:
+                    with VaultRegistry(operations_dir) as ingest_registry:
                         duplicate = ingest_registry.find_ingest_duplicate(
                             requested_url=identifier if source_kind == "url" else "",
                             content_hash=content_hash,
@@ -853,7 +888,7 @@ def ingest(
                     # Explicit refresh of an owned source also refreshes metadata:
                     # equal body text must not discard a title/provenance revision.
                     if dup_path is not None and not replacing:
-                        with VaultRegistry(config.llmwiki_dir) as ingest_registry:
+                        with VaultRegistry(operations_dir) as ingest_registry:
                             ingest_registry.upsert_ingest_hash(
                                 requested_url=identifier,
                                 canonical_url=source.url or identifier,
@@ -877,6 +912,7 @@ def ingest(
                                 truncated=truncated,
                                 preview=preview_mode,
                                 duplicate_of=dup_path.name,
+                                extraction_diagnostics=list(source.provenance.diagnostics) or None,
                             ),
                             f"   ⏭ {source.title[:60]} — duplicate of {dup_path.name}",
                         )
@@ -904,38 +940,18 @@ def ingest(
                         continue
 
                     if replacing:
-                        from obsidian_llm_wiki.core.backups import backup_file
-                        from obsidian_llm_wiki.core.review import is_reviewed_page
-
-                        assert refresh_target is not None
-                        target, previous_text, _previous_meta = refresh_target
-                        if is_reviewed_page(previous_text):
-                            raise RuntimeError("Refusing to refresh a reviewed source")
-                        if truncated:
-                            raise RuntimeError(
-                                "Refusing to replace source with truncated extraction"
-                            )
-                        if target.read_text(encoding="utf-8") != previous_text:
-                            raise RuntimeError("Source changed during refresh; retry after editing")
-                        backup_file(target, config.llmwiki_dir / "backups")
-                        filepath = target
-                    else:
-                        filepath = _reserve_collision_safe_path(
-                            config.sources_dir,
-                            source,
-                            preferred_stem=(
-                                Path(identifier).stem if source_kind == "clipping" else None
-                            ),
+                        raise RuntimeError(
+                            'Refusing to replace an editable source; save a new revision'
                         )
-                    try:
-                        atomic_write(filepath, render_source_page(source))
-                    except BaseException:
-                        if not replacing:
-                            filepath.unlink(missing_ok=True)
-                        raise
+                    from obsidian_llm_wiki.core.application import install_source
+
+                    filepath = install_source(
+                        config, source, render_source_page(source),
+                        preferred_stem=Path(identifier).stem if source_kind == "clipping" else None,
+                    )
                     output_file = filepath.name
                     source_paths.add(filepath)
-                    with VaultRegistry(config.llmwiki_dir) as ingest_registry:
+                    with VaultRegistry(operations_dir) as ingest_registry:
                         ingest_registry.upsert_ingest_hash(
                             requested_url=identifier,
                             canonical_url=source.url or identifier,
@@ -981,6 +997,7 @@ def ingest(
                         output_file=output_file,
                         truncated=truncated,
                         preview=preview_mode,
+                        extraction_diagnostics=list(source.provenance.diagnostics) or None,
                     ),
                     f"   ✅ {source.title[:60]} ({size} bytes)",
                 )
@@ -988,7 +1005,7 @@ def ingest(
                 if record is not None:
                     store.transition(record, OperationStatus.CANCELLED, error="interrupted")
                 if queue_id is not None:
-                    with VaultRegistry(config.llmwiki_dir) as ingest_registry:
+                    with VaultRegistry(operations_dir) as ingest_registry:
                         ingest_registry.fail_dirty(
                             queue_id,
                             "interrupted",
@@ -1008,8 +1025,14 @@ def ingest(
                 outcome.extraction_errors.append(f"{source_kind}:{identifier}: {error}")
                 if record is not None:
                     store.transition(record, OperationStatus.FAILED, error=error)
+                    # Failed extraction is resumable even without a SIGINT. Keep
+                    # it outside the immutable registry along with cancellations.
+                    remaining = store.read_resume_marker()
+                    remaining.append({"source": identifier, "source_kind": source_kind,
+                                      "status": OperationStatus.FAILED.value})
+                    store.write_resume_marker(run_id, remaining)
                 if queue_id is not None:
-                    with VaultRegistry(config.llmwiki_dir) as ingest_registry:
+                    with VaultRegistry(operations_dir) as ingest_registry:
                         ingest_registry.fail_dirty(
                             queue_id,
                             error,
@@ -1044,7 +1067,7 @@ def ingest(
         )
 
     if not preview_mode and failed_urls:
-        ledger_path = _update_failed_ledger(config.llmwiki_dir, failed_urls)
+        ledger_path = _update_failed_ledger(operations_dir, failed_urls)
         _emit(
             json_output,
             {"type": "ledger", "event": "updated", "path": str(ledger_path)},
@@ -1060,7 +1083,7 @@ def ingest(
 
     # Known URLs still need the pipeline: a prior extraction can have succeeded
     # while synthesis failed, or source metadata/cache compatibility changed.
-    if not planned:
+    if not planned and not resume:
         outcome.finish(
             0,
             "\n⚠ No new sources to ingest.\n"
@@ -1077,8 +1100,9 @@ def ingest(
         return
 
     try:
-        with VaultRegistry(config.llmwiki_dir) as source_registry:
-            source_load = load_sources_incremental(config.sources_dir, source_registry)
+        from obsidian_llm_wiki.core.application import source_inventory
+
+        source_load = source_inventory(config)
     except (OSError, ValueError) as exc:
         outcome.inventory_errors.append(f"Source inventory failed; no synthesis performed: {exc}")
         outcome.finish(new_count)
@@ -1259,15 +1283,5 @@ def _inbox_url_paths(config: Any) -> dict[str, list[Path]]:
 
 
 def _archive_inbox_url_files(paths: list[Path], config: Any) -> list[Path]:
-    """Archive successfully ingested 00-Inbox URL records without reprocessing them."""
-    if not paths:
-        return []
-    archive_dir = config.vault / "00-Inbox" / "processed"
-    archived: list[Path] = []
-    for path in paths:
-        if not path.is_file():
-            continue
-        destination = _archive_without_overwrite(path, archive_dir)
-        if destination is not None:
-            archived.append(destination)
-    return archived
+    """Keep human queue files in place; the operational URL index skips duplicates."""
+    return []

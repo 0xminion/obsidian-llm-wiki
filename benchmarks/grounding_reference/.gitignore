@@ -1,0 +1,4 @@
+# Private quoted evaluation inputs; public metadata/hashes/scripts stay tracked.
+cases.*.jsonl
+coverage_obligations.json
+predictions*.jsonl

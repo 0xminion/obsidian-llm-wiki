@@ -15,7 +15,10 @@ BROWSER_HEADERS: dict[str, str] = {
     "User-Agent": BROWSER_UA,
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br",
+    # HTTPX's standard-library decoders are always available. Brotli is optional;
+    # advertising it without the extra dependency leaves compressed PDF bytes
+    # undecoded and makes valid documents fail signature validation.
+    "Accept-Encoding": "gzip, deflate",
     "Sec-Fetch-Dest": "document",
     "Sec-Fetch-Mode": "navigate",
     "Sec-Fetch-Site": "none",

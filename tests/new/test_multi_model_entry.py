@@ -572,6 +572,8 @@ async def test_pipeline_two_pass_routes_to_multi_model():
         llm=LLMProviderConfig(model="test"),
         synthesis_mode="two_pass",
         min_source_chars=10,
+        # Two-pass has no span-ID anchoring yet: explicit unchecked mode only.
+        grounding_review="off",
     )
     source = SourceDoc(title="Test", content="Enough content. " * 3)
 

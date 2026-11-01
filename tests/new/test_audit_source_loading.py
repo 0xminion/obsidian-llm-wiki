@@ -30,14 +30,14 @@ def test_incremental_loader_never_treats_unreadable_source_as_deletion(
             path.unlink()
             directory.rmdir()
         else:
-            original = Path.read_text
+            original = Path.open
 
             def denied(self, *args, **kwargs):
                 if self == path:
                     raise PermissionError("fixture denied")
                 return original(self, *args, **kwargs)
 
-            monkeypatch.setattr(Path, "read_text", denied)
+            monkeypatch.setattr(Path, "open", denied)
         with pytest.raises(OSError, match="source|Source"):
             load_sources_incremental(directory, registry)
         assert registry.source_filenames() == {"known.md"}

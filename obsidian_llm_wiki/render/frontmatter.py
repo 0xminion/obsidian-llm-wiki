@@ -91,7 +91,7 @@ def build_frontmatter(fm_dict: dict[str, Any]) -> str:
     return f"---\n{dumped}\n---\n"
 
 
-_FM_RE = re.compile(r"^---\n(.*?)\n---\n?(.*)$", re.DOTALL)
+_FM_RE = re.compile(r"^---\r?\n(.*?)\r?\n---(?:\r?\n)?(.*)$", re.DOTALL)
 
 
 def parse_frontmatter(raw: str) -> tuple[dict, str]:
@@ -102,7 +102,7 @@ def parse_frontmatter(raw: str) -> tuple[dict, str]:
       * No trailing newline after the closing ``---``
       * A YAML scalar (non-dict) frontmatter block
     """
-    if not raw.startswith("---\n"):
+    if not raw.startswith(("---\n", "---\r\n")):
         return {}, raw
     match = _FM_RE.match(raw)
     if not match:
@@ -114,7 +114,9 @@ def parse_frontmatter(raw: str) -> tuple[dict, str]:
         return {}, raw
     if not isinstance(meta, dict):
         meta = {}
-    body = body.lstrip("\n")
+    # Strip leading empty LF/CRLF lines only, as the LF parser did. Do not
+    # strip spaces, tabs or bare CR, and never normalize interior line endings.
+    body = re.sub(r"^(?:\r?\n)+", "", body)
     return meta, body
 
 
@@ -149,9 +151,13 @@ def extract_wikilinks(body: str) -> list[tuple[str, str]]:
 
 
 def safe_read_file(path: str | Path) -> str:
-    """Read a file, returning empty string on error."""
+    """Read UTF-8 without newline translation, returning empty string on error.
+
+    Source hashes, quoted evidence and character offsets share these exact
+    decoded bytes; universal-newline reads would change their interpretation.
+    """
     try:
-        return Path(path).read_text(encoding="utf-8")
+        return Path(path).read_bytes().decode("utf-8")
     except (OSError, UnicodeDecodeError):
         return ""
 
@@ -168,6 +174,13 @@ def atomic_write(path: str | Path, content: str) -> None:
             f.write(content)
             f.flush()
             os.fsync(f.fileno())
+        from obsidian_llm_wiki.core.publication_transaction import (
+            preserve_replacement_metadata,
+            record_replace,
+        )
+
+        preserve_replacement_metadata(p, Path(tmp))
+        record_replace(p, Path(tmp))
         os.replace(tmp, p)
         # Persist the directory entry too: rename is atomic, but not durable
         # across a power loss until the containing directory is flushed.

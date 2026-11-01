@@ -5,8 +5,8 @@ from __future__ import annotations
 import asyncio
 
 
-def test_structured_synthesis_uses_json_mode_and_bounded_output(monkeypatch):
-    """Synthesis must request Ollama JSON mode instead of prompt-only JSON."""
+def test_structured_synthesis_uses_schema_and_bounded_output(monkeypatch):
+    """Synthesis requests the closed schema, not prompt-only or plain JSON mode."""
     from obsidian_llm_wiki.config import Config
     from obsidian_llm_wiki.core.pipeline import _call_structured_synthesis
 
@@ -25,10 +25,15 @@ def test_structured_synthesis_uses_json_mode_and_bounded_output(monkeypatch):
     )
 
     assert result == "{}"
-    assert captured["format"]["type"] == "object"
-    assert set(captured["format"]["required"]) == {
-        "source_title", "source_summary", "concepts", "maps",
+    schema = captured["format"]
+    assert isinstance(schema, dict)
+    assert schema["type"] == "object"
+    assert set(schema["required"]) == {
+        "source_title", "source_summary", "source_tags", "key_points",
+        "open_questions", "language", "concepts", "maps",
     }
+    assert set(schema["required"]) == set(schema["properties"])
+    assert schema["additionalProperties"] is False
     assert captured["options"] == {"num_predict": 16_384, "temperature": 0}
 
 

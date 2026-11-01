@@ -1,0 +1,255 @@
+{
+  "baseline_commit": "ca0f99b48e4c365800effc792507a1b065b0e92c",
+  "cases": [
+    {
+      "id": "T01",
+      "category": "medium",
+      "url": "https://karpathy.medium.com/software-2-0-a64152b37c35"
+    },
+    {
+      "id": "T02",
+      "category": "medium",
+      "url": "https://medium.com/pm%E7%9A%84%E7%94%9F%E7%94%A2%E5%8A%9B%E5%B7%A5%E5%85%B7%E7%AE%B1/%E4%BB%80%E9%BA%BC%E6%98%AF%E7%9F%A5%E8%AD%98%E7%AE%A1%E7%90%86-6413a2f11203"
+    },
+    {
+      "id": "T03",
+      "category": "medium",
+      "url": "https://medium.com/pm%E7%9A%84%E7%94%9F%E7%94%A2%E5%8A%9B%E5%B7%A5%E5%85%B7%E7%AE%B1/%E5%80%8B%E4%BA%BA%E7%9F%A5%E8%AD%98%E7%AE%A1%E7%90%86%E7%B3%BB%E5%88%97-4-%E6%AD%A5%E9%A9%9F%E6%95%B4%E7%90%86%E8%AE%80%E6%9B%B8%E7%AD%86%E8%A8%98-%E8%AE%93%E7%AD%86%E8%A8%98%E5%85%A7%E5%AE%B9%E8%83%BD%E5%A4%A0%E9%87%8D%E8%A4%87%E5%88%A9%E7%94%A8-a5d8af430796"
+    },
+    {
+      "id": "T04",
+      "category": "medium",
+      "url": "https://medium.com/@mohamedelhaddioui99/the-10-best-open-source-large-language-models-llms-in-2025-ec7bcdd636a8"
+    },
+    {
+      "id": "T05",
+      "category": "medium",
+      "url": "https://medium.com/@karuturividyasagar/the-big-llm-architecture-comparison-2025-a-beginner-friendly-guide-to-the-latest-open-weight-e731318af967"
+    },
+    {
+      "id": "T06",
+      "category": "medium",
+      "url": "https://medium.com/personal-knowledge-management/the-ultimate-beginners-guide-to-obsidian-01b1d34ba241"
+    },
+    {
+      "id": "T07",
+      "category": "x",
+      "url": "https://x.com/0xminion/status/2109716396120969448?s=20"
+    },
+    {
+      "id": "T08",
+      "category": "x",
+      "url": "https://x.com/karpathy/status/1990116666194456651"
+    },
+    {
+      "id": "T09",
+      "category": "x",
+      "url": "https://x.com/karpathy/status/1935519334123848101"
+    },
+    {
+      "id": "T10",
+      "category": "x",
+      "url": "https://x.com/karpathy/status/1886192184808149383?lang="
+    },
+    {
+      "id": "T11",
+      "category": "x",
+      "url": "https://x.com/MichaelGannotti/article/2075638377634779305"
+    },
+    {
+      "id": "T12",
+      "category": "pdf",
+      "url": "https://drive.google.com/file/d/19YPsXg_bChXEq0o_D-hUpGqtz8Pz9nk5/view?usp=sharing"
+    },
+    {
+      "id": "T13",
+      "category": "pdf",
+      "url": "https://proceedings.neurips.cc/paper/7181-attention-is-all-you-need.pdf"
+    },
+    {
+      "id": "T14",
+      "category": "pdf",
+      "url": "https://math.pku.edu.cn/teachers/zhzhang/MAI2.pdf"
+    },
+    {
+      "id": "T15",
+      "category": "pdf",
+      "url": "https://www.digitalpolicy.gov.hk/tc/our_work/data_governance/policies_standards/ethical_ai_framework/doc/Ethical_AI_Framework_tc.pdf"
+    },
+    {
+      "id": "T16",
+      "category": "pdf",
+      "url": "https://hai.stanford.edu/assets/files/hai_ai_index_report_2025_chinese_version_061325.pdf"
+    },
+    {
+      "id": "T17",
+      "category": "pdf",
+      "url": "https://filesamples.com/samples/document/pdf/sample3.pdf"
+    },
+    {
+      "id": "T18",
+      "category": "document",
+      "url": "https://filesamples.com/samples/document/doc/sample2.doc"
+    },
+    {
+      "id": "T19",
+      "category": "document",
+      "url": "https://filesamples.com/samples/document/docx/sample4.docx"
+    },
+    {
+      "id": "T20",
+      "category": "document",
+      "url": "https://docs.google.com/document/d/1Kd4AOoRG8q18PVZ0JMusgKWJmgjrWvv3iTdKUjLEdT4/edit"
+    },
+    {
+      "id": "T21",
+      "category": "document",
+      "url": "https://docs.google.com/document/d/10xzXrfWvtznJRJSTTU4WohsUsT5eq8MLcV62RwQ0DL8/edit?tab=t.0"
+    },
+    {
+      "id": "T22",
+      "category": "document",
+      "url": "https://docs.google.com/document/d/e/2PACX-1vRuv0KITnW5FJoDxE7rEMnFBmwt65cTvU7-xrrqy-4ng75bMxSXaivEjRj6X1AsMrzW2ILue6hvBomb/pub"
+    },
+    {
+      "id": "T23",
+      "category": "article",
+      "url": "https://www.sciencedirect.com/science/article/pii/S0165032726000716"
+    },
+    {
+      "id": "T24",
+      "category": "article",
+      "url": "https://arxiv.org/abs/1706.03762"
+    },
+    {
+      "id": "T25",
+      "category": "article",
+      "url": "https://pmc.ncbi.nlm.nih.gov/articles/PMC12479233"
+    },
+    {
+      "id": "T26",
+      "category": "article",
+      "url": "https://ruanyifeng.com/blog/2026/04/weekly-issue-391.html"
+    },
+    {
+      "id": "T27",
+      "category": "article",
+      "url": "https://ruanyifeng.com/blog/2019/09/weekly-issue-74.html"
+    },
+    {
+      "id": "T28",
+      "category": "article",
+      "url": "https://paulgraham.com/ds.html?viewfullsite=1"
+    },
+    {
+      "id": "T29",
+      "category": "article",
+      "url": "https://paulgraham.com/ds.html?viewfullsite=1#audit-duplicate"
+    },
+    {
+      "id": "T30",
+      "category": "article",
+      "url": "https://zh.wikipedia.org/wiki/%E6%9C%BA%E5%99%A8%E4%BA%BA"
+    },
+    {
+      "id": "Y01",
+      "category": "youtube",
+      "url": "https://youtube.com/watch?v=cdiD-9MMpb0"
+    },
+    {
+      "id": "Y02",
+      "category": "youtube",
+      "url": "https://youtube.com/watch?ab_channel=LexFridman&v=jvqFAi7vkBc"
+    },
+    {
+      "id": "Y03",
+      "category": "youtube",
+      "url": "https://youtu.be/Nlkk3glap_U"
+    },
+    {
+      "id": "Y04",
+      "category": "youtube",
+      "url": "https://youtube.com/watch?v=gWAsJQqk_eA"
+    },
+    {
+      "id": "Y05",
+      "category": "youtube",
+      "url": "https://youtube.com/watch?v=aircAruvnKk&vl=en&xstg=CAMSBhUDze3xHw%3D%3D"
+    },
+    {
+      "id": "Y06",
+      "category": "youtube",
+      "url": "https://youtube.com/shorts/3HQkVfZ4DNY"
+    },
+    {
+      "id": "Y07",
+      "category": "youtube",
+      "url": "https://youtube.com/watch?v=CKc1MRS2XNc"
+    },
+    {
+      "id": "Y08",
+      "category": "youtube",
+      "url": "https://youtube.com/watch?ra=m&v=dQw4w9WgXcQ"
+    },
+    {
+      "id": "A01",
+      "category": "apple",
+      "url": "https://podcasts.apple.com/at/podcast/333-andrej-karpathy-tesla-ai-self-driving-optimus-aliens/id1434243584?i=1000584342757"
+    },
+    {
+      "id": "A02",
+      "category": "apple",
+      "url": "https://podcasts.apple.com/us/podcast/dario-amodei-anthropic-ceo-$10-billion-models-openai/id1516093381?i=1000623806335"
+    },
+    {
+      "id": "A03",
+      "category": "apple",
+      "url": "https://podcasts.apple.com/us/podcast/all-the-claw-things-news/id341623264?i=1000750023191&l=pt-BR"
+    },
+    {
+      "id": "A04",
+      "category": "apple",
+      "url": "https://podcasts.apple.com/ci/podcast/100-objects-21-window-from-the-house-of-d/id394775318?i=1000793501212"
+    },
+    {
+      "id": "A05",
+      "category": "apple",
+      "url": "https://podcasts.apple.com/us/podcast/lex-fridman-podcast/id1434243584"
+    },
+    {
+      "id": "S01",
+      "category": "spotify",
+      "url": "https://open.spotify.com/episode/69V7CtdbB8blcxNPXvpnmk"
+    },
+    {
+      "id": "S02",
+      "category": "spotify",
+      "url": "https://open.spotify.com/episode/2jesNeddpvEHo4m5k8eOmo"
+    },
+    {
+      "id": "S03",
+      "category": "spotify",
+      "url": "https://open.spotify.com/episode/2ZNrpVSrgZMlDwQinl20Ay?si=9D4aG1l7S-2wzLsiILRLIg"
+    },
+    {
+      "id": "S04",
+      "category": "spotify",
+      "url": "https://open.spotify.com/episode/5UODcEPPuWBiB4dydOHGq9?si=cfe6e7f826254e54"
+    },
+    {
+      "id": "S05",
+      "category": "spotify",
+      "url": "https://open.spotify.com/show/2MAi0BvDc6GTFvKFPXnkCL"
+    },
+    {
+      "id": "R01",
+      "category": "rss",
+      "url": "https://changelog.com/podcast/feed"
+    },
+    {
+      "id": "R02",
+      "category": "rss",
+      "url": "https://atp.fm/rss"
+    }
+  ]
+}

@@ -7,6 +7,12 @@ import pytest
 from obsidian_llm_wiki.config import Config
 from obsidian_llm_wiki.core.models import SourceDoc
 from obsidian_llm_wiki.core.pipeline import _synthesize_source, run_pipeline
+from tests.new.grounding_doubles import legacy_fixture_llm, producer_call_count
+from tests.new.immutable_semantic_helpers import (
+    published_meta,
+    published_registry,
+    published_root,
+)
 
 
 @pytest.mark.asyncio
@@ -17,15 +23,25 @@ async def test_placeholder_chunk_rejects_complete_source(tmp_path, monkeypatch):
     async def response(*args, **kwargs):
         nonlocal calls
         calls += 1
-        return json.dumps({
-            "source_summary": "Treatment increased observed growth." if calls == 1 else "TODO",
-            "concepts": [], "maps": [],
-        })
+        return json.dumps(
+            {
+                "source_summary": "Treatment increased observed growth." if calls == 1 else "TODO",
+                "concepts": [],
+                "maps": [],
+            }
+        )
 
     monkeypatch.setattr("obsidian_llm_wiki.providers.llm.acall_llm", response)
-    result = await run_pipeline(tmp_path, {"experiment.md": SourceDoc(
-        "Experiment", "Treatment increased observed growth, whereas controls were unchanged. " * 15
-    )}, config)
+    result = await run_pipeline(
+        tmp_path,
+        {
+            "experiment.md": SourceDoc(
+                "Experiment",
+                "Treatment increased observed growth, whereas controls were unchanged. " * 15,
+            )
+        },
+        config,
+    )
     assert result.compiled == 0
     assert result.errors
     assert not (config.entries_dir / "experiment.md").exists()
@@ -42,10 +58,13 @@ async def test_chunk_tasks_are_bounded_not_only_provider_requests(tmp_path, monk
         await asyncio.sleep(0)
         return json.dumps({"source_summary": "Observation recorded.", "concepts": [], "maps": []})
 
-    monkeypatch.setattr("obsidian_llm_wiki.providers.llm.acall_llm", response)
-    result = await _synthesize_source(config, "experiment.md", SourceDoc(
-        "Experiment", "An experimental observation was recorded. " * 200
-    ), [])
+    monkeypatch.setattr("obsidian_llm_wiki.providers.llm.acall_llm", legacy_fixture_llm(response))
+    result = await _synthesize_source(
+        config,
+        "experiment.md",
+        SourceDoc("Experiment", "An experimental observation was recorded. " * 200),
+        [],
+    )
     assert result is not None
     assert max(live) <= 4
 
@@ -64,19 +83,18 @@ async def test_bounded_chunk_worker_propagates_cancellation():
 @pytest.mark.asyncio
 async def test_metadata_only_title_edit_refreshes_entry_and_caches(tmp_path, monkeypatch):
     from obsidian_llm_wiki.core.cache import load_synthesis
-    from obsidian_llm_wiki.core.registry import VaultRegistry
     from tests.new.test_incremental_cache import FAKE_SYNTH_A
 
     config = Config(vault_path=str(tmp_path), embeddings_enabled=False)
-    llm = AsyncMock(return_value=FAKE_SYNTH_A)
+    llm = AsyncMock(side_effect=legacy_fixture_llm(FAKE_SYNTH_A))
     monkeypatch.setattr("obsidian_llm_wiki.providers.llm.acall_llm", llm)
     sources = {"alpha.md": SourceDoc("Original title", "Measured observations. " * 8)}
     await run_pipeline(tmp_path, sources, config)
     sources["alpha.md"].title = "Corrected title"
     result = await run_pipeline(tmp_path, sources, config)
     assert not result.errors
-    assert llm.call_count == 1
-    assert "title: Corrected title" in (config.entries_dir / "alpha.md").read_text()
-    assert load_synthesis(config.llmwiki_dir, "alpha.md").source_title == "Corrected title"
-    with VaultRegistry(config.llmwiki_dir) as registry:
+    assert producer_call_count(llm) == 1
+    assert "title: Corrected title" in (published_root(config) / "entries" / "alpha.md").read_text()
+    assert load_synthesis(published_meta(config), "alpha.md").source_title == "Corrected title"
+    with published_registry(config) as registry:
         assert registry.load_synthesis("alpha.md").source_title == "Corrected title"

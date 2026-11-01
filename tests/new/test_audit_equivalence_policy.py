@@ -1,4 +1,5 @@
 """Explicit equivalence assertions link language variants without merging prose."""
+
 import json
 from unittest.mock import AsyncMock
 
@@ -6,8 +7,12 @@ import pytest
 
 from obsidian_llm_wiki.config import Config
 from obsidian_llm_wiki.core.pipeline import run_pipeline
-from obsidian_llm_wiki.core.registry import VaultRegistry
 from obsidian_llm_wiki.ingest.sources import load_sources_incremental
+from tests.new.grounding_doubles import legacy_fixture_llm, producer_call_count
+from tests.new.immutable_semantic_helpers import (
+    input_registry,
+    published_root,
+)
 
 
 @pytest.mark.asyncio
@@ -23,38 +28,60 @@ async def test_equivalence_policy_updates_unchanged_corpus_without_new_llm(tmp_p
     }
     for filename, body in bodies.items():
         (config.sources_dir / filename).write_text(body)
-    responses = [json.dumps({
-        "source_title": filename, "source_summary": body,
-        "concepts": [{"title": title, "slug": slug, "summary": body,
-                      "sections": [{"heading": heading, "prose": body}]}], "maps": [],
-    }, ensure_ascii=False) for filename, body, title, slug, heading in [
-        ("chinese.md", bodies["chinese.md"], "增长", "增长", "观察"),
-        ("english.md", bodies["english.md"], "Growth", "growth", "Observation"),
-    ]]
-    llm = AsyncMock(side_effect=responses)
+    responses = [
+        json.dumps(
+            {
+                "source_title": filename,
+                "source_summary": body,
+                "concepts": [
+                    {
+                        "title": title,
+                        "slug": slug,
+                        "summary": body,
+                        "sections": [{"heading": heading, "prose": body}],
+                    }
+                ],
+                "maps": [],
+            },
+            ensure_ascii=False,
+        )
+        for filename, body, title, slug, heading in [
+            ("chinese.md", bodies["chinese.md"], "增长", "增长", "观察"),
+            ("english.md", bodies["english.md"], "Growth", "growth", "Observation"),
+        ]
+    ]
+    remaining = iter(responses)
+    llm = AsyncMock(side_effect=legacy_fixture_llm(lambda *_args, **_kwargs: next(remaining)))
     monkeypatch.setattr("obsidian_llm_wiki.providers.llm.acall_llm", llm)
 
     async def build():
-        with VaultRegistry(config.llmwiki_dir) as registry:
+        with input_registry(config) as registry:
             loaded = load_sources_incremental(config.sources_dir, registry)
         return await run_pipeline(
-            tmp_path, loaded.sources, config, unchanged_filenames=loaded.unchanged_filenames,
+            tmp_path,
+            loaded.sources,
+            config,
+            unchanged_filenames=loaded.unchanged_filenames,
             source_file_signatures=loaded.signatures,
         )
 
     first = await build()
     assert first.compiled == 2
     ids = [concept.canonical_id for concept in first.concepts]
-    (config.llmwiki_dir / "equivalences.json").write_text(json.dumps({
-        "schema_version": 1, "equivalent_concepts": [ids],
-    }))
+    (config.llmwiki_dir / "equivalences.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "equivalent_concepts": [ids],
+            }
+        )
+    )
     second = await build()
     assert not second.errors
-    assert llm.call_count == 2
+    assert producer_call_count(llm) == 2
     assert len(second.concepts) == 2
-    assert all(any(link.relation == "equivalent_to" for link in c.related)
-               for c in second.concepts)
-    english = (config.concepts_dir / "growth.md").read_text()
+    assert all(any(link.relation == "equivalent_to" for link in c.related) for c in second.concepts)
+    english = (published_root(config) / "concepts" / "growth.md").read_text()
     assert bodies["english.md"] in english
     assert bodies["chinese.md"] not in english
     assert "equivalent_to" in english

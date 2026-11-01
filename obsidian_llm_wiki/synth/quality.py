@@ -453,6 +453,10 @@ def _claim_key(claim: Claim) -> tuple[str, ...]:
     if claim.evidence is None:
         return (claim.text, claim.source_ref)
     evidence = claim.evidence
+    from obsidian_llm_wiki.core.models import EvidenceFragments, evidence_identity
+
+    if isinstance(evidence, EvidenceFragments):
+        return (claim.text, claim.source_ref, "fragments", evidence_identity(evidence))
     return (
         claim.text,
         evidence.quote,
@@ -484,6 +488,13 @@ def _merge_claims(pass1: list[Claim], pass2: list[Claim]) -> list[Claim]:
         if key in seen_text:
             idx = seen_text[key]
             existing = merged[idx]
+            from obsidian_llm_wiki.core.models import EvidenceFragments
+
+            if (isinstance(existing.evidence, EvidenceFragments)
+                    or isinstance(claim.evidence, EvidenceFragments)):
+                if not any(_claim_key(item) == _claim_key(claim) for item in merged):
+                    merged.append(claim)
+                continue
             existing_has_evidence = (
                 existing.evidence is not None
                 and bool(existing.evidence.quote)

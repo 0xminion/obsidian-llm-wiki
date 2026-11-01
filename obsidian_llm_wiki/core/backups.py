@@ -71,14 +71,23 @@ def backup_file(
     name = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
     destination = directory / _backup_filename(name, uuid.uuid4().hex, source.name)
 
+    from obsidian_llm_wiki.core.publication_transaction import _restore_metadata, _state
+
+    metadata = _state(source)
     fd, temporary_name = tempfile.mkstemp(dir=directory, prefix=".backup-", suffix=".tmp")
     temporary = Path(temporary_name)
     try:
-        with source.open("rb") as input_file, os.fdopen(fd, "wb") as output_file:
+        with os.fdopen(fd, "wb") as output_file, source.open("rb") as input_file:
             while chunk := input_file.read(1024 * 1024):
                 output_file.write(chunk)
             output_file.flush()
+            _restore_metadata(output_file.fileno(), metadata)
             os.fsync(output_file.fileno())
+        if _state(temporary) != metadata:
+            raise RuntimeError(f"publication backup content/metadata mismatch: {source}")
+        from obsidian_llm_wiki.core.publication_transaction import record_replace
+
+        record_replace(destination, temporary)
         os.replace(temporary, destination)
     except BaseException:
         with suppress(FileNotFoundError):
@@ -87,6 +96,14 @@ def backup_file(
 
     backups = list_backups(source, backups_root)
     for old_backup in backups[:-max_backups]:
+        from obsidian_llm_wiki.core.publication_transaction import record_delete
+        from obsidian_llm_wiki.render.obsidian import _ACTIVE_RENDER_TRANSACTION
+
+        render = _ACTIVE_RENDER_TRANSACTION.get()
+        if render is not None:
+            render.before_change(old_backup)
+            render.record_delete(old_backup)
+        record_delete(old_backup)
         old_backup.unlink()
     return destination
 

@@ -33,7 +33,17 @@ def validate(
         olw validate ~/MyVault --strict
     """
     vault_path, config = resolve_vault(vault)
-    bundle_dir = config.wiki_dir
+    from obsidian_llm_wiki.core.immutable_publication import current_publication
+    from obsidian_llm_wiki.core.publication_transaction import require_publication_ready
+
+    try:
+        committed = current_publication(config.wiki_dir)
+        if not committed:
+            require_publication_ready(config.llmwiki_dir)
+    except (RuntimeError, ValueError) as exc:
+        typer.echo(str(exc))
+        raise typer.Exit(code=1) from exc
+    bundle_dir = committed[0] if committed else config.wiki_dir
 
     print(f"🔍 Validating: {bundle_dir}")
 
@@ -52,7 +62,7 @@ def validate(
     all_md_files = sorted(
         path
         for path in bundle_dir.rglob("*.md")
-        if not ({".llmwiki", "views"} & set(path.relative_to(bundle_dir).parts))
+        if not ({".llmwiki", "views", "OLW-Publications"} & set(path.relative_to(bundle_dir).parts))
     )
     note_stems = {f.stem for f in all_md_files}
 

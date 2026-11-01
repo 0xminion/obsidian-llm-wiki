@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import math
+from copy import deepcopy
 from pathlib import Path
 
 import pytest
@@ -24,6 +25,10 @@ from obsidian_llm_wiki.synth.embedding import (
     load_embeddings_cache,
     save_embeddings_cache,
 )
+from tests.new.bilateral_fixture_helpers import assess, fact_verdict, upsert_reviewed
+from tests.new.grounding_doubles import reviewed
+from tests.new.immutable_lifecycle_helpers import compile_legacy
+from tests.new.immutable_semantic_helpers import assert_preserved, file_state, published_registry
 
 
 def _unit(angle: float, dimensions: int = 16) -> list[float]:
@@ -297,6 +302,9 @@ def test_candidate_ids_collapsing_distinct_model_slugs_are_merged(
     tmp_path: Path,
 ) -> None:
     versions = ArtifactVersions("extract", "prompt", "schema", "model")
+    fact = "FlashAttention is the IO-aware exact attention algorithm of Dao et al."
+    existing_source = SourceDoc("Existing", f"Flash attention on GPUs. {fact}\n")
+    new_source = SourceDoc("New", f"Notes on attention kernels. {fact}\n")
     existing = SourceSynthesis(
         source_title="Existing",
         source_summary="summary",
@@ -304,9 +312,7 @@ def test_candidate_ids_collapsing_distinct_model_slugs_are_merged(
         concepts=[ConceptNote("Flash Attention", "flash-attention", "summary")],
     )
     with VaultRegistry(tmp_path / ".llmwiki") as registry:
-        registry.upsert_synthesis(
-            "existing.md", SourceDoc("Existing", "body"), existing, versions
-        )
+        upsert_reviewed(registry, "existing.md", existing_source, existing, versions)
         canonical_id = existing.concepts[0].canonical_id
         synthesis = SourceSynthesis(
             source_title="New",
@@ -327,11 +333,27 @@ def test_candidate_ids_collapsing_distinct_model_slugs_are_merged(
                 ),
             ],
         )
+        unproven = deepcopy(synthesis)
+        registry.assign_canonical_ids(unproven)
+        # Both concepts are assessed ``same`` against the candidate through the
+        # shared source fact: still only one may bind.
+        assert len(assess(registry, synthesis, new_source, fact_verdict(same=(fact,)))) == 2
+        assert [r["verdict"] for r in synthesis.review_receipt["identity"]["assessments"]] == [
+            "same", "same",
+        ]
         registry.assign_canonical_ids(synthesis)
         _normalize_synthesis_identity(synthesis)
 
-    assert [concept.slug for concept in synthesis.concepts] == ["flash-attention"]
+    # A candidate ID is an untrusted proposal. A typographic label variant
+    # ("FlashAttention") is a naming fact, not identity evidence.
+    assert all(concept.canonical_id != canonical_id for concept in unproven.concepts)
+    # With an explicit assessment the first claim binds; a second claim on the
+    # same ID by the same source never collapses a distinct concept into it.
+    assert [concept.slug for concept in synthesis.concepts] == [
+        "flash-attention", "gpu-flash-attention",
+    ]
     assert synthesis.concepts[0].canonical_id == canonical_id
+    assert synthesis.concepts[1].canonical_id != canonical_id
 
 
 def test_partial_embedding_namespace_resumes_missing_vectors(
@@ -347,14 +369,17 @@ def test_partial_embedding_namespace_resumes_missing_vectors(
         "beta.md": SourceDoc("Beta Source", "beta body " * 50, source_file="beta.md"),
     }
 
+    synthesis_calls = []
+
     async def fake_retry(_config, filename, source, *_args, **_kwargs):
+        synthesis_calls.append(filename)
         slug = filename.removesuffix(".md")
-        return SourceSynthesis(
+        return reviewed(SourceSynthesis(
             source_title=source.title,
             source_summary="summary",
             source_file=filename,
             concepts=[ConceptNote(slug.title(), slug, f"{slug} summary")],
-        )
+        ), source, filename, _config)
 
     def fake_embed_text(text, **_kwargs):
         return _unit(0.0 if "alpha" in text.casefold() else math.pi / 2)
@@ -375,7 +400,12 @@ def test_partial_embedding_namespace_resumes_missing_vectors(
         similarity_dedup_threshold=0.99,
     )
 
-    asyncio.run(pipeline_module.run_pipeline(tmp_path, sources, config))
+    config.sources_dir.mkdir(parents=True)
+    for filename, source in sources.items():
+        (config.sources_dir / filename).write_text(source.content)
+
+    # An interrupted legacy backfill is mutable; a committed generation is not.
+    asyncio.run(compile_legacy(config, sources))
     with VaultRegistry(config.llmwiki_dir) as registry:
         rows = registry.connection.execute(
             """
@@ -384,6 +414,10 @@ def test_partial_embedding_namespace_resumes_missing_vectors(
             """
         ).fetchall()
         assert len(rows) == 2
+        vectors_before = [tuple(row) for row in registry.connection.execute(
+            "SELECT entity_id, model_id, dimensions, input_hash, schema_version, vector "
+            "FROM embedding WHERE entity_kind='concept' ORDER BY entity_id",
+        )]
         missing_id = str(rows[0][0])
         schema_version = str(rows[0][1])
         with registry.connection:
@@ -396,9 +430,17 @@ def test_partial_embedding_namespace_resumes_missing_vectors(
                 (missing_id,),
             )
 
-    asyncio.run(pipeline_module.run_pipeline(tmp_path, sources, config))
+    legacy_before = file_state(config.llmwiki_dir)
+    result = asyncio.run(pipeline_module.run_pipeline(tmp_path, sources, config))
+    assert result.compiled == 0 and not result.errors
+    assert synthesis_calls == ["alpha.md", "beta.md"]
+    assert_preserved(config.llmwiki_dir, legacy_before)
 
-    with VaultRegistry(config.llmwiki_dir) as registry:
+    with published_registry(config) as registry:
+        assert [tuple(row) for row in registry.connection.execute(
+            "SELECT entity_id, model_id, dimensions, input_hash, schema_version, vector "
+            "FROM embedding WHERE entity_kind='concept' ORDER BY entity_id",
+        )] == vectors_before
         assert registry.embedding_count(
             "concept",
             model_id=config.embedding_model,

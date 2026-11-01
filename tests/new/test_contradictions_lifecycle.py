@@ -14,6 +14,8 @@ from obsidian_llm_wiki.core.contradictions import ContradictionStore
 from obsidian_llm_wiki.core.models import SourceDoc
 from obsidian_llm_wiki.core.pipeline import run_pipeline
 from obsidian_llm_wiki.providers import llm
+from tests.new.grounding_doubles import legacy_fixture_llm
+from tests.new.immutable_semantic_helpers import published_meta
 
 runner = CliRunner()
 
@@ -32,7 +34,9 @@ def _response(claim: str) -> str:
                     "claims": [
                         {
                             "text": claim,
-                            "concept_slug": "deployment-window",
+                            # Grounded contract: closed claim fields; the
+                            # quote is mapped to a catalog span ID by the double.
+                            "quote": claim,
                             "source_ref": "section-1",
                         }
                     ],
@@ -54,7 +58,7 @@ async def test_changed_source_creates_reviewable_record_visible_to_health_and_fi
     async def synthesize_initial(*_args, **_kwargs) -> str:
         return _response("Deploy on Friday.")
 
-    monkeypatch.setattr(llm, "acall_llm", synthesize_initial)
+    monkeypatch.setattr(llm, "acall_llm", legacy_fixture_llm(synthesize_initial))
     initial = await run_pipeline(
         vault,
         {source_name: SourceDoc(title="Deployment", content="Deploy on Friday.")},
@@ -65,7 +69,10 @@ async def test_changed_source_creates_reviewable_record_visible_to_health_and_fi
     async def synthesize_changed(*_args, **_kwargs) -> str:
         return _response("Do not deploy on Friday.")
 
-    monkeypatch.setattr(llm, "acall_llm", synthesize_changed)
+    monkeypatch.setattr(llm, "acall_llm", legacy_fixture_llm(
+        synthesize_changed,
+        identity_verdicts={("Deployment window", "Deployment window"): "same"},
+    ))
     changed = await run_pipeline(
         vault,
         {source_name: SourceDoc(title="Deployment", content="Do not deploy on Friday.")},
@@ -73,7 +80,7 @@ async def test_changed_source_creates_reviewable_record_visible_to_health_and_fi
     )
     assert changed.errors == []
 
-    store_path = vault / "04-Wiki" / ".llmwiki" / "contradictions.json"
+    store_path = published_meta(config) / "contradictions.json"
     store = ContradictionStore(store_path)
     records = store.records()
     assert len(records) == 1

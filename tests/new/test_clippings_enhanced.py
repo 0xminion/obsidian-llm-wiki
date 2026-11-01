@@ -55,50 +55,52 @@ def test_content_hash_dedup_skips_duplicate_source(tmp_path: Path) -> None:
     assert len(md_files) == 1
 
 
-def test_processed_clippings_archived_to_subdirectory(tmp_path: Path) -> None:
+def test_processed_clippings_retained_and_reingest_is_idempotent(tmp_path: Path) -> None:
     vault = _make_vault(tmp_path)
     body = "This is a substantial article body with enough content to pass the quality gate. " * 8
     clipping = _write_clipping(
         vault, "clip1.md", "Clip One", body, url="https://example.com/clip1"
     )
+    before = (clipping.read_bytes(), clipping.stat().st_ino, clipping.stat().st_mtime_ns)
 
     result = runner.invoke(
         app, ["ingest", str(vault), "--skip-synthesis"]
     )
     assert result.exit_code == 0
 
-    # Clipping should have been moved to 02-Clippings/processed/
+    # Processing is recorded operationally; human clippings stay in place.
     processed_dir = vault / "02-Clippings" / "processed"
-    assert processed_dir.is_dir()
-    assert (processed_dir / "clip1.md").exists()
-    # Original location should no longer have the file.
-    assert not clipping.exists()
+    assert not processed_dir.exists()
+    assert (clipping.read_bytes(), clipping.stat().st_ino, clipping.stat().st_mtime_ns) == before
 
-    # Re-running should not find any new clippings.
+    # Re-running must deduplicate without moving or rewriting the clipping.
     result = runner.invoke(
         app, ["ingest", str(vault), "--skip-synthesis", "--json"]
     )
     assert result.exit_code == 0
+    assert (clipping.read_bytes(), clipping.stat().st_ino, clipping.stat().st_mtime_ns) == before
+    assert len(list((vault / "04-Wiki" / "sources").glob("*.md"))) == 1
 
 
-def test_duplicate_clipping_archived_even_though_skipped(tmp_path: Path) -> None:
+def test_duplicate_clipping_retained_without_duplicate_source(tmp_path: Path) -> None:
     vault = _make_vault(tmp_path)
     body = "This is a substantial article body with enough content to pass the quality gate. " * 8
-    _write_clipping(vault, "first.md", "First", body, url="https://example.com/first")
+    first = _write_clipping(vault, "first.md", "First", body, url="https://example.com/first")
+    first_before = (first.read_bytes(), first.stat().st_ino, first.stat().st_mtime_ns)
 
-    # First ingest processes and archives.
+    # First ingest processes without moving the human input.
     result = runner.invoke(app, ["ingest", str(vault), "--skip-synthesis"])
     assert result.exit_code == 0
 
-    # Second clipping with same content — should be deduped AND archived.
-    _write_clipping(vault, "second.md", "Second", body, url="https://example.com/second")
+    # A duplicate remains in place too; deduplication must not delete either input.
+    second = _write_clipping(vault, "second.md", "Second", body, url="https://example.com/second")
+    second_before = (second.read_bytes(), second.stat().st_ino, second.stat().st_mtime_ns)
     result = runner.invoke(app, ["ingest", str(vault), "--skip-synthesis"])
     assert result.exit_code == 0
 
-    # Both clippings should be in processed/ — even the duplicate.
-    processed = vault / "02-Clippings" / "processed"
-    assert (processed / "first.md").exists()
-    assert (processed / "second.md").exists()
+    assert not (vault / "02-Clippings" / "processed").exists()
+    assert (first.read_bytes(), first.stat().st_ino, first.stat().st_mtime_ns) == first_before
+    assert (second.read_bytes(), second.stat().st_ino, second.stat().st_mtime_ns) == second_before
 
     # Only one source file should exist.
     sources = [

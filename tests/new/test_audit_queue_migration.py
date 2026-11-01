@@ -78,7 +78,13 @@ def test_legacy_queue_migration_preserves_rows_with_concurrent_openers(
     with VaultRegistry(tmp_path) as registry:
         assert registry.connection.execute(
             "SELECT value FROM meta WHERE key='schema_version'"
-        ).fetchone()[0] == "6"
+        ).fetchone()[0] == "7"
+        assert registry.connection.execute(
+            "SELECT count(*) FROM identity_source_context"
+        ).fetchone()[0] == 0
+        assert registry.connection.execute(
+            "SELECT count(*) FROM identity_entity_history"
+        ).fetchone()[0] == 0
         new_fields = registry.connection.execute(
             "SELECT pending_payload_json, pending_next_attempt_at, lease_token FROM dirty_queue"
         ).fetchall()

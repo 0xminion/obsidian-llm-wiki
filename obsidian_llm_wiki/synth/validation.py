@@ -12,14 +12,18 @@ import re
 from obsidian_llm_wiki.core.evidence import resolve_quote
 from obsidian_llm_wiki.core.models import (
     Claim,
+    EvidenceFragments,
     EvidenceSpan,
     EvidenceVerification,
     SourceDoc,
     SourceSynthesis,
 )
+from obsidian_llm_wiki.core.span_catalog import verify_evidence_anchor
 
 __all__ = [
-    "SynthesisValidationError", "validate_synthesis", "validate_source_summary",
+    "SynthesisValidationError",
+    "validate_synthesis",
+    "validate_source_summary",
     "validate_local_identities",
 ]
 
@@ -29,12 +33,23 @@ class SynthesisValidationError(ValueError):
 
 
 # Deliberately narrow: exact canned values, not length or vocabulary thresholds.
-_PLACEHOLDERS = frozenset({
-    "todo", "tbd", "placeholder", "insertsummaryhere", "summarygoeshere",
-    "insertcontenthere", "contentgoeshere", "nocontentavailable",
-    "thissourcediscussesimportanttopics", "thisdocumentdiscussesvarioustopics",
-    "本文介绍了相关内容", "待补充", "待完善",
-})
+_PLACEHOLDERS = frozenset(
+    {
+        "todo",
+        "tbd",
+        "placeholder",
+        "insertsummaryhere",
+        "summarygoeshere",
+        "insertcontenthere",
+        "contentgoeshere",
+        "nocontentavailable",
+        "thissourcediscussesimportanttopics",
+        "thisdocumentdiscussesvarioustopics",
+        "本文介绍了相关内容",
+        "待补充",
+        "待完善",
+    }
+)
 
 
 def _require_content(value: str, field: str) -> None:
@@ -123,16 +138,20 @@ def validate_synthesis(
     synthesis: SourceSynthesis | None,
     source: SourceDoc,
     source_file: str = "",
+    *,
+    summary_source: SourceDoc | None = None,
 ) -> SourceSynthesis:
     """Return accepted output or raise a retryable SynthesisValidationError.
 
     Empty concept lists and concise summaries are legitimate; no arbitrary
-    minimum lengths or concept counts are enforced.
+    minimum lengths or concept counts are enforced. ``summary_source`` limits
+    the summary quote exemption to the chunk actually shown to the model,
+    while evidence anchors are always checked against the complete source.
     """
     if not isinstance(synthesis, SourceSynthesis):
         raise SynthesisValidationError("no synthesis returned")
     validate_local_identities(synthesis)
-    validate_source_summary(synthesis.source_summary, source)
+    validate_source_summary(synthesis.source_summary, summary_source or source)
     for field in ("key_points", "open_questions"):
         for index, value in enumerate(getattr(synthesis, field)):
             _require_content(value, f"{field}[{index}]")
@@ -156,6 +175,17 @@ def validate_synthesis(
             _require_content(claim.text, f"{path}.claim")
             # Legacy source_ref-only claims remain readable. A supplied quote,
             # however, is a falsifiable assertion and must actually occur.
+            # Catalog-anchored evidence is machine-built: verify the anchor
+            # exactly and keep it (quote search would discard repeated spans).
+            if (
+                isinstance(claim.evidence, EvidenceFragments)
+                or isinstance(claim.evidence, EvidenceSpan)
+                and claim.evidence.span_ids
+            ):
+                reason = verify_evidence_anchor(claim.evidence, source.content, filename)
+                if reason:
+                    raise SynthesisValidationError(f"{path}.claim: {reason}")
+                continue
             if isinstance(claim.evidence, EvidenceSpan):
                 evidence = resolve_quote(claim.evidence.quote, source.content, filename)
                 if evidence.verification == EvidenceVerification.UNMATCHED:

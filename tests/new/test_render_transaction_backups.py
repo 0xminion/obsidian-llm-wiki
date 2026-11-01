@@ -19,8 +19,10 @@ def test_rollback_keeps_existing_backups_and_removes_backups_created_mid_render(
 
     transaction = _RenderTransaction(bundle)
     page.write_text("after", encoding="utf-8")
+    transaction.record_write(page, "after")
     new_backup = backups / "new-alpha.md.bak"
     new_backup.write_text("new", encoding="utf-8")
+    transaction.record_created(new_backup)
     transaction.rollback()
 
     assert page.read_text(encoding="utf-8") == "before"

@@ -17,6 +17,14 @@ from obsidian_llm_wiki.config import load_config
 from obsidian_llm_wiki.core.models import SourceDoc
 from obsidian_llm_wiki.core.pipeline import run_pipeline
 from obsidian_llm_wiki.render.obsidian import parse_frontmatter, safe_read_file
+from tests.new.grounding_doubles import legacy_fixture_llm
+from tests.new.immutable_semantic_helpers import (
+    assert_preserved,
+    file_state,
+    published_meta,
+    published_registry,
+    published_root,
+)
 
 # ── Fake LLM responses ──────────────────────────────────────────────────
 
@@ -77,7 +85,7 @@ async def test_incremental_cache_preserves_existing_concepts(tmp_path: Path):
     with patch(
         "obsidian_llm_wiki.providers.llm.acall_llm",
         new_callable=AsyncMock,
-        side_effect=_mock_acall_a,
+        side_effect=legacy_fixture_llm(_mock_acall_a),
     ):
         result1 = await run_pipeline(vault, sources_a, config, force=True)
 
@@ -86,8 +94,11 @@ async def test_incremental_cache_preserves_existing_concepts(tmp_path: Path):
     assert call_count == 1
 
     # Verify A1 is in the vault.
-    assert (config.concepts_dir / "concept-a1.md").exists()
-    assert (config.concepts_dir / "concept-shared.md").exists()
+    assert (published_root(config) / "concepts" / "concept-a1.md").exists()
+    assert (published_root(config) / "concepts" / "concept-shared.md").exists()
+
+    previous = published_root(config)
+    before = file_state(previous)
 
     # ── Run 2: ingest source B (source A still present) ────────────────
     # The pipeline should reuse A's cached synthesis and only call the LLM for B.
@@ -104,7 +115,10 @@ async def test_incremental_cache_preserves_existing_concepts(tmp_path: Path):
     with patch(
         "obsidian_llm_wiki.providers.llm.acall_llm",
         new_callable=AsyncMock,
-        side_effect=_mock_acall_b,
+        side_effect=legacy_fixture_llm(
+            _mock_acall_b,
+            identity_verdicts={("Concept Shared", "Concept Shared"): "same"},
+        ),
     ):
         result2 = await run_pipeline(vault, sources_ab, config, force=False)
 
@@ -114,12 +128,14 @@ async def test_incremental_cache_preserves_existing_concepts(tmp_path: Path):
     assert call_count == 2  # Only 2 total LLM calls (A in run 1, B in run 2)
 
     # Both A's and B's concepts should be in the vault.
-    assert (config.concepts_dir / "concept-a1.md").exists()
-    assert (config.concepts_dir / "concept-b1.md").exists()
-    assert (config.concepts_dir / "concept-shared.md").exists()
+    assert (published_root(config) / "concepts" / "concept-a1.md").exists()
+    assert (published_root(config) / "concepts" / "concept-b1.md").exists()
+    assert (published_root(config) / "concepts" / "concept-shared.md").exists()
 
     # The rendered bundle should have all 3 unique concepts.
     assert len(result2.concepts) == 3  # A1, B1, Shared (merged)
+    assert published_root(config) != previous
+    assert_preserved(previous, before)
 
 
 @pytest.mark.asyncio
@@ -158,14 +174,20 @@ async def test_delete_source_orphans_exclusive_concepts(tmp_path: Path):
     with patch(
         "obsidian_llm_wiki.providers.llm.acall_llm",
         new_callable=AsyncMock,
-        side_effect=_mock_acall,
+        side_effect=legacy_fixture_llm(
+            _mock_acall,
+            identity_verdicts={("Concept Shared", "Concept Shared"): "same"},
+        ),
     ):
         result1 = await run_pipeline(vault, sources_ab, config, force=True)
 
     assert result1.compiled == 2
-    assert (config.concepts_dir / "concept-a1.md").exists()
-    assert (config.concepts_dir / "concept-b1.md").exists()
-    assert (config.concepts_dir / "concept-shared.md").exists()
+    assert (published_root(config) / "concepts" / "concept-a1.md").exists()
+    assert (published_root(config) / "concepts" / "concept-b1.md").exists()
+    assert (published_root(config) / "concepts" / "concept-shared.md").exists()
+
+    previous = published_root(config)
+    before = file_state(previous)
 
     # ── Run 2: only B (A deleted) ──────────────────────────────────────
     sources_b_only = {
@@ -175,7 +197,7 @@ async def test_delete_source_orphans_exclusive_concepts(tmp_path: Path):
     with patch(
         "obsidian_llm_wiki.providers.llm.acall_llm",
         new_callable=AsyncMock,
-        return_value=FAKE_SYNTH_B,
+        side_effect=legacy_fixture_llm(FAKE_SYNTH_B),
     ):
         result2 = await run_pipeline(vault, sources_b_only, config, force=False)
 
@@ -183,16 +205,35 @@ async def test_delete_source_orphans_exclusive_concepts(tmp_path: Path):
     assert result2.deleted == 1
 
     # A's exclusive concept (A1) should be orphaned.
-    a1_raw = safe_read_file(config.concepts_dir / "concept-a1.md")
+    a1_raw = safe_read_file(published_root(config) / "concepts" / "concept-a1.md")
     a1_meta, _ = parse_frontmatter(a1_raw)
     assert a1_meta.get("orphaned") is True
 
     # Shared concept should NOT be orphaned (B still owns it).
-    shared_raw = safe_read_file(config.concepts_dir / "concept-shared.md")
+    shared_raw = safe_read_file(published_root(config) / "concepts" / "concept-shared.md")
     shared_meta, _ = parse_frontmatter(shared_raw)
     assert "orphaned" not in shared_meta
 
     # B's exclusive concept (B1) should still be alive.
-    b1_raw = safe_read_file(config.concepts_dir / "concept-b1.md")
+    b1_raw = safe_read_file(published_root(config) / "concepts" / "concept-b1.md")
     b1_meta, _ = parse_frontmatter(b1_raw)
     assert "orphaned" not in b1_meta
+    assert published_root(config) != previous
+    assert_preserved(previous, before)
+    # Historical facts remain in the old generation and revision context. Only
+    # current membership/cache remove A; shared contributions still belong to B.
+    assert (previous / "sources/source-alpha.md").is_file()
+    assert (previous / ".llmwiki/cache/source-alpha.md.json").is_file()
+    assert not (published_meta(config) / "cache/source-alpha.md.json").exists()
+    with published_registry(config) as registry:
+        assert registry.source_filenames() == {"source-beta.md"}
+        assert registry.load_synthesis("source-alpha.md") is None
+        assert registry.load_synthesis("source-beta.md") is not None
+        historical = registry.connection.execute(
+            "SELECT content FROM identity_source_context WHERE filename='source-alpha.md'",
+        ).fetchall()
+        assert [row[0] for row in historical] == [source_a_content]
+        assert registry.connection.execute(
+            "SELECT count(*) FROM concept_source cs JOIN source s ON s.id=cs.source_id "
+            "WHERE s.filename='source-alpha.md'",
+        ).fetchone()[0] == 0

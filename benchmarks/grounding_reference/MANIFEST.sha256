@@ -1,0 +1,5 @@
+# sha256  file  (grounding-reference-v1; frozen before any new model output)
+304feaba3059a06fe6dbc934a1b711464f54c29d7677f89e0ae6102c9f66f5c6  sources.json
+4d3db3aaafdcc7642ee1a2b7ffc964a4e2a3bc4024e8a76214fab36ab5c88d48  cases.calibration.jsonl
+604745ac5d73718c6dc6b5bc41b3181997e30ae934bd82239bcf710f856b220b  cases.heldout.jsonl
+769565d1a95e4f6d36ade1a9317f213333093bfcfb37c916b7060599d5ee7887  coverage_obligations.json

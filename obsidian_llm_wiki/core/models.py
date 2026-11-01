@@ -110,8 +110,7 @@ def _regenerate_slug(value: object) -> str:
         return ""
     normalized = unicodedata.normalize("NFKD", value).casefold()
     cleaned = "".join(
-        char if char.isalnum() else "-"
-        for char in normalized if not unicodedata.combining(char)
+        char if char.isalnum() else "-" for char in normalized if not unicodedata.combining(char)
     )
     cleaned = re.sub(r"-+", "-", cleaned)
     return cleaned.strip("-_")[:_MAX_SLUG_LENGTH].rstrip("-_")
@@ -208,11 +207,21 @@ class EvidenceSpan:
     start_offset: int | None = None
     end_offset: int | None = None
     verification: EvidenceVerification | str = EvidenceVerification.UNVERIFIED
+    # Machine-resolved catalog anchors (grounded producer). Empty for legacy
+    # quote-only evidence, which remains readable but is never produced anew.
+    span_ids: tuple[str, ...] = ()
+    catalog_version: str = ""
+    # Explicit UTF-8 offsets for the versioned multi-fragment representation.
+    start_byte: int | None = None
+    end_byte: int | None = None
 
     def __post_init__(self) -> None:
         self.quote = _string(self.quote)
         self.source_file = _string(self.source_file)
         self.source_hash = _string(self.source_hash)
+        raw_ids = self.span_ids if isinstance(self.span_ids, (list, tuple)) else ()
+        self.span_ids = tuple(item for item in raw_ids if isinstance(item, str) and item)
+        self.catalog_version = _string(self.catalog_version)
         try:
             self.verification = EvidenceVerification(self.verification)
         except ValueError:
@@ -236,18 +245,63 @@ class EvidenceSpan:
 
 
 @dataclass
+class EvidenceFragments:
+    """Separate literal anchors; deliberately has no synthetic quote or outer offsets."""
+
+    fragments: tuple[EvidenceSpan, ...]
+    version: str = "evidence-fragments-v1"
+
+    def __post_init__(self) -> None:
+        if (
+            self.version != "evidence-fragments-v1"
+            or not isinstance(self.fragments, (list, tuple))
+            or not 2 <= len(self.fragments) <= 3
+            or any(not isinstance(f, EvidenceSpan) for f in self.fragments)
+        ):
+            raise ValueError("invalid evidence fragments")
+        self.fragments = tuple(self.fragments)
+
+
+def evidence_fragments(
+    evidence: EvidenceSpan | EvidenceFragments | None,
+) -> tuple[EvidenceSpan, ...]:
+    """Explicit accessor shared by consumers: never flatten gaps into quotations."""
+    if isinstance(evidence, EvidenceFragments):
+        return evidence.fragments
+    return (evidence,) if isinstance(evidence, EvidenceSpan) else ()
+
+
+def evidence_identity(evidence: EvidenceSpan | EvidenceFragments | None) -> tuple:
+    """Exact fragment-aware identity for deduplication and publication consumers."""
+    return tuple(
+        (
+            f.quote,
+            f.source_file,
+            f.source_hash,
+            f.start_offset,
+            f.end_offset,
+            f.span_ids,
+            f.catalog_version,
+            f.start_byte,
+            f.end_byte,
+        )
+        for f in evidence_fragments(evidence)
+    )
+
+
+@dataclass
 class Claim:
     """A single factual claim extracted from the source, tied to a concept."""
 
     text: str
     concept_slug: str = ""
     source_ref: str = ""  # e.g. "source#para3" or source filename
-    evidence: EvidenceSpan | dict[str, Any] | None = None
+    evidence: EvidenceSpan | EvidenceFragments | dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
         if isinstance(self.evidence, dict):
             self.evidence = _evidence_from_dict(self.evidence)
-        elif not isinstance(self.evidence, EvidenceSpan):
+        elif not isinstance(self.evidence, (EvidenceSpan, EvidenceFragments)):
             self.evidence = None
 
 
@@ -321,6 +375,9 @@ class SourceSynthesis:
     concepts: list[ConceptNote] = field(default_factory=list)
     maps: list[MapOfContent] = field(default_factory=list)
     source_file: str = ""  # filename this synthesis was derived from
+    # Machine-written grounding review receipt (see ``synth.review``). None for
+    # legacy/unreviewed payloads; never produced from model output.
+    review_receipt: dict[str, Any] | None = None
 
 
 @dataclass
@@ -394,10 +451,49 @@ def _strings(value: object) -> list[str]:
     return [item for item in value if isinstance(item, str)] if isinstance(value, list) else []
 
 
-def _evidence_from_dict(data: object) -> EvidenceSpan | None:
+def _evidence_from_dict(data: object) -> EvidenceSpan | EvidenceFragments | None:
     """Build an EvidenceSpan without coercing malformed cache/LLM values."""
     if not isinstance(data, dict):
         return None
+    if "fragments" in data or "version" in data:
+        if set(data) != {"version", "fragments"} or data["version"] != "evidence-fragments-v1":
+            raise ValueError("invalid evidence fragments envelope")
+        raw = data["fragments"]
+        fields = {
+            "quote",
+            "source_file",
+            "source_hash",
+            "start_offset",
+            "end_offset",
+            "verification",
+            "span_ids",
+            "catalog_version",
+            "start_byte",
+            "end_byte",
+        }
+        if not isinstance(raw, list) or not 2 <= len(raw) <= 3:
+            raise ValueError("invalid evidence fragment count")
+        for f in raw:
+            if (
+                not isinstance(f, dict)
+                or set(f) != fields
+                or any(
+                    not isinstance(f[k], str) or not f[k]
+                    for k in ("quote", "source_file", "source_hash", "catalog_version")
+                )
+                or f["verification"] != "verified"
+                or any(
+                    type(f[k]) is not int or f[k] < 0
+                    for k in ("start_offset", "end_offset", "start_byte", "end_byte")
+                )
+                or f["start_offset"] >= f["end_offset"]
+                or f["start_byte"] >= f["end_byte"]
+                or not isinstance(f["span_ids"], list)
+                or not f["span_ids"]
+                or any(not isinstance(i, str) or not i for i in f["span_ids"])
+            ):
+                raise ValueError("invalid evidence fragment fields")
+        return EvidenceFragments(tuple(_evidence_from_dict(f) for f in raw))
     quote = _string(data.get("quote", ""))
     if not quote:
         return None
@@ -410,6 +506,10 @@ def _evidence_from_dict(data: object) -> EvidenceSpan | None:
         start_offset=start if isinstance(start, int) and not isinstance(start, bool) else None,
         end_offset=end if isinstance(end, int) and not isinstance(end, bool) else None,
         verification=_string(data.get("verification", EvidenceVerification.UNVERIFIED)),
+        span_ids=tuple(_strings(data.get("span_ids", []))),
+        catalog_version=_string(data.get("catalog_version", "")),
+        start_byte=data.get("start_byte"),
+        end_byte=data.get("end_byte"),
     )
 
 
@@ -446,9 +546,7 @@ def _validate_collections(
         if field_name not in data:
             continue
         value = data[field_name]
-        if not isinstance(value, list) or any(
-            not isinstance(item, member_type) for item in value
-        ):
+        if not isinstance(value, list) or any(not isinstance(item, member_type) for item in value):
             raise ValueError(f"{field_name} must be an array of {member_type.__name__}")
 
 
@@ -459,14 +557,11 @@ def source_synthesis_from_dict(data: dict[str, Any]) -> SourceSynthesis:
     of completed output is separate from conversion of intermediate skeletons.
     """
     _validate_collections(
-        data, strings=("source_tags", "tags", "key_points", "open_questions"),
+        data,
+        strings=("source_tags", "tags", "key_points", "open_questions"),
         objects=("concepts", "maps"),
     )
-    concepts = [
-        _concept_from_dict(c)
-        for c in data.get("concepts", [])
-        if isinstance(c, dict)
-    ]
+    concepts = [_concept_from_dict(c) for c in data.get("concepts", []) if isinstance(c, dict)]
     # Resolve local references through the very same normalization mapping.
     # Independently normalizing an invalid reference loses the concept's title
     # fallback and used to turn valid links into the literal "untitled".
@@ -483,11 +578,7 @@ def source_synthesis_from_dict(data: dict[str, Any]) -> SourceSynthesis:
             link.slug = slug_map.get(_string(raw_link.get("slug", "")), link.slug)
         for claim in concept.claims:
             claim.concept_slug = slug_map.get(claim.concept_slug, claim.concept_slug)
-    maps = [
-        _moc_from_dict(m)
-        for m in data.get("maps", [])
-        if isinstance(m, dict)
-    ]
+    maps = [_moc_from_dict(m) for m in data.get("maps", []) if isinstance(m, dict)]
     for raw, moc in zip(data.get("maps", []), maps, strict=True):
         moc.concept_slugs = [
             slug_map.get(slug, normalize_slug(slug)) for slug in raw.get("concept_slugs", [])
@@ -502,13 +593,18 @@ def source_synthesis_from_dict(data: dict[str, Any]) -> SourceSynthesis:
         concepts=concepts,
         maps=maps,
         source_file=_string(data.get("source_file", "")),
+        review_receipt=(
+            data["review_receipt"] if isinstance(data.get("review_receipt"), dict) else None
+        ),
     )
 
 
 def _concept_from_dict(data: dict[str, Any]) -> ConceptNote:
     """Build a ConceptNote from a raw dict."""
     _validate_collections(
-        data, strings=("tags", "aliases"), objects=("sections", "claims", "related"),
+        data,
+        strings=("tags", "aliases"),
+        objects=("sections", "claims", "related"),
     )
     for section in data.get("sections", []):
         _validate_collections(section, strings=("points",))
@@ -522,10 +618,7 @@ def _concept_from_dict(data: dict[str, Any]) -> ConceptNote:
         if isinstance(s, dict)
     ]
     # Drop empty sections (both points and prose empty/missing).
-    sections = [
-        section for section in sections
-        if section.points or section.prose.strip()
-    ]
+    sections = [section for section in sections if section.points or section.prose.strip()]
     claims = [_claim_from_dict(c) for c in data.get("claims", []) if isinstance(c, dict)]
     related = [
         ConceptLink(
@@ -580,6 +673,27 @@ def _moc_from_dict(data: dict[str, Any]) -> MapOfContent:
 # ── Serialization (for synthesis cache) ──────────────────────────────────
 
 
+def evidence_to_dict(evidence: EvidenceSpan | EvidenceFragments) -> dict[str, Any]:
+    if isinstance(evidence, EvidenceFragments):
+        return {
+            "version": evidence.version,
+            "fragments": [evidence_to_dict(f) for f in evidence.fragments],
+        }
+    result = {
+        "quote": evidence.quote,
+        "source_file": evidence.source_file,
+        "source_hash": evidence.source_hash,
+        "start_offset": evidence.start_offset,
+        "end_offset": evidence.end_offset,
+        "verification": evidence.verification.value,
+    }
+    if evidence.span_ids:
+        result.update(span_ids=list(evidence.span_ids), catalog_version=evidence.catalog_version)
+    if evidence.start_byte is not None or evidence.end_byte is not None:
+        result.update(start_byte=evidence.start_byte, end_byte=evidence.end_byte)
+    return result
+
+
 def concept_note_to_dict(c: ConceptNote) -> dict[str, Any]:
     """Serialize a ConceptNote to a plain dict."""
     return {
@@ -599,16 +713,7 @@ def concept_note_to_dict(c: ConceptNote) -> dict[str, Any]:
                 "concept_slug": claim.concept_slug,
                 "source_ref": claim.source_ref,
                 **(
-                    {
-                        "evidence": {
-                            "quote": claim.evidence.quote,
-                            "source_file": claim.evidence.source_file,
-                            "source_hash": claim.evidence.source_hash,
-                            "start_offset": claim.evidence.start_offset,
-                            "end_offset": claim.evidence.end_offset,
-                            "verification": claim.evidence.verification.value,
-                        }
-                    }
+                    {"evidence": evidence_to_dict(claim.evidence)}
                     if claim.evidence is not None
                     else {}
                 ),
@@ -648,4 +753,5 @@ def source_synthesis_to_dict(s: SourceSynthesis) -> dict[str, Any]:
         "concepts": [concept_note_to_dict(c) for c in s.concepts],
         "maps": [moc_to_dict(m) for m in s.maps],
         "source_file": s.source_file,
+        **({"review_receipt": s.review_receipt} if s.review_receipt is not None else {}),
     }

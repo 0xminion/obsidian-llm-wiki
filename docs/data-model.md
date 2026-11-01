@@ -8,7 +8,7 @@ Active reference. Source definitions: [`core/models.py`](../obsidian_llm_wiki/co
 - **Per-source synthesis** is structured intermediate knowledge (`SourceSynthesis`), persisted in SQLite and a portable JSON cache. It contains source summary/tags/key points/open questions, language, concepts, MoCs, and source filename.
 - **Merged bundle** (`SynthesisBundle`) is the in-memory union of live source syntheses. It is not a separate authoritative source document. Rendering consumes the entire bundle on a changed build.
 - **Registry** indexes runtime identities, ownership, version compatibility, search, queues, and render state. It does not make generated Markdown authoritative over human edits.
-- **Generated notes** are a materialized view with human-edit protection. A protected note may diverge from the synthesis registry. Queries reading Markdown can therefore see a different view than synthesis candidate retrieval reading SQLite.
+- **Generated notes** are immutable, generation-qualified materialized views. Public readers validate and resolve the committed generation; they do not treat retained legacy notes or annotations as current generated evidence. Human edits belong in separate annotations, original sources, policy, or legacy notes, not installed generations. See [current caller boundaries](immutable-application-callers.md).
 
 ## Identities
 
@@ -67,15 +67,22 @@ Each nonempty list item must be a two-element array of **distinct existing** `co
 
 ### Discover IDs, do not derive them from titles
 
-Current generated concept frontmatter includes `canonical_id`. Legacy/protected notes may lack it or retain stale metadata; do not edit their IDs to force a match. Prefer the current registry on the stopped-writer **rehearsal copy** created in [migration](migration.md). This snippet lists IDs, slugs, definitions and source ownership without invoking providers or the migrating `VaultRegistry` constructor:
+Current generated concept frontmatter includes `canonical_id`. Legacy/protected notes may lack it or retain stale metadata; do not edit their IDs to force a match. Resolve the committed generation on the stopped-writer **rehearsal copy** created in [migration](migration.md). This snippet lists IDs, slugs, definitions and source ownership from an in-memory copy without invoking providers or the migrating `VaultRegistry` constructor:
 
 ```bash
 TARGET="$REHEARSAL" python - <<'PY'
 import json, os, sqlite3
 from pathlib import Path
-p = Path(os.environ['TARGET']).resolve() / '04-Wiki/.llmwiki/registry.db'
-assert p.is_file(), 'Migrate the rehearsal copy first'
-c = sqlite3.connect(p.as_uri() + '?mode=ro', uri=True)
+from obsidian_llm_wiki.core.immutable_publication import current_publication
+vault = Path(os.environ['TARGET']).resolve()
+snapshot = current_publication(vault / '04-Wiki')
+assert snapshot is not None, 'Build the rehearsal copy first, then resolve current'
+p = snapshot[0] / '.llmwiki/registry.db'
+c = sqlite3.connect(':memory:')
+raw = bytearray(p.read_bytes())
+raw[18] = raw[19] = 1  # closed WAL snapshot: change only the private memory header
+c.deserialize(bytes(raw))
+c.execute('PRAGMA query_only=ON')
 c.row_factory = sqlite3.Row
 try:
     for row in c.execute('SELECT id, slug, title, summary FROM concept ORDER BY slug'):
@@ -89,7 +96,7 @@ finally:
 PY
 ```
 
-`mode=ro` prevents DB content writes but SQLite WAL handling can create sidecars; use the disposable copy for inspection, not a claimed zero-write production probe. An orphaned/missing concept is not a valid active assertion target.
+The installed registry is read as bytes and deserialized into memory; do not open it with the writable registry constructor or create WAL sidecars beside it. Keep writers stopped during this rehearsal. An orphaned/missing concept is not a valid active assertion target.
 
 ### Assert a reviewed pair on the copy
 
@@ -103,18 +110,27 @@ TARGET="$REHEARSAL" python - <<'PY'
 import json, os, sqlite3, tempfile
 from pathlib import Path
 from obsidian_llm_wiki.core.identity_policy import load_equivalences
-root = Path(os.environ['TARGET']).resolve() / '04-Wiki/.llmwiki'
+from obsidian_llm_wiki.core.immutable_publication import current_publication
+vault = Path(os.environ['TARGET']).resolve()
+snapshot = current_publication(vault / '04-Wiki')
+assert snapshot is not None, 'Build the rehearsal copy first, then resolve current'
+root = vault / '04-Wiki/.llmwiki'
 policy = root / 'equivalences.json'
 assert not root.is_symlink() and not policy.is_symlink(), 'Unexpected policy symlink'
 left, right = os.environ['LEFT_ID'], os.environ['RIGHT_ID']
 pairs = [list(pair) for pair in load_equivalences(policy)]
-c = sqlite3.connect((root / 'registry.db').as_uri() + '?mode=ro', uri=True)
+c = sqlite3.connect(':memory:')
+raw = bytearray((snapshot[0] / '.llmwiki/registry.db').read_bytes())
+raw[18] = raw[19] = 1  # closed WAL snapshot: never modify the published file
+c.deserialize(bytes(raw))
+c.execute('PRAGMA query_only=ON')
 try:
     for identity in (left, right):
         assert c.execute('SELECT 1 FROM concept WHERE id=?', (identity,)).fetchone(), identity
 finally:
     c.close()
 pairs.append([left, right])
+root.mkdir(parents=True, exist_ok=True)
 fd, name = tempfile.mkstemp(dir=root, prefix='equivalences-', suffix='.json')
 temporary = Path(name)
 try:
@@ -132,7 +148,7 @@ olw build "$REHEARSAL" --refresh-render
 
 The final build is **not a no-provider guarantee**: current compatible sources reuse cached synthesis, but changed/incompatible ones may call the configured provider. Check its exit status and review concept/MoC files. A policy edit participates in the checkpoint, so a normal unchanged-source build also notices it. Syntax/format errors abort; unresolved IDs add errors and prevent a successful checkpoint, but other valid work may still render—policy application is not all-or-nothing publication.
 
-Resolved pairs add symmetric `equivalent_to` links to the render bundle and authorize direct counterpart MoC membership **with embeddings disabled**. Titles/prose and canonical IDs remain separate; no concepts are merged. This is derived render policy, not an automatic rewrite of per-source synthesis ownership/FTS. Removing a pair retracts its policy-derived effect on the next reconciliation, unless another source/explicit link supplies it or human-edit protection preserves an older page. There is no dedicated CLI pair-approval or destructive-merge command.
+Resolved pairs add symmetric `equivalent_to` links to the render bundle and authorize direct counterpart MoC membership **with embeddings disabled**. Titles/prose and canonical IDs remain separate; no concepts are merged. This is derived render policy, not an automatic rewrite of per-source synthesis ownership/FTS. Removing a pair retracts its policy-derived effect in a new projection unless another source/explicit link supplies it; older immutable generations and human notes remain intact. There is no dedicated CLI pair-approval or destructive-merge command.
 
 ## Provenance and evidence
 
@@ -144,7 +160,7 @@ Only accepted per-source text should be treated as evidence. Mechanical merge pr
 
 ## SQLite and portable files
 
-All paths below are relative to `04-Wiki/.llmwiki/`.
+For current compiled state, paths below are relative to `.llmwiki/` **inside the validated current generation** (`04-Wiki/OLW-Publications/generations/<generation>/`). Human `schema.yaml` and `equivalences.json` remain under `04-Wiki/.llmwiki/`; legacy flat metadata is retained, not current generated state. Mutable ingest operations live separately under `OLW-Publications/operations/`. Resolve current with `olw current VAULT --json`; never pass an installed generation to a writable registry constructor.
 
 | Store/table group | Purpose |
 | --- | --- |
@@ -161,7 +177,7 @@ All paths below are relative to `04-Wiki/.llmwiki/`.
 | `render-page-hashes.json` | Last recognized generated content for edit protection. Missing/changed hashes make existing notes conservative, not disposable. |
 | `backups/`, graph/report/transcript files | Recovery copies and derived/cached artifacts with different retention/persistence rules. |
 
-SQLite is opened in WAL mode with foreign keys enabled and `synchronous=NORMAL`. Markdown and DB commits are not one atomic unit; back up the **whole vault with writers stopped**, including DB/WAL/SHM, rather than copying only `registry.db` during activity.
+Writable private-workspace and operational registries use WAL mode with foreign keys enabled and `synchronous=NORMAL`. Installed generation registries are closed snapshots read into memory; publication advances the current pointer only after generation validation. This is not an atomic transaction across extraction and all vault state: back up the **whole vault with writers stopped**, including any operational/legacy DB/WAL/SHM, rather than copying only `registry.db` during activity.
 
 ## Version namespaces
 
@@ -170,16 +186,18 @@ These are independent numbers/labels, not a single “version 3” contract:
 | Contract | Current value / meaning |
 | --- | --- |
 | Package | `3.0.0` in `pyproject.toml`. |
-| SQLite physical schema | **6**, in `meta.schema_version`; opening a newer unknown schema fails. Opening an older supported schema can write migrations immediately. |
+| SQLite physical schema | **7**, in `meta.schema_version`; a writable constructor rejects newer unknown schemas and can migrate older supported ones. Public readers do not migrate installed generations. |
 | Legacy ownership migration | Pre-v3 registry data backfills source/concept/MoC/membership ownership. |
 | v5 search migration | Adds/backfills `concept_fts_identity`, cleans superseded FTS rows, clears the pipeline checkpoint. |
 | v6 queue migration | Adds lease-token fencing and durable successor payload/due-time fields; preserves a running payload while newer invalidations wait. |
+| v7 identity history migration | Adds historical identity source contexts and entity history; older migration descriptions above remain historical. |
 | Portable synthesis cache envelope | `_CACHE_ARTIFACT_SCHEMA_VERSION = 2`. |
 | Extraction artifact label | `extract-v2`. This invalidates compatibility; `build` does not itself re-download a URL. |
-| Synthesis schema label | `synthesis-schema-v2`. |
-| Prompt compatibility | `synthesis-v3:<effective-settings hash>`; includes model routing, language, synthesis mode, candidate/evidence/chunk settings, and schema policy. |
+| Synthesis schema label | `synthesis-schema-v5-fragments`: closed structured output with grounded evidence. |
+| Prompt compatibility | `synthesis-v7-span-range-feedback-refine:<effective-settings hash>`; includes model routing, language, synthesis mode, candidate/evidence/chunk settings, and schema policy. |
 | Rendering fingerprint | `render-v4` inside renderer fingerprint calculation. |
-| Pipeline checkpoint | `integrity-v2` plus artifact versions, selected non-secret build settings, and normalized human equivalence pairs. |
+| Private pipeline checkpoint | `identity-publication-plan-v1` plus artifact versions, selected non-secret settings, and human equivalence pairs. |
+| Public generation format | `immutable-generation-v1`; `current.json` selects the accepted generation and binds its files and observed inputs. |
 
 Embedding identity additionally includes model, dimensions/input/version information. Do not reuse vectors across an unverified model namespace change. Metadata-only identity repair must not relabel stale synthesis as current. Legacy import deliberately uses `legacy` version labels so the normal build can regenerate incompatible output.
 

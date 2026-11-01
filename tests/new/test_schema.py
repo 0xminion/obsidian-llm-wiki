@@ -107,4 +107,4 @@ def test_prompt_includes_policy_only_in_explicit_user_controlled_guidance_block(
     assert "Allowed tags: ai-research" in configured_prompt
     assert "Prioritize primary sources." in configured_prompt
     assert "Requested synthesis granularity: detailed" in configured_prompt
-    assert configured_prompt.count("--- SOURCE DOCUMENT ---") == 1
+    assert configured_prompt.count("--- SOURCE DOCUMENT") == 1

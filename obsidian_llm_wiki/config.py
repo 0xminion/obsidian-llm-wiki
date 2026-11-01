@@ -46,6 +46,10 @@ class LLMProviderConfig:
     # Pass 2 (expand) model override — for perspective diversity in two-pass
     # synthesis.  When unset, falls back to the default ``model``.
     expand_model: str | None = None
+    # Grounding-review model override. When unset the review runs as a new,
+    # separate call to the synthesis (ingest) model — a different context, not
+    # an independent ground truth.
+    review_model: str | None = None
     api_key: str | None = None
     timeout_ms: int = 1_800_000  # 30 minutes
     context_window: int = 256_000  # 256K tokens for cloud models (e.g. gemma4:31b-cloud)
@@ -93,9 +97,21 @@ class Config:
     output_language: str = ""
 
     # ── Synthesis mode ──────────────────────────────
-    # "single" = one LLM call per source (default, fast)
-    # "two_pass" = extract skeleton + expand each concept (deep, slow)
+    # "single" = one grounded producer call per span window (default, fast)
+    # "two_pass" with GROUNDING_REVIEW=required: per span window, an unchecked
+    #   span-range draft, then a complete refinement (task "expand" ->
+    #   LLM_EXPAND_MODEL when set) that alone is reviewed and published.
+    # "two_pass" with GROUNDING_REVIEW=off: legacy unchecked skeleton +
+    #   per-concept expansion (quote evidence), marked unchecked.
     synthesis_mode: str = "single"
+
+    # ── Grounding review ────────────────────────────
+    # "required" (default): every generated unit of a new synthesis must pass a
+    # separate closed-schema support review before cache/state/notes success.
+    # "off": explicit UNCHECKED mode; receipts are marked unchecked and caches
+    # are incompatible with "required" (artifact versions differ).
+    grounding_review: str = "required"
+    review_batch_units: int = 16
 
     # ── Quality gates ───────────────────────────────
     concept_min_body_chars: int = 1200
@@ -174,6 +190,7 @@ class Config:
             "max_source_chars": (1, 100_000_000),
             "min_source_chars": (0, 100_000_000),
             "chunk_size": (1, 10_000_000),
+            "review_batch_units": (1, 200),
             "compile_concurrency": (1, 256),
             "request_min_interval_ms": (0, 3_600_000),
             "candidate_limit": (1, 1_000_000),
@@ -207,6 +224,9 @@ class Config:
             # The range comparison also rejects NaN and infinities.
             if type(value) not in (int, float) or not 0 <= value <= 1:
                 raise ValueError(f"{name.upper()} must be a finite number between 0 and 1")
+        # Fail closed: a typo must never silently disable the review gate.
+        if self.grounding_review not in ("required", "off"):
+            raise ValueError("GROUNDING_REVIEW must be 'required' or 'off'")
 
     # ── Path properties ──────────────────────────────
 
@@ -333,16 +353,39 @@ def _model_aliases(values: dict[str, str]) -> dict[str, str]:
     return values
 
 
+def _review_llm_values(env: dict[str, str]) -> dict:
+    """The reviewer selector shared by ordinary config and read-only preview."""
+    return {
+        "provider": env.get("LLM_PROVIDER", "ollama"),
+        "host": env.get("LLM_HOST", "http://localhost:11434"),
+        "model": env.get("LLM_MODEL", "gemma3:27b"),
+        "ingest_model": _optional_model_env("LLM_INGEST_MODEL", env),
+        "review_model": _optional_model_env("LLM_REVIEW_MODEL", env),
+    }
+
+
+def load_review_policy(env_file: str | None = None, **overrides: str):
+    """Read only review policy using ordinary precedence; no Config/provider creation.
+
+    This narrow view cannot certify the full synthesis/publication policy. It
+    contains no credentials, paths, writer state or values taken from a receipt.
+    """
+    from types import SimpleNamespace
+
+    env = _config_environment(env_file, overrides)
+    mode = env.get("GROUNDING_REVIEW", "required").strip().lower()
+    if mode not in ("required", "off"):
+        raise ValueError("GROUNDING_REVIEW must be 'required' or 'off'")
+    return SimpleNamespace(grounding_review=mode, llm=SimpleNamespace(**_review_llm_values(env)))
+
+
 def load_config(env_file: str | None = None, **overrides: str) -> Config:
     """Load deterministic configuration without mutating process environment."""
     env = _config_environment(env_file, overrides)
     get = env.get
 
     llm_config = LLMProviderConfig(
-        provider=get("LLM_PROVIDER", "ollama"),
-        host=get("LLM_HOST", "http://localhost:11434"),
-        model=get("LLM_MODEL", "gemma3:27b"),
-        ingest_model=_optional_model_env("LLM_INGEST_MODEL", env),
+        **_review_llm_values(env),
         maintenance_model=_optional_model_env("LLM_MAINTENANCE_MODEL", env),
         query_model=_optional_model_env("LLM_QUERY_MODEL", env),
         expand_model=_optional_model_env("LLM_EXPAND_MODEL", env),
@@ -370,6 +413,8 @@ def load_config(env_file: str | None = None, **overrides: str) -> Config:
         graph_monolith_threshold=_int_env("GRAPH_MONOLITH_THRESHOLD", 10_000, env),
         output_language=get("OUTPUT_LANGUAGE", ""),
         synthesis_mode=get("SYNTHESIS_MODE", "single"),
+        grounding_review=get("GROUNDING_REVIEW", "required").strip().lower(),
+        review_batch_units=_int_env("REVIEW_BATCH_UNITS", 16, env),
         concept_min_body_chars=_int_env("CONCEPT_MIN_BODY_CHARS", 1200, env),
         entry_min_body_chars=_int_env("ENTRY_MIN_BODY_CHARS", 500, env),
         clipping_min_body_chars=_int_env("CLIPPING_MIN_BODY_CHARS", 500, env),

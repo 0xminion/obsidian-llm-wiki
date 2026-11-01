@@ -11,6 +11,7 @@ from typer.testing import CliRunner
 from obsidian_llm_wiki.config import Config
 from obsidian_llm_wiki.core.models import SourceDoc
 from obsidian_llm_wiki.render.obsidian import render_source_page
+from tests.new.cli_text import unstyle
 
 
 def _invoke(monkeypatch, config, *args, extractor=None):
@@ -54,7 +55,7 @@ def test_edited_duplicate_target_does_not_discard_new_clipping(tmp_path, monkeyp
     assert new in target.read_text()
 
 
-def test_refresh_failure_and_review_protection_keep_last_good_source(tmp_path, monkeypatch):
+def test_refresh_refusal_and_acquisition_failure_preserve_last_good_source(tmp_path, monkeypatch):
     config = Config(vault_path=str(tmp_path))
     url = "https://example.test/protected"
     result = _invoke(
@@ -69,16 +70,27 @@ def test_refresh_failure_and_review_protection_keep_last_good_source(tmp_path, m
     target = config.sources_dir / "protected.md"
     original = target.read_bytes()
 
-    def unavailable(_url):
+    attempts = []
+
+    def unavailable(value):
+        attempts.append(value)
         raise RuntimeError("fixture unavailable")
 
     result = _invoke(
         monkeypatch, config, "--url", url, "--refresh", "--skip-synthesis", extractor=unavailable
     )
-    assert any(event.get("status") == "failed" for event in _events(result))
+    assert result.exit_code == 2 and "Refusing --refresh" in unstyle(result.output)
+    assert attempts == []
     assert target.read_bytes() == original
-    # The retry queue intentionally backs off this failed URL. Verify review
-    # protection independently on a second source with no pending retry lease.
+    # A supported new-source acquisition can still fail; it must not erase
+    # existing evidence or conceal the extraction error.
+    failed = _invoke(monkeypatch, config, "--url", "https://example.test/unavailable",
+                     "--skip-synthesis", extractor=unavailable)
+    assert failed.exit_code == 1
+    assert any(event.get("status") == "failed" for event in _events(failed))
+    assert attempts == ["https://example.test/unavailable"]
+    assert target.read_bytes() == original
+    # Reviewed human source protection remains independent of retry state.
     reviewed_url = "https://example.test/reviewed"
     result = _invoke(
         monkeypatch,
@@ -103,11 +115,11 @@ def test_refresh_failure_and_review_protection_keep_last_good_source(tmp_path, m
         "--skip-synthesis",
         extractor=lambda value: SourceDoc(title="Protected", content="Changed. " * 90, url=value),
     )
-    assert any("reviewed" in event.get("error", "") for event in _events(result))
+    assert result.exit_code == 2 and "Refusing --refresh" in unstyle(result.output)
     assert target.read_bytes() == reviewed
 
 
-def test_refresh_replaces_same_source_in_place_with_backup(tmp_path, monkeypatch):
+def test_refresh_refusal_preserves_original_and_allows_separate_revision(tmp_path, monkeypatch):
     config = Config(vault_path=str(tmp_path))
     url = "https://example.test/revised"
     old = "Version one evidence. " * 40
@@ -132,10 +144,20 @@ def test_refresh_replaces_same_source_in_place_with_backup(tmp_path, monkeypatch
         "--skip-synthesis",
         extractor=lambda value: SourceDoc(title="Revised title", content=new, url=value),
     )
-    assert result.exit_code == 0, result.output
-    assert new.strip() in target.read_text()
+    assert result.exit_code == 2 and "Refusing --refresh" in unstyle(result.output)
+    assert target.read_bytes() == original
     assert list(config.sources_dir.glob("*.md")) == [target]
-    assert any(p.read_bytes() == original for p in (config.llmwiki_dir / "backups").rglob("*.bak"))
+    # The supported alternative is a separate reviewed input, not replacement
+    # of the original source (which may carry human edits).
+    config.clippings_dir.mkdir()
+    revision = config.clippings_dir / "reviewed-revision.md"
+    revision.write_text(f"---\ntitle: Revised title\n---\n{new}")
+    revision_bytes = revision.read_bytes()
+    added = _invoke(monkeypatch, config, "--skip-synthesis")
+    assert added.exit_code == 0, added.output
+    assert target.read_bytes() == original and revision.read_bytes() == revision_bytes
+    assert any(new.strip() in p.read_text() for p in config.sources_dir.glob("*.md"))
+    assert len(list(config.sources_dir.glob("*.md"))) == 2
 
 
 def test_podcast_preview_does_not_write_transcript_cache(tmp_path, monkeypatch):
@@ -152,7 +174,8 @@ def test_podcast_preview_does_not_write_transcript_cache(tmp_path, monkeypatch):
         monkeypatch,
         config,
         "--url",
-        "https://example.test/episode",
+        # Explicit episode route under the strengthened inline admission contract.
+        "https://example.test/episodes/42",
         "--preview",
         extractor=podcast._extract_podcast,
     )
@@ -265,7 +288,7 @@ def test_bad_inbox_encoding_does_not_abort_valid_planned_urls(tmp_path, monkeypa
     assert not config.llmwiki_dir.exists()
 
 
-def test_refresh_tracks_original_request_across_changed_redirects(tmp_path, monkeypatch):
+def test_refresh_preview_tracks_request_without_replacing_original(tmp_path, monkeypatch):
     from obsidian_llm_wiki.ingest.provenance import stamp_source
 
     config = Config(vault_path=str(tmp_path))
@@ -300,13 +323,26 @@ def test_refresh_tracks_original_request_across_changed_redirects(tmp_path, monk
         "--skip-synthesis",
         extractor=lambda _url: revision(2),
     )
-    assert result.exit_code == 0, result.output
+    assert result.exit_code == 2 and "Refusing --refresh" in unstyle(result.output)
     pages = list(config.sources_dir.glob("*.md"))
     assert len(pages) == 1
-    assert "Revision 2." in pages[0].read_text()
+    before = pages[0].read_bytes()
+    assert "Revision 1." in pages[0].read_text()
+    assert "Revision 2." not in pages[0].read_text()
+    seen = []
+
+    def preview_revision(value):
+        seen.append(value)
+        return revision(2)
+
+    preview = _invoke(monkeypatch, config, "--url", requested, "--refresh", "--preview",
+                      extractor=preview_revision)
+    assert preview.exit_code == 0, preview.output
+    assert seen == [requested]  # original request, not its old redirect target
+    assert pages[0].read_bytes() == before
 
 
-def test_refreshed_shared_page_does_not_keep_stale_url_alias(tmp_path, monkeypatch):
+def test_refused_refresh_preserves_shared_source_and_valid_url_alias(tmp_path, monkeypatch):
     config = Config(vault_path=str(tmp_path))
     first = "https://example.test/first"
     alias = "https://example.test/alias"
@@ -331,14 +367,21 @@ def test_refreshed_shared_page_does_not_keep_stale_url_alias(tmp_path, monkeypat
         "--skip-synthesis",
         extractor=lambda value: SourceDoc(title="Shared", content=new, url=value),
     )
-    assert result.exit_code == 0, result.output
+    assert result.exit_code == 2 and "Refusing --refresh" in unstyle(result.output)
+    preserved = {p.name: p.read_bytes() for p in config.sources_dir.glob("*.md")}
+
+    def must_not_extract(_value):
+        raise AssertionError("unchanged URL alias must remain indexed")
+
     result = _invoke(
         monkeypatch,
         config,
         "--url",
         alias,
         "--skip-synthesis",
-        extractor=lambda value: SourceDoc(title="Alias", content=old, url=value),
+        extractor=must_not_extract,
     )
     assert result.exit_code == 0, result.output
     assert any(old in path.read_text() for path in config.sources_dir.glob("*.md"))
+    assert not any(new in path.read_text() for path in config.sources_dir.glob("*.md"))
+    assert preserved == {p.name: p.read_bytes() for p in config.sources_dir.glob("*.md")}

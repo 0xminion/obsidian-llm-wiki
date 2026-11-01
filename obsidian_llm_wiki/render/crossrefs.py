@@ -7,6 +7,7 @@ relationship graphs as ASCII flow diagrams inside markdown code blocks.
 from __future__ import annotations
 
 from obsidian_llm_wiki.core.models import ConceptNote
+from obsidian_llm_wiki.render.links import generated_link
 
 __all__ = [
     "build_cross_ref_diagram",
@@ -75,7 +76,9 @@ def build_cross_links(
         if target:
             descriptor = link.relation or "related"
             display = link.display or target.title
-            cross_link_lines.append(f"- [[{link.slug}|{display}]] ({descriptor})")
+            cross_link_lines.append(
+                f"- {generated_link('concepts', link.slug, display)} ({descriptor})"
+            )
     return cross_link_lines
 
 
@@ -150,7 +153,7 @@ def build_moc_cross_links(
             target = all_concepts.get(link.slug)
             descriptor = link.relation or "related"
             display = link.display or (target.title if target else link.slug)
-            cross_links.append(f"- [[{link.slug}|{display}]] ({descriptor})")
+            cross_links.append(f"- {generated_link('concepts', link.slug, display)} ({descriptor})")
 
     return cross_links
 

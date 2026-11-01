@@ -82,6 +82,13 @@ def _is_usable_twitter_source(source: SourceDoc | None) -> bool:
     """Reject X login chrome and URL-derived titles before persistence."""
     if source is None or _is_bad_twitter_title(source.title):
         return False
+    from obsidian_llm_wiki.ingest.extractors import _is_x_article_preview
+
+    # A legitimate short post is allowed, but an article card is not the
+    # linked long-form article. The outer specialist gate only annotates
+    # short content, so this rejection must occur before candidate selection.
+    if _is_x_article_preview(source.content or ""):
+        return False
     content = (source.content or "").lower()
     if any(marker.lower() in content for marker in _STUB_MARKERS):
         return False
@@ -118,6 +125,11 @@ def extract_twitter(raw_url: str) -> SourceDoc:
         if not _is_usable_twitter_source(source):
             errors.append(f"{extractor}: rejected too short, likely stub")
             return
+        from obsidian_llm_wiki.ingest.provenance import stamp_source
+
+        source.provenance = stamp_source(
+            source, requested_url=raw_url, extractor=extractor,
+        ).provenance
         candidates.append(source)
 
     # ── Primary: Defuddle CLI (local) ─────────────────────────────────
@@ -191,24 +203,13 @@ def _extract_via_defuddle_md(url: str) -> SourceDoc | None:
         logger.debug("defuddle.md returned JS stub/error for %s — skipping", url)
         return None
 
-    # Parse frontmatter (defuddle.md returns YAML frontmatter + markdown body)
-    title = ""
-    content = text
+    # Use the same safe, line-delimited YAML parser as generic web output.
+    # A literal '---' inside a quoted title is not a closing delimiter.
+    from obsidian_llm_wiki.render.frontmatter import parse_frontmatter
 
-    if text.startswith("---"):
-        fm_end = text.find("---", 3)
-        if fm_end > 0:
-            fm_text = text[3:fm_end].strip()
-            content = text[fm_end + 3:].strip()
-
-            # Parse YAML frontmatter manually (avoid yaml dependency)
-            for line in fm_text.split("\n"):
-                if line.startswith("title:"):
-                    title = line[6:].strip().strip('"').strip("'")
-                elif line.startswith("author:"):
-                    pass  # Author available but not needed in SourceDoc
-                elif line.startswith("word_count:"):
-                    pass  # Available but not needed
+    metadata, content = parse_frontmatter(text.replace("\r\n", "\n"))
+    raw_title = metadata.get("title", "")
+    title = raw_title.strip() if isinstance(raw_title, str) else ""
 
     if not title:
         # Try first # heading
@@ -226,7 +227,16 @@ def _extract_via_defuddle_md(url: str) -> SourceDoc | None:
     if not content or len(content.strip()) < 50:
         return None
 
-    source = SourceDoc(title=title, content=content.strip(), url=url)
+    from obsidian_llm_wiki.ingest.provenance import stamp_source
+
+    source = stamp_source(
+        SourceDoc(title=title, content=content.strip(), url=url),
+        requested_url=url,
+        resolved_url=str(resp.url),
+        extracted_url=str(resp.url),
+        extractor="defuddle_md",
+        document_format="markdown",
+    )
     return source if _is_usable_twitter_source(source) else None
 
 

@@ -175,8 +175,16 @@ def test_archive_inbox_url_files_moves_only_confirmed_records(tmp_path: Path):
     queued = inbox / "article.url"
     queued.write_text("https://example.com/article\n", encoding="utf-8")
 
+    pending = inbox / "pending.url"
+    pending.write_text("https://example.com/pending\n", encoding="utf-8")
+    before = {p.name: (p.read_bytes(), p.stat().st_ino, p.stat().st_mtime_ns)
+              for p in (queued, pending)}
+
     archived = _archive_inbox_url_files([queued], _make_config(tmp_path))
 
-    assert not queued.exists()
-    assert archived == [inbox / "processed" / "article.url"]
-    assert archived[0].read_text(encoding="utf-8") == "https://example.com/article\n"
+    # Immutable-mode intake records completion in operational state; the
+    # compatibility archive entrypoint must not move human inbox files.
+    assert archived == []
+    assert not (inbox / "processed").exists()
+    assert before == {p.name: (p.read_bytes(), p.stat().st_ino, p.stat().st_mtime_ns)
+                      for p in (queued, pending)}

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from copy import deepcopy
 from unittest import mock
 
 import pytest
@@ -19,6 +20,16 @@ from obsidian_llm_wiki.core.models import (
     SourceDoc,
     SourceSynthesis,
     SynthesisBundle,
+)
+from tests.new.grounding_doubles import legacy_fixture_llm, reviewed
+from tests.new.immutable_lifecycle_helpers import assert_input_hash
+from tests.new.immutable_semantic_helpers import (
+    assert_preserved,
+    file_state,
+    generated_link,
+    published_meta,
+    published_registry,
+    published_root,
 )
 
 _BODY = "A meaningful body sentence. " * 30
@@ -530,7 +541,7 @@ def test_recompile_strips_frontmatter_and_matches_build_hash(tmp_path, monkeypat
     # The stored hash must equal what the build path would compute.
     from obsidian_llm_wiki.config import load_config
     config = load_config(env_file=None, VAULT_PATH=str(tmp_path))
-    state = read_state(config.state_file)
+    state = read_state(published_meta(config) / "state.json")
     build_doc = load_source_file(sources_dir / "article.md")
     assert state.sources["article.md"].hash == hash_content(build_doc.content)
 
@@ -539,7 +550,6 @@ def test_recompile_updates_the_authoritative_registry(tmp_path, monkeypatch):
     """A v2 recompile must not update only the ignored portable JSON cache."""
     from obsidian_llm_wiki.config import Config
     from obsidian_llm_wiki.core import pipeline as pl
-    from obsidian_llm_wiki.core.registry import VaultRegistry
 
     sources_dir = tmp_path / "04-Wiki" / "sources"
     sources_dir.mkdir(parents=True)
@@ -562,7 +572,7 @@ def test_recompile_updates_the_authoritative_registry(tmp_path, monkeypatch):
     config = Config(vault_path=str(tmp_path))
     result = asyncio.run(pl.recompile_single_source(tmp_path, "article.md", config))
 
-    with VaultRegistry(config.llmwiki_dir) as registry:
+    with published_registry(config) as registry:
         loaded = registry.load_synthesis("article.md")
 
     assert result.compiled == 1
@@ -575,33 +585,36 @@ def test_incremental_semantic_remap_persists_for_unchanged_sources(
     tmp_path,
     monkeypatch,
 ):
-    """SQLite and the portable cache must not diverge after corpus dedup."""
+    """A source-local slug remap must persist without changing entity or revision.
+
+    The normalization double renames one bound entity, not an unassessed merge
+    of two subjects. Both the registry and portable cache must consume the plan.
+    """
     from obsidian_llm_wiki.config import Config
     from obsidian_llm_wiki.core import pipeline as pl
     from obsidian_llm_wiki.core.registry import VaultRegistry
 
     async def fake_retry(_config, filename, source, *_args, **_kwargs):
-        slug = "victim" if filename == "a.md" else "survivor"
-        return SourceSynthesis(
+        slug = "victim" if filename == "a.md" else "new-concept"
+        return reviewed(SourceSynthesis(
             source_title=source.title,
             source_summary="summary",
             source_file=filename,
             concepts=[_concept(slug)],
-        )
+        ), source, filename, _config)
 
     def fake_dedup(bundle, **_kwargs):
         slugs = {concept.slug for concept in bundle.concepts}
-        if {"victim", "survivor"} <= slugs:
-            survivor = next(
-                concept for concept in bundle.concepts if concept.slug == "survivor"
-            )
-            bundle.concepts = [survivor]
+        if {"victim", "new-concept"} <= slugs:
+            # Keep reviewed title/body/ID and source-local provenance intact.
+            for concept in bundle.concepts:
+                if concept.slug == "victim":
+                    concept.slug = "survivor"
             for source_synthesis in bundle.sources:
                 if source_synthesis.source_file == "a.md":
-                    source_synthesis.concepts = [survivor]
+                    source_synthesis.concepts[0].slug = "survivor"
 
     monkeypatch.setattr(pl, "_synthesize_with_retry", fake_retry)
-    monkeypatch.setattr(pl, "render_vault", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(
         "obsidian_llm_wiki.synth.dedupe.semantic_dedupe_concepts",
         fake_dedup,
@@ -630,9 +643,13 @@ def test_incremental_semantic_remap_persists_for_unchanged_sources(
         "---\ntype: Source\ntitle: Source B\n---\n\n# Source B\n\n" + "body " * 100,
         encoding="utf-8",
     )
-    with VaultRegistry(config.llmwiki_dir) as registry:
-        incremental = source_loader.load_sources_incremental(config.sources_dir, registry)
-    assert incremental.sources["a.md"].content == ""
+    from obsidian_llm_wiki.core.application import source_inventory
+
+    previous = published_root(config)
+    before = file_state(previous)
+    incremental = source_inventory(config)
+    # Immutable public inventory always reads human inputs; cached synthesis is still reused.
+    assert incremental.sources["a.md"].content == initial.sources["a.md"].content
     asyncio.run(
         pl.run_pipeline(
             tmp_path,
@@ -643,7 +660,7 @@ def test_incremental_semantic_remap_persists_for_unchanged_sources(
         )
     )
 
-    with VaultRegistry(config.llmwiki_dir) as registry:
+    with published_registry(config) as registry:
         persisted = registry.load_synthesis("a.md")
         persisted_hash = registry.connection.execute(
             "SELECT content_hash FROM source WHERE filename='a.md'"
@@ -654,6 +671,15 @@ def test_incremental_semantic_remap_persists_for_unchanged_sources(
     assert loaded_a is not None
     assert [concept.slug for concept in persisted.concepts] == ["survivor"]
     assert persisted_hash == pl.hash_content(loaded_a.content)
+    from obsidian_llm_wiki.core.cache import load_synthesis
+    from obsidian_llm_wiki.core.models import source_synthesis_to_dict
+    from obsidian_llm_wiki.core.state import read_state
+
+    assert source_synthesis_to_dict(persisted) == source_synthesis_to_dict(
+        load_synthesis(published_meta(config), "a.md"),
+    )
+    assert read_state(published_meta(config) / "state.json").sources["a.md"].hash == persisted_hash
+    assert_preserved(previous, before)
 
 
 def test_late_render_failure_preserves_deleted_source_registry_and_cache(
@@ -663,7 +689,6 @@ def test_late_render_failure_preserves_deleted_source_registry_and_cache(
     from obsidian_llm_wiki.config import Config
     from obsidian_llm_wiki.core import pipeline as pl
     from obsidian_llm_wiki.core.cache import synthesis_cache_path
-    from obsidian_llm_wiki.core.registry import VaultRegistry
 
     async def fake_retry(_config, filename, source, *_args, **_kwargs):
         return SourceSynthesis(
@@ -676,11 +701,12 @@ def test_late_render_failure_preserves_deleted_source_registry_and_cache(
     config = Config(vault_path=str(tmp_path), embeddings_enabled=False)
     source = SourceDoc("Source", "body " * 100, source_file="source.md")
     monkeypatch.setattr(pl, "_synthesize_with_retry", fake_retry)
-    monkeypatch.setattr(pl, "render_vault", lambda *_args, **_kwargs: [])
     asyncio.run(pl.run_pipeline(tmp_path, {"source.md": source}, config))
 
-    cache_path = synthesis_cache_path(config.llmwiki_dir, "source.md")
+    cache_path = synthesis_cache_path(published_meta(config), "source.md")
     assert cache_path.is_file()
+    previous = published_root(config)
+    before = file_state(previous)
 
     def fail_render(*_args, **_kwargs):
         raise RuntimeError("late render failure")
@@ -689,9 +715,11 @@ def test_late_render_failure_preserves_deleted_source_registry_and_cache(
     with pytest.raises(RuntimeError, match="late render failure"):
         asyncio.run(pl.run_pipeline(tmp_path, {}, config))
 
-    with VaultRegistry(config.llmwiki_dir) as registry:
+    with published_registry(config) as registry:
         assert registry.load_synthesis("source.md") is not None
     assert cache_path.is_file()
+    assert published_root(config) == previous
+    assert_preserved(previous, before)
 
 
 def test_recorded_signature_matches_the_bytes_that_were_synthesized(
@@ -714,39 +742,198 @@ def test_recorded_signature_matches_the_bytes_that_were_synthesized(
     with VaultRegistry(config.llmwiki_dir) as registry:
         initial = source_loader.load_sources_incremental(config.sources_dir, registry)
 
+    attempted_contents = []
+
     async def fake_retry(_config, filename, source, *_args, **_kwargs):
-        assert "original" in source.content
-        source_path.write_text(
-            "---\ntype: Source\ntitle: Source\n---\n\n# Source\n\n" + "edited " * 120,
-            encoding="utf-8",
-        )
-        return SourceSynthesis(
+        attempted_contents.append(source.content)
+        if len(attempted_contents) == 1:
+            assert "original" in source.content
+            source_path.write_text(
+                "---\ntype: Source\ntitle: Source\n---\n\n# Source\n\n" + "edited " * 120,
+                encoding="utf-8",
+            )
+        else:
+            assert "edited" in source.content and "original" not in source.content
+        return reviewed(SourceSynthesis(
             source_title=source.title,
             source_summary="summary",
             source_file=filename,
             concepts=[_concept("source-concept")],
-        )
+        ), source, filename, _config)
 
     monkeypatch.setattr(pl, "_synthesize_with_retry", fake_retry)
-    monkeypatch.setattr(pl, "render_vault", lambda *_args, **_kwargs: [])
-    asyncio.run(
-        pl.run_pipeline(
-            tmp_path,
-            initial.sources,
-            config,
-            unchanged_filenames=initial.unchanged_filenames,
-            source_file_signatures=initial.signatures,
+    # The complete-plan fence now rejects drift before publication rather than
+    # reporting success for superseded bytes. Rediscovery/retry remains required.
+    with pytest.raises(RuntimeError, match="source or policy changed before publication; retry"):
+        asyncio.run(
+            pl.run_pipeline(
+                tmp_path,
+                initial.sources,
+                config,
+                unchanged_filenames=initial.unchanged_filenames,
+                source_file_signatures=initial.signatures,
+            )
         )
-    )
 
     with VaultRegistry(config.llmwiki_dir) as registry:
+        assert registry.load_synthesis("source.md") is None
         next_run = source_loader.load_sources_incremental(config.sources_dir, registry)
 
     assert "source.md" not in next_run.unchanged_filenames
     assert "edited" in next_run.sources["source.md"].content
+    assert not (config.concepts_dir / "source-concept.md").exists()
+    retried = asyncio.run(pl.run_pipeline(
+        tmp_path, next_run.sources, config,
+        unchanged_filenames=next_run.unchanged_filenames,
+        source_file_signatures=next_run.signatures,
+    ))
+    assert retried.compiled == 1 and not retried.errors
+    raw = source_path.read_bytes()
+    assert_input_hash(config, "source.md", raw)
+    with published_registry(config) as registry:
+        # Public inventories use exact raw hashes, not legacy stat shortcuts.
+        assert registry.source_file_states() == {}
+        assert registry.connection.execute(
+            "SELECT content_hash FROM source WHERE filename='source.md'",
+        ).fetchone()[0] == pl.hash_content(next_run.sources["source.md"].content)
+    assert len(attempted_contents) == 2
 
 
 def test_one_changed_source_reads_and_synthesizes_only_that_markdown(
+    tmp_path, monkeypatch, record_property,
+):
+    """Public full-input capture is separate from dependency-local model work.
+
+    The immutable contract intentionally replaces the old stat-stub hot path:
+    read every human body, capture/validate every input in a fresh workspace,
+    but synthesize only the changed source. The exact legacy one-read bound
+    remains exercised in test_legacy_workspace_keeps_one_changed_source_read_bound.
+    """
+    from pathlib import Path
+
+    from obsidian_llm_wiki.config import Config
+    from obsidian_llm_wiki.core import pipeline as pl
+    from obsidian_llm_wiki.core.application import source_inventory
+    from obsidian_llm_wiki.ingest import sources as source_loader
+
+    config = Config(vault_path=str(tmp_path), embeddings_enabled=False)
+    config.sources_dir.mkdir(parents=True)
+    for name, title in (("a.md", "Source A"), ("b.md", "Source B")):
+        (config.sources_dir / name).write_text(
+            f"---\ntype: Source\ntitle: {title}\n---\n\n# {title}\n\n" + "body " * 100,
+        )
+    calls = []
+
+    async def synthesize(cfg, name, source, *_args, **_kwargs):
+        calls.append(name)
+        return reviewed(SourceSynthesis(
+            source_title=source.title, source_summary="summary", source_file=name,
+            concepts=[_concept(f"concept-{name[0]}")],
+        ), source, name, cfg)
+
+    monkeypatch.setattr(pl, "_synthesize_with_retry", synthesize)
+    monkeypatch.setattr("obsidian_llm_wiki.providers.llm.acall_llm", legacy_fixture_llm(""))
+    real_load = source_loader.load_source_file
+    loads = []
+    raw_reads = []
+    parse_reads = []
+    parsing = []
+    real_read_bytes = Path.read_bytes
+
+    def counted_load(path):
+        kind = "human" if path.parent == config.sources_dir else "captured"
+        loads.append((kind, path.name))
+        parsing.append(path)
+        try:
+            return real_load(path)
+        finally:
+            parsing.pop()
+
+    def counted_bytes(path):
+        data = real_read_bytes(path)
+        if path.parent == config.sources_dir:
+            # Exact decoding now uses read_bytes instead of read_text. Keep
+            # parser I/O separate so the original four-fence/copy bound stays.
+            target = parse_reads if path in parsing else raw_reads
+            target.append((path.name, len(data)))
+        return data
+
+    monkeypatch.setattr(source_loader, "load_source_file", counted_load)
+    monkeypatch.setattr(Path, "read_bytes", counted_bytes)
+
+    def build():
+        loaded = source_inventory(config)
+        result = asyncio.run(pl.run_pipeline(
+            tmp_path, loaded.sources, config,
+            unchanged_filenames=loaded.unchanged_filenames,
+            source_file_signatures=loaded.signatures,
+        ))
+        assert not result.errors
+        return loaded, result
+
+    _, initial = build()
+    assert initial.compiled == 2 and calls == ["a.md", "b.md"]
+    assert loads == [("human", "a.md"), ("human", "b.md"),
+                     ("captured", "a.md"), ("captured", "b.md")]
+    previous = published_root(config)
+    before = file_state(previous)
+    (config.sources_dir / "b.md").write_text(
+        "---\ntype: Source\ntitle: Source B\n---\n\n" + "changed " * 100,
+    )
+    human_before = file_state(config.sources_dir)
+    calls.clear()
+    loads.clear()
+    raw_reads.clear()
+    parse_reads.clear()
+    loaded, changed = build()
+    # Two full human parses + two private captured-input validation parses.
+    assert loads == [("human", "a.md"), ("human", "b.md"),
+                     ("captured", "a.md"), ("captured", "b.md")]
+    # Three input hash fences plus the copy into source-inputs, exactly once each.
+    assert [name for name, _ in raw_reads] == ["a.md", "b.md"] * 4
+    assert [name for name, _ in parse_reads] == ["a.md", "b.md"]
+    record_property("changed_public_body_parses", json.dumps(loads))
+    record_property("changed_public_parse_read_bytes", json.dumps(parse_reads))
+    record_property("changed_public_raw_read_bytes", json.dumps(raw_reads))
+    assert calls == ["b.md"] and changed.compiled == 1 and changed.skipped == 1
+    assert loaded.unchanged_filenames == set()  # never trust human mtime/size as content
+    assert all(doc.content for doc in loaded.sources.values())
+    assert_preserved(config.sources_dir, human_before)
+    assert_preserved(previous, before)
+    for name in ("a.md", "b.md"):
+        assert_input_hash(config, name, (config.sources_dir / name).read_bytes())
+    with published_registry(config) as registry:
+        assert registry.source_content_hashes() == {
+            name: pl.hash_content(doc.content) for name, doc in loaded.sources.items()
+        }
+
+    source_a = config.sources_dir / "a.md"
+    source_a.write_text(source_a.read_text().replace(
+        "type: Source", "type: Source\ntags:\n  - reviewed-source",
+    ))
+    calls.clear()
+    metadata, result = build()
+    assert result.compiled == 0 and calls == []
+    assert metadata.sources["a.md"].tags == ["reviewed-source"]
+    assert_input_hash(config, "a.md", source_a.read_bytes())
+    previous = published_root(config)
+    before = file_state(previous)
+    loads.clear()
+    raw_reads.clear()
+    parse_reads.clear()
+    _, noop = build()
+    assert noop.compiled == 0 and noop.skipped == 2 and calls == []
+    assert loads == [("human", "a.md"), ("human", "b.md")]
+    assert [name for name, _ in raw_reads] == ["a.md", "b.md"]
+    assert [name for name, _ in parse_reads] == ["a.md", "b.md"]
+    record_property("noop_public_parse_read_bytes", json.dumps(parse_reads))
+    record_property("noop_public_body_parses", json.dumps(loads))
+    record_property("noop_public_raw_read_bytes", json.dumps(raw_reads))
+    assert published_root(config) == previous
+    assert_preserved(previous, before)
+
+
+def test_legacy_workspace_keeps_one_changed_source_read_bound(
     tmp_path,
     monkeypatch,
 ):
@@ -770,18 +957,19 @@ def test_one_changed_source_reads_and_synthesizes_only_that_markdown(
 
     async def fake_retry(_config, filename, source, *_args, **_kwargs):
         synthesis_calls.append(filename)
-        return SourceSynthesis(
+        return reviewed(SourceSynthesis(
             source_title=source.title,
             source_summary="summary",
             source_file=filename,
             concepts=[_concept(f"concept-{filename[0]}")],
-        )
+        ), source, filename, _config)
 
     monkeypatch.setattr(pl, "_synthesize_with_retry", fake_retry)
+    monkeypatch.setattr("obsidian_llm_wiki.providers.llm.acall_llm", legacy_fixture_llm(""))
     with VaultRegistry(config.llmwiki_dir) as registry:
         initial = source_loader.load_sources_incremental(config.sources_dir, registry)
     asyncio.run(
-        pl.run_pipeline(
+        pl._run_pipeline_workspace(
             tmp_path,
             initial.sources,
             config,
@@ -819,7 +1007,7 @@ def test_one_changed_source_reads_and_synthesizes_only_that_markdown(
 
     synthesis_calls.clear()
     asyncio.run(
-        pl.run_pipeline(
+        pl._run_pipeline_workspace(
             tmp_path,
             incremental.sources,
             config,
@@ -848,7 +1036,7 @@ def test_one_changed_source_reads_and_synthesizes_only_that_markdown(
         )
     synthesis_calls.clear()
     asyncio.run(
-        pl.run_pipeline(
+        pl._run_pipeline_workspace(
             tmp_path,
             metadata_only_change.sources,
             config,
@@ -913,27 +1101,33 @@ def test_pipeline_records_and_reuses_cross_lingual_embedding_links(tmp_path, mon
         title="Language models", slug="language-models", summary="", concept_slugs=[english.slug],
     )
 
+    model_calls = []
+
     async def fake_retry(_config, filename, _source, _existing, *_args, **_kwargs):
-        return SourceSynthesis(
+        model_calls.append(("synthesis", filename))
+        return reviewed(SourceSynthesis(
             source_title="Bilingual source",
             source_summary="",
             source_file=filename,
-            concepts=[english, chinese],
-            maps=[moc],
-        )
+            concepts=[deepcopy(english), deepcopy(chinese)],
+            maps=[deepcopy(moc)],
+        ), _source, filename, _config)
 
     captured: dict = {}
+
+    real_render = pl.render_vault
 
     def fake_render(_dir, _bundle, _sources, **kwargs):
         captured["cross_lingual_links"] = kwargs["cross_lingual_links"]
         captured["bundle_slugs"] = [concept.slug for concept in _bundle.concepts]
-        return []
+        return real_render(_dir, _bundle, _sources, **kwargs)
 
     links: dict[str, list[tuple[str, float, str]]] = {}
     monkeypatch.setattr(pl, "_synthesize_with_retry", fake_retry)
     monkeypatch.setattr(pl, "render_vault", fake_render)
 
     def fake_embed_batch(texts, **_kwargs):
+        model_calls.append(("embedding", tuple(texts)))
         return [
             [0.0, 1.0] if "大语言模型" in text else [1.0, 0.0]
             for text in texts
@@ -943,10 +1137,11 @@ def test_pipeline_records_and_reuses_cross_lingual_embedding_links(tmp_path, mon
         "obsidian_llm_wiki.synth.embedding.embed_batch",
         fake_embed_batch,
     )
-    monkeypatch.setattr(
-        "obsidian_llm_wiki.synth.embedding.embed_text",
-        lambda _text, **_kwargs: [1.0, 0.0],
-    )
+    def fake_embed_text(text, **_kwargs):
+        model_calls.append(("embedding", text))
+        return [1.0, 0.0]
+
+    monkeypatch.setattr("obsidian_llm_wiki.synth.embedding.embed_text", fake_embed_text)
     def fake_cross_lingual(concepts, **kwargs):
         captured["comparison_slugs"] = set(kwargs["comparison_slugs"])
         if not kwargs["comparison_slugs"]:
@@ -986,40 +1181,72 @@ def test_pipeline_records_and_reuses_cross_lingual_embedding_links(tmp_path, mon
     assert metrics_data is not None
     assert metrics_data["rendering"]["cross_lingual_links"] == 1
 
+    def assert_links():
+        # Embedding similarity is a persisted proposal, not permission to
+        # merge identity or invent reviewed relationships/MoC membership.
+        for slug, edges in links.items():
+            page = (published_root(config) / "concepts" / (slug + ".md")).read_text()
+            for target, _score, title in edges:
+                assert generated_link(config, "concepts", target, title) not in page
+        moc_page = (published_root(config) / "mocs/language-models.md").read_text()
+        assert generated_link(config, "concepts", english.slug) in moc_page
+        assert generated_link(config, "concepts", chinese.slug) not in moc_page
+        with published_registry(config) as registry:
+            bilingual = registry.load_synthesis("bilingual.md")
+            assert {c.title for c in bilingual.concepts} == {english.title, chinese.title}
+            assert len({c.canonical_id for c in bilingual.concepts}) == 2
+            persisted = sorted(tuple(row) for row in registry.connection.execute(
+                "SELECT source_slug, target_slug, score, display FROM cross_lingual_link",
+            ))
+        assert persisted == sorted(
+            (slug, target, score, title) for slug, edges in links.items()
+            for target, score, title in edges
+        )
+
+    assert_links()
+    calls_before = list(model_calls)
+    previous = published_root(config)
+    before = file_state(previous)
     captured.clear()
     second = asyncio.run(
         pl.run_pipeline(tmp_path, {"bilingual.md": source}, config)
     )
     assert second.compiled == 0
+    assert captured == {}, "a genuine no-op must not re-embed or re-render"
+    assert model_calls == calls_before
+    assert_links()
+    assert published_root(config) == previous
+    assert_preserved(previous, before)
+    refreshed = asyncio.run(pl.run_pipeline(
+        tmp_path, {"bilingual.md": source}, config, refresh_render=True,
+    ))
+    assert refreshed.compiled == 0 and not refreshed.errors
     assert captured["cross_lingual_links"] == links
+    assert model_calls == calls_before, "refresh reuses cached vectors and synthesis"
+    assert_links()
+    assert_preserved(previous, before)
 
 
 def test_pipeline_embedding_metric_uses_pruned_cache_count(tmp_path, monkeypatch):
-    """A dedup victim must not inflate the final embedding metric."""
+    """An obsolete cached vector must not inflate the final embedding metric."""
     from obsidian_llm_wiki.config import Config
     from obsidian_llm_wiki.core import pipeline as pl
     from obsidian_llm_wiki.core.metrics import MetricsCollector
 
     survivor = _concept("survivor")
-    victim = _concept("victim")
-
     async def fake_retry(_config, filename, _source, _existing, *_args, **_kwargs):
-        return SourceSynthesis(
+        return reviewed(SourceSynthesis(
             source_title="Source",
             source_summary="",
             source_file=filename,
-            concepts=[survivor, victim],
-        )
-
-    def fake_dedup(bundle, **_kwargs):
-        bundle.concepts = [survivor]
+            concepts=[deepcopy(survivor)],
+        ), _source, filename, _config)
 
     persisted: dict[str, list[float]] = {}
     metrics: dict[str, int] = {}
     monkeypatch.setattr(pl, "_synthesize_with_retry", fake_retry)
-    monkeypatch.setattr(pl, "render_vault", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(
-        "obsidian_llm_wiki.synth.dedupe.semantic_dedupe_concepts", fake_dedup,
+        "obsidian_llm_wiki.synth.embedding.embed_text", lambda *_a, **_k: [1.0, 0.0],
     )
     monkeypatch.setattr(
         "obsidian_llm_wiki.synth.embedding.load_embeddings_cache",

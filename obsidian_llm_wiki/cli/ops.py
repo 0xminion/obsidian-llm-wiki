@@ -30,7 +30,11 @@ def metrics(
 
     from obsidian_llm_wiki.core.metrics import print_metrics_summary
 
-    print_metrics_summary(vault_path)
+    try:
+        print_metrics_summary(vault_path)
+    except (OSError, ValueError, RuntimeError) as exc:
+        typer.echo(f"Metrics refused: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
 
 
 @app.command()
@@ -41,7 +45,7 @@ def recompile(
     """Manually retry a single failed source file.
 
     Loads the source from sources/, retries synthesis of the complete input,
-    and caches the result. Run build afterwards to render the updated cache.
+    and publishes a complete new immutable generation, retaining all old ones.
 
     Examples:
         olw recompile ~/MyVault my-article.md

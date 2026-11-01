@@ -29,6 +29,7 @@ from collections.abc import Mapping, Sequence
 from copy import deepcopy
 
 from obsidian_llm_wiki.core.models import (
+    Claim,
     ConceptNote,
     MapOfContent,
     SourceSynthesis,
@@ -159,33 +160,116 @@ def merge_concepts(concepts: list[ConceptNote]) -> list[ConceptNote]:
 # ── Bundle merging ──────────────────────────────────────────────────────
 
 
+def _join_summary_paragraphs(*texts: str) -> str:
+    from obsidian_llm_wiki.synth.review import summary_paragraphs
+
+    paragraphs: list[str] = []
+    for text in texts:
+        for paragraph in summary_paragraphs(text):
+            if paragraph not in paragraphs:
+                paragraphs.append(paragraph)
+    return "\n\n".join(paragraphs)
+
+
+def _published_claim_identity(claim: Claim) -> tuple:
+    evidence = claim.evidence
+    from obsidian_llm_wiki.core.models import EvidenceFragments, evidence_identity
+
+    if isinstance(evidence, EvidenceFragments):
+        return (claim.text, claim.source_ref, "fragments", evidence_identity(evidence))
+    return (
+        claim.text, claim.source_ref,
+        getattr(evidence, "source_file", ""), getattr(evidence, "start_offset", None),
+        getattr(evidence, "end_offset", None), tuple(getattr(evidence, "span_ids", ()) or ()),
+        getattr(evidence, "quote", ""),
+    )
+
+
+def _merge_published_concept(existing: ConceptNote, concept: ConceptNote) -> None:
+    """Merge another source's contribution without dropping any reviewed item.
+
+    Every contributor's title survives (as an alias when it differs), every
+    summary paragraph, section, claim (with its own evidence) and typed
+    relation is kept; only exact duplicates are removed. Whether a contributor
+    may be published under the surviving title at all is decided by the
+    publication plan (:mod:`obsidian_llm_wiki.synth.publication`).
+    """
+    from obsidian_llm_wiki.core.entity_identity import label_key
+
+    aliases = list(existing.aliases)
+    if label_key(concept.title) != label_key(existing.title):
+        aliases.append(concept.title)
+    aliases.extend(concept.aliases)
+    existing.aliases = [
+        alias for alias in dict.fromkeys(aliases)
+        if label_key(alias) and label_key(alias) != label_key(existing.title)
+    ]
+    existing.tags = normalise_tags(existing.tags + concept.tags)
+    existing.summary = _join_summary_paragraphs(existing.summary, concept.summary)
+    known_sections = {
+        (section.heading, tuple(section.points), section.prose) for section in existing.sections
+    }
+    for section in concept.sections:
+        identity = (section.heading, tuple(section.points), section.prose)
+        if identity not in known_sections:
+            existing.sections.append(section)
+            known_sections.add(identity)
+    known_claims = {_published_claim_identity(claim) for claim in existing.claims}
+    for claim in concept.claims:
+        identity = _published_claim_identity(claim)
+        if identity not in known_claims:
+            existing.claims.append(claim)
+            known_claims.add(identity)
+    known_links = {(link.slug, link.relation, link.display) for link in existing.related}
+    for link in concept.related:
+        identity = (link.slug, link.relation, link.display)
+        if identity not in known_links:
+            existing.related.append(link)
+            known_links.add(identity)
+    existing.confidence = max(existing.confidence, concept.confidence)
+    existing.is_new = existing.is_new and concept.is_new
+    existing.canonical_id = existing.canonical_id or concept.canonical_id
+
+
 def merge_bundle(sources: list[SourceSynthesis]) -> SynthesisBundle:
     """Merge multiple SourceSynthesis into a single SynthesisBundle.
 
-    Applies corpus-level concept dedup and tag normalisation.
+    Cross-source merge is lossless: same-slug concepts (one canonical entity)
+    keep every source's title, summary paragraphs, sections, claims and typed
+    relations; same-slug MoCs keep every summary paragraph, tag and member.
     """
-    all_concepts: list[ConceptNote] = []
+    by_slug: dict[str, ConceptNote] = {}
     all_maps: dict[str, MapOfContent] = {}
     errors: list[str] = []
 
     for src in sources:
-        all_concepts.extend(src.concepts)
+        for source_concept in src.concepts:
+            concept = deepcopy(source_concept)
+            if not concept.slug:
+                concept.slug = slugify(concept.title)
+            existing_concept = by_slug.get(concept.slug)
+            if existing_concept is None:
+                concept.tags = normalise_tags(concept.tags)
+                by_slug[concept.slug] = concept
+            else:
+                _merge_published_concept(existing_concept, concept)
         for moc in src.maps:
             if not moc.slug:
                 moc.slug = slugify(moc.title)
             existing = all_maps.get(moc.slug)
             if existing is None:
-                moc.tags = normalise_tags(moc.tags)
-                all_maps[moc.slug] = deepcopy(moc)
+                copied = deepcopy(moc)
+                copied.tags = normalise_tags(copied.tags)
+                copied.concept_slugs = list(dict.fromkeys(copied.concept_slugs))
+                all_maps[moc.slug] = copied
             else:
-                # Merge concept slugs.
-                existing_slugs = set(existing.concept_slugs)
-                for s in moc.concept_slugs:
-                    if s not in existing_slugs:
-                        existing.concept_slugs.append(s)
-                        existing_slugs.add(s)
+                existing.summary = _join_summary_paragraphs(existing.summary, moc.summary)
+                existing.tags = normalise_tags(existing.tags + moc.tags)
+                existing.concept_slugs = list(
+                    dict.fromkeys([*existing.concept_slugs, *moc.concept_slugs])
+                )
 
-    merged_concepts = merge_concepts(all_concepts)
+    merged_concepts = list(by_slug.values())
     merged_maps = list(all_maps.values())
 
     return SynthesisBundle(
@@ -552,18 +636,13 @@ def _clean_merged_references(concept: ConceptNote, merge_map: Mapping[str, str])
 
 
 def _merge_into(survivor: ConceptNote, victim: ConceptNote) -> None:
-    """Merge *victim* concept fields into *survivor* in-place."""
-    survivor.tags = normalise_tags(survivor.tags + victim.tags)
-    survivor.aliases = list(dict.fromkeys(survivor.aliases + victim.aliases))
-    survivor.sections.extend(victim.sections)
-    survivor.claims.extend(victim.claims)
-    existing_rel_slugs = {r.slug for r in survivor.related}
-    for link in victim.related:
-        if link.slug not in existing_rel_slugs:
-            survivor.related.append(link)
-            existing_rel_slugs.add(link.slug)
-    survivor.confidence = max(survivor.confidence, victim.confidence)
-    survivor.is_new = survivor.is_new and victim.is_new
+    """Merge *victim* concept fields into *survivor* in-place, losslessly.
+
+    The victim's title and summary paragraphs survive; whether the victim's
+    reviewed content may be published under the survivor's title is checked
+    by the publication plan, which makes an unbound merge a visible error.
+    """
+    _merge_published_concept(survivor, victim)
 
 
 # ── Embedding-based MoC assignment for orphans ───────────────────────────

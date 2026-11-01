@@ -172,15 +172,27 @@ def test_assemblyai_remote_url_polls_to_completion_without_key_leak():
 
 def test_podcast_prefers_cached_transcript_over_all_remote_providers(monkeypatch):
     """A local cache hit prevents transcript URL, Supadata, and AssemblyAI calls."""
-    cached = TranscriptResult(text=_LONG_TEXT, provider="rss_podcast_transcript")
+    # A cache hit must be one of the episode's own artifacts (here its tag).
+    cached = TranscriptResult(
+        text=_LONG_TEXT, provider="rss_podcast_transcript",
+        artifact_url="https://cdn.example/episode.vtt",
+    )
     asset = podcast.EpisodeAsset(
         title="Cached Episode",
         audio_url="https://cdn.example/episode.mp3",
+        transcript_url="https://cdn.example/episode.vtt",
         guid="episode-guid-42",
     )
     monkeypatch.setattr(podcast, "_fetch_defuddle_md_metadata", lambda _url: {})
     monkeypatch.setattr(podcast, "_resolve_episode_asset", lambda *_args, **_kwargs: asset)
-    monkeypatch.setattr(podcast, "load_transcript_cache", lambda _identity: cached)
+    def bound_hit(identity):
+        # An epoch-3 entry carries explicit episode + artifact provenance.
+        body = json.loads(identity.split("\n", 1)[1])
+        artifact = body.pop("artifact")
+        return cached, {"identity": identity, "podcast_binding": {
+            "epoch": 3, "origin": "acquired", "episode": body, "artifact": artifact}}
+
+    monkeypatch.setattr(podcast, "load_transcript_cache_record", bound_hit)
     monkeypatch.setattr(
         podcast,
         "fetch_public_transcript",
@@ -213,7 +225,7 @@ def test_podcast_prefers_assemblyai_before_supadata(monkeypatch):
     )
     monkeypatch.setattr(podcast, "_fetch_defuddle_md_metadata", lambda _url: {})
     monkeypatch.setattr(podcast, "_resolve_episode_asset", lambda *_args, **_kwargs: asset)
-    monkeypatch.setattr(podcast, "load_transcript_cache", lambda _identity: None)
+    monkeypatch.setattr(podcast, "load_transcript_cache_record", lambda _identity: None)
     monkeypatch.setattr(podcast, "get_assemblyai_key", lambda: "test-key")
     monkeypatch.setattr(
         podcast, "assemblyai_transcribe_url", lambda *_args: assembly_result,
@@ -236,7 +248,7 @@ def test_podcast_uses_supadata_when_assemblyai_returns_no_transcript(monkeypatch
     )
     monkeypatch.setattr(podcast, "_fetch_defuddle_md_metadata", lambda _url: {})
     monkeypatch.setattr(podcast, "_resolve_episode_asset", lambda *_args, **_kwargs: asset)
-    monkeypatch.setattr(podcast, "load_transcript_cache", lambda _identity: None)
+    monkeypatch.setattr(podcast, "load_transcript_cache_record", lambda _identity: None)
     monkeypatch.setattr(podcast, "get_assemblyai_key", lambda: "test-key")
     monkeypatch.setattr(podcast, "assemblyai_transcribe_url", lambda *_args: None)
     monkeypatch.setattr(podcast, "_get_supadata_key", lambda: "supadata-key")

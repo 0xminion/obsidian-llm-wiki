@@ -2,13 +2,19 @@
 
 ## Active references
 
+- [Current delivery status and validation limits](delivery-status.md): tested implementation, final live-adapter failure, and gates that remain unverified.
+
 - [Repository quick start](../README.md): installation, normal commands, and operational caveats.
+- [Immutable publication](immutable-publication.md) and [application callers](immutable-application-callers.md): generation layout, current resolution, retained human files, and refused compatibility options. Earlier lane-specific receipt/status statements are historical, not aggregate acceptance.
 - [Implementation](implementation.md): build stages, extraction/admission, synthesis, language, configuration, queues, and user-edit protection.
 - [Data model](data-model.md): identities, matching/merging, typed relationships, provenance, persistent stores, and independent schema/version namespaces.
 - [Migration and recovery](migration.md): verified offline backup, disposable migration rehearsal, production application, and whole-vault rollback.
 - [Scaling](scaling.md): actual cost model, benchmark interpretation, proposed local dependency batches, and a separate million-note index/Obsidian working set.
 - [Audit issue ledger](audit-issues.md): severity, root cause, affected code, regression selectors, and fixed versus unresolved boundaries.
 - [Verification](verification.md): baseline, intermediate independent failures, scoped follow-up receipts, measured benchmarks, and a final acceptance section for the integrating reviewer.
+- [Live 50-URL audit](live-source-audit.md): real extraction corpus, content-loss and provider-schema fixes, changed podcast admission, refresh guidance, and verification limits.
+- [Podcast admission](podcast-admission.md): shared episode/artifact checks, conservative inline/link routing, cache admission version, and explicit refresh behavior.
+- [Legacy Word extraction](legacy-word-extraction.md): LibreOffice dependencies, native DOC→DOCX conversion, fidelity checks and omitted-content diagnostics.
 
 Source code and `olw COMMAND --help` define the available API/options. The active references distinguish read-only planning from migration, source-language preservation from explicit translation, and scoped regression results from final aggregate acceptance.
 

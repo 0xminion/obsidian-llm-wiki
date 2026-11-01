@@ -7,6 +7,10 @@ from collections.abc import Iterable
 from difflib import SequenceMatcher
 
 _WORD_RE = re.compile(r"\w+", re.UNICODE)
+_NEGATIONS = frozenset({
+    "not", "no", "never", "none", "nor", "without", "cannot", "neither",
+    "dont", "doesnt", "didnt", "isnt", "wasnt", "arent", "werent", "wont", "t",
+})
 
 
 def dedupe_statements(items: Iterable[str]) -> list[str]:
@@ -49,6 +53,14 @@ def _same_statement(
 ) -> bool:
     if left == right:
         return True
+    # Paraphrase folding must never drop a distinct reviewed statement: numbers
+    # (12% vs 15%, 2023 vs 2024) and negation change meaning, not wording.
+    if {t for t in left_tokens if any(c.isdigit() for c in t)} != {
+        t for t in right_tokens if any(c.isdigit() for c in t)
+    }:
+        return False
+    if bool(left_tokens & _NEGATIONS) != bool(right_tokens & _NEGATIONS):
+        return False
     if min(len(left_tokens), len(right_tokens)) < 6:
         return False
     similarity = SequenceMatcher(None, left, right, autojunk=False).ratio()

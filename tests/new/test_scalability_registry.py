@@ -17,6 +17,7 @@ from obsidian_llm_wiki.core.models import (
     source_synthesis_to_dict,
 )
 from obsidian_llm_wiki.core.registry import ArtifactVersions, VaultRegistry
+from tests.new.bilateral_fixture_helpers import assess, assess_same, fact_verdict, upsert_reviewed
 
 
 def test_registry_creates_the_v2_schema_in_wal_mode(tmp_path: Path) -> None:
@@ -78,7 +79,14 @@ def test_canonical_id_assignment_remaps_slugs_links_and_moc_memberships(
     tmp_path: Path,
 ) -> None:
     versions = ArtifactVersions("extract-v2", "prompt-v2", "schema-v2", "model-a")
-    source = SourceDoc(title="English", content="body " * 30, source_file="en.md")
+    fact = "Both were introduced in the 2017 paper Attention Is All You Need."
+    source = SourceDoc(
+        title="English", source_file="en.md",
+        content=f"The transformer architecture and positional encoding. {fact}\n",
+    )
+    zh_source = SourceDoc(
+        title="中文", source_file="zh.md", content=f"变换器架构与位置编码。 {fact}\n",
+    )
     existing = SourceSynthesis(
         source_title="English",
         source_summary="summary",
@@ -97,7 +105,7 @@ def test_canonical_id_assignment_remaps_slugs_links_and_moc_memberships(
         ],
     )
     with VaultRegistry(tmp_path / ".llmwiki") as registry:
-        registry.upsert_synthesis("en.md", source, existing, versions)
+        upsert_reviewed(registry, "en.md", source, existing, versions)
         ids = {concept.slug: concept.canonical_id for concept in existing.concepts}
         incoming = SourceSynthesis(
             source_title="中文",
@@ -136,7 +144,28 @@ def test_canonical_id_assignment_remaps_slugs_links_and_moc_memberships(
             ],
         )
 
+        # A bilingual title is a naming fact, not identity evidence; this
+        # fixture's reuse is an explicit bilateral assessment of both
+        # candidates, keyed to the shared source fact AND the definition pair
+        # each concept vouches for (the two concepts share both sources, so the
+        # fact alone could not tell them apart).
+        verdict = fact_verdict(
+            same=(fact,), pairs=(("架构", "architecture"), ("位置", "positions")),
+        )
+        requests = assess(registry, incoming, zh_source, verdict)
+        same = {
+            (r["subject_title"], r["candidate_id"])
+            for r in incoming.review_receipt["identity"]["assessments"] if r["verdict"] == "same"
+        }
+        assert same == {
+            ("Transformer Architecture (Transformer 架构)", ids["transformer-architecture"]),
+            ("Positional Encoding (位置编码)", ids["positional-encoding"]),
+        }
+        assert len(requests) >= 2
         registry.assign_canonical_ids(incoming)
+        assert [c.canonical_id for c in incoming.concepts] == [
+            ids["transformer-architecture"], ids["positional-encoding"],
+        ]
 
     assert [concept.slug for concept in incoming.concepts] == [
         "transformer-architecture",
@@ -153,8 +182,10 @@ def test_canonical_concept_payload_aggregates_all_current_source_owners(
     tmp_path: Path,
 ) -> None:
     versions = ArtifactVersions("extract", "prompt", "schema", "model")
-    source_one = SourceDoc("One", "one " * 30, source_file="one.md")
-    source_two = SourceDoc("Two", "two " * 30, source_file="two.md")
+    fact = "The shared entity is the Delta observatory in Lima."
+    source_one = SourceDoc("One", f"A short account. {fact}\n", source_file="one.md")
+    source_two = SourceDoc("Two", f"A much longer account of the same site. {fact}\n",
+                           source_file="two.md")
     synthesis_one = SourceSynthesis(
         source_title="One",
         source_summary="one",
@@ -185,11 +216,14 @@ def test_canonical_concept_payload_aggregates_all_current_source_owners(
     )
 
     with VaultRegistry(tmp_path / ".llmwiki") as registry:
-        registry.upsert_synthesis("one.md", source_one, synthesis_one, versions)
+        upsert_reviewed(registry, "one.md", source_one, synthesis_one, versions)
         # Different definitions require explicit reuse of a known stable ID;
         # a shared title/slug alone is not evidence of equivalence.
         synthesis_two.concepts[0].canonical_id = synthesis_one.concepts[0].canonical_id
+        # ...and the reuse itself needs an explicit bilateral identity assessment.
+        assert len(assess_same(registry, synthesis_two, source_two, fact)) == 1
         registry.upsert_synthesis("two.md", source_two, synthesis_two, versions)
+        assert synthesis_two.concepts[0].canonical_id == synthesis_one.concepts[0].canonical_id
         row = registry.connection.execute(
             "SELECT payload_json FROM concept WHERE slug='shared'"
         ).fetchone()
@@ -470,15 +504,22 @@ def test_registry_removes_stale_entities_but_retains_shared_ownership(
     tmp_path: Path,
 ) -> None:
     versions = ArtifactVersions("extract", "prompt", "schema", "model")
+    fact = "The shared concept is the Delta observatory in Lima."
+    sources = {
+        "one.md": SourceDoc("One", f"first revision {fact}\n"),
+        "two.md": SourceDoc("Two", f"second source {fact}\n"),
+        "one-v2.md": SourceDoc("One", f"replacement revision {fact}\n"),
+    }
 
-    def synthesis(filename: str, slugs: list[str]) -> SourceSynthesis:
+    def synthesis(filename: str, slugs: list[str], shared_id: str = "") -> SourceSynthesis:
         return SourceSynthesis(
             source_title=filename,
             source_summary="summary",
             source_file=filename,
             concepts=[
                 ConceptNote(
-                    title=slug.title(), slug=slug, summary=f"marker {slug}"
+                    title=slug.title(), slug=slug, summary=f"marker {slug}",
+                    canonical_id=shared_id if slug == "shared" else "",
                 )
                 for slug in slugs
             ],
@@ -493,24 +534,23 @@ def test_registry_removes_stale_entities_but_retains_shared_ownership(
         )
 
     with VaultRegistry(tmp_path / ".llmwiki") as registry:
-        registry.upsert_synthesis(
-            "one.md",
-            SourceDoc("One", "first revision"),
-            synthesis("one.md", ["shared", "obsolete"]),
+        first = upsert_reviewed(
+            registry, "one.md", sources["one.md"], synthesis("one.md", ["shared", "obsolete"]),
             versions,
         )
-        registry.upsert_synthesis(
-            "two.md",
-            SourceDoc("Two", "second source"),
-            synthesis("two.md", ["shared", "current"]),
-            versions,
-        )
-        registry.upsert_synthesis(
-            "one.md",
-            SourceDoc("One", "replacement revision"),
-            synthesis("one.md", ["shared", "replacement"]),
-            versions,
-        )
+        shared_id = first.concepts[0].canonical_id
+        # two.md co-owns "shared" only through an explicit bilateral assessment
+        # (same title, same generic definition and copied ID are not evidence).
+        two = synthesis("two.md", ["shared", "current"], shared_id)
+        assert len(assess_same(registry, two, sources["two.md"], fact)) == 1
+        registry.upsert_synthesis("two.md", sources["two.md"], two, versions)
+        assert two.concepts[0].canonical_id == shared_id
+        # one.md's replacement revision keeps "shared" through assessed continuity
+        # against the co-owner; "obsolete" leaves with the old revision.
+        replacement = synthesis("one.md", ["shared", "replacement"], shared_id)
+        assert len(assess_same(registry, replacement, sources["one-v2.md"], fact)) == 1
+        registry.upsert_synthesis("one.md", sources["one-v2.md"], replacement, versions)
+        assert replacement.concepts[0].canonical_id == shared_id
 
         slugs = {
             str(row[0]) for row in registry.connection.execute("SELECT slug FROM concept")
