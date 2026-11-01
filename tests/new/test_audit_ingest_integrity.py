@@ -11,6 +11,7 @@ from typer.testing import CliRunner
 from obsidian_llm_wiki.config import Config
 from obsidian_llm_wiki.core.models import SourceDoc
 from obsidian_llm_wiki.render.obsidian import render_source_page
+from tests.new.cli_text import unstyle
 
 
 def _invoke(monkeypatch, config, *args, extractor=None):
@@ -78,7 +79,7 @@ def test_refresh_refusal_and_acquisition_failure_preserve_last_good_source(tmp_p
     result = _invoke(
         monkeypatch, config, "--url", url, "--refresh", "--skip-synthesis", extractor=unavailable
     )
-    assert result.exit_code == 2 and "Refusing --refresh" in result.output
+    assert result.exit_code == 2 and "Refusing --refresh" in unstyle(result.output)
     assert attempts == []
     assert target.read_bytes() == original
     # A supported new-source acquisition can still fail; it must not erase
@@ -114,7 +115,7 @@ def test_refresh_refusal_and_acquisition_failure_preserve_last_good_source(tmp_p
         "--skip-synthesis",
         extractor=lambda value: SourceDoc(title="Protected", content="Changed. " * 90, url=value),
     )
-    assert result.exit_code == 2 and "Refusing --refresh" in result.output
+    assert result.exit_code == 2 and "Refusing --refresh" in unstyle(result.output)
     assert target.read_bytes() == reviewed
 
 
@@ -143,7 +144,7 @@ def test_refresh_refusal_preserves_original_and_allows_separate_revision(tmp_pat
         "--skip-synthesis",
         extractor=lambda value: SourceDoc(title="Revised title", content=new, url=value),
     )
-    assert result.exit_code == 2 and "Refusing --refresh" in result.output
+    assert result.exit_code == 2 and "Refusing --refresh" in unstyle(result.output)
     assert target.read_bytes() == original
     assert list(config.sources_dir.glob("*.md")) == [target]
     # The supported alternative is a separate reviewed input, not replacement
@@ -322,7 +323,7 @@ def test_refresh_preview_tracks_request_without_replacing_original(tmp_path, mon
         "--skip-synthesis",
         extractor=lambda _url: revision(2),
     )
-    assert result.exit_code == 2 and "Refusing --refresh" in result.output
+    assert result.exit_code == 2 and "Refusing --refresh" in unstyle(result.output)
     pages = list(config.sources_dir.glob("*.md"))
     assert len(pages) == 1
     before = pages[0].read_bytes()
@@ -366,7 +367,7 @@ def test_refused_refresh_preserves_shared_source_and_valid_url_alias(tmp_path, m
         "--skip-synthesis",
         extractor=lambda value: SourceDoc(title="Shared", content=new, url=value),
     )
-    assert result.exit_code == 2 and "Refusing --refresh" in result.output
+    assert result.exit_code == 2 and "Refusing --refresh" in unstyle(result.output)
     preserved = {p.name: p.read_bytes() for p in config.sources_dir.glob("*.md")}
 
     def must_not_extract(_value):

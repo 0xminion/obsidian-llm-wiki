@@ -13,6 +13,7 @@ from obsidian_llm_wiki.cli import app
 from obsidian_llm_wiki.config import Config
 from obsidian_llm_wiki.core.immutable_publication import current_publication
 from obsidian_llm_wiki.core.models import SourceDoc
+from tests.new.cli_text import unstyle
 from tests.new.grounding_doubles import (
     ground_legacy_response,
     legacy_fixture_llm,
@@ -632,7 +633,7 @@ def test_refresh_refuses_mutation_but_preview_and_duplicate_are_safe(vault, monk
     title = "Revised title"
     refreshed = CliRunner().invoke(app, [*args, "--refresh"])
     assert refreshed.exit_code != 0
-    assert "Refusing --refresh" in refreshed.output
+    assert "Refusing --refresh" in unstyle(refreshed.output)
     assert _snapshot(vault.vault) == before_vault
     assert path.read_bytes() == before
     preview = CliRunner().invoke(app, [*args, "--refresh", "--preview", "--json"])

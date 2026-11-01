@@ -8,6 +8,7 @@ from pathlib import Path
 from typer.testing import CliRunner
 
 from obsidian_llm_wiki.cli import app
+from tests.new.cli_text import unstyle
 
 runner = CliRunner()
 
@@ -16,7 +17,7 @@ def test_fix_help_describes_restore_as_refused_compatibility_option() -> None:
     result = CliRunner().invoke(app, ["fix", "--help"], terminal_width=200)
 
     assert result.exit_code == 0, result.output
-    help_text = " ".join(result.output.replace("│", " ").split())
+    help_text = " ".join(unstyle(result.output).replace("│", " ").split())
     assert "--restore" in help_text
     assert "Retained compatibility option; always refused under immutable publication" in help_text
     assert "Restore one trusted backup path" not in help_text

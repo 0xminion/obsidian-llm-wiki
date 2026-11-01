@@ -22,7 +22,7 @@ The frozen 443-file application snapshot delivered before this integration had:
 | Packaging acceptance | 46 unique tests passed; plugin typecheck/build checked |
 | Delivered-source CLI smoke | Help, build/ingest help, dry-run and ingest plan passed; English/Chinese source fixture bytes preserved; no model/network calls |
 
-These counts describe their exercised snapshots, not a new CI matrix result. Integration changes only documentation, one behavior-equivalent test-dictionary literal for Ruff, and a trailing blank test-file line; application source bytes remain identical to that tested snapshot. Current GitHub Actions results must be read for the current PR/commit rather than inferred from historical runs.
+These counts describe their exercised snapshots, not a new CI matrix result. Integration changes only documentation, test-only lint/whitespace cleanup, and ANSI stripping for human-visible CLI text assertions exposed by forced-color CI; raw JSON parsing, exit codes and preservation assertions remain unchanged. Application source bytes remain identical to that tested snapshot. Current GitHub Actions results must be read for the current PR/commit rather than inferred from historical runs.
 
 ## Final live comparison: blocked, not passed
 
