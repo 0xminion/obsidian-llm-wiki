@@ -1,4 +1,4 @@
-export type CliOperation = "ingest" | "preview" | "health" | "fix" | "query";
+export type CliOperation = "ingest" | "preview" | "health" | "fix" | "query" | "current";
 
 /** A single structured event emitted by `olw --json`. */
 export type OlwJsonEvent = Record<string, unknown>;

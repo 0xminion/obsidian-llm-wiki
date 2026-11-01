@@ -22,6 +22,7 @@ from obsidian_llm_wiki.core.metrics import (
     print_metrics_summary,
 )
 from obsidian_llm_wiki.ingest import supadata_utils
+from tests.new.grounding_doubles import reviewed
 
 # ── Metrics collection tests ───────────────────────────────────────────────
 
@@ -169,11 +170,11 @@ class TestRetryWithoutDataLoss:
             if len(call_lengths) == 1:
                 return None
             from obsidian_llm_wiki.core.models import SourceSynthesis
-            return SourceSynthesis(
+            return reviewed(SourceSynthesis(
                 source_title="Test",
                 source_summary="Summary",
                 source_file=filename,
-            )
+            ), src, filename, config)
 
         with mock.patch(
             "obsidian_llm_wiki.core.pipeline._synthesize_source",
@@ -206,9 +207,9 @@ class TestRetryWithoutDataLoss:
 
         async def mock_synth(_config, filename, src, _existing_concepts, **_kwargs):
             seen.append(src)
-            return None if len(seen) == 1 else SourceSynthesis(
+            return None if len(seen) == 1 else reviewed(SourceSynthesis(
                 source_title=src.title, source_summary="Summary", source_file=filename,
-            )
+            ), src, filename, _config)
 
         with mock.patch(
             "obsidian_llm_wiki.core.pipeline._synthesize_source", side_effect=mock_synth,
@@ -269,9 +270,9 @@ class TestRetryWithoutDataLoss:
         async def mock_synth(config, filename, src, existing_concepts, **_kwargs):
             call_lengths.append(len(src.content))
             from obsidian_llm_wiki.core.models import SourceSynthesis
-            return SourceSynthesis(
+            return reviewed(SourceSynthesis(
                 source_title="Short", source_summary="S", source_file=filename,
-            )
+            ), src, filename, config)
 
         with mock.patch(
             "obsidian_llm_wiki.core.pipeline._synthesize_source",
@@ -414,7 +415,7 @@ class TestWhisperFallback:
             ),
         ), mock.patch.object(
             podcast,
-            "load_transcript_cache",
+            "load_transcript_cache_record",
             return_value=None,
         ), mock.patch.object(
             podcast, "_get_supadata_key", return_value="fake-key",

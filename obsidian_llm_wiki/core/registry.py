@@ -17,9 +17,11 @@ import time
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from functools import wraps
 from itertools import islice
 from pathlib import Path
 from types import TracebackType
+from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
 from obsidian_llm_wiki.core.models import (
@@ -44,7 +46,27 @@ __all__ = [
     "VaultRegistry",
 ]
 
-_SCHEMA_VERSION = 6
+
+def _identity_read_snapshot(method):
+    """Share read-only decodes within one synchronous identity planning call.
+
+    Nested helpers share the scope; nothing survives its exit (including errors).
+    SQL rows are still read on each lookup, and changed payload bytes get a new
+    decode even within a scope. Ownership and source-content reads are not cached.
+    """
+    @wraps(method)
+    def wrapped(self, *args, **kwargs):
+        if hasattr(self, "_identity_decodes"):
+            return method(self, *args, **kwargs)
+        self._identity_decodes = {}
+        try:
+            return method(self, *args, **kwargs)
+        finally:
+            del self._identity_decodes
+    return wrapped
+
+
+_SCHEMA_VERSION = 7
 _LSH_TABLES = 8
 _LSH_BITS = 12
 _LSH_SPARSITY = 8
@@ -53,6 +75,13 @@ _LIVE_OPERATION_HISTORY = 1_000
 _DIRTY_LEASE_SECONDS = 600
 
 _SCHEMA = """
+CREATE TABLE IF NOT EXISTS identity_entity_history (
+    id TEXT PRIMARY KEY, slug TEXT NOT NULL UNIQUE
+);
+CREATE TABLE IF NOT EXISTS identity_source_context (
+    filename TEXT NOT NULL, revision TEXT NOT NULL, content TEXT NOT NULL,
+    PRIMARY KEY(filename, revision)
+);
 CREATE TABLE IF NOT EXISTS meta (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -957,11 +986,15 @@ class VaultRegistry:
         source: SourceDoc,
         synthesis: SourceSynthesis,
         versions: ArtifactVersions,
+        *, identity_plan=None,
     ) -> None:
-        """Atomically persist one source revision and its synthesis payload."""
+        """Persist the frozen plan verbatim; standalone callers still resolve proposals."""
         now = _now()
         input_hash = _content_hash(source.content)
-        self._assign_canonical_ids(synthesis)
+        if identity_plan is None:
+            self._assign_canonical_ids(synthesis)
+        else:
+            identity_plan.check_source(synthesis)
         requested_url = source.provenance.requested_url or source.url or ""
         canonical_url = (
             source.provenance.extracted_url
@@ -976,6 +1009,12 @@ class VaultRegistry:
             separators=(",", ":"),
         )
         with self.connection:
+            from obsidian_llm_wiki.core.span_catalog import source_revision
+            self.connection.execute(
+                "INSERT OR IGNORE INTO "
+                "identity_source_context(filename,revision,content) VALUES(?,?,?)",
+                (filename, source_revision(source.content), source.content),
+            )
             self.connection.execute(
                 """
                 INSERT INTO source(
@@ -1037,6 +1076,7 @@ class VaultRegistry:
         filename: str,
         synthesis: SourceSynthesis,
         versions: ArtifactVersions,
+        *, identity_plan=None,
     ) -> None:
         """Update synthesis ownership without rewriting its source revision."""
         row = self.connection.execute(
@@ -1044,7 +1084,10 @@ class VaultRegistry:
         ).fetchone()
         if row is None:
             raise KeyError(f"Unknown source: {filename}")
-        self._assign_canonical_ids(synthesis)
+        if identity_plan is None:
+            self._assign_canonical_ids(synthesis)
+        else:
+            identity_plan.check_source(synthesis)
         now = _now()
         with self.connection:
             self._upsert_synthesis_payload_unlocked(
@@ -1062,6 +1105,11 @@ class VaultRegistry:
     ) -> None:
         """Persist one synthesis and rebuild its canonical ownership rows."""
         self._set_meta_unlocked("pipeline_checkpoint", "")
+        for concept in synthesis.concepts:
+            self.connection.execute(
+                "INSERT OR IGNORE INTO identity_entity_history(id,slug) VALUES(?,?)",
+                (concept.canonical_id, concept.slug),
+            )
         synthesis.source_file = filename
         payload = json.dumps(
             source_synthesis_to_dict(synthesis),
@@ -1140,14 +1188,510 @@ class VaultRegistry:
         }
         self._rebuild_moc_aggregates(touched_moc_ids, now, changed_members)
 
+    def apply_publication_projection(self, plan) -> None:
+        """Project the frozen render aggregates and occurrence targets, with no matching."""
+        from obsidian_llm_wiki.core.identity_plan import canonical
+        from obsidian_llm_wiki.core.models import _concept_from_dict, _moc_from_dict
+        bundle = json.loads(plan.bundle_json)
+        by_slug = {c["slug"]: c["canonical_id"] for c in bundle["concepts"]}
+        with self.connection:
+            for raw in bundle["concepts"]:
+                concept = _concept_from_dict(raw)
+                payload = canonical(concept_note_to_dict(concept))
+                self.connection.execute(
+                    "UPDATE concept SET "
+                    "slug=?,title=?,summary=?,tags_json=?,payload_json=?,content_hash=? WHERE id=?",
+                    (
+                        concept.slug,
+                        concept.title,
+                        concept.summary,
+                        canonical(concept.tags),
+                        payload,
+                        _content_hash(payload),
+                        concept.canonical_id,
+                    ),
+                )
+                self._replace_concept_fts_unlocked(concept)
+            for raw in bundle["maps"]:
+                moc = _moc_from_dict(raw)
+                moc_id = self._stable_id("moc", moc.slug)
+                payload = canonical(moc_to_dict(moc))
+                self.connection.execute(
+                    "UPDATE moc SET "
+                    "title=?,summary=?,tags_json=?,payload_json=?,content_hash=? WHERE id=?",
+                    (
+                        moc.title,
+                        moc.summary,
+                        canonical(moc.tags),
+                        payload,
+                        _content_hash(payload),
+                        moc_id,
+                    ),
+                )
+                self.connection.execute("DELETE FROM membership WHERE moc_id=?", (moc_id,))
+                self.connection.execute("DELETE FROM membership_source WHERE moc_id=?", (moc_id,))
+                for position, slug in enumerate(moc.concept_slugs):
+                    if slug in by_slug:
+                        self.connection.execute(
+                            "INSERT OR IGNORE INTO "
+                            "membership(moc_id,concept_id,position) VALUES(?,?,?)",
+                            (moc_id, by_slug[slug], position),
+                        )
+            for filename, payload in plan.sources:
+                source = source_synthesis_from_dict(json.loads(payload))
+                row = self.connection.execute(
+                    "SELECT id FROM source WHERE filename=?", (filename,)
+                ).fetchone()
+                refs = (source.review_receipt or {}).get("references", {})
+                for i, moc in enumerate(source.maps):
+                    for j, _slug in enumerate(moc.concept_slugs):
+                        ref = refs.get(f"maps[{i}].members[{j}]", {})
+                        target = ref.get("target_id")
+                        if target and target in by_slug.values():
+                            self.connection.execute(
+                                "INSERT OR IGNORE INTO "
+                                "membership_source(source_id,moc_id,concept_id,position) "
+                                "VALUES(?,?,?,?)",
+                                (row[0], self._stable_id("moc", moc.slug), target, j),
+                            )
+
+    def identity_diagnostics(self) -> list[dict[str, str]]:
+        """Bounded log of rejected identity proposals (newest last)."""
+        return list(getattr(self, "_identity_diagnostics", []))
+
+    def _record_identity_rejection(
+        self, source_file: str, concept: ConceptNote, proposed_id: str, reason: str,
+    ) -> None:
+        import logging
+
+        log = getattr(self, "_identity_diagnostics", None)
+        if log is None:
+            log = self._identity_diagnostics = []
+        entry = {
+            "source_file": source_file, "title": concept.title,
+            "proposed_id": proposed_id, "reason": reason,
+        }
+        if entry not in log:
+            log.append(entry)
+            del log[:-200]
+            logging.getLogger("obswiki.registry").warning(
+                "Identity proposal rejected for %r in %s: %s is not bound (%s)",
+                concept.title, source_file or "<unsaved>", proposed_id, reason,
+            )
+
+    def _identity_payload(self, filename, raw):
+        """Read-only decoded row; keyed by exact bytes, never a mutable proposal."""
+        cache = getattr(self, "_identity_decodes", {})
+        key = (filename, raw)
+        if key not in cache:
+            try:
+                payload = json.loads(raw or "{}")
+            except (TypeError, ValueError):
+                payload = {}
+            cache[key] = {"payload": payload if isinstance(payload, dict) else {}}
+        return cache[key]
+
+    def _identity_syntheses(self, filenames):
+        syntheses = {}
+        # Contexts are bounded to MAX_CONTEXT_OWNERS (and own-source lookups
+        # contain one filename); keep every read indexed and payload-validated.
+        for filename in sorted(filenames):
+            row = self.connection.execute(
+                "SELECT sy.payload_json FROM synthesis sy JOIN source s ON s.id=sy.source_id "
+                "WHERE s.filename=? AND sy.status='ready'", (filename,),
+            ).fetchone()
+            if row is None:
+                continue
+            entry = self._identity_payload(filename, row[0])
+            if "synthesis" not in entry:
+                entry["synthesis"] = source_synthesis_from_dict(entry["payload"])
+                entry["synthesis"].source_file = filename
+            syntheses[filename] = entry["synthesis"]
+        return syntheses
+
+    def _owner_snapshots(self, concept_id: str) -> list[tuple[str, str, str]]:
+        """``(filename, title, summary)`` of each owner's own reviewed contribution.
+
+        Owners are ordered incumbent first: the earliest-registered owning
+        source (filename breaks ties). Title/summary come from that source's
+        own committed payload, never from the merged aggregate row.
+        """
+        rows = self.connection.execute(
+            "SELECT s.filename, sy.payload_json FROM concept_source cs "
+            "JOIN source s ON s.id=cs.source_id "
+            "LEFT JOIN synthesis sy ON sy.source_id=s.id "
+            "WHERE cs.concept_id=? ORDER BY s.created_at, s.filename",
+            (concept_id,),
+        ).fetchall()
+        owners: list[tuple[str, str, str]] = []
+        for filename, payload_json in rows:
+            title = summary = ""
+            payload = self._identity_payload(filename, payload_json)["payload"]
+            for item in payload.get("concepts", []):
+                if not isinstance(item, dict):
+                    continue
+                item_id = str(item.get("canonical_id") or "") or self._stable_id(
+                    "concept", str(item.get("slug") or "")
+                )
+                if item_id == concept_id:
+                    title, summary = str(item.get("title") or ""), str(item.get("summary") or "")
+                    break
+            owners.append((str(filename), title, summary))
+        return owners
+
+    def identity_content(self, filename, revision):
+        incoming = getattr(self, "_identity_source_contents", {}).get(filename)
+        from obsidian_llm_wiki.core.span_catalog import source_revision
+        if isinstance(incoming, str) and source_revision(incoming) == revision:
+            return incoming
+        row = self.connection.execute(
+            "SELECT content FROM identity_source_context WHERE filename=? AND revision=?",
+            (filename, revision)).fetchone()
+        return str(row[0]) if row else None
+
+    @_identity_read_snapshot
+    def candidate_context(self, concept_id):
+        from obsidian_llm_wiki.core.identity_context import MAX_CONTEXT_OWNERS, source_context
+        from obsidian_llm_wiki.core.identity_plan import digest
+        filenames = [owner[0] for owner in self._owner_snapshots(concept_id)]
+        if not filenames:
+            pending = getattr(self, "_planned_concepts", {}).get(concept_id, [])
+            owners = [
+                source_context(
+                    s,
+                    i,
+                    self.identity_content(
+                        s.source_file, (s.review_receipt or {}).get("source_sha256", "")
+                    ),
+                    "candidate:" + concept_id,
+                )
+                for s, i in pending[:MAX_CONTEXT_OWNERS]
+            ]
+            context = {"candidate_id": concept_id, "owners": owners,
+                       "complete": bool(owners) and len(owners) == len(pending)
+                       and all(owner["complete"] for owner in owners)}
+            return context, digest(context)
+        owners = []
+        for filename, synthesis in sorted(
+            self._identity_syntheses(set(filenames[:MAX_CONTEXT_OWNERS])).items()
+        ):
+            receipt = synthesis.review_receipt or {}
+            content = self.identity_content(filename, receipt.get("source_sha256", ""))
+            for index, concept in enumerate(synthesis.concepts):
+                if concept.canonical_id == concept_id:
+                    owners.append(
+                        source_context(synthesis, index, content, "candidate:" + concept_id)
+                    )
+        context = {"candidate_id": concept_id, "owners": owners,
+                   "complete": bool(owners) and len(owners) == len(filenames)
+                   and all(owner["complete"] for owner in owners)}
+        return context, digest(context)
+
+    @_identity_read_snapshot
+    def candidate_snapshot(
+        self, concept_id: str, source_file: str,
+    ) -> dict[str, str] | None:
+        """Definition snapshot of existing entity ``concept_id`` as seen by a proposer.
+
+        The snapshot is the incumbent definition among the entity's owners
+        OTHER than ``source_file`` (an orphan row falls back to its own
+        title/summary). ``None`` when the entity is unknown or owned solely
+        by ``source_file``. ``sha256`` is ``""`` when the definition is
+        missing, which makes the candidate non-assessable.
+        """
+        from obsidian_llm_wiki.core.entity_identity import definition_snapshot
+
+        row = self.connection.execute(
+            "SELECT title, summary FROM concept WHERE id=?", (concept_id,)
+        ).fetchone()
+        if row is None:
+            pending = getattr(self, "_planned_concepts", {}).get(concept_id, [])
+            if not pending:
+                return None
+            synthesis, index = pending[0]
+            concept = synthesis.concepts[index]
+            context, context_sha = self.candidate_context(concept_id)
+            return {"candidate_id": concept_id, "anchor_source": synthesis.source_file,
+                    "title": concept.title, "summary": concept.summary,
+                    "sha256": definition_snapshot(concept.title, concept.summary),
+                    "context": context, "context_sha256": context_sha}
+        owners = self._owner_snapshots(concept_id)
+        others = [owner for owner in owners if owner[0] != source_file]
+        anchor, title, summary = (others or owners)[0] if owners else ("", str(row[0]), str(row[1]))
+        context, context_sha = self.candidate_context(concept_id)
+        return {
+            "candidate_id": concept_id, "anchor_source": anchor, "title": title,
+            "summary": summary, "sha256": definition_snapshot(title, summary),
+            "context": context, "context_sha256": context_sha,
+        }
+
+    def _reuse_is_bound(
+        self,
+        concept_id: str,
+        concept: ConceptNote,
+        source_file: str,
+        *,
+        explicit: bool = True,
+        receipt: object = None,
+    ) -> tuple[bool, str]:
+        """Accept unchanged established revisions or a contextual bilateral assessment.
+
+        Ownership and identical definitions are lookup hints only. All changed
+        subjects, including sole owners, need revision-bound continuity proof.
+        """
+        from obsidian_llm_wiki.core.entity_identity import (
+            contribution_snapshot,
+            definition_snapshot,
+            find_assessment,
+        )
+
+        del explicit
+        row = self.connection.execute(
+            "SELECT 1 FROM concept WHERE id=?", (concept_id,)
+        ).fetchone()
+        if row is None and concept_id not in getattr(self, "_planned_concepts", {}):
+            return False, "unknown identity"
+        # Ownership is a lookup hint, never permission to change the referent.
+        own_sha = definition_snapshot(concept.title, concept.summary)
+        owners = self._owner_snapshots(concept_id)
+        mine = [owner for owner in owners if owner[0] == source_file]
+        if mine:
+            previous = self._identity_syntheses({source_file}).get(source_file)
+            old_receipt = previous.review_receipt if previous else None
+            if isinstance(receipt, dict) and isinstance(old_receipt, dict):
+                binding = old_receipt.get("publication_binding", {}).get(concept_id, {})
+                if (
+                    receipt.get("source_sha256") == old_receipt.get("source_sha256")
+                    and binding.get("subject_sha256") == own_sha
+                    and binding.get("contribution_sha256") == contribution_snapshot(concept)
+                    and (
+                        not binding.get("assessor")
+                        or binding.get("assessor")
+                        == getattr(self, "_identity_assessor", binding.get("assessor"))
+                    )
+                    and binding.get("basis")
+                    in {
+                        "new entity",
+                        "assessed same entity",
+                        "unchanged revision binding",
+                        "own reservation",
+                    }
+                ):
+                    return True, "unchanged revision binding"
+        candidate = self.candidate_snapshot(concept_id, source_file)
+        candidate_sha = candidate["sha256"] if candidate else ""
+        if not own_sha:
+            return False, "no identity evidence: the proposal has no definition"
+        if not candidate_sha:
+            return False, "no identity evidence: the candidate has no definition"
+        record = find_assessment(
+            receipt, subject_sha=own_sha, candidate_id=concept_id, candidate_sha=candidate_sha,
+            candidate_context_sha=candidate["context_sha256"] if candidate else "",
+        )
+        if record:
+            from obsidian_llm_wiki.core.identity_context import source_context
+            from obsidian_llm_wiki.core.identity_plan import digest
+            subject = record.get("subject_context", {})
+            # Recompute from actual source bytes rather than trusting echoed proof.
+            revision = receipt.get("source_sha256", "")
+            incoming = getattr(self, "_identity_proposals", {}).get(source_file)
+            if incoming is not None:
+                index = next((i for i, c in enumerate(incoming.concepts) if c is concept), None)
+                if index is not None and record.get("subject_context_sha256") == digest(
+                    source_context(incoming, index, self.identity_content(source_file, revision))
+                ):
+                    return True, "assessed same entity"
+            elif subject.get("source_file") == source_file and self.identity_content(
+                source_file, revision
+            ):
+                # Standalone assignment has the current synthesis registered below.
+                return False, "no identity evidence: subject context unavailable"
+
+        return False, (
+            "no identity evidence: names/aliases/word overlap are not proof and no "
+            "assessment is bound to this candidate ID and definition snapshot"
+        )
+
+    def _terminal_context_matches(self, record, candidate, synthesis, index):
+        """Match exact context, or the proven removal of this rejected subject.
+
+        A split removes the rejected contribution from the candidate's owners.
+        Only a `different` verdict may survive that specific transition: every
+        remaining owner, revision, review and span must still match exactly,
+        and the removed owner must be this unchanged subject, now owned by a
+        distinct entity. No projection is used to authorize a `same` binding.
+        """
+        from obsidian_llm_wiki.core.identity_context import source_context
+        from obsidian_llm_wiki.core.identity_plan import digest
+
+        if record.get("assessor") != getattr(self, "_identity_assessor", record.get("assessor")):
+            return False
+        if record.get("subject_context_sha256") != digest(record.get("subject_context", {})):
+            return False
+        context = record.get("candidate_context", {})
+        if record.get("candidate_context_sha256") != digest(context):
+            return False
+        if record.get("candidate_context_sha256") == candidate["context_sha256"]:
+            return True
+        if record["verdict"] != "different" or not context.get("complete"):
+            return False
+        filename = synthesis.source_file
+        concept_id = synthesis.concepts[index].canonical_id
+        if not concept_id or concept_id == candidate["candidate_id"]:
+            return False
+        if not self.connection.execute(
+            "SELECT 1 FROM concept_source cs JOIN source s ON s.id=cs.source_id "
+            "WHERE s.filename=? AND cs.concept_id=?",
+            (filename, concept_id),
+        ).fetchone():
+            return False
+        owners = context.get("owners", [])
+        removed = [owner for owner in owners if owner.get("source_file") == filename]
+        revision = (synthesis.review_receipt or {}).get("source_sha256", "")
+        expected = source_context(
+            synthesis, index, self.identity_content(filename, revision),
+            "candidate:" + candidate["candidate_id"],
+        )
+        if removed != [expected] or not expected["complete"]:
+            return False
+        remaining = [owner for owner in owners if owner.get("source_file") != filename]
+        projected = {**context, "owners": remaining}
+        return bool(remaining) and digest(projected) == candidate["context_sha256"]
+
+    @_identity_read_snapshot
+    def identity_requests(self, synthesis: SourceSynthesis) -> list[dict[str, Any]]:
+        """Proposals that need an explicit identity assessment, BEFORE assignment.
+
+        One request per concept whose proposal (its ``canonical_id`` or the
+        persisted producer hint in its receipt) names an existing entity that
+        no other evidence binds, when both definitions exist and no terminal
+        verdict for exactly this subject/candidate/snapshot pair is recorded.
+        Pure: never mutates the synthesis or the registry.
+        """
+        from obsidian_llm_wiki.core.entity_identity import (
+            TERMINAL_VERDICTS,
+            assessment_records,
+            definition_snapshot,
+            identity_proposal,
+        )
+
+        proposals = getattr(self, "_identity_proposals", None)
+        if proposals is None:
+            proposals = self._identity_proposals = {}
+        proposals[synthesis.source_file] = synthesis
+        receipt = synthesis.review_receipt
+        records = assessment_records(receipt)
+        source_file = synthesis.source_file or ""
+        requests: list[dict[str, Any]] = []
+        seen: set[tuple[str, str]] = set()
+        for index, concept in enumerate(synthesis.concepts):
+            from obsidian_llm_wiki.core.identity_context import source_context
+            from obsidian_llm_wiki.core.identity_plan import digest
+            subject_context = source_context(synthesis, index, self.identity_content(
+                source_file, (receipt or {}).get("source_sha256", "")))
+            own_sha = definition_snapshot(concept.title, concept.summary)
+            if not own_sha:
+                continue
+            from obsidian_llm_wiki.core.entity_identity import label_key, labels_of
+            proposal_labels = labels_of(concept.title, concept.aliases)
+            hints = [str(row[0]) for row in self.connection.execute(
+                "SELECT id FROM concept WHERE slug=? OR title=? ORDER BY id",
+                (concept.slug, concept.title))]
+            for label in (concept.title, *concept.aliases):
+                hints.extend(str(row[0]) for row in self.connection.execute(
+                    "SELECT concept_id FROM concept_alias WHERE alias=? ORDER BY concept_id",
+                    (label_key(label),)))
+            hints.extend(
+                cid
+                for cid, parts in getattr(self, "_planned_concepts", {}).items()
+                if any(
+                    s.concepts[i].slug == concept.slug
+                    or proposal_labels & labels_of(s.concepts[i].title, s.concepts[i].aliases)
+                    for s, i in parts
+                )
+            )
+            for proposal in dict.fromkeys(
+                [identity_proposal(receipt, own_sha), concept.canonical_id, *hints]
+            ):
+                if not proposal or (own_sha, proposal) in seen:
+                    continue
+                ok, _basis = self._reuse_is_bound(
+                    proposal, concept, source_file, receipt=receipt,
+                )
+                if ok:
+                    break
+                candidate = self.candidate_snapshot(proposal, source_file)
+                if candidate is None or not candidate["sha256"]:
+                    continue
+                if any(
+                    record["subject_sha256"] == own_sha
+                    and record["candidate_id"] == proposal
+                    and record["candidate_sha256"] == candidate["sha256"]
+                    and self._terminal_context_matches(record, candidate, synthesis, index)
+                    and record.get("source_sha256") == (receipt or {}).get("source_sha256")
+                    and record.get("subject_context_sha256") == digest(subject_context)
+                    and record["verdict"] in TERMINAL_VERDICTS
+                    for record in records
+                ):
+                    continue
+                seen.add((own_sha, proposal))
+                requests.append({
+                    "concept_index": index, "subject_title": concept.title,
+                    "subject_summary": concept.summary, "subject_sha256": own_sha,
+                    "subject_context": subject_context,
+                    "candidate_id": proposal, "candidate_title": candidate["title"],
+                    "candidate_summary": candidate["summary"],
+                    "candidate_sha256": candidate["sha256"],
+                    "anchor_source": candidate["anchor_source"],
+                    "candidate_context": candidate["context"],
+                    "candidate_context_sha256": candidate["context_sha256"],
+                })
+        return requests
+
+    def binding_evidence(self) -> dict[tuple[str, str], str]:
+        """``(source_file, canonical_id) -> basis`` of assignments since the last reset."""
+        return dict(getattr(self, "_binding_log", {}))
+
+    def reset_binding_evidence(self) -> None:
+        """Start a fresh binding-evidence log (e.g. before the final assignment pass)."""
+        self._binding_log = {}
+
+    @_identity_read_snapshot
     def _assign_canonical_ids(self, synthesis: SourceSynthesis) -> None:
-        """Resolve model-provided IDs only when they already exist locally."""
+        """Resolve identity proposals from affirmative evidence only.
+
+        A model ``canonical_id`` (or a copied/owned slug) is an untrusted
+        matching proposal, never the authority to merge into another entity:
+        it binds only on a basis accepted by :meth:`_reuse_is_bound`
+        (ownership continuity, identical definition, or an explicit identity
+        assessment recorded in the synthesis receipt and bound to the
+        candidate ID and definition snapshots). A rejected proposal falls back
+        to the concept's own identity — a copied canonical slug is replaced by
+        the concept's own title slug — BEFORE any registry mutation. Direct
+        API callers without an assessment get no implicit approval.
+        """
+        from obsidian_llm_wiki.core.models import normalize_slug
+        from obsidian_llm_wiki.render.frontmatter import slugify
+
         slug_map: dict[str, str] = {}
+        claimed_ids: set[str] = set()
         reservations = getattr(self, "_concept_reservations", None)
         if reservations is None:
             reservations = self._concept_reservations = {}
 
-        def definition_key(title: str, summary: str) -> str:
+        source_file = synthesis.source_file or ""
+        proposals = getattr(self, "_identity_proposals", None)
+        if proposals is None:
+            proposals = self._identity_proposals = {}
+        proposals[source_file] = synthesis
+
+        def definition_key(title: str, summary: str, *, owner: str) -> str:
+            # A missing definition never matches another one: its key is
+            # private to its owner (row ID or proposing source).
+            if not " ".join(summary.split()):
+                return "missing:" + hashlib.sha256(
+                    f"{owner}\x1f{title}".encode()
+                ).hexdigest()
             text = "\x1f".join(" ".join(value.casefold().split()) for value in (title, summary))
             return hashlib.sha256(text.encode()).hexdigest()
 
@@ -1161,21 +1705,81 @@ class VaultRegistry:
                     "WHERE cs.concept_id=? AND s.filename=?",
                     (row[0], synthesis.source_file),
                 ).fetchone() is not None
-                return str(row[0]), str(row[1]), definition_key(str(row[2]), str(row[3])), owned
+                return (
+                    str(row[0]), str(row[1]),
+                    definition_key(str(row[2]), str(row[3]), owner=str(row[0])), owned,
+                )
+            historical = self.connection.execute(
+                "SELECT id FROM identity_entity_history WHERE slug=?", (slug,)).fetchone()
+            if historical is not None:
+                return str(historical[0]), slug, "historical entity", False
             pending = reservations.get(slug)
             if pending is not None:
                 identity, fingerprint, owner = pending
                 return identity, slug, fingerprint, owner == synthesis.source_file
             return None
 
+        receipt = synthesis.review_receipt
+        binding_log = getattr(self, "_binding_log", None)
+        if binding_log is None:
+            binding_log = self._binding_log = {}
+        bases: dict[str, str] = {}
+
+        def bound(concept_id: str, concept: ConceptNote, *, explicit: bool) -> bool:
+            if concept_id in claimed_ids:
+                self._record_identity_rejection(
+                    source_file, concept, concept_id,
+                    "identity already claimed by another concept of this source",
+                )
+                return False
+            ok, reason = self._reuse_is_bound(
+                concept_id, concept, source_file, explicit=explicit, receipt=receipt,
+            )
+            if not ok:
+                self._record_identity_rejection(source_file, concept, concept_id, reason)
+            else:
+                bases[concept_id] = reason
+            return ok
+
+        from obsidian_llm_wiki.core.entity_identity import (
+            contribution_snapshot,
+            definition_snapshot,
+            find_assessment,
+            identity_proposal,
+        )
+
         for concept in synthesis.concepts:
             original_slug = concept.slug
-            fingerprint = definition_key(concept.title, concept.summary)
+            fingerprint = definition_key(concept.title, concept.summary, owner=source_file)
+            own_sha = definition_snapshot(concept.title, concept.summary)
             row = None
-            if concept.canonical_id:
-                row = self.connection.execute(
-                    "SELECT id, slug FROM concept WHERE id=?", (concept.canonical_id,)
+            basis = ""
+            proposals = [concept.canonical_id] if concept.canonical_id else []
+            # The producer's original hint survives a rejection in the receipt;
+            # an assessment recorded for it (e.g. after a retried assessment or
+            # a cache upgrade) is tried first.
+            persisted = identity_proposal(receipt, own_sha)
+            if persisted and persisted not in proposals and find_assessment(
+                receipt, subject_sha=own_sha, candidate_id=persisted,
+            ):
+                proposals.insert(0, persisted)
+            for proposed in proposals:
+                hinted = self.connection.execute(
+                    "SELECT id, slug FROM concept WHERE id=?", (proposed,)
                 ).fetchone()
+                if hinted is None:
+                    pending = getattr(self, "_planned_concepts", {}).get(proposed, [])
+                    if pending:
+                        hinted = (proposed, pending[0][0].concepts[pending[0][1]].slug)
+                if hinted is not None and bound(str(hinted[0]), concept, explicit=True):
+                    row, basis = hinted, bases[str(hinted[0])]
+                    break
+                if hinted is not None and concept.slug == str(hinted[1]):
+                    # The proposal also copied the rejected entity's canonical
+                    # slug; resolve this concept under its own reviewed title.
+                    # (When its own title slug is identical, the collision rule
+                    # below gives it a distinct definition-derived slug.)
+                    concept.slug = normalize_slug(slugify(concept.title), concept.title)
             if row is None and synthesis.source_file:
                 # Revisions keep a previously disambiguated source-owned note.
                 # Look only through this source's indexed ownership, not the vault.
@@ -1189,27 +1793,78 @@ class VaultRegistry:
                     candidate for candidate in owned_rows
                     if " ".join(str(candidate[2]).casefold().split())
                     == " ".join(concept.title.casefold().split())
+                    and str(candidate[0]) not in claimed_ids
                 ]
-                if len(matches) == 1:
-                    row = matches[0]
+                if len(matches) == 1 and bound(str(matches[0][0]), concept, explicit=False):
+                    row, basis = matches[0], bases[str(matches[0][0])]
             if row is None:
                 candidate = existing_identity(concept.slug)
-                if candidate is not None and candidate[2] != fingerprint and not candidate[3]:
-                    # Equal titles can still be homonyms (Python the language vs
-                    # the snake). Only exact definitions or prior source ownership
-                    # permit implicit reuse. Semantic reuse must name a known ID.
-                    suffix = fingerprint[:16]
-                    concept.slug = f"{original_slug[:80 - len(suffix) - 1]}-{suffix}"
-                    candidate = existing_identity(concept.slug)
-                    if candidate is not None and candidate[2] != fingerprint and not candidate[3]:
-                        raise ValueError(f"Ambiguous canonical identity for {original_slug!r}")
                 if candidate is not None:
-                    row = candidate[:2]
+                    if self.connection.execute(
+                        "SELECT 1 FROM concept WHERE id=?", (candidate[0],)
+                    ).fetchone():
+                        if bound(candidate[0], concept, explicit=False):
+                            row, basis = candidate[:2], bases[candidate[0]]
+                    elif candidate[3] and candidate[2] == fingerprint:
+                        row, basis = candidate[:2], "own reservation"
+                    elif bound(candidate[0], concept, explicit=False):
+                        row, basis = candidate[:2], bases[candidate[0]]
+                if candidate is not None and row is None:
+                    # Labels and equal generic definitions never authorize a collision.
+                    suffix = hashlib.sha256(f"{source_file}\0{fingerprint}".encode()).hexdigest()[
+                        :16
+                    ]
+                    base = normalize_slug(slugify(concept.title), concept.title)
+                    concept.slug = f"{base[:80 - len(suffix) - 1]}-{suffix}"
+                    other = existing_identity(concept.slug)
+                    if other is not None:
+                        if other[3] and other[2] == fingerprint:
+                            row, basis = other[:2], "own reservation"
+                        elif bound(other[0], concept, explicit=False):
+                            row, basis = other[:2], bases[other[0]]
+                        else:
+                            raise ValueError(f"Ambiguous canonical identity for {original_slug!r}")
             if row is not None:
                 concept.canonical_id = str(row[0])
                 concept.slug = str(row[1])
             else:
-                concept.canonical_id = self._stable_id("concept", concept.slug)
+                revision = (receipt or {}).get("source_sha256", "")
+                concept.canonical_id = self._stable_id(
+                    "concept", f"{source_file}\0{revision}\0{fingerprint}")
+                basis = "new entity"
+            binding_log[(source_file, concept.canonical_id)] = basis
+            if isinstance(receipt, dict) and basis in {
+                "new entity",
+                "assessed same entity",
+                "unchanged revision binding",
+                "own reservation",
+            }:
+                previous_binding = receipt.get("publication_binding", {}).get(
+                    concept.canonical_id, {}
+                )
+                if basis == "unchanged revision binding":
+                    # This is a reuse decision, not a new proof. Preserve the
+                    # admitted record validated by _reuse_is_bound, not a
+                    # caller-supplied binding or a rewritten diagnostic basis.
+                    previous = self._identity_syntheses({source_file})[source_file]
+                    binding = dict(previous.review_receipt["publication_binding"][
+                        concept.canonical_id
+                    ])
+                else:
+                    proof = find_assessment(
+                        receipt, subject_sha=own_sha, candidate_id=concept.canonical_id
+                    )
+                    binding = {
+                        "subject_sha256": own_sha,
+                        "source_sha256": receipt.get("source_sha256", ""),
+                        "contribution_sha256": contribution_snapshot(concept),
+                        "basis": basis,
+                        "assessor": (proof or {}).get(
+                            "assessor", previous_binding.get("assessor", "")
+                        ),
+                    }
+                receipt.setdefault("publication_binding", {})[concept.canonical_id] = binding
+            claimed_ids.add(concept.canonical_id)
             reservations.setdefault(
                 concept.slug, (concept.canonical_id, fingerprint, synthesis.source_file)
             )
@@ -1247,7 +1902,18 @@ class VaultRegistry:
         self._assign_moc_identities(synthesis)
 
     def _assign_moc_identities(self, synthesis: SourceSynthesis) -> None:
-        """Reuse topic labels only with ownership or shared canonical members."""
+        """Reuse a MoC across sources only with ownership or an identity-bound member.
+
+        A MoC has no producer ``canonical_id``; its reuse proposal is a slug.
+        Cross-source reuse requires the same exact topic title (case/space
+        normalized, punctuation preserved), the same detected language, AND at
+        least one shared member that THIS source defines itself — i.e. whose
+        identity the concept assignment above bound with affirmative evidence.
+        A member slug the source merely references (an unverified external
+        proposal) never counts, and a title alone never merges two topics.
+        This is the one remaining automatic (non-assessed) match; it is
+        documented in docs/implementation.md.
+        """
         from obsidian_llm_wiki.synth.language import detect_language
 
         reservations = getattr(self, "_moc_reservations", None)
@@ -1274,10 +1940,11 @@ class VaultRegistry:
             return (" ".join(str(row[1]).casefold().split()),
                     detect_language(str(row[2]) or str(row[1])), members, "")
 
+        defined = {concept.slug for concept in synthesis.concepts}
         for moc in synthesis.maps:
             title_key = " ".join(moc.title.casefold().split())
             language = detect_language(moc.summary or moc.title)
-            members = set(moc.concept_slugs)
+            members = set(moc.concept_slugs) & defined
             previous_owned = [str(row[0]) for row in owned
                               if " ".join(str(row[1]).casefold().split()) == title_key]
             if len(previous_owned) == 1:
@@ -1592,7 +2259,13 @@ class VaultRegistry:
             if not contributions:
                 continue
             # These are freshly decoded objects, never caller-owned syntheses.
+            # Same lossless projection as render's merge_bundle: every owner's
+            # summary paragraphs and tags survive (first owner's title).
+            from obsidian_llm_wiki.synth.dedupe import _join_summary_paragraphs
+
             merged = contributions[0][1]
+            merged.summary = _join_summary_paragraphs(*(moc.summary for _s, moc in contributions))
+            merged.tags = normalise_tags([tag for _s, moc in contributions for tag in moc.tags])
             payload = moc_to_dict(merged)
             payload["tags"] = normalise_tags(merged.tags)
             members: dict[str, str] = {}

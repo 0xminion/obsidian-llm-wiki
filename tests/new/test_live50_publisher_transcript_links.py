@@ -11,6 +11,7 @@ from xml.sax.saxutils import escape
 import httpx
 import pytest
 
+from obsidian_llm_wiki.ingest import transcript_resolver as tr
 from obsidian_llm_wiki.ingest import url_safety
 from obsidian_llm_wiki.ingest.extractors import podcast
 
@@ -45,6 +46,8 @@ def rss(notes="", *, title=TITLE):
     return (
         '<rss><channel><title>Example Show</title><language>en</language><item>'
         f'<title>{escape(title)}</title><guid>{GUID}</guid>'
+        # Spotify identity policy: the item must be corroborated (same day).
+        '<pubDate>Tue, 03 Sep 2024 16:24:11 +0000</pubDate>'
         f'<description>{escape(notes)}</description>'
         f'<enclosure url="{AUDIO}" type="audio/mpeg"/>'
         '</item></channel></rss>'
@@ -85,15 +88,35 @@ def acquisition(monkeypatch, tmp_path):
     monkeypatch.setattr(podcast, "_get_supadata_key", lambda: "")
     monkeypatch.setattr(podcast, "_whisper_fallback_transcribe", lambda url: asr.append(url) or "")
     routes["https://itunes.apple.com/search?term=Example+Show&media=podcast&limit=5"] = {
-        "results": [{"feedUrl": "https://publisher.example/rss"}],
+        # A directory entry must name the show to be an identity candidate.
+        "results": [{"collectionName": "Example Show", "feedUrl": "https://publisher.example/rss"}],
     }
+    # Spotify pools the episode-title directory search as a candidate route.
+    routes[str(httpx.URL("https://itunes.apple.com/search", params={
+        "term": TITLE, "media": "podcast", "limit": 5,
+    }))] = {"results": []}
     routes["https://publisher.example/rss"] = rss()
     return routes, requests, asr
 
 
+def bound_cache(artifact):
+    """The cache entry bound to (episode identity, ``artifact``); epoch-3 keys."""
+    import json
+
+    hits = []
+    for path in tr._cache_dir().glob("*.json"):
+        identity = json.loads(path.read_text()).get("identity", "")
+        head, _, body = identity.partition("\n")
+        bound = head == "olw-podcast-transcript-binding-v3"
+        if bound and json.loads(body)["artifact"][1] == artifact:
+            hits.append(identity)
+    assert len(hits) <= 1, hits
+    return tr.load_transcript_cache(hits[0]) if hits else None
+
+
 def metadata(routes, notes, *, title=TITLE):
     routes["https://defuddle.md/open.spotify.com/episode/synthetic452"] = (
-        f"---\ntitle: {title}\nauthor: Example Show\nlanguage: en\n"
+        f"---\ntitle: {title}\nauthor: Example Show\npublished: 2024-09-03\nlanguage: en\n"
         f"description: {notes}\n---\n{notes}"
     )
 
@@ -137,7 +160,10 @@ def test_unsafe_or_ambiguous_url_syntax_is_never_requested(acquisition, url):
     metadata(routes, f"Transcript:{url}")
     with pytest.raises(RuntimeError, match="no transcript"):
         podcast.extract_spotify(SOURCE)
-    assert len(requests) == 3  # metadata, directory and RSS only
+    # Contract change: such a link names no publisher hosting the listed feed,
+    # so no feed is authoritative (or, unparsable, no directory is searched).
+    assert all(u.startswith(("https://defuddle.md/", "https://itunes.apple.com/"))
+               for u in requests)
 
 
 @pytest.mark.parametrize("notes", [
@@ -151,7 +177,11 @@ def test_arbitrary_or_multiple_distinct_labels_are_not_discovery(acquisition, no
     metadata(routes, notes)
     with pytest.raises(RuntimeError, match="no transcript"):
         podcast.extract_spotify(SOURCE)
-    assert len(requests) == 3
+    # Only metadata, directory and (when Spotify's description names the
+    # publisher) its feed are requested; never an arbitrary or ambiguous link.
+    assert all(u.startswith(("https://defuddle.md/", "https://itunes.apple.com/"))
+               or u == "https://publisher.example/rss" for u in requests)
+    assert ARTIFACT not in requests
 
 
 @pytest.mark.parametrize("mode", ["unmatched", "ambiguous"])
@@ -204,7 +234,9 @@ def test_link_heading_and_long_sponsors_are_not_an_inline_transcript(acquisition
     with pytest.raises(RuntimeError, match="no transcript"):
         podcast.extract_spotify(SOURCE)
 
-    assert requests.count(ARTIFACT) == 1
+    # The frontmatter description ("## Transcript") names no publisher, so no
+    # feed is authoritative and the link is not followed (contract change).
+    assert requests.count(ARTIFACT) == 0
     assert not list(tmp_path.rglob("*.json"))
 
 
@@ -229,7 +261,7 @@ def test_hidden_or_nested_link_text_does_not_authorize_a_request(acquisition, no
     metadata(routes, notes)
     with pytest.raises(RuntimeError, match="no transcript"):
         podcast.extract_spotify(SOURCE)
-    assert len(requests) == 3
+    assert ARTIFACT not in requests and "https://publisher.example/rss" not in requests
 
 
 def test_plain_label_acquires_same_episode_before_asr_with_provenance(acquisition):
@@ -245,7 +277,7 @@ def test_plain_label_acquires_same_episode_before_asr_with_provenance(acquisitio
     assert source.provenance.extracted_url == ARTIFACT
     assert source.provenance.resolved_url == ARTIFACT
     assert source.provenance.extractor_chain == ("publisher_transcript_link",)
-    cached = podcast.load_transcript_cache(f"{GUID}|{AUDIO}")
+    cached = bound_cache(ARTIFACT)
     assert cached is not None
     assert cached.artifact_url == ARTIFACT
     assert cached.provider == "publisher_transcript_link"
@@ -260,6 +292,11 @@ def test_plain_label_acquires_same_episode_before_asr_with_provenance(acquisitio
 
 @pytest.mark.parametrize("field", ["description", "encoded", "summary"])
 def test_labels_in_only_the_matched_rss_item_are_available(acquisition, field):
+    """Item-only labels are used on an authoritative feed (here the requested RSS).
+
+    Contract change: a Spotify page whose description names no publisher no
+    longer authenticates a directory feed, so the Spotify route fails closed.
+    """
     routes, requests, asr = acquisition
     metadata(routes, "Description without a transcript link.")
     feed = rss(f"Transcript: {ARTIFACT}")
@@ -267,14 +304,19 @@ def test_labels_in_only_the_matched_rss_item_are_available(acquisition, field):
         "</description>", f"</{field}>",
     ).replace("<language>en</language>", "<language>pt-BR</language>")
     routes["https://publisher.example/rss"] = feed
+    routes["https://defuddle.md/publisher.example/rss"] = httpx.Response(404)
     routes[ARTIFACT] = transcript_html()
 
-    source = podcast.extract_spotify(SOURCE)
+    with pytest.raises(RuntimeError, match="no transcript"):
+        podcast.extract_spotify(SOURCE)
+    assert ARTIFACT not in requests
+
+    source = podcast.extract_podcast_rss("https://publisher.example/rss")
 
     assert SPEECH in source.content
     assert requests.count(ARTIFACT) == 1
     assert asr == []
-    cached = podcast.load_transcript_cache(f"{GUID}|{AUDIO}")
+    cached = bound_cache(ARTIFACT)
     assert cached is not None and cached.language == "pt-BR"
 
 
@@ -284,11 +326,13 @@ def test_labels_in_only_the_matched_rss_item_are_available(acquisition, field):
 ])
 def test_rss_html_labels_use_anchor_destination(acquisition, notes):
     routes, requests, asr = acquisition
-    metadata(routes, "Show notes only.")
     routes["https://publisher.example/rss"] = rss(notes)
+    routes["https://defuddle.md/publisher.example/rss"] = httpx.Response(404)
     routes[ARTIFACT] = transcript_html()
 
-    source = podcast.extract_spotify(SOURCE)
+    # Authoritative requested feed (a Spotify page without a labelled link
+    # cannot authenticate a directory feed; see the authority-binding doc).
+    source = podcast.extract_podcast_rss("https://publisher.example/rss")
 
     assert SPEECH in source.content
     assert requests.count(ARTIFACT) == 1

@@ -1,6 +1,6 @@
 # Migration, dry runs, backups, and recovery
 
-Active operating procedure. There is **no `olw migrate` command**. [`VaultRegistry.__init__`](../obsidian_llm_wiki/core/registry.py) upgrades supported SQLite schemas on open; `migrate_legacy()` imports old JSON state/cache. A normal build invokes both paths. See [version namespaces](data-model.md#version-namespaces).
+Active operating procedure. There is **no `olw migrate` command**. See [identity-migration-preview.md](identity-migration-preview.md) for legacy identity inventory and schema-7 publication inspection: `olw identity-migration "$VAULT" --dry-run` is read-only, refuses busy/uncheckpointed-WAL registries, and has **no apply or recovery mode**. [`VaultRegistry.__init__`](../obsidian_llm_wiki/core/registry.py) upgrades supported SQLite schemas on writable open; `migrate_legacy()` imports old JSON state/cache. Public builds perform this work in a private workspace, not by migrating human legacy metadata or installed generations in place. See [immutable application callers](immutable-application-callers.md) and [version namespaces](data-model.md#version-namespaces).
 
 ## Offline command rehearsal receipt
 
@@ -11,7 +11,7 @@ The documented snapshot, read-only plan, explicit migration, canonical-ID discov
 1. Stop all `olw` processes, scheduled jobs, the desktop bridge, editors, and sync writers for this vault. A compiler lock is not a lock against an editor or cloud sync client.
 2. Keep the old application environment/package version available for rollback. Do not run an old binary against the upgraded database; future-schema protection rejects that.
 3. Snapshot the **entire vault**, including sources, notes, `.env`, policy, `.llmwiki`, backups, `registry.db`, and any `registry.db-wal`/`registry.db-shm`. Copying only the DB during activity can lose WAL state. Per-page automatic backups are not a migration snapshot.
-4. Rehearse on a disposable copy. `olw build --dry-run` is now **read-only**: it reads source bodies and `state.json` without opening SQLite or contacting providers. It does **not** preview schema migration, version compatibility, cache validity, retry eligibility, or render changes. Missing JSON state classifies present sources as new; invalid state/inventory fails closed. `health` and normal registry opens can write maintenance/schema state, so use the snapshot first.
+4. Rehearse on a disposable copy. `olw build --dry-run` is **read-only**: it validates current publication, then reads source bodies and current (or legacy fallback) `state.json` without writable SQLite opens or provider calls. Its content plan does **not** predict schema migration, synthesis compatibility, retry eligibility, or render changes. Missing JSON state classifies present sources as new; invalid state/inventory or corrupt publication fails closed. `health` is read-only; direct writable registry constructors can still migrate, so use only a disposable legacy copy for the internal snippet below.
 
 The following Bash/Python commands use the installed `olw` and the same activated Python environment. Replace only the vault path. They refuse symlinks rather than accidentally running a rehearsal through links back into production; handle a symlinked vault with an explicit filesystem snapshot strategy instead.
 
@@ -63,7 +63,7 @@ PY
 
 Store `WORK` somewhere durable if `TMPDIR` is periodically pruned; the example location is suitable for rehearsal, not long-term backup retention. The snapshot contains credentials from `.env`; restrict access and do not upload it as audit evidence.
 
-### 2. Rehearse schema and legacy import without LLM calls
+### 2. Rehearse legacy schema import without LLM calls
 
 First exercise the actual read-only CLI inventory on the copy (this does not migrate SQLite):
 
@@ -71,7 +71,7 @@ First exercise the actual read-only CLI inventory on the copy (this does not mig
 olw build "$REHEARSAL" --dry-run
 ```
 
-Then explicitly exercise the internal migration API and database checks on that same copy. This is an executable Python maintenance snippet, **not a new CLI command**:
+For a **legacy flat-layout rehearsal only**, the following explicitly exercises the internal migration API and database checks on that disposable copy. It mutates the copy's legacy metadata and is **not a new CLI command or the current immutable publication path**. Do not point it at an installed generation. For an already-published vault, use `olw current "$REHEARSAL" --json` and `olw identity-migration "$REHEARSAL" --dry-run --json` instead; leave installed and legacy metadata intact.
 
 ```bash
 TARGET="$REHEARSAL" python - <<'PY'
@@ -97,7 +97,7 @@ with VaultRegistry(root) as registry:
 PY
 ```
 
-The current target schema is 6. Legacy import is marker-based and upsert-oriented; a second call should not re-import a completed migration. The legacy operation ledger is separately imported on registry open. Invalid/skipped legacy JSON needs manual inspection: a migration marker is not proof that every old cache entry was valid.
+The candidate target schema is **7**, adding exact historical identity source contexts and entity history. The schema-6 rehearsal receipt above is historical, not verification of this new contract. Legacy import is marker-based and upsert-oriented; a second call should not re-import a completed migration. The legacy operation ledger is separately imported on registry open. Invalid/skipped legacy JSON needs manual inspection: a migration marker is not proof that every old cache entry was valid. Missing historical context is not fabricated by preview.
 
 Do not pass current artifact labels to certify old output. Legacy material remains version-incompatible until it is successfully re-synthesized. Check expected source filenames and important notes, not only row counts or `integrity_check`.
 
@@ -107,6 +107,7 @@ These steps may contact the configured LLM/embedding service and incur cost. Rev
 
 ```bash
 olw build "$REHEARSAL"
+olw current "$REHEARSAL" --json
 olw health "$REHEARSAL" --full --json
 olw validate "$REHEARSAL" --strict
 olw metrics "$REHEARSAL"
@@ -121,7 +122,7 @@ Inspect errors and per-source outcomes as well as process exit status. Build/rec
 - Failed replacement syntheses retained last-good output and are still retryable.
 - Re-running an unchanged build performs no new synthesis; a changed source updates its dependents.
 
-Old notes with no `render-page-hashes.json` entry are intentionally protected. A build may preserve them instead of adopting/replacing them. Review and back up a legacy note before moving it out of a generated path; then compare regenerated output and merge your edits explicitly. There is no blanket “trust all old generated files” migration switch.
+Existing legacy notes stay in place regardless of render ownership hashes. New output lives under `04-Wiki/OLW-Publications/generations/<generation>/`; use the `entrypoint` returned by `current`, not the old flat `index.md`. Keep human edits in retained legacy notes or separate annotations; do not move or overwrite them merely to make room for regenerated pages. There is no blanket “trust all old generated files” migration switch.
 
 ### 4. Apply to the original
 
@@ -129,6 +130,7 @@ After the copy has passed your checks, confirm production has not changed since 
 
 ```bash
 olw build "$VAULT"
+olw current "$VAULT" --json
 olw health "$VAULT" --full --json
 olw validate "$VAULT" --strict
 ```
@@ -137,12 +139,36 @@ Do not copy just a rehearsal `registry.db` over production: caches, page hashes,
 
 ## Choose the right recovery operation
 
+### Legacy identity publication journal gate
+
+For legacy metadata before the first immutable publication, inspect the identity journal read-only:
+
+```bash
+olw identity-migration "$REHEARSAL" --dry-run --json
+```
+
+In that legacy layout, any `.llmwiki/publication-stage` is an explicit blocker, **even with a committed
+`identity-publication.json` marker**. A pending, interrupted, malformed, binary-
+blocked or cleanup-incomplete journal is not a clean generation. The preview
+leaves every byte untouched, makes no provider calls and never attempts recovery.
+Exit 3 inventories the blocker; exit 2 refuses an unsafe/busy database snapshot.
+Neither is success/readiness. Preserve the whole vault and journal for diagnosis.
+Do not delete a journal or sidecars to silence the gate. Rehearse recovery only
+with a matching writer whose recovery behavior has been separately verified;
+the audited candidate had human-file recovery and marker/journal ordering defects.
+Normal builds and maintenance APIs may write and contact providers; they are not
+read-only substitutes. See the preview guide for filesystem race, atime and
+snapshot limits. This workflow does not certify production migration apply.
+
+For immutable publications, `OLW-Publications/current.json` is the authoritative pointer. Resolve it with `olw current "$VAULT" --json`. A pending new private workspace does not invalidate a valid previous generation. Corrupt current generations are refused by build and readers; do not edit manifests, delete journals, or overwrite generation files to bypass validation. The earlier legacy journal findings above describe their historical audit, not a replacement for the current [publication contract](immutable-publication.md).
+
 | Problem | Operation | Caveat |
 | --- | --- | --- |
-| Missing/damaged generated artifact with otherwise current synthesis | `olw build "$VAULT" --refresh-render` | Reconciles output without forcing synthesis. Protected edited/unknown files remain protected. |
+| Need a fresh projection from a valid current generation or legacy inputs | `olw build "$VAULT" --refresh-render` | Publishes a complete new immutable generation through normal review; compatible syntheses are reused, but changed/incompatible inputs may call models and incur cost. Existing human files and generations are retained. |
+| Damaged/corrupt committed generation | Stop writers, preserve the whole state, and inspect a verified whole-vault snapshot | `--refresh-render` does not bypass current-generation validation or repair files in place. Do not mix individual DB, cache, page, or pointer backups. |
 | Need fresh inference for every source | `olw build "$VAULT" --force` | Expensive; re-reads/re-synthesizes everything and explicitly resets pending synthesis retry backoff. Does not steal live claims or bypass edit protection. |
-| One failed source needs another synthesis attempt | `olw recompile "$VAULT" article.md`, then `olw build "$VAULT"` | Uses complete input; cannot recover text missing from extraction. |
-| Source text was truncated or changed upstream | `olw ingest "$VAULT" --url URL --refresh` | Re-extract after checking limits/access; title/provenance-only refresh is retained too. A larger prompt cannot restore lost source text. |
+| One failed source needs another synthesis attempt | `olw recompile "$VAULT" article.md` | Forces the named complete input through synthesis/review and publishes a complete new generation; no follow-up build is needed. Cannot recover text missing from extraction. |
+| Source text was truncated or changed upstream | `olw ingest "$VAULT" --url URL --refresh --preview` | Observational extraction may contact services. Review and save accepted text under a new input filename, preserving existing sources, then build. Mutating `--refresh` is refused. A larger prompt cannot restore lost source text. |
 | Interrupted ingestion | `olw ingest "$VAULT" --resume` | Check results and pending retry times; not an exactly-once guarantee. Repeating a known URL with synthesis enabled also builds the existing corpus; it need not extract a new URL to recover due synthesis work. |
 | Whole migration or cross-store inconsistency | Restore the complete snapshot below | Do not mix old DB with new generated state. |
 
@@ -187,10 +213,10 @@ PY
 
 If the copy fails, leave writers stopped; the failed vault is preserved and the backup remains intact. Do not overlay arbitrary DB/cache files until you have chosen a consistent snapshot.
 
-For a **single maintenance backup**, the supported command is:
+## Single-backup inspection and republishing
 
-```bash
-olw fix "$VAULT" --restore "$VAULT/04-Wiki/.llmwiki/backups/PATH/FILE.bak"
-```
+`olw fix --restore` is a **retained compatibility option that is always refused**, including for a trusted backup. It is not a working single-file restoration command. The refusal protects existing human files and immutable generations; supplying a different backup path does not enable restoration.
 
-Replace `PATH/FILE.bak` with an actual trusted backup path. This restores one supported backup, not the whole database or a migration. Review the target and make a full snapshot first; `--restore` cannot be combined with `--dry-run` or `--apply`.
+Inspect a backup read-only. If its content is useful, copy it manually to a **new, separate annotation file** under `03-Raw-Annotations/`, preserving the backup and all existing files. Do not overwrite a legacy note, an existing annotation, or any file inside `OLW-Publications/generations/`.
+
+To regenerate output from source inputs when the current publication is valid, use `olw build "$VAULT" --refresh-render`. `olw fix "$VAULT" --apply` also republishes a complete projection (and refuses when there are no source inputs); it does not apply each dry-run text edit. Both use normal synthesis/review gates and **may call models and incur cost** for changed/incompatible inputs. They retain human files and old immutable generations and do not automatically resolve human-review findings. This is republishing, not restoring backup bytes. Whole-vault snapshot rollback above is a separate, explicit recovery operation.

@@ -76,9 +76,12 @@ def save_synthesis(
     source_file: str,
     *,
     artifact_versions: Mapping[str, str] | None = None,
+    identity_plan=None,
 ) -> None:
     """Persist a SourceSynthesis to the cache, keyed by source filename."""
     synthesis.source_file = source_file
+    if identity_plan is not None:
+        identity_plan.check_source(synthesis)
     data = {
         "_artifact": {
             "kind": "source_synthesis",
@@ -88,6 +91,8 @@ def save_synthesis(
         "payload": source_synthesis_to_dict(synthesis),
     }
     path = synthesis_cache_path(cache_root, source_file)
+    if identity_plan is not None and path.is_file():
+        archive_cache(cache_root, path)
     atomic_write(path, json.dumps(data, indent=2, ensure_ascii=False))
 
 
@@ -166,9 +171,23 @@ def _cache_payload(data: dict[str, object]) -> dict[str, object]:
     return data
 
 
+def archive_cache(cache_root: Path, path: Path) -> None:
+    raw = path.read_bytes()
+    archived = checked_generated_path(
+        cache_root / "cache-history" / (sha256(raw).hexdigest() + ".json"), cache_root
+    )
+    if not archived.exists():
+        atomic_write(archived, raw.decode("utf-8"))
+
+
 def delete_cached_synthesis(cache_root: Path, source_file: str) -> None:
     """Remove a cached synthesis file (called when a source is deleted)."""
     path = synthesis_cache_path(cache_root, source_file)
+    if path.is_file():
+        archive_cache(cache_root, path)
+    from obsidian_llm_wiki.core.publication_transaction import record_delete
+
+    record_delete(path)
     with suppress(OSError):
         path.unlink(missing_ok=True)
 

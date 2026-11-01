@@ -37,29 +37,38 @@ def fix(
     vault: str = typer.Argument(..., help="Path to Obsidian vault"),
     dry_run: bool = typer.Option(False, "--dry-run", help="Print a plan without writing files"),
     apply: bool = typer.Option(
-        False, "--apply", help="Apply only deterministic non-reviewed fixes"
+        False, "--apply", help="Publish a new projection; never patch legacy or published files"
     ),
-    restore: Path | None = typer.Option(None, "--restore", help="Restore one trusted backup path"),
+    restore: Path | None = typer.Option(
+        None, "--restore",
+        help="Retained compatibility option; always refused under immutable publication",
+    ),
     json_output: bool = typer.Option(False, "--json", help="Emit the plan or result as JSON"),
 ) -> None:
     """Plan or explicitly apply conservative maintenance repairs.
 
-    Default mode is a dry run.  ``--apply`` never assigns MoCs, adds aliases,
-    resolves contradictions, or modifies a page marked ``reviewed: true``.
+    Default mode is a dry run. ``--apply`` rebuilds a complete new immutable
+    projection through normal review gates (changed inputs can require model
+    calls). It never edits existing pages or resolves human review findings.
     """
     if dry_run and apply:
         raise typer.BadParameter("choose either --dry-run or --apply, not both")
     _, config = resolve_vault(vault)
-    bundle_dir = config.wiki_dir
+    from obsidian_llm_wiki.core.application import read_publication
+
+    if restore is not None:
+        _emit_error(
+            "Refusing --restore: immutable publication never replaces human or published pages. "
+            "Inspect/copy the backup to a separate annotation manually, or run "
+            "build --refresh-render to publish a new generation.", json_output,
+        )
+    try:
+        bundle_dir, manifest = read_publication(config)
+    except (OSError, ValueError, RuntimeError) as exc:
+        _emit_error(str(exc), json_output)
     if not bundle_dir.is_dir():
         _emit_error(f"Bundle directory not found: {bundle_dir}", json_output)
 
-    if restore is not None:
-        if dry_run or apply:
-            raise typer.BadParameter("--restore cannot be combined with --dry-run or --apply")
-        result = _restore_backup(bundle_dir, restore, json_output)
-        _emit(result, json_output)
-        return
 
     findings_count, findings = _scan_maintenance_findings(bundle_dir)
     plan = plan_fixes(findings)
@@ -83,14 +92,34 @@ def fix(
         _emit(result, json_output)
         return
 
-    applied = _apply_fixes(bundle_dir, applicable)
+    # Repair the projection from accepted evidence; never patch a published or
+    # legacy human page. The existing semantic pipeline preserves review gates.
+    import asyncio
+
+    from obsidian_llm_wiki.core.application import source_inventory
+    from obsidian_llm_wiki.core.pipeline import run_pipeline
+
+    try:
+        sources = source_inventory(config).sources
+        if not sources:
+            raise ValueError(
+                "Refusing maintenance without source inputs; inspect annotations/backups manually."
+            )
+        compiled = asyncio.run(run_pipeline(config.vault, sources, config, refresh_render=True))
+        if compiled.errors:
+            raise ValueError("; ".join(compiled.errors))
+        _, published = read_publication(config)
+    except (OSError, ValueError, RuntimeError) as exc:
+        _emit_error("Maintenance publication failed: " + str(exc), json_output)
     result = {
-        "mode": "apply",
+        "mode": "publish",
+        "generation": published["generation"],
+        "action": "new immutable projection; legacy/human files retained; no in-place fixes",
         "files_scanned": findings_count,
         "plan": [_planned_fix_payload(item) for item in plan],
         "contradiction_review_actions": contradiction_review_actions,
         "summary": {
-            "applied": applied,
+            "pages_published": len(compiled.pages),
             "requires_review": len(requires_review) + len(contradiction_review_actions),
             "skipped_reviewed": skipped_reviewed,
         },

@@ -14,6 +14,7 @@ class TaskModelConfig:
     maintenance_model: str | None = None
     query_model: str | None = None
     expand_model: str | None = None
+    review_model: str | None = None
 
     def __post_init__(self) -> None:
         """Reject explicitly configured task models that contain no model name."""
@@ -22,21 +23,35 @@ class TaskModelConfig:
             "maintenance_model",
             "query_model",
             "expand_model",
+            "review_model",
         ):
             override = getattr(self, field_name)
             if override is not None and not override.strip():
                 raise ValueError(f"{field_name} must not be blank when provided")
 
 
-_SUPPORTED_TASKS = frozenset({"ingest", "maintenance", "query", "expand"})
+_SUPPORTED_TASKS = frozenset({"ingest", "maintenance", "query", "expand", "review", "identity"})
 
 
 def resolve_task_model(config: TaskModelConfig, task: str) -> str:
-    """Return the model configured for *task*, falling back to ``config.model``."""
+    """Return the model configured for *task*, falling back to ``config.model``.
+
+    ``review`` falls back to the ingest (synthesis) model, so grounding review
+    defaults to a separate call of the generator rather than the chat default.
+    """
     if task not in _SUPPORTED_TASKS:
         raise ValueError(
-            f"Unsupported task: {task!r}. Supported: ingest, maintenance, query, expand."
+            f"Unsupported task: {task!r}. "
+            "Supported: ingest, maintenance, query, expand, review, identity."
         )
+    if task == "identity":
+        # Cross-source identity assessment is judged by the reviewer model.
+        return resolve_task_model(config, "review")
+    if task == "review":
+        override = getattr(config, "review_model", None)
+        if override is not None:
+            return override
+        return resolve_task_model(config, "ingest")
 
     override = getattr(config, f"{task}_model")
     return override if override is not None else config.model

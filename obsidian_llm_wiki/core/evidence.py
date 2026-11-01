@@ -9,6 +9,7 @@ from obsidian_llm_wiki.core.models import (
     EvidenceVerification,
     SourceDoc,
     SourceSynthesis,
+    evidence_fragments,
 )
 
 __all__ = ["resolve_quote", "resolve_synthesis_evidence"]
@@ -60,6 +61,10 @@ def resolve_synthesis_evidence(
     filename = source_file or source.source_file or synthesis.source_file
     for concept in synthesis.concepts:
         for claim in concept.claims:
+            # Catalog-anchored evidence is machine-built from span IDs; quote
+            # search would turn a repeated span into an unanchored ambiguity.
+            if any(f.span_ids for f in evidence_fragments(claim.evidence)):
+                continue
             if claim.evidence is not None and claim.evidence.quote:
                 claim.evidence = resolve_quote(claim.evidence.quote, source.content, filename)
     return synthesis

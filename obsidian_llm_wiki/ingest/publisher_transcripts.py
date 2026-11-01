@@ -125,16 +125,11 @@ def conflicting_episode_title(document_title: str, episode_title: str) -> bool:
     return False
 
 
-def fetch_labelled_transcript(
-    notes: str, *, episode_title: str, language: str = "",
-) -> TranscriptResult | None:
-    """Fetch one unambiguous label; never crawl links found in the response.
+def labelled_transcript_urls(notes: str) -> tuple[str, ...] | None:
+    """Return distinct explicitly labelled transcript destinations, in order.
 
-    Duplicate labels are harmless, distinct targets are ambiguous. One candidate
-    uses the shared retrieval cap of five redirects (at most six HTTP requests).
-    Admission deliberately requires a matching transcript-title line and at
-    least three substantive timestamped turns from two speakers; unsupported
-    publisher layouts fail closed rather than becoming article/ASR lookalikes.
+    ``None`` means the label syntax is unsupported or ambiguous (nested link
+    text, a URL displayed inside other anchor text). This performs no request.
     """
     parser = _NotesParser()
     parser.feed(notes)
@@ -146,8 +141,22 @@ def fetch_labelled_transcript(
         return None
     if any(re.search(r"\[[^\]\n]*$", rendered[:match.start()]) for match in matches):
         return None  # A URL inside anchor text is not that anchor's destination.
-    urls = list(dict.fromkeys(match[1] for match in matches))
-    if len(urls) != 1:
+    return tuple(dict.fromkeys(match[1] for match in matches))
+
+
+def fetch_labelled_transcript(
+    notes: str, *, episode_title: str, language: str = "",
+) -> TranscriptResult | None:
+    """Fetch one unambiguous label; never crawl links found in the response.
+
+    Duplicate labels are harmless, distinct targets are ambiguous. One candidate
+    uses the shared retrieval cap of five redirects (at most six HTTP requests).
+    Admission deliberately requires a matching transcript-title line and at
+    least three substantive timestamped turns from two speakers; unsupported
+    publisher layouts fail closed rather than becoming article/ASR lookalikes.
+    """
+    urls = labelled_transcript_urls(notes)
+    if urls is None or len(urls) != 1:
         return None
     try:
         parsed = urlparse(urls[0])

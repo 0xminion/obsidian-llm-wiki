@@ -64,7 +64,9 @@ def test_production_wire_root_is_closed_and_requires_every_field(production_wire
         "stream": False,
         "response_format": {
             "type": "json_schema",
-            "json_schema": {"name": "response", "schema": pipeline._SYNTHESIS_RESPONSE_SCHEMA},
+            "json_schema": {
+                "name": "response", "schema": pipeline._SYNTHESIS_RESPONSE_SCHEMA, "strict": True,
+            },
         },
         "temperature": 0,
         "max_tokens": 16_384,
@@ -93,12 +95,18 @@ def _assert_prompt_contract(schema, prompt_model, path="$", object_paths=None):
     elif isinstance(prompt_model, list):
         assert schema["type"] == "array", path
         # Arrays represent optional information; requiring keys must not require facts.
-        assert schema.get("minItems", 0) == 0, path
+        if path.endswith(".evidence_span_ranges"):
+            assert schema["minItems"] == 1 and schema["maxItems"] == 3
+        else:
+            assert schema.get("minItems", 0) == 0, path
         _assert_prompt_contract(schema["items"], prompt_model[0], f"{path}[]", object_paths)
     else:
         kind = "number" if path.endswith(".confidence") else (
             "boolean" if path.endswith(".is_new") else "string"
         )
+        if path.endswith(".evidence_span_ranges[].count"):
+            kind = "integer"
+            assert schema["enum"] == [1, 2, 3, 4, 5, 6]
         assert schema["type"] == kind, path
         if path.endswith(".relation"):
             assert set(schema["enum"]) == VALID_RELATIONS
@@ -122,13 +130,15 @@ def test_production_wire_recursively_matches_prompt_objects(production_wire, pro
     paths = _assert_prompt_contract(schema, SYNTHESIS_SCHEMA)
     assert set(paths) == {
         "$", "$.concepts[]", "$.concepts[].sections[]", "$.concepts[].claims[]",
+        # Citation interface evidence-span-count-v1: one closed {start_id, count}.
+        "$.concepts[].claims[].evidence_span_ranges[]",
         "$.concepts[].related[]", "$.maps[]",
     }
 
 
 def test_new_wire_contract_invalidates_v2_artifact_versions():
     versions = pipeline._artifact_versions_for_config(Config())
-    assert versions.schema == "synthesis-schema-v3"
+    assert versions.schema == "synthesis-schema-v5-fragments"
 
 
 @pytest.fixture

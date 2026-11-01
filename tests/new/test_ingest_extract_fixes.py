@@ -229,7 +229,7 @@ def test_podcast_without_transcript_or_description_raises(monkeypatch):
     monkeypatch.setattr(
         podcast, "_resolve_episode_asset", lambda *_a, **_kw: podcast.EpisodeAsset(),
     )
-    monkeypatch.setattr(podcast, "load_transcript_cache", lambda _identity: None)
+    monkeypatch.setattr(podcast, "load_transcript_cache_record", lambda _identity: None)
 
     with pytest.raises(RuntimeError, match="no transcript"):
         podcast._extract_podcast("https://podcasts.example/ep", platform="generic")
@@ -249,7 +249,7 @@ def test_podcast_with_description_only_requires_an_explicit_clipping(monkeypatch
     monkeypatch.setattr(
         podcast, "_resolve_episode_asset", lambda *_a, **_kw: podcast.EpisodeAsset(),
     )
-    monkeypatch.setattr(podcast, "load_transcript_cache", lambda _identity: None)
+    monkeypatch.setattr(podcast, "load_transcript_cache_record", lambda _identity: None)
 
     with pytest.raises(RuntimeError, match="no transcript.*clipping"):
         podcast._extract_podcast("https://podcasts.example/ep", platform="generic")

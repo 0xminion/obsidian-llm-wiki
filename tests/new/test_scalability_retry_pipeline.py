@@ -8,7 +8,7 @@ import pytest
 from obsidian_llm_wiki.config import Config
 from obsidian_llm_wiki.core.models import SourceDoc
 from obsidian_llm_wiki.core.pipeline import run_pipeline
-from obsidian_llm_wiki.core.registry import VaultRegistry
+from tests.new.immutable_semantic_helpers import published_registry
 
 
 @pytest.mark.asyncio
@@ -33,7 +33,7 @@ async def test_synthesis_failures_persist_retry_diagnostics(tmp_path: Path, monk
         force=True,
     )
 
-    with VaultRegistry(config.llmwiki_dir) as registry:
+    with published_registry(config) as registry:
         retries = [
             record
             for record in registry.list_dirty(state="pending")

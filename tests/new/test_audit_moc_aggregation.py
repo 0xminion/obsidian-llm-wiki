@@ -17,12 +17,25 @@ from obsidian_llm_wiki.core.models import (
 )
 from obsidian_llm_wiki.core.registry import ArtifactVersions, VaultRegistry
 from obsidian_llm_wiki.synth.dedupe import merge_bundle
+from tests.new.bilateral_fixture_helpers import assess_same, reviewed, upsert_reviewed
 
 V = ArtifactVersions("e", "p", "s", "m")
 OWNERS = ("a.md", "b.md")
+# Shared source fact: the explicit evidence both owners must carry before the
+# fixture assessor binds b.md's "Heat" to a.md's entity. Names, the identical
+# generic definition "Heat transfer." and the shared slug are not evidence.
+HEAT_FACT = "Heat transfer is governed by Fourier's law of conduction."
+SOURCE_TEXT = {
+    "a.md": f"Copper experiment. {HEAT_FACT}\n",
+    "b.md": f"Silver experiment. {HEAT_FACT}\n",
+}
 
 
-def contribution(filename):
+def source_doc(filename):
+    return SourceDoc(filename, SOURCE_TEXT[filename])
+
+
+def contribution(filename, heat_id=""):
     token = "Copper" if filename == "a.md" else "Silver"
     member = token.lower()
     return SourceSynthesis(
@@ -30,7 +43,7 @@ def contribution(filename):
         f"{token} source summary.",
         source_file=filename,
         concepts=[
-            ConceptNote("Heat", "heat", "Heat transfer."),
+            ConceptNote("Heat", "heat", "Heat transfer.", canonical_id=heat_id),
             ConceptNote(token, member, f"{token} experiment."),
         ],
         maps=[
@@ -46,10 +59,19 @@ def contribution(filename):
 
 
 def add_owners(registry, order=OWNERS):
+    heat_id = ""
     for filename in order:
-        registry.upsert_synthesis(
-            filename, SourceDoc(filename, filename), contribution(filename), V
-        )
+        synthesis = contribution(filename, heat_id)
+        if heat_id:
+            # The second owner proposes the first owner's "Heat" entity; the
+            # proposal binds only through the bilateral source-fact assessment.
+            assert len(assess_same(registry, synthesis, source_doc(filename), HEAT_FACT)) == 1
+            registry.upsert_synthesis(filename, source_doc(filename), synthesis, V)
+            assert registry.binding_evidence()[(filename, heat_id)] == "assessed same entity"
+        else:
+            upsert_reviewed(registry, filename, source_doc(filename), synthesis, V)
+        heat_id = synthesis.concepts[0].canonical_id
+    assert registry.connection.execute("SELECT count(*) FROM concept").fetchone()[0] == 3
     assert registry.connection.execute("SELECT count(*) FROM moc").fetchone()[0] == 1
     assert registry.connection.execute("SELECT count(*) FROM moc_source").fetchone()[0] == 2
 
@@ -108,7 +130,9 @@ def test_changed_owner_and_noop_preserve_local_contributions(tmp_path, method, c
         revised.maps[0].tags = ["revised", "Thermal Conductivity"]
         revised.maps[0].concept_slugs.reverse()
         if method == "upsert":
-            registry.upsert_synthesis(changed, SourceDoc(changed, "Revised body"), revised, V)
+            # The owner's reviewed source bytes are unchanged (its receipt still
+            # agrees with them); only its MoC contribution is revised.
+            registry.upsert_synthesis(changed, source_doc(changed), revised, V)
         else:
             registry.update_synthesis(changed, revised, V)
         expected = assert_aggregate(registry, OWNERS)
@@ -157,7 +181,7 @@ def test_moc_centroid_invalidation_keeps_fresh_membership_hash(tmp_path, mutatio
             revised = registry.load_synthesis(changed)
             revised.maps[0].concept_slugs.remove(removed)
             if mutation == "upsert":
-                registry.upsert_synthesis(changed, SourceDoc(changed, "Revision"), revised, V)
+                registry.upsert_synthesis(changed, source_doc(changed), revised, V)
             else:
                 registry.update_synthesis(changed, revised, V)
         for table in ("embedding", "ann_bucket"):
@@ -233,11 +257,27 @@ def test_removed_external_member_rebuilds_moc_not_owned_by_changed_source(tmp_pa
         assert registry.connection.execute("PRAGMA foreign_key_check").fetchall() == []
 
 
-@pytest.mark.parametrize("mutation", ["update", "upsert", "delete"])
-def test_changed_member_vectors_invalidate_centroids_even_with_same_members(tmp_path, mutation):
+def _heat_summary(registry, cid):
+    return str(registry.connection.execute(
+        "SELECT summary FROM concept WHERE id=?", (cid,)
+    ).fetchone()[0])
+
+
+@pytest.mark.parametrize(
+    ("mutation", "reassessed"),
+    [("update", True), ("upsert", True), ("delete", True),
+     ("update", False), ("upsert", False)],
+)
+def test_changed_member_vectors_invalidate_centroids_even_with_same_members(
+    tmp_path, mutation, reassessed,
+):
     with VaultRegistry(tmp_path) as registry:
         # MoC is owned elsewhere: source c contributes a longer canonical
         # definition, and removing it changes the member vector, not membership.
+        fact = "Heat flows from hot to cold bodies according to the second law."
+        src_a = SourceDoc("A", f"Body A. {fact}\n")
+        src_c = SourceDoc("C", f"Body C. {fact}\n")
+        src_c2 = SourceDoc("C", f"Revised C with a corrected definition. {fact}\n")
         first = SourceSynthesis(
             "A",
             "A summary",
@@ -249,7 +289,7 @@ def test_changed_member_vectors_invalidate_centroids_even_with_same_members(tmp_
                 )
             ],
         )
-        registry.upsert_synthesis("a.md", SourceDoc("A", "Body A"), first, V)
+        upsert_reviewed(registry, "a.md", src_a, first, V)
         cid = first.concepts[0].canonical_id
         second = SourceSynthesis(
             "C",
@@ -259,10 +299,16 @@ def test_changed_member_vectors_invalidate_centroids_even_with_same_members(tmp_
                 ConceptNote("Heat", "heat", "A longer old heat definition.", canonical_id=cid)
             ],
         )
-        registry.upsert_synthesis("c.md", SourceDoc("C", "Body C"), second, V)
+        assert len(assess_same(registry, second, src_c, fact)) == 1
+        registry.upsert_synthesis("c.md", src_c, second, V)
+        assert second.concepts[0].canonical_id == cid  # c.md co-owns heat (assessed)
+        assert "A longer old heat definition." in _heat_summary(registry, cid)
+        # Without a fresh assessment, c.md's revised definition is no longer
+        # bound to heat: c.md leaves the entity and heat reverts to a.md's
+        # definition -- the member vector still changes with the same members.
         summary = (
             "Short heat definition."
-            if mutation == "delete"
+            if mutation == "delete" or not reassessed
             else "New significantly longer corrected heat definition."
         )
         hashes = {
@@ -291,11 +337,22 @@ def test_changed_member_vectors_invalidate_centroids_even_with_same_members(tmp_
         if mutation == "delete":
             registry.delete_source("c.md")
         else:
-            second.concepts[0].summary = summary
+            second.concepts[0].summary = (
+                "New significantly longer corrected heat definition."
+            )
+            # The revised contribution is re-reviewed against its revised source.
+            reviewed(second, src_c2)
+            if reassessed:
+                assert len(assess_same(registry, second, src_c2, fact)) == 1
             if mutation == "update":
                 registry.update_synthesis("c.md", second, V)
             else:
-                registry.upsert_synthesis("c.md", SourceDoc("C", "Revised C"), second, V)
+                registry.upsert_synthesis("c.md", src_c2, second, V)
+            assert (second.concepts[0].canonical_id == cid) is reassessed
+        assert ("corrected" in _heat_summary(registry, cid)) is (
+            "corrected" in summary
+        )
+        assert "A longer old heat definition." not in _heat_summary(registry, cid)
         for table in ("embedding", "ann_bucket"):
             assert {
                 row[0]
@@ -334,7 +391,7 @@ def test_moc_mutation_rolls_back_all_state(tmp_path, mutation, failure):
                 if mutation == "update":
                     registry.update_synthesis("a.md", revised, V)
                 else:
-                    registry.upsert_synthesis("a.md", SourceDoc("A", "Revised body"), revised, V)
+                    registry.upsert_synthesis("a.md", source_doc("a.md"), revised, V)
         assert list(registry.connection.iterdump()) == before
         assert registry.get_pipeline_checkpoint() == "published"
         assert registry.connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
@@ -387,6 +444,8 @@ def test_moc_rebuild_work_is_bounded_by_indexed_owners(tmp_path, monkeypatch, mu
                 finally:
                     registry.connection.set_progress_handler(None, 0)
             assert set(touched) <= set(OWNERS)
+            # Identity planning decodes an unchanged own payload at most once;
+            # aggregate rebuild work remains bounded by these indexed owners.
             assert len(touched) <= 6
             assert registry.connection.execute("SELECT count(*) FROM moc").fetchone()[0] == size + 1
             assert (

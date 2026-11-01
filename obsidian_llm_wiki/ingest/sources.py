@@ -7,6 +7,7 @@ pipeline always receives the full corpus.
 
 from __future__ import annotations
 
+import io
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -133,6 +134,50 @@ def _source_provenance(value: object) -> SourceProvenance:
         content_sha256=scalar.get("content_sha256", ""),
         diagnostics=tuple(repeated["diagnostics"]),
     )
+
+
+# The extractor stamp is part of both inner artifacts and the outer no-op gate.
+SOURCE_INTERPRETATION_VERSION = "extract-v3-raw-newlines"
+LEGACY_SOURCE_INTERPRETATION_VERSION = "extract-v2"
+
+
+def source_body_for_receipt(
+    raw: str,
+    revision: str,
+    *,
+    extractor_version: str = "",
+    historical_content: str | None = None,
+) -> tuple[str | None, str]:
+    """Resolve exact captured bytes, or *classify* known historical interpretation.
+
+    Current CLI bodies retain the established frontmatter + outer-strip contract;
+    API captures may instead be the entire raw string, including trailing spaces.
+    Neither representation translates interior line endings.
+
+    extract-v2 CLI reads used universal newlines before the LF frontmatter parser.
+    Replay that known interpretation ONLY to identify stored, hash-verified history.
+    Never synthesize missing historical content, rewrite a receipt, or admit this
+    historical branch as the current exact-source interpretation.
+    """
+    from obsidian_llm_wiki.core.span_catalog import source_revision
+
+    body = parse_frontmatter(raw)[1].strip()
+    for content, interpretation in ((body, "exact-body"), (raw, "exact-raw")):
+        if source_revision(content) == revision:
+            return content, interpretation
+    if extractor_version != LEGACY_SOURCE_INTERPRETATION_VERSION:
+        return None, "unknown-or-incompatible-source-interpretation"
+    if historical_content is None:
+        return None, "historical-source-content-unavailable"
+    if source_revision(historical_content) != revision:
+        return None, "historical-source-hash-mismatch"
+    # This is compatibility evidence, never a normalization of a SourceDoc.
+    with io.StringIO(raw, newline=None) as stream:
+        legacy_raw = stream.read()
+    legacy_body = parse_frontmatter(legacy_raw)[1].strip()
+    if historical_content != legacy_body:
+        return None, "historical-source-does-not-match-capture"
+    return historical_content, "historical-universal-newlines"
 
 
 def load_source_file(path: Path) -> SourceDoc | None:

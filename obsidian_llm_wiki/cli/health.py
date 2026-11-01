@@ -18,7 +18,6 @@ from obsidian_llm_wiki.core.maintenance import (
     FindingSeverity,
     MaintenanceFinding,
 )
-from obsidian_llm_wiki.core.registry import VaultRegistry
 from obsidian_llm_wiki.core.review import is_reviewed_page
 from obsidian_llm_wiki.render.frontmatter import sanitize_tag
 from obsidian_llm_wiki.render.obsidian import parse_frontmatter, safe_read_file
@@ -39,7 +38,7 @@ def _content_markdown_files(bundle_dir: Path) -> list[Path]:
     return sorted(
         path
         for path in bundle_dir.rglob("*.md")
-        if not ({".llmwiki", "views"} & set(path.relative_to(bundle_dir).parts))
+        if not ({".llmwiki", "views", "OLW-Publications"} & set(path.relative_to(bundle_dir).parts))
     )
 
 
@@ -72,7 +71,48 @@ def health(
     intended for automation and contains only deterministic typed findings.
     """
     _, config = resolve_vault(vault)
+    from obsidian_llm_wiki.core.immutable_publication import current_publication
+    from obsidian_llm_wiki.core.publication_transaction import require_publication_ready
+
+    try:
+        committed = current_publication(config.wiki_dir)
+        if not committed:
+            require_publication_ready(config.llmwiki_dir)
+    except (RuntimeError, ValueError) as exc:
+        typer.echo(json.dumps({"error": str(exc)}) if json_output else str(exc))
+        raise typer.Exit(code=1) from exc
     bundle_dir = config.wiki_dir
+
+    from obsidian_llm_wiki.core.application import registry_inspection
+
+    try:
+        inspected_bundle = committed[0] if committed else bundle_dir
+        source_hashes, rendered = registry_inspection(config, inspected_bundle)
+        scan = _append_source_hash_findings(
+            _scan_maintenance_findings(inspected_bundle), config.wiki_dir, source_hashes,
+        )
+        if rendered is not None:
+            scan = _append_unmanaged_generated_findings(scan, inspected_bundle, rendered)
+    except (OSError, ValueError, RuntimeError) as exc:
+        typer.echo(json.dumps({"error": str(exc)}) if json_output else str(exc))
+        raise typer.Exit(code=1) from exc
+
+    if committed:
+        bundle_dir, manifest = committed
+        # Published SQL/metadata are immutable: use a read-only full scan,
+        # not the legacy maintenance-batch checkpoint writer.
+        if write:
+            typer.echo('Immutable health is read-only; redirect the report outside the generation.')
+            raise typer.Exit(code=1)
+        if json_output:
+            payload = _health_json_payload(bundle_dir, scan=scan)
+            payload['generation'] = manifest['generation']
+            payload['publication_warnings'] = manifest['errors']
+            typer.echo(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        else:
+            typer.echo('Immutable generation: ' + manifest['generation'])
+            typer.echo(_generate_health_report(bundle_dir))
+        return
 
     if not bundle_dir.is_dir():
         if json_output:
@@ -83,105 +123,17 @@ def health(
             typer.echo(f"❌ Bundle directory not found: {bundle_dir}")
         raise typer.Exit(code=1)
 
-    incremental_scan: tuple[int, list[MaintenanceFinding]] | None = None
-    indexed_full_scan: tuple[int, list[MaintenanceFinding]] | None = None
-    cycle_complete = True
-    snapshot_complete = True
-    if not full:
-        with VaultRegistry(config.llmwiki_dir) as registry:
-            relative_paths, cycle_complete = registry.next_maintenance_batch(
-                limit=batch_size
-            )
-            (
-                all_stems,
-                concept_stems,
-                source_stems,
-                moced_slugs,
-                moc_counts,
-            ) = registry.maintenance_page_sets()
-            selected = [
-                bundle_dir / path
-                for path in relative_paths
-                if (bundle_dir / path).is_file()
-            ]
-            if relative_paths or not _content_markdown_files(bundle_dir):
-                batch_scan = _scan_selected_maintenance_findings(
-                    bundle_dir,
-                    selected,
-                    all_stems,
-                    concept_stems,
-                    source_stems,
-                    moced_slugs,
-                    moc_counts,
-                )
-                registry.commit_maintenance_batch(
-                    relative_paths,
-                    (_finding_payload(finding) for finding in batch_scan[1]),
-                    cycle_complete=cycle_complete,
-                )
-                snapshot_complete = registry.maintenance_snapshot_complete()
-                incremental_scan = (
-                    batch_scan[0],
-                    [
-                        _finding_from_registry_payload(finding)
-                        for finding in registry.health_findings()
-                    ],
-                )
-        if incremental_scan is None:
-            # Legacy vaults have no render manifest yet. Perform one explicit
-            # full scan and seed the durable snapshot instead of returning a
-            # batch-shaped result that silently omits unindexed pages.
-            with VaultRegistry(config.llmwiki_dir) as registry:
-                indexed_full_scan = _append_source_hash_findings(
-                    _scan_maintenance_findings(bundle_dir),
-                    bundle_dir,
-                    registry.source_content_hashes(),
-                )
-                registry.replace_all_health_findings(
-                    _finding_payload(finding) for finding in indexed_full_scan[1]
-                )
-    else:
-        with VaultRegistry(config.llmwiki_dir) as registry:
-            indexed_full_scan = _append_source_hash_findings(
-                _scan_maintenance_findings(bundle_dir),
-                bundle_dir,
-                registry.source_content_hashes(),
-            )
-            indexed_full_scan = _append_unmanaged_generated_findings(
-                indexed_full_scan,
-                bundle_dir,
-                registry.rendered_paths(),
-            )
-            registry.replace_all_health_findings(
-                _finding_payload(finding) for finding in indexed_full_scan[1]
-            )
-
-    if json_output:
-        payload = _health_json_payload(
-            bundle_dir,
-            scan=incremental_scan or indexed_full_scan,
-            incremental=incremental_scan is not None,
-            cycle_complete=cycle_complete,
-            snapshot_complete=snapshot_complete,
-        )
-        typer.echo(json.dumps(payload, ensure_ascii=False, sort_keys=True))
-        return
-
-    report = (
-        _generate_incremental_health_report(
-            incremental_scan[0], incremental_scan[1], cycle_complete
-        )
-        if incremental_scan is not None
-        else _generate_health_report(bundle_dir)
-    )
-    typer.echo(report)
-
+    # Legacy pages are human-editable too. Health is observational; never
+    # construct a WAL registry merely to display findings or seed a checkpoint.
     if write:
-        llmwiki_dir = bundle_dir / ".llmwiki"
-        llmwiki_dir.mkdir(parents=True, exist_ok=True)
-        report_path = llmwiki_dir / "health-report.md"
-        report_path.write_text(report, encoding="utf-8")
-        typer.echo(f"\n📄 Report written to: {report_path}")
+        typer.echo('Refusing --write: redirect the health report outside the vault instead.')
+        raise typer.Exit(code=1)
+    if json_output:
+        typer.echo(json.dumps(
+            _health_json_payload(bundle_dir, scan=scan), ensure_ascii=False, sort_keys=True,
+        ))
+    else:
+        typer.echo(_generate_health_report(bundle_dir))
 
 
 def _health_json_payload(

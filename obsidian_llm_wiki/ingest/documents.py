@@ -13,12 +13,12 @@ import re
 import tempfile
 from collections.abc import Callable
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from email.message import Message
 from html.parser import HTMLParser
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from time import monotonic
-from urllib.parse import parse_qs, urljoin, urlparse
+from urllib.parse import parse_qs, unquote, urljoin, urlparse
 
 import httpx
 
@@ -259,9 +259,10 @@ def dispatch_document(
 ) -> SourceDoc:
     """Extract a supported local file or direct remote document safely.
 
-    PDF text extraction remains PyMuPDF-first.  Other supported formats route to
-    LiteParse.  Callers must use this function for known binary URLs rather than
-    falling through to the generic HTML extractor.
+    PDF text extraction remains PyMuPDF-first, DOCX uses python-docx and legacy
+    Word ``.doc`` uses an isolated LibreOffice DOC->DOCX conversion.  Other
+    supported formats route to LiteParse.  Callers must use this function for
+    known binary URLs rather than falling through to the generic HTML extractor.
     """
     cfg = config or load_config()
     raw = str(value)
@@ -470,7 +471,36 @@ def _parse_local_document(path: Path, *, source_url: str, config: Config) -> Sou
             source = docx.extract_docx(str(path))
             source.url = source_url
             return source
+    if path.suffix.lower() == ".doc":
+        return _parse_legacy_doc(path, source_url=source_url, config=config)
     return parse_document(path, source_url=source_url, config=config)
+
+
+def _parse_legacy_doc(path: Path, *, source_url: str, config: Config) -> SourceDoc:
+    """Prefer native LibreOffice DOC->DOCX text over LiteParse's PDF rendering.
+
+    LiteParse renders ``.doc`` through PDF and re-reads the layout, which
+    replaces typographic punctuation (for example U+2019 with ``'``).  It is
+    only used when the native route is not installed, and says so.
+    """
+    from obsidian_llm_wiki.ingest import office
+
+    try:
+        return office.extract_legacy_doc(path, source_url=source_url, config=config)
+    except office.OfficeRouteUnavailableError as exc:
+        source = parse_document(path, source_url=source_url, config=config)
+        note = (
+            f"{exc}; legacy .doc parsed by the LiteParse PDF route, which may normalize "
+            "punctuation (for example U+2019 to ASCII apostrophe) and table layout"
+        )
+        source.provenance = replace(
+            source.provenance, diagnostics=(*source.provenance.diagnostics, note)
+        )
+        return source
+    except (office.EncryptedDocumentError, office.UnsupportedDocumentError) as exc:
+        raise InvalidDocumentError(str(exc)) from exc
+    except office.OfficeConversionError as exc:
+        raise DocumentError(str(exc)) from exc
 
 
 def _stamp_download_provenance(
@@ -482,6 +512,7 @@ def _stamp_download_provenance(
     discovered: bool = False,
 ) -> SourceDoc:
     """Attach the complete retrieval chain after the final extracted text exists."""
+    _replace_temporary_title(source, downloaded, extracted_url)
     common = {
         "requested_url": requested_url,
         "resolved_url": downloaded.resolved_url,
@@ -498,6 +529,25 @@ def _stamp_download_provenance(
     # immutable stamp.
     parsed.provenance = stamped.provenance
     return parsed
+
+
+def _replace_temporary_title(
+    source: SourceDoc, downloaded: DownloadedDocument, extracted_url: str
+) -> None:
+    """Never publish the random download filename as a document title.
+
+    Parsers fall back to the local file stem when a document has no title
+    metadata or heading; for downloads that stem is a ``tempfile`` name.
+    """
+    if source.title.strip() and source.title.strip() != downloaded.path.stem:
+        return
+    for url in (extracted_url, downloaded.resolved_url, downloaded.source_url):
+        name = unquote(PurePosixPath(urlparse(url).path).name)
+        if Path(name).suffix.lower() in DOCUMENT_SUFFIXES and Path(name).stem.strip():
+            source.title = Path(name).stem.strip()
+            return
+    first_line = next((line.strip() for line in source.content.splitlines() if line.strip()), "")
+    source.title = first_line.lstrip("#").strip()[:120] or "Untitled document"
 
 
 def _validate_mime(content_type: str, suffix: str) -> None:

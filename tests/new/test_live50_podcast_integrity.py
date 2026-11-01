@@ -7,6 +7,7 @@ from xml.sax.saxutils import escape, quoteattr
 import httpx
 import pytest
 
+from obsidian_llm_wiki.ingest import transcript_resolver
 from obsidian_llm_wiki.ingest.extractors import podcast
 
 
@@ -293,7 +294,11 @@ def test_public_transcript_provenance_and_language_survive_dispatch_and_cache(
     assert source.provenance.resolved_url == artifact
     assert source.provenance.extractor_chain == ("rss_podcast_transcript", "extract_podcast_rss")
     assert source.provenance.content_type == "text/vtt"
-    cached = podcast.load_transcript_cache("canonical-id|https://cdn.example/canonical-id.mp3")
+    # Epoch-3 key: episode identity (requested feed item) plus the artifact.
+    cached = transcript_resolver.load_transcript_cache(podcast._bound_cache_identity(
+        podcast._episode_binding(url, podcast._resolve_episode_asset(url, "rss", {}), {}),
+        "tag", artifact,
+    ))
     assert cached is not None
     assert cached.language == language
     assert cached.artifact_url == artifact
@@ -404,6 +409,9 @@ def test_inline_public_transcript_succeeds_without_rss_or_asr(public_http):
         "---\ntitle: Episode One\nauthor: Show\n---\n## Transcript\n\n" + transcript
     )
     routes["https://itunes.apple.com/search?term=Show&media=podcast&limit=5"] = {"results": []}
+    routes["https://itunes.apple.com/search?term=Episode+One&media=podcast&limit=5"] = {
+        "results": [],
+    }
 
     source = podcast.extract_spotify(url)
 

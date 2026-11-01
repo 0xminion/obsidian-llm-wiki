@@ -92,6 +92,10 @@ def offline(monkeypatch, tmp_path):
         URL: "<title>Publisher page</title><p>Public shell.</p>",
         "https://defuddle.md/" + URL.removeprefix("https://"): metadata(),
         "https://itunes.apple.com/lookup?id=24680": {"results": [{"feedUrl": FEED}]},
+        # Spotify also pools the episode-title directory search (shared policy).
+        str(httpx.URL("https://itunes.apple.com/search", params={
+            "term": TITLE, "media": "podcast", "limit": 5,
+        })): {"results": []},
         FEED: feed(item()),
         ART: html(),
     }
@@ -117,6 +121,19 @@ def offline(monkeypatch, tmp_path):
     monkeypatch.setattr(httpx, "Client", client)
     monkeypatch.setenv("VAULT_PATH", str(tmp_path / "extract-vault"))
     return routes, requests
+
+
+def bound_cache(artifact):
+    """The cache entry bound to (episode identity, ``artifact``); epoch-3 keys."""
+    hits = []
+    for path in tr._cache_dir().glob("*.json"):
+        identity = json.loads(path.read_text()).get("identity", "")
+        head, _, body = identity.partition("\n")
+        bound = head == "olw-podcast-transcript-binding-v3"
+        if bound and json.loads(body)["artifact"][1] == artifact:
+            hits.append((identity, path))
+    assert len(hits) <= 1, hits
+    return (tr.load_transcript_cache(hits[0][0]), hits[0][1]) if hits else (None, None)
 
 
 def run_cli(monkeypatch, tmp_path, url=URL):
@@ -158,7 +175,7 @@ def test_canonical_rss_title_wins_over_contradictory_storefront(offline, monkeyp
     assert source.content in files[0].read_text()
     assert source.content.count(SENTENCE) == source.content.count(SPEECH) == 3
     assert source.provenance.extracted_url == ART
-    cached = tr.load_transcript_cache(IDENTITY)
+    cached, _path = bound_cache(ART)
     assert cached is not None and cached.language == "zh-Hans"
 
 
@@ -171,11 +188,19 @@ def test_ambiguous_identity_never_authorizes_inline(offline, monkeypatch, tmp_pa
                else "https://publisher.example/episodes/71")
         routes[url] = '<title>Podcast episode</title><audio></audio>'
         routes["https://itunes.apple.com/search?term=Review+Show&media=podcast&limit=5"] = {
-            "results": [{"feedUrl": FEED}],
+            # Spotify candidates must name the show (shared identity policy).
+            "results": [{"collectionName": "Review Show", "feedUrl": FEED}],
         }
     routes["https://defuddle.md/" + url.removeprefix("https://")] = metadata(
         body="## Transcript\n\n" + (SPEECH + "\n") * 8,
     )
+    if route == "spotify":
+        # Spotify's description must name the publisher for its feed to count;
+        # the publisher-hosted feed is then ambiguous.
+        routes["https://defuddle.md/" + url.removeprefix("https://")] = routes[
+            "https://defuddle.md/" + url.removeprefix("https://")].replace(
+            "description: Ordinary episode metadata, not full speech.",
+            f"description: Listen to this episode from Review Show on Spotify. Transcript: {ART}")
     routes[FEED] = feed(item(), item("Duplicate identity" if route == "apple" else TITLE))
     rejected(monkeypatch, tmp_path, url)
 
@@ -256,10 +281,13 @@ def test_pre_admission_public_cache_misses_without_mutating_evidence(
     routes[ART] = html()
     source = extractors.extract(URL)
     assert SENTENCE in source.content
-    saved = json.loads(cache.read_text())
+    # Reacquisition writes the episode+artifact-bound key; the legacy file
+    # remains untouched evidence (stronger than the former atomic replace).
+    assert cache.read_bytes() == before
+    cached, bound_path = bound_cache(ART)
+    saved = json.loads(bound_path.read_text())
     assert saved["normalization_version"] == 2
     assert saved["podcast_admission_version"] == 1
-    cached = tr.load_transcript_cache(IDENTITY)
     assert cached is not None and cached.document_title == "Transcript for " + TITLE
     requests.clear()
     assert extractors.extract(URL).content == source.content
@@ -303,7 +331,7 @@ def test_explicit_inline_episode_without_rss_retains_exact_body_and_language(
     }
     source = extractors.extract(url)
     assert source.content.endswith(speech)
-    cached = tr.load_transcript_cache(url)
+    cached, _path = bound_cache(url)
     assert cached is not None and cached.text == speech
     assert cached.language == "zh-Hans"
     assert extractors.extract(url).content == source.content

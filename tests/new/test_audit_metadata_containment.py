@@ -260,23 +260,34 @@ async def test_pipeline_preflights_metadata_before_reads_or_writes(
     before = snapshot(outside)
     reads = []
     original_read = Path.read_text
+    original_stat = Path.stat
 
     def observed_read(path, *args, **kwargs):
         if path.resolve().is_relative_to(outside):
             reads.append(str(path))
         return original_read(path, *args, **kwargs)
 
+    def observed_stat(path, *args, **kwargs):
+        if path == link and kwargs.get("follow_symlinks", True):
+            reads.append(f"stat followed {path}")
+        return original_stat(path, *args, **kwargs)
+
     monkeypatch.setattr(Path, "read_text", observed_read)
+    monkeypatch.setattr(Path, "stat", observed_stat)
     try:
         with pytest.raises(ValueError, match="Unsafe generated path"):
             if entrypoint == "pipeline":
                 await run_pipeline(vault, {}, config)
             else:
                 await recompile_single_source(vault, "note.md", config)
-        assert not reads, f"metadata was read before validation: {reads}"
+        preflight_reads = list(reads)
         assert snapshot(outside) == before
         assert not lock_module._held_locks
         assert not (metadata / "registry.db").exists() or component == "registry.db"
+        if entrypoint == "pipeline" and component in {"registry.db-wal", "registry.db-journal"}:
+            # Rejection now precedes even creation/acquisition of the writer lock.
+            assert not (vault / "04-Wiki" / "OLW-Publications").exists()
+        assert not preflight_reads, f"metadata was read before validation: {preflight_reads}"
     finally:
         for held in list(lock_module._held_locks.values()):
             os.close(held)
@@ -324,7 +335,8 @@ async def test_pipeline_cleanup_releases_replaced_lock_even_when_metrics_fails(
 
     vault = tmp_path / "vault"
     config = Config(vault_path=str(vault))
-    lock = config.lock_file
+    import fcntl
+    writer_lock = vault / "04-Wiki" / "OLW-Publications" / "writer.lock"
     outside = tmp_path / "outside"
     outside.mkdir()
     sentinel = outside / "note"
@@ -334,6 +346,7 @@ async def test_pipeline_cleanup_releases_replaced_lock_even_when_metrics_fails(
     exception = asyncio.CancelledError if cancelled else RuntimeError
 
     def failing_save(self):
+        lock = self.llmwiki_dir / "lock"
         captured.append(lock_module._held_locks[lock.absolute()])
         lock.unlink()
         lock.symlink_to(sentinel)
@@ -348,6 +361,11 @@ async def test_pipeline_cleanup_releases_replaced_lock_even_when_metrics_fails(
             os.fstat(fd)
     assert not lock_module._held_locks
     assert snapshot(outside) == before
+    fd = os.open(writer_lock, os.O_RDWR | os.O_NOFOLLOW)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    finally:
+        os.close(fd)
 
 
 def test_metrics_explicit_path_cannot_override_authorized_root(tmp_path):

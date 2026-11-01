@@ -134,7 +134,8 @@ def test_health_and_fix_offer_parenthetical_aliases_without_applying_them(
 
     assert health.exit_code == 0, health.output
     assert plan.exit_code == 0, plan.output
-    assert applied.exit_code == 0, applied.output
+    assert applied.exit_code == 1
+    assert "too short" in json.loads(applied.output)["error"]
     assert json.loads(health.output)["findings"] == [
         {
             "details": {"alias": "QRR", "title": "Quarterly Research Report (QRR)"},
@@ -153,7 +154,6 @@ def test_health_and_fix_offer_parenthetical_aliases_without_applying_them(
             "requires_review": True,
         }
     ]
-    assert json.loads(applied.output)["summary"]["applied"] == 0
     assert source.read_text(encoding="utf-8") == original
 
 
@@ -188,11 +188,11 @@ def test_health_reports_all_content_quality_classes_as_typed_findings(
     assert summary["undersized_moc"] == 1
 
 
-def test_incremental_health_returns_a_persistent_whole_vault_snapshot(
+def test_readonly_health_returns_whole_vault_findings_without_checkpoint_writes(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
-    """A clean batch must not hide findings discovered in earlier batches."""
+    """Batch hints must not hide findings or create persistent checkpoints."""
     vault = tmp_path / "vault"
     wiki = vault / "04-Wiki"
     first_path = wiki / "concepts" / "first.md"
@@ -218,6 +218,8 @@ def test_incremental_health_returns_a_persistent_whole_vault_snapshot(
         registry.commit_render_manifest("concept-page", manifest, diff)
 
     monkeypatch.delenv("VAULT_PATH", raising=False)
+    from tests.new.immutable_semantic_helpers import file_state
+    before = file_state(vault)
     first = runner.invoke(
         app, ["health", str(vault), "--json", "--batch-size", "1"]
     )
@@ -229,13 +231,9 @@ def test_incremental_health_returns_a_persistent_whole_vault_snapshot(
     assert second.exit_code == 0, second.output
     first_payload = json.loads(first.output)
     second_payload = json.loads(second.output)
-    assert first_payload["snapshot_complete"] is False
-    assert second_payload["snapshot_complete"] is True
-    assert first_payload["summary"] == {
-        "orphan_concept": 1,
-        "short_concept_stub": 1,
-        "tag_normalization": 1,
-    }
+    # Read-only health performs a complete scan rather than writing a cursor.
+    assert first_payload == second_payload
+    assert file_state(vault) == before
     assert second_payload["summary"] == {
         "broken_relation": 1,
         "orphan_concept": 2,
@@ -244,6 +242,7 @@ def test_incremental_health_returns_a_persistent_whole_vault_snapshot(
     }
 
     _write_page(first_path, "---\ntype: Concept\ntags: []\n---\n# First\n")
+    before_refresh = file_state(vault)
     refreshed = runner.invoke(
         app, ["health", str(vault), "--json", "--batch-size", "1"]
     )
@@ -253,6 +252,7 @@ def test_incremental_health_returns_a_persistent_whole_vault_snapshot(
         "orphan_concept": 2,
         "short_concept_stub": 2,
     }
+    assert file_state(vault) == before_refresh
 
 
 def test_full_health_detects_same_size_source_edit_with_restored_mtime(

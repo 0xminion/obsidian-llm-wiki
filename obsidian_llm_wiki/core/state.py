@@ -90,7 +90,9 @@ def _classify(file_path: Path, prev_state: WikiState) -> SourceStatus:
 def read_state(state_file: str | Path) -> WikiState:
     """Read persisted wiki state from disk."""
     from obsidian_llm_wiki.core.models import SourceState
+    from obsidian_llm_wiki.core.publication_transaction import require_publication_ready
 
+    require_publication_ready(Path(state_file).parent)
     raw = safe_read_file(state_file)
     if not raw:
         return WikiState()

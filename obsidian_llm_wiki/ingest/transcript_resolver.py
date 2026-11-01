@@ -9,11 +9,14 @@ extractor because it must acquire the media locally.
 
 from __future__ import annotations
 
+import errno
+import functools
 import hashlib
 import json
 import logging
 import os
 import re
+import sys
 import tempfile
 import time
 from dataclasses import asdict, dataclass
@@ -42,10 +45,13 @@ _PUBLIC_PROVIDERS = frozenset({
 __all__ = [
     "TranscriptResult",
     "assemblyai_transcribe_url",
+    "decode_transcript_cache_bytes",
     "fetch_public_transcript",
     "get_assemblyai_key",
     "load_transcript_cache",
+    "load_transcript_cache_record",
     "save_transcript_cache",
+    "save_transcript_cache_exclusive",
     "validate_assemblyai_key",
 ]
 
@@ -83,14 +89,51 @@ def _cache_key(identity: str) -> str:
 
 def load_transcript_cache(identity: str) -> TranscriptResult | None:
     """Load a previously acquired transcript by canonical episode identity."""
+    record = load_transcript_cache_record(identity)
+    return record[0] if record is not None else None
+
+
+def load_transcript_cache_record(identity: str) -> tuple[TranscriptResult, dict] | None:
+    """Like ``load_transcript_cache`` but also return the stored payload.
+
+    Callers that bind entries to explicit provenance (podcast epoch-3 keys)
+    verify the payload's ``identity`` and binding fields themselves.
+    """
     if not identity:
         return None
     path = _cache_dir() / f"{_cache_key(identity)}.json"
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+        raw = path.read_bytes()
+    except OSError:
         return None
+    return decode_transcript_cache_bytes(raw)
 
+
+def decode_transcript_cache_bytes(raw: bytes) -> tuple[TranscriptResult, dict] | None:
+    """The single cache decoder: exact stored bytes -> admitted result + payload.
+
+    Every reader (the normal cache loader and the operator import, which must
+    decode the very bytes the operator hashed) goes through this function, so
+    an import can never admit a payload that the cache itself would reject.
+    """
+    payload = _parse_cache_bytes(raw)
+    if payload is None:
+        return None
+    result = _admit_cache_payload(payload)
+    return (result, payload) if result is not None else None
+
+
+def _parse_cache_bytes(raw: bytes) -> dict | None:
+    """Strict UTF-8 JSON object, else ``None`` (never raises on corrupt bytes)."""
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _admit_cache_payload(payload: dict) -> TranscriptResult | None:
+    """Current cache-admission rules for one parsed payload (no I/O, no mutation)."""
     # Older public HTML normalization could silently delete literal '<' and
     # subsequent prose. Reacquire those artifacts instead of serving corruption.
     # Unaffected ASR caches remain reusable; this is not a blanket paid-ASR retry.
@@ -121,30 +164,180 @@ def load_transcript_cache(identity: str) -> TranscriptResult | None:
     )
 
 
-def save_transcript_cache(identity: str, result: TranscriptResult) -> None:
-    """Persist a usable transcript and immutable provenance for re-use."""
-    if not writes_allowed() or not identity or len(result.text.strip()) < _MIN_TRANSCRIPT_CHARS:
-        return
-
-    cache_path = _cache_dir() / f"{_cache_key(identity)}.json"
-    cache_path.parent.mkdir(parents=True, exist_ok=True)
+def _cache_payload(
+    identity: str, result: TranscriptResult, provenance: dict | None, acquired_at: str | None,
+) -> dict:
     payload = {
         **asdict(result),
         "identity": identity,
         "normalization_version": _PUBLIC_NORMALIZATION_VERSION,
         "podcast_admission_version": _PODCAST_ADMISSION_VERSION,
-        "acquired_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "acquired_at": (
+            acquired_at if acquired_at is not None
+            else time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        ),
     }
-    fd, temporary = tempfile.mkstemp(dir=cache_path.parent, prefix=".transcript-", suffix=".tmp")
+    if provenance is not None:
+        payload["podcast_binding"] = provenance
+    return payload
+
+
+def _write_temporary(folder: Path, payload: dict) -> Path:
+    """A complete, fsynced sibling temporary file (removed again on failure)."""
+    fd, temporary = tempfile.mkstemp(dir=folder, prefix=".transcript-", suffix=".tmp")
     tmp_path = Path(temporary)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             json.dump(payload, handle, ensure_ascii=False, indent=2)
             handle.flush()
             os.fsync(handle.fileno())
+    except BaseException:
+        tmp_path.unlink(missing_ok=True)
+        raise
+    return tmp_path
+
+
+def save_transcript_cache(
+    identity: str,
+    result: TranscriptResult,
+    *,
+    provenance: dict | None = None,
+    acquired_at: str | None = None,
+) -> Path | None:
+    """Persist a usable transcript and immutable provenance for re-use.
+
+    ``provenance`` is stored verbatim as ``podcast_binding`` (episode +
+    artifact binding, origin). ``acquired_at`` overrides the acquisition time
+    only for explicit operator imports, which must keep the original time
+    rather than presenting old data as freshly acquired. Returns the written
+    path, or ``None`` when nothing was written.
+
+    This is the normal acquisition/refresh path: it atomically *replaces* any
+    existing entry. Operator imports use ``save_transcript_cache_exclusive``.
+    """
+    if not writes_allowed() or not identity or len(result.text.strip()) < _MIN_TRANSCRIPT_CHARS:
+        return None
+
+    cache_path = _cache_dir() / f"{_cache_key(identity)}.json"
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = _write_temporary(cache_path.parent, _cache_payload(
+        identity, result, provenance, acquired_at))
+    try:
         tmp_path.replace(cache_path)
     finally:
         tmp_path.unlink(missing_ok=True)
+    return cache_path
+
+
+# Hard links are refused by some filesystems (FAT/exFAT, some FUSE/SMB mounts).
+_NO_HARD_LINKS = frozenset(
+    code for code in (
+        errno.EPERM, errno.ENOTSUP, getattr(errno, "EOPNOTSUPP", errno.ENOTSUP),
+        errno.ENOSYS, errno.EMLINK, errno.EXDEV,
+    )
+)
+_AT_FDCWD = -100
+_RENAME_NOREPLACE = 1
+
+
+@functools.lru_cache(maxsize=1)
+def _renameat2():
+    if not sys.platform.startswith("linux"):
+        return None
+    import ctypes
+
+    try:
+        function = ctypes.CDLL(None, use_errno=True).renameat2
+    except (OSError, AttributeError):
+        return None
+    function.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p,
+                         ctypes.c_uint]
+    function.restype = ctypes.c_int
+    return function
+
+
+def _rename_noreplace_supported() -> bool:
+    return _renameat2() is not None
+
+
+def _rename_noreplace(source: Path, target: Path) -> None:
+    """``renameat2(RENAME_NOREPLACE)``: atomic, fails if *any* entry is at target."""
+    function = _renameat2()
+    if function is None:
+        raise OSError(errno.ENOTSUP, "atomic no-overwrite rename unavailable", str(target))
+    import ctypes
+
+    if function(_AT_FDCWD, os.fsencode(source), _AT_FDCWD, os.fsencode(target),
+                _RENAME_NOREPLACE) != 0:
+        code = ctypes.get_errno()
+        raise OSError(code, os.strerror(code), str(target))
+
+
+def _publish_noreplace(tmp_path: Path, cache_path: Path) -> None:
+    """Make a complete temporary file visible at ``cache_path`` without overwrite.
+
+    ``link(2)`` and ``renameat2(RENAME_NOREPLACE)`` both fail with ``EEXIST``
+    when *anything* (a regular file, a fresh entry written concurrently, or a
+    dangling symlink) already occupies the name; neither follows a symlink.
+    """
+    try:
+        os.link(tmp_path, cache_path)
+    except FileExistsError:
+        raise
+    except OSError as exc:
+        if exc.errno not in _NO_HARD_LINKS or not _rename_noreplace_supported():
+            raise
+        _rename_noreplace(tmp_path, cache_path)
+
+
+def _fsync_directory(folder: Path) -> None:
+    try:
+        fd = os.open(folder, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError as exc:  # durability only: the entry is already complete
+        logger.warning("Could not fsync transcript cache directory %s: %s", folder, exc)
+    finally:
+        os.close(fd)
+
+
+def save_transcript_cache_exclusive(
+    identity: str,
+    result: TranscriptResult,
+    *,
+    provenance: dict | None = None,
+    acquired_at: str | None = None,
+) -> Path | None:
+    """Publish a *new* entry atomically; never replace anything at its key.
+
+    The payload is written and fsynced to a sibling temporary file and only
+    then linked into place, so a reader sees either no entry or the complete
+    one. Raises ``FileExistsError`` if any directory entry (including a
+    dangling symlink, or a fresh entry written concurrently) already occupies
+    the key, and ``OSError`` for any other failure; in both cases no entry and
+    no temporary file is left behind. Returns ``None`` (nothing written) under
+    the same policy/length conditions as ``save_transcript_cache``.
+    """
+    if not writes_allowed() or not identity or len(result.text.strip()) < _MIN_TRANSCRIPT_CHARS:
+        return None
+
+    cache_path = _cache_dir() / f"{_cache_key(identity)}.json"
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    if os.path.lexists(cache_path):
+        raise FileExistsError(errno.EEXIST, "transcript cache entry exists", str(cache_path))
+    tmp_path = _write_temporary(cache_path.parent, _cache_payload(
+        identity, result, provenance, acquired_at))
+    try:
+        _publish_noreplace(tmp_path, cache_path)
+    finally:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError as exc:  # the published link is complete either way
+            logger.warning("Could not remove transcript temporary %s: %s", tmp_path, exc)
+    _fsync_directory(cache_path.parent)
+    return cache_path
 
 
 class _TranscriptDocumentParser(HTMLParser):

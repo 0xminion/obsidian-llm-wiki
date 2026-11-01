@@ -144,20 +144,21 @@ def test_query_command_uses_the_configured_query_task(monkeypatch, tmp_path):
     """The actual query command opts into QUERY_MODEL rather than the default model."""
     import obsidian_llm_wiki.cli.query as query_module
     from obsidian_llm_wiki.cli import app
+    from tests.new.test_query_cli import _citation, _vault_with_wiki
 
-    wiki = tmp_path / "04-Wiki" / "concepts"
-    wiki.mkdir(parents=True)
-    (wiki / "seed.md").write_text("# Seed\nGrounding evidence.", encoding="utf-8")
+    monkeypatch.setenv("QUERY_MODEL", "query-model")
+    _vault_with_wiki(tmp_path, monkeypatch)
     captured: dict[str, object] = {}
 
     def fake_call(_system, _messages, _config, **kwargs):
         captured.update(kwargs)
-        return "Grounded answer [[concepts/seed.md]]."
+        captured["configured_query_model"] = _config.llm.query_model
+        return "Seed evidence [[" + _citation(tmp_path, "concepts/seed.md") + "]]."
 
     monkeypatch.setattr(query_module, "call_llm", fake_call)
-    monkeypatch.setenv("QUERY_MODEL", "query-model")
 
     result = CliRunner().invoke(app, ["query", str(tmp_path), "--ask", "seed", "--json"])
 
     assert result.exit_code == 0, result.output
     assert captured["task"] == "query"
+    assert captured["configured_query_model"] == "query-model"

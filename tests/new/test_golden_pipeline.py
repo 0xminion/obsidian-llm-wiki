@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import patch
 
 import pytest
 
@@ -18,6 +18,14 @@ from obsidian_llm_wiki.config import load_config
 from obsidian_llm_wiki.core.models import SourceDoc
 from obsidian_llm_wiki.core.pipeline import run_pipeline
 from obsidian_llm_wiki.render.obsidian import parse_frontmatter, safe_read_file
+from tests.new.grounding_doubles import legacy_fixture_llm
+from tests.new.immutable_semantic_helpers import (
+    assert_preserved,
+    file_state,
+    generated_link,
+    published_meta,
+    published_root,
+)
 
 # ── Fake LLM response matching the SynthesisBundle schema ───────────────
 
@@ -55,7 +63,7 @@ FAKE_LLM_RESPONSE = json.dumps({
                 },
             ],
             "claims": [
-                {"text": "Self-attention complexity is O(n^2) in sequence length", "source_ref": "section 3.2"},  # noqa: E501
+                {"text": "Self-attention complexity is O(n^2) in sequence length", "source_ref": "section 3.2", "quote": "O(n^2) in sequence length"},  # noqa: E501
             ],
             "related": [
                 {"slug": "multi-head-attention", "relation": "component_of", "display": "Multi-Head Attention"},  # noqa: E501
@@ -145,16 +153,17 @@ async def test_golden_pipeline_end_to_end(tmp_path: Path):
             title="Attention Is All You Need",
             content="We propose a new simple network architecture, the Transformer, "
                     "based solely on attention mechanisms, dispensing with recurrence "
-                    "and convolutions entirely.",
+                    "and convolutions entirely. Self-attention complexity is O(n^2) "
+                    "in sequence length.",
             url="https://arxiv.org/abs/1706.03762",
         ),
     }
 
     # ── Mock the LLM call ───────────────────────────────────────────────
+    # Grounded contract: explicit reviewer double + span-ID claim citations.
     with patch(
         "obsidian_llm_wiki.providers.llm.acall_llm",
-        new_callable=AsyncMock,
-        return_value=FAKE_LLM_RESPONSE,
+        side_effect=legacy_fixture_llm(FAKE_LLM_RESPONSE),
     ):
         result = await run_pipeline(vault, sources, config, force=True)
 
@@ -164,7 +173,7 @@ async def test_golden_pipeline_end_to_end(tmp_path: Path):
     assert len(result.errors) == 0
 
     # ── Assert vault structure ──────────────────────────────────────────
-    bundle = vault / "04-Wiki"
+    bundle = published_root(config)
     assert (bundle / "sources" / "attention-is-all-you-need.md").exists()
     assert (bundle / "entries" / "attention-is-all-you-need.md").exists()
     assert (bundle / "concepts" / "self-attention.md").exists()
@@ -197,8 +206,8 @@ async def test_golden_pipeline_end_to_end(tmp_path: Path):
     assert "Self-attention complexity is O(n^2)" in body
     assert "## Related Concepts" not in body
     assert "## Cross-References" in body
-    assert "[[multi-head-attention|" in body
-    assert "[[positional-encoding|" in body
+    assert generated_link(config, "concepts", "multi-head-attention", "Multi-Head Attention") in body
+    assert generated_link(config, "concepts", "positional-encoding", "Positional Encoding") in body
 
     # ── Assert entry page content ───────────────────────────────────────
     entry_page = safe_read_file(bundle / "entries" / "attention-is-all-you-need.md")
@@ -211,8 +220,8 @@ async def test_golden_pipeline_end_to_end(tmp_path: Path):
     assert "## Key Findings" in body
     assert "Self-attention mechanism eliminates recurrence" in body
     assert "## Linked Concepts" in body
-    assert "[[self-attention]]" in body
-    assert "[[multi-head-attention]]" in body
+    assert generated_link(config, "concepts", "self-attention") in body
+    assert generated_link(config, "concepts", "multi-head-attention") in body
     assert "## Open Questions" in body
 
     # ── Assert MOC page content ─────────────────────────────────────────
@@ -222,12 +231,12 @@ async def test_golden_pipeline_end_to_end(tmp_path: Path):
     assert meta["type"] == "Map of Content"
     assert "# Attention Mechanisms" in body
     assert "## Concepts" in body
-    assert "[[self-attention]]" in body
-    assert "[[multi-head-attention]]" in body
+    assert generated_link(config, "concepts", "self-attention") in body
+    assert generated_link(config, "concepts", "multi-head-attention") in body
 
     # ── Assert state was persisted ──────────────────────────────────────
     import json as _json
-    state_data = _json.loads(safe_read_file(config.state_file))
+    state_data = _json.loads(safe_read_file(published_meta(config) / "state.json"))
     assert "attention-is-all-you-need.md" in state_data["sources"]
     src_state = state_data["sources"]["attention-is-all-you-need.md"]
     assert len(src_state["concepts"]) == 3
@@ -255,8 +264,7 @@ async def test_golden_pipeline_incremental_skip(tmp_path: Path):
     # First run.
     with patch(
         "obsidian_llm_wiki.providers.llm.acall_llm",
-        new_callable=AsyncMock,
-        return_value=json.dumps({
+        side_effect=legacy_fixture_llm(json.dumps({
             "source_title": "Test",
             "source_summary": "Unchanged sources reuse cached synthesis.",
             "concepts": [{
@@ -266,12 +274,14 @@ async def test_golden_pipeline_incremental_skip(tmp_path: Path):
                     "heading": "Reuse", "prose": "An unchanged source hash permits cached synthesis reuse.",
                 }],
             }],
-        }),
+        })),
     ):
         result1 = await run_pipeline(vault, sources, config, force=True)
     assert result1.compiled == 1
 
-    # Second run — should skip (source unchanged).
+    previous = published_root(config)
+    before = file_state(previous)
+    # Second run — should skip (source unchanged), without a new generation.
     call_count = 0
 
     async def _mock_acall(*args, **kwargs):
@@ -285,3 +295,5 @@ async def test_golden_pipeline_incremental_skip(tmp_path: Path):
     assert result2.compiled == 0
     assert result2.skipped == 1
     assert call_count == 0  # LLM was NOT called on second run
+    assert published_root(config) == previous
+    assert_preserved(previous, before)

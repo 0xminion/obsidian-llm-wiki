@@ -1,6 +1,6 @@
 # Verification report and acceptance handoff
 
-**Final local acceptance passed for the exercised Linux workflows.** The complete Python matrix, independent review closures, package/plugin checks and measured limits are recorded below. This report preserves earlier failures rather than presenting the audit as green from the start. It is not a security certification or proof of model correctness.
+**Historical local acceptance for the earlier audit snapshot passed for the exercised Linux workflows.** The current implementation and unresolved live semantic gates are summarized in [delivery status](delivery-status.md). The complete earlier Python matrix, independent review closures, package/plugin checks and measured limits are recorded below. This report preserves earlier failures rather than presenting the audit as green from the start. It is not a security certification or proof of model correctness.
 
 ## Target and receipt locations
 

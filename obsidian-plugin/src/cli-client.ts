@@ -43,6 +43,8 @@ export function cliArguments(request: CliRequest): string[] {
   const base = [request.vaultPath];
 
   switch (request.operation) {
+    case "current":
+      return ["current", ...base, "--json"];
     case "ingest":
       return ["ingest", ...base, "--json", ...urlArguments(request.urls)];
     case "preview":

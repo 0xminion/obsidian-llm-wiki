@@ -1,0 +1,362 @@
+[
+  {
+    "inputs": {
+      "content": "Mira: It stopped. Only here.",
+      "source_file": "legacy.md",
+      "source_sha256": "8e7461b0bfa9e8e4fc473d63d6d76f00abfb22638b09bbef7bb9d7976047e5d7",
+      "catalog_version": "offset-v1",
+      "unit_key": "legacy-unit",
+      "cited_span_ids": [
+        "old-span"
+      ],
+      "citation_start": 6,
+      "citation_end": 17,
+      "visible_intervals": [
+        [
+          0,
+          28
+        ]
+      ]
+    },
+    "bindings": {
+      "review-context-v1": {
+        "json": "{\"catalog_version\":\"offset-v1\",\"citation_end\":17,\"citation_start\":6,\"cited_span_ids\":[\"old-span\"],\"offered_context\":[{\"byte_end\":6,\"byte_start\":0,\"char_end\":6,\"char_start\":0,\"context_id\":\"ctx-879902052b95336eb4db6e8726945fc21d4be03d40c8c098bda45cb0d217e7ba\",\"text\":\"Mira: \",\"text_sha256\":\"b9f1475db928fbefeb1ebfd13e0f81297e5eb5fd735e41509c5257b9eb5d87f9\"},{\"byte_end\":28,\"byte_start\":17,\"char_end\":28,\"char_start\":17,\"context_id\":\"ctx-7fa5e8a1bcf8efb83f3c29b294da5660331f582964606df705d82644731c840b\",\"text\":\" Only here.\",\"text_sha256\":\"9bce52b03379761166ce36e5d0883a4170f2f4fa3105b4cfab98331ff4ca357d\"}],\"policy\":\"review-context-v1\",\"source_file\":\"legacy.md\",\"source_sha256\":\"8e7461b0bfa9e8e4fc473d63d6d76f00abfb22638b09bbef7bb9d7976047e5d7\",\"unit_key\":\"legacy-unit\",\"visible_intervals\":[[0,28]]}",
+        "sha256": "5919cca5b22ac5e4dd473009c97a3f21c76bb6f5bcc57cee6a00e2a49be55262"
+      },
+      "review-context-v2": {
+        "json": "{\"catalog_version\":\"offset-v1\",\"citation_end\":17,\"citation_start\":6,\"cited_span_ids\":[\"old-span\"],\"offered_context\":[{\"byte_end\":6,\"byte_start\":0,\"char_end\":6,\"char_start\":0,\"context_id\":\"ctx-513bb40dab5606da3694a1a000d9f1afaf59a6ee4646e1ba5e1e21624e23c174\",\"text\":\"Mira: \",\"text_sha256\":\"b9f1475db928fbefeb1ebfd13e0f81297e5eb5fd735e41509c5257b9eb5d87f9\"},{\"byte_end\":28,\"byte_start\":17,\"char_end\":28,\"char_start\":17,\"context_id\":\"ctx-2f586268ac5e40653238168760074f524232334315831fd232c24ce236cbc404\",\"text\":\" Only here.\",\"text_sha256\":\"9bce52b03379761166ce36e5d0883a4170f2f4fa3105b4cfab98331ff4ca357d\"}],\"policy\":\"review-context-v2\",\"source_file\":\"legacy.md\",\"source_sha256\":\"8e7461b0bfa9e8e4fc473d63d6d76f00abfb22638b09bbef7bb9d7976047e5d7\",\"unit_key\":\"legacy-unit\",\"visible_intervals\":[[0,28]]}",
+        "sha256": "f22f1eb197492a86ac6d74b4c75ac6fd323bc0bd7fb7e5b2bc35731cdb8721a3"
+      }
+    }
+  },
+  {
+    "inputs": {
+      "content": "Mira: It stopped. Only here.",
+      "source_file": "legacy.md",
+      "source_sha256": "8e7461b0bfa9e8e4fc473d63d6d76f00abfb22638b09bbef7bb9d7976047e5d7",
+      "catalog_version": "offset-v1",
+      "unit_key": "legacy-unit",
+      "cited_span_ids": [
+        "old-span"
+      ],
+      "citation_start": 6,
+      "citation_end": 17,
+      "visible_intervals": [
+        [
+          6,
+          17
+        ]
+      ]
+    },
+    "bindings": {
+      "review-context-v1": {
+        "json": "{\"catalog_version\":\"offset-v1\",\"citation_end\":17,\"citation_start\":6,\"cited_span_ids\":[\"old-span\"],\"offered_context\":[],\"policy\":\"review-context-v1\",\"source_file\":\"legacy.md\",\"source_sha256\":\"8e7461b0bfa9e8e4fc473d63d6d76f00abfb22638b09bbef7bb9d7976047e5d7\",\"unit_key\":\"legacy-unit\",\"visible_intervals\":[[6,17]]}",
+        "sha256": "6cf26a9f77b5e007ffb3fbf1fa67463968d98f20c4dac25970e782bca49efcd1"
+      },
+      "review-context-v2": {
+        "json": "{\"catalog_version\":\"offset-v1\",\"citation_end\":17,\"citation_start\":6,\"cited_span_ids\":[\"old-span\"],\"offered_context\":[],\"policy\":\"review-context-v2\",\"source_file\":\"legacy.md\",\"source_sha256\":\"8e7461b0bfa9e8e4fc473d63d6d76f00abfb22638b09bbef7bb9d7976047e5d7\",\"unit_key\":\"legacy-unit\",\"visible_intervals\":[[6,17]]}",
+        "sha256": "bd9163d6b2417bd98f23e55fac50698658fd28d219e01d49ac3ca232edea0051"
+      }
+    }
+  },
+  {
+    "inputs": {
+      "content": "Inez said:\n\n> Keep it idle.",
+      "source_file": "legacy.md",
+      "source_sha256": "847c6f92a5b5bb997b53f00a915fe1c333a0c9aed509a1155b3f8700ddb28a0f",
+      "catalog_version": "offset-v1",
+      "unit_key": "legacy-unit",
+      "cited_span_ids": [
+        "old-span"
+      ],
+      "citation_start": 12,
+      "citation_end": 27,
+      "visible_intervals": [
+        [
+          0,
+          27
+        ]
+      ]
+    },
+    "bindings": {
+      "review-context-v1": {
+        "json": "{\"catalog_version\":\"offset-v1\",\"citation_end\":27,\"citation_start\":12,\"cited_span_ids\":[\"old-span\"],\"offered_context\":[],\"policy\":\"review-context-v1\",\"source_file\":\"legacy.md\",\"source_sha256\":\"847c6f92a5b5bb997b53f00a915fe1c333a0c9aed509a1155b3f8700ddb28a0f\",\"unit_key\":\"legacy-unit\",\"visible_intervals\":[[0,27]]}",
+        "sha256": "707cb8f7d42e22e65f89605e8619bb331ff48173d3665fdf7e2cdf4939817a79"
+      },
+      "review-context-v2": {
+        "json": "{\"catalog_version\":\"offset-v1\",\"citation_end\":27,\"citation_start\":12,\"cited_span_ids\":[\"old-span\"],\"offered_context\":[{\"byte_end\":12,\"byte_start\":0,\"char_end\":12,\"char_start\":0,\"context_id\":\"ctx-b5b0cc84aeb7ac8e3a23a19717a86698762923c2506039006214c6343a4f21ea\",\"text\":\"Inez said:\\n\\n\",\"text_sha256\":\"0bf642040be5d1fd2fb322b174fa8ca0b2501835b1eb7e8c2e50902065c19b47\"}],\"policy\":\"review-context-v2\",\"source_file\":\"legacy.md\",\"source_sha256\":\"847c6f92a5b5bb997b53f00a915fe1c333a0c9aed509a1155b3f8700ddb28a0f\",\"unit_key\":\"legacy-unit\",\"visible_intervals\":[[0,27]]}",
+        "sha256": "7c66c762f1d933de4a56d6ffe47d54584bf0dcc1218af9bff9e0eabf968d954f"
+      }
+    }
+  },
+  {
+    "inputs": {
+      "content": "Inez said:\n\n> Keep it idle.",
+      "source_file": "legacy.md",
+      "source_sha256": "847c6f92a5b5bb997b53f00a915fe1c333a0c9aed509a1155b3f8700ddb28a0f",
+      "catalog_version": "offset-v1",
+      "unit_key": "legacy-unit",
+      "cited_span_ids": [
+        "old-span"
+      ],
+      "citation_start": 12,
+      "citation_end": 27,
+      "visible_intervals": [
+        [
+          12,
+          27
+        ]
+      ]
+    },
+    "bindings": {
+      "review-context-v1": {
+        "json": "{\"catalog_version\":\"offset-v1\",\"citation_end\":27,\"citation_start\":12,\"cited_span_ids\":[\"old-span\"],\"offered_context\":[],\"policy\":\"review-context-v1\",\"source_file\":\"legacy.md\",\"source_sha256\":\"847c6f92a5b5bb997b53f00a915fe1c333a0c9aed509a1155b3f8700ddb28a0f\",\"unit_key\":\"legacy-unit\",\"visible_intervals\":[[12,27]]}",
+        "sha256": "7ad1224466dcbbcf1b9a9348d2f88fda74399c6ace5fd75295709de72d9ef7ce"
+      },
+      "review-context-v2": {
+        "json": "{\"catalog_version\":\"offset-v1\",\"citation_end\":27,\"citation_start\":12,\"cited_span_ids\":[\"old-span\"],\"offered_context\":[],\"policy\":\"review-context-v2\",\"source_file\":\"legacy.md\",\"source_sha256\":\"847c6f92a5b5bb997b53f00a915fe1c333a0c9aed509a1155b3f8700ddb28a0f\",\"unit_key\":\"legacy-unit\",\"visible_intervals\":[[12,27]]}",
+        "sha256": "af89eb420f95bc0a123e7b469d0c4e64d32990734a2a2a38647e506fa9e03577"
+      }
+    }
+  },
+  {
+    "inputs": {
+      "content": "柳青表示：\r\n\r\n> 它必须关闭。",
+      "source_file": "legacy.md",
+      "source_sha256": "3f1e3a7da1cfbfa7e08685222c87f265eadeb1e8244f8de1a6f547d5916501fb",
+      "catalog_version": "offset-v1",
+      "unit_key": "legacy-unit",
+      "cited_span_ids": [
+        "old-span"
+      ],
+      "citation_start": 9,
+      "citation_end": 17,
+      "visible_intervals": [
+        [
+          0,
+          17
+        ]
+      ]
+    },
+    "bindings": {
+      "review-context-v1": {
+        "json": "{\"catalog_version\":\"offset-v1\",\"citation_end\":17,\"citation_start\":9,\"cited_span_ids\":[\"old-span\"],\"offered_context\":[],\"policy\":\"review-context-v1\",\"source_file\":\"legacy.md\",\"source_sha256\":\"3f1e3a7da1cfbfa7e08685222c87f265eadeb1e8244f8de1a6f547d5916501fb\",\"unit_key\":\"legacy-unit\",\"visible_intervals\":[[0,17]]}",
+        "sha256": "d5ccdad5b16cda7f612997b2a405d37159034afd39adaeb0bc613400a4a7a3d4"
+      },
+      "review-context-v2": {
+        "json": "{\"catalog_version\":\"offset-v1\",\"citation_end\":17,\"citation_start\":9,\"cited_span_ids\":[\"old-span\"],\"offered_context\":[{\"byte_end\":19,\"byte_start\":0,\"char_end\":9,\"char_start\":0,\"context_id\":\"ctx-538a205b07b559d05b19b725dedad2ad1c1a5caf733350928df2332fcf09963f\",\"text\":\"柳青表示：\\r\\n\\r\\n\",\"text_sha256\":\"c516b2798fc648f69671d35f71655429cd7eacecbe33e56ededfe0354306da09\"}],\"policy\":\"review-context-v2\",\"source_file\":\"legacy.md\",\"source_sha256\":\"3f1e3a7da1cfbfa7e08685222c87f265eadeb1e8244f8de1a6f547d5916501fb\",\"unit_key\":\"legacy-unit\",\"visible_intervals\":[[0,17]]}",
+        "sha256": "a319ea22bfd6357dde7b64905528ddf3d9eef1786e07abc6f02b0afb9e088769"
+      }
+    }
+  },
+  {
+    "inputs": {
+      "content": "柳青表示：\r\n\r\n> 它必须关闭。",
+      "source_file": "legacy.md",
+      "source_sha256": "3f1e3a7da1cfbfa7e08685222c87f265eadeb1e8244f8de1a6f547d5916501fb",
+      "catalog_version": "offset-v1",
+      "unit_key": "legacy-unit",
+      "cited_span_ids": [
+        "old-span"
+      ],
+      "citation_start": 9,
+      "citation_end": 17,
+      "visible_intervals": [
+        [
+          9,
+          17
+        ]
+      ]
+    },
+    "bindings": {
+      "review-context-v1": {
+        "json": "{\"catalog_version\":\"offset-v1\",\"citation_end\":17,\"citation_start\":9,\"cited_span_ids\":[\"old-span\"],\"offered_context\":[],\"policy\":\"review-context-v1\",\"source_file\":\"legacy.md\",\"source_sha256\":\"3f1e3a7da1cfbfa7e08685222c87f265eadeb1e8244f8de1a6f547d5916501fb\",\"unit_key\":\"legacy-unit\",\"visible_intervals\":[[9,17]]}",
+        "sha256": "bff3ee89f540dd2e87bf6b65b1a474fb28c1e47c428c504664c4f5d2d0d55fc7"
+      },
+      "review-context-v2": {
+        "json": "{\"catalog_version\":\"offset-v1\",\"citation_end\":17,\"citation_start\":9,\"cited_span_ids\":[\"old-span\"],\"offered_context\":[],\"policy\":\"review-context-v2\",\"source_file\":\"legacy.md\",\"source_sha256\":\"3f1e3a7da1cfbfa7e08685222c87f265eadeb1e8244f8de1a6f547d5916501fb\",\"unit_key\":\"legacy-unit\",\"visible_intervals\":[[9,17]]}",
+        "sha256": "eabc0b6623e36db2694c4be6887ca35984a22eaa4210e164a83b12c6555d7af5"
+      }
+    }
+  },
+  {
+    "inputs": {
+      "content": "Earlier.\n\nMira spoke.\n\n> It stopped.",
+      "source_file": "legacy.md",
+      "source_sha256": "a132274b988d893502eec33193b843197bf5f9cb917a9e6b43b1d19ae8036bd8",
+      "catalog_version": "offset-v1",
+      "unit_key": "legacy-unit",
+      "cited_span_ids": [
+        "old-span"
+      ],
+      "citation_start": 23,
+      "citation_end": 36,
+      "visible_intervals": [
+        [
+          0,
+          36
+        ]
+      ]
+    },
+    "bindings": {
+      "review-context-v1": {
+        "json": "{\"catalog_version\":\"offset-v1\",\"citation_end\":36,\"citation_start\":23,\"cited_span_ids\":[\"old-span\"],\"offered_context\":[],\"policy\":\"review-context-v1\",\"source_file\":\"legacy.md\",\"source_sha256\":\"a132274b988d893502eec33193b843197bf5f9cb917a9e6b43b1d19ae8036bd8\",\"unit_key\":\"legacy-unit\",\"visible_intervals\":[[0,36]]}",
+        "sha256": "aecae7889fca01e0565b02ae72fc99845df599d0d5ee7e1d206bdaaea9f24245"
+      },
+      "review-context-v2": {
+        "json": "{\"catalog_version\":\"offset-v1\",\"citation_end\":36,\"citation_start\":23,\"cited_span_ids\":[\"old-span\"],\"offered_context\":[],\"policy\":\"review-context-v2\",\"source_file\":\"legacy.md\",\"source_sha256\":\"a132274b988d893502eec33193b843197bf5f9cb917a9e6b43b1d19ae8036bd8\",\"unit_key\":\"legacy-unit\",\"visible_intervals\":[[0,36]]}",
+        "sha256": "b3bcfdb100241995d8866ab48a95368d92e2795ed66336f11ff5870dd884c381"
+      }
+    }
+  },
+  {
+    "inputs": {
+      "content": "Earlier.\n\nMira spoke.\n\n> It stopped.",
+      "source_file": "legacy.md",
+      "source_sha256": "a132274b988d893502eec33193b843197bf5f9cb917a9e6b43b1d19ae8036bd8",
+      "catalog_version": "offset-v1",
+      "unit_key": "legacy-unit",
+      "cited_span_ids": [
+        "old-span"
+      ],
+      "citation_start": 23,
+      "citation_end": 36,
+      "visible_intervals": [
+        [
+          23,
+          36
+        ]
+      ]
+    },
+    "bindings": {
+      "review-context-v1": {
+        "json": "{\"catalog_version\":\"offset-v1\",\"citation_end\":36,\"citation_start\":23,\"cited_span_ids\":[\"old-span\"],\"offered_context\":[],\"policy\":\"review-context-v1\",\"source_file\":\"legacy.md\",\"source_sha256\":\"a132274b988d893502eec33193b843197bf5f9cb917a9e6b43b1d19ae8036bd8\",\"unit_key\":\"legacy-unit\",\"visible_intervals\":[[23,36]]}",
+        "sha256": "feb601b21b9518c9975be13cc03a22896eea263f257336c343831e0c3de2c78d"
+      },
+      "review-context-v2": {
+        "json": "{\"catalog_version\":\"offset-v1\",\"citation_end\":36,\"citation_start\":23,\"cited_span_ids\":[\"old-span\"],\"offered_context\":[],\"policy\":\"review-context-v2\",\"source_file\":\"legacy.md\",\"source_sha256\":\"a132274b988d893502eec33193b843197bf5f9cb917a9e6b43b1d19ae8036bd8\",\"unit_key\":\"legacy-unit\",\"visible_intervals\":[[23,36]]}",
+        "sha256": "5d3ea8110c23d88e659b598ac2ab962fd22f889a71ebafdafe8dc381bafc4858"
+      }
+    }
+  },
+  {
+    "inputs": {
+      "content": "🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶It stopped.中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中",
+      "source_file": "legacy.md",
+      "source_sha256": "d79e91c61621a0990be438fcaef1cce808a8ada5a9c9219025cec762e95b073a",
+      "catalog_version": "offset-v1",
+      "unit_key": "legacy-unit",
+      "cited_span_ids": [
+        "old-span"
+      ],
+      "citation_start": 500,
+      "citation_end": 511,
+      "visible_intervals": [
+        [
+          0,
+          1011
+        ]
+      ]
+    },
+    "bindings": {
+      "review-context-v1": {
+        "json": "{\"catalog_version\":\"offset-v1\",\"citation_end\":511,\"citation_start\":500,\"cited_span_ids\":[\"old-span\"],\"offered_context\":[{\"byte_end\":2000,\"byte_start\":464,\"char_end\":500,\"char_start\":116,\"context_id\":\"ctx-dc6f102c1683aa4b7738d29b08018b81b03aa3a361d06ad25dc7b60cb52b9767\",\"text\":\"🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶\",\"text_sha256\":\"07cd2384739078fc449f20b8d71b949d1ae66888d109c269a0f8c91d76ce616a\"},{\"byte_end\":3163,\"byte_start\":2011,\"char_end\":895,\"char_start\":511,\"context_id\":\"ctx-98aea2c9573bd0ef1521f86d3216b61a91f4e603c1315c78c0b9dcfecb45d415\",\"text\":\"中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中\",\"text_sha256\":\"deb55768a935a4399ac0df55246dd390de4c941d6a253ba96d25c6bf0fe4021e\"}],\"policy\":\"review-context-v1\",\"source_file\":\"legacy.md\",\"source_sha256\":\"d79e91c61621a0990be438fcaef1cce808a8ada5a9c9219025cec762e95b073a\",\"unit_key\":\"legacy-unit\",\"visible_intervals\":[[0,1011]]}",
+        "sha256": "655a7082bf6a8489e9a380b4c9d8a704050ad82011505a04fa9957d9cd19869a"
+      },
+      "review-context-v2": {
+        "json": "{\"catalog_version\":\"offset-v1\",\"citation_end\":511,\"citation_start\":500,\"cited_span_ids\":[\"old-span\"],\"offered_context\":[{\"byte_end\":2000,\"byte_start\":464,\"char_end\":500,\"char_start\":116,\"context_id\":\"ctx-6ca32ab105995ce992eb559440158fe45e465e033eff7a8bb8ab6f3fc20c570f\",\"text\":\"🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶\",\"text_sha256\":\"07cd2384739078fc449f20b8d71b949d1ae66888d109c269a0f8c91d76ce616a\"},{\"byte_end\":3163,\"byte_start\":2011,\"char_end\":895,\"char_start\":511,\"context_id\":\"ctx-1b340c4052b13eb63e59a835ce3debe564588dc7df71160255f1f78d8baf9608\",\"text\":\"中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中\",\"text_sha256\":\"deb55768a935a4399ac0df55246dd390de4c941d6a253ba96d25c6bf0fe4021e\"}],\"policy\":\"review-context-v2\",\"source_file\":\"legacy.md\",\"source_sha256\":\"d79e91c61621a0990be438fcaef1cce808a8ada5a9c9219025cec762e95b073a\",\"unit_key\":\"legacy-unit\",\"visible_intervals\":[[0,1011]]}",
+        "sha256": "c0350360bd0b0b083c2c2542f0fc75bcf786f008536bc6ae034e2a2331f7088d"
+      }
+    }
+  },
+  {
+    "inputs": {
+      "content": "🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶🪶It stopped.中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中",
+      "source_file": "legacy.md",
+      "source_sha256": "d79e91c61621a0990be438fcaef1cce808a8ada5a9c9219025cec762e95b073a",
+      "catalog_version": "offset-v1",
+      "unit_key": "legacy-unit",
+      "cited_span_ids": [
+        "old-span"
+      ],
+      "citation_start": 500,
+      "citation_end": 511,
+      "visible_intervals": [
+        [
+          500,
+          511
+        ]
+      ]
+    },
+    "bindings": {
+      "review-context-v1": {
+        "json": "{\"catalog_version\":\"offset-v1\",\"citation_end\":511,\"citation_start\":500,\"cited_span_ids\":[\"old-span\"],\"offered_context\":[],\"policy\":\"review-context-v1\",\"source_file\":\"legacy.md\",\"source_sha256\":\"d79e91c61621a0990be438fcaef1cce808a8ada5a9c9219025cec762e95b073a\",\"unit_key\":\"legacy-unit\",\"visible_intervals\":[[500,511]]}",
+        "sha256": "e288405c61361a75c4e5e391dc7bc037ebb292e7420218f745cd8c9a3f7f4bb6"
+      },
+      "review-context-v2": {
+        "json": "{\"catalog_version\":\"offset-v1\",\"citation_end\":511,\"citation_start\":500,\"cited_span_ids\":[\"old-span\"],\"offered_context\":[],\"policy\":\"review-context-v2\",\"source_file\":\"legacy.md\",\"source_sha256\":\"d79e91c61621a0990be438fcaef1cce808a8ada5a9c9219025cec762e95b073a\",\"unit_key\":\"legacy-unit\",\"visible_intervals\":[[500,511]]}",
+        "sha256": "3c0469b922474e4d975a7d28aa9b1a3d666baeaf85a37282b050e9dc9962b158"
+      }
+    }
+  },
+  {
+    "inputs": {
+      "content": "First.\n\nInez said:\n\n> Keep it idle.\n\nOther.",
+      "source_file": "legacy.md",
+      "source_sha256": "71505f7513f52ec8dbbdef0fab70893cf4ce1cf5d8a76e2f9b297b92dcb8aa3e",
+      "catalog_version": "offset-v1",
+      "unit_key": "legacy-unit",
+      "cited_span_ids": [
+        "old-span"
+      ],
+      "citation_start": 20,
+      "citation_end": 35,
+      "visible_intervals": [
+        [
+          0,
+          43
+        ]
+      ]
+    },
+    "bindings": {
+      "review-context-v1": {
+        "json": "{\"catalog_version\":\"offset-v1\",\"citation_end\":35,\"citation_start\":20,\"cited_span_ids\":[\"old-span\"],\"offered_context\":[],\"policy\":\"review-context-v1\",\"source_file\":\"legacy.md\",\"source_sha256\":\"71505f7513f52ec8dbbdef0fab70893cf4ce1cf5d8a76e2f9b297b92dcb8aa3e\",\"unit_key\":\"legacy-unit\",\"visible_intervals\":[[0,43]]}",
+        "sha256": "28dd94674a6ba026596cb50b32dde63a8d6a282341d1e984c7ddb0bc2e4d6e2c"
+      },
+      "review-context-v2": {
+        "json": "{\"catalog_version\":\"offset-v1\",\"citation_end\":35,\"citation_start\":20,\"cited_span_ids\":[\"old-span\"],\"offered_context\":[{\"byte_end\":20,\"byte_start\":8,\"char_end\":20,\"char_start\":8,\"context_id\":\"ctx-5c2d4efb33389b55bd14b037602ef925538793f4cce58f7f78e77638170c65c0\",\"text\":\"Inez said:\\n\\n\",\"text_sha256\":\"0bf642040be5d1fd2fb322b174fa8ca0b2501835b1eb7e8c2e50902065c19b47\"}],\"policy\":\"review-context-v2\",\"source_file\":\"legacy.md\",\"source_sha256\":\"71505f7513f52ec8dbbdef0fab70893cf4ce1cf5d8a76e2f9b297b92dcb8aa3e\",\"unit_key\":\"legacy-unit\",\"visible_intervals\":[[0,43]]}",
+        "sha256": "b210e3d1bb3ff7f72735d85d7946badf2a84c765f48859567cca051cdaed398f"
+      }
+    }
+  },
+  {
+    "inputs": {
+      "content": "First.\n\nInez said:\n\n> Keep it idle.\n\nOther.",
+      "source_file": "legacy.md",
+      "source_sha256": "71505f7513f52ec8dbbdef0fab70893cf4ce1cf5d8a76e2f9b297b92dcb8aa3e",
+      "catalog_version": "offset-v1",
+      "unit_key": "legacy-unit",
+      "cited_span_ids": [
+        "old-span"
+      ],
+      "citation_start": 20,
+      "citation_end": 35,
+      "visible_intervals": [
+        [
+          20,
+          35
+        ]
+      ]
+    },
+    "bindings": {
+      "review-context-v1": {
+        "json": "{\"catalog_version\":\"offset-v1\",\"citation_end\":35,\"citation_start\":20,\"cited_span_ids\":[\"old-span\"],\"offered_context\":[],\"policy\":\"review-context-v1\",\"source_file\":\"legacy.md\",\"source_sha256\":\"71505f7513f52ec8dbbdef0fab70893cf4ce1cf5d8a76e2f9b297b92dcb8aa3e\",\"unit_key\":\"legacy-unit\",\"visible_intervals\":[[20,35]]}",
+        "sha256": "d1ab0bb32c2f8120256633f52a7945856f044702310f94bcc9429ebbcd1fd690"
+      },
+      "review-context-v2": {
+        "json": "{\"catalog_version\":\"offset-v1\",\"citation_end\":35,\"citation_start\":20,\"cited_span_ids\":[\"old-span\"],\"offered_context\":[],\"policy\":\"review-context-v2\",\"source_file\":\"legacy.md\",\"source_sha256\":\"71505f7513f52ec8dbbdef0fab70893cf4ce1cf5d8a76e2f9b297b92dcb8aa3e\",\"unit_key\":\"legacy-unit\",\"visible_intervals\":[[20,35]]}",
+        "sha256": "55ae5ce90c5b7815a367804eaaa1b3a07be1a30204737ebb1d9e9d12d71d5796"
+      }
+    }
+  }
+]

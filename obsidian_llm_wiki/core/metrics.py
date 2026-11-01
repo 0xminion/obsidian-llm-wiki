@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import time
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
@@ -116,7 +117,11 @@ class MetricsCollector:
     """
 
     def __init__(self, vault_path: str | Path) -> None:
-        config = Config(vault_path=str(vault_path))
+        # Validate the expanded lexical spelling before Config.vault resolves it.
+        # Keep that spelling to detect a replaced ancestor again at save time.
+        self._input_vault_path = Path(os.path.expandvars(str(vault_path))).expanduser().absolute()
+        checked_generated_path(self._input_vault_path)
+        config = Config(vault_path=str(self._input_vault_path))
         self.vault_path = config.vault
         self.llmwiki_dir = config.llmwiki_dir
         self.metrics_file = checked_generated_path(
@@ -226,6 +231,11 @@ class MetricsCollector:
         Appends the current run to a ``runs`` list, keeping history.
         Also writes ``latest`` key for backward-compatible single-run access.
         """
+        from obsidian_llm_wiki.core.publication_write_guard import require_domain_workspace
+
+        checked_generated_path(self._input_vault_path)
+        require_domain_workspace(self.llmwiki_dir)
+        require_domain_workspace(self.metrics_file)
         # Recheck at use time: a collector may outlive a replaced directory.
         checked_generated_path(self.llmwiki_dir, self.vault_path)
         checked_generated_path(self.metrics_file, self.vault_path)
@@ -307,7 +317,10 @@ def load_metrics(vault_path: str | Path) -> dict[str, Any] | None:
         that expect a flat run dict). Use ``load_all_metrics`` for full history.
     """
     config = Config(vault_path=str(vault_path))
-    metrics_file = checked_generated_path(config.llmwiki_dir / "metrics.json", config.vault)
+    from obsidian_llm_wiki.core.application import read_publication
+
+    bundle, _ = read_publication(config)
+    metrics_file = checked_generated_path(bundle / ".llmwiki/metrics.json", config.vault)
     if not metrics_file.exists():
         return None
     try:
@@ -332,7 +345,10 @@ def load_all_metrics(vault_path: str | Path) -> list[dict[str, Any]]:
         List of run metric dicts, oldest first. Empty list if no metrics.
     """
     config = Config(vault_path=str(vault_path))
-    metrics_file = checked_generated_path(config.llmwiki_dir / "metrics.json", config.vault)
+    from obsidian_llm_wiki.core.application import read_publication
+
+    bundle, _ = read_publication(config)
+    metrics_file = checked_generated_path(bundle / ".llmwiki/metrics.json", config.vault)
     if not metrics_file.exists():
         return []
     try:

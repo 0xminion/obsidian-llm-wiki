@@ -49,6 +49,14 @@ subsections, and cached language/provenance remain intact.
 
 ## Existing caches and persisted sources
 
+> **Cache keys (epoch 3).** Podcast transcript caches are keyed by the
+> episode identity *and* the selected artifact. Each entry carries explicit
+> `podcast_binding` provenance. Version-1 (`guid|enclosure`, raw-URL) and
+> version-2 entries are **never read automatically**. They miss once and stay
+> byte-identical; reuse needs an explicit operator-attested import. See
+> [podcast authority binding](podcast-authority-binding.md#legacy-entries-v1-and-v2-never-read-automatically).
+> The per-provider admission rules below still apply to every entry.
+
 Text normalization remains **version 2**. A separate
 `podcast_admission_version: 1` marks the current cache representation.
 
@@ -65,21 +73,29 @@ reacquisition replaces the cache atomically; failed reacquisition preserves the
 old bytes as evidence. Current caches still pass the shared episode admission
 check before publication.
 
-Legacy AssemblyAI, Supadata, and local Whisper caches are unaffected and remain
-reusable. This is not blanket ASR invalidation. If free reacquisition fails, the
-normal configured ASR fallbacks still apply; operators wanting a strictly free
-refresh must disable paid providers in their effective configuration first.
+At the resolver level (`load_transcript_cache`), AssemblyAI, Supadata and
+local Whisper payloads are still loadable. The podcast extractor itself,
+however, now reads only epoch-3 bound entries (see the note above). Legacy
+podcast ASR entries are therefore **not** reused automatically, and the first
+request after upgrade runs the configured ASR chain again. This supersedes the
+earlier "legacy ASR caches remain reusable" statement for podcasts. Operators
+wanting a strictly free refresh must disable paid providers in their effective
+configuration first, or use the operator-attested import for entries they
+have verified.
 
 Already persisted source notes are not silently deleted or repaired by a cache
-miss. To reacquire a particular source, use the existing explicit refresh flow:
+miss. Mutating `--refresh` is refused by current immutable callers. Inspect a
+fresh extraction without replacing existing sources:
 
 ```sh
-olw ingest /path/to/vault --url 'EPISODE_URL' --refresh --parallel 0 --json --skip-synthesis
+olw ingest /path/to/vault --url 'EPISODE_URL' --refresh --preview --json
 ```
 
-A failed refresh preserves the last-good durable source and cache. Ordinary retry
-backoff remains in effect. Regenerate dependent notes after successful refresh
-using the normal compilation and user-edit protections.
+Preview may invoke extraction/transcription services and incur cost; it is not
+a no-network mode. Review the extraction and provenance, then save accepted
+text under a new input filename, preserving existing sources. Use normal
+`olw build` to publish a new immutable generation through review; changed inputs
+may call synthesis/review models. See [application callers](immutable-application-callers.md).
 
 ## Regression coverage
 

@@ -9,6 +9,7 @@ from hashlib import sha256
 from typer.testing import CliRunner
 
 from obsidian_llm_wiki.cli import app
+from obsidian_llm_wiki.core.application import operational_directory
 
 runner = CliRunner()
 
@@ -39,7 +40,7 @@ def test_ingest_plan_is_no_network_no_write_and_emits_ndjson_source_events(
     assert result.exit_code == 0, result.output
     events = _events(result.output)
     assert any(event["type"] == "source" and event["status"] == "planned" for event in events)
-    assert not (config.llmwiki_dir / "operations.json").exists()
+    assert not (operational_directory(config) / "operations.json").exists()
     assert not config.sources_dir.exists()
 
 
@@ -185,10 +186,10 @@ def test_ingest_cancellation_persists_source_state_and_resume_marker(tmp_path, m
         and event.get("remaining") == 2
         for event in events
     )
-    operations_path = config.llmwiki_dir / "operations.json"
+    operations_path = operational_directory(config) / "operations.json"
     operations = json.loads(operations_path.read_text(encoding="utf-8"))
     assert operations["operations"][0]["status"] == "cancelled"
-    resume_path = config.llmwiki_dir / "ingest-resume.json"
+    resume_path = operational_directory(config) / "ingest-resume.json"
     resume = json.loads(resume_path.read_text(encoding="utf-8"))
     assert resume["sources"] == [
         {"source": "https://example.test/a", "source_kind": "url", "status": "cancelled"},
@@ -203,7 +204,7 @@ def test_resume_retries_cancelled_source_and_clears_marker(tmp_path, monkeypatch
     from obsidian_llm_wiki.core.operations import OperationRecord, OperationStatus, OperationStore
 
     config = Config(vault_path=str(tmp_path))
-    store = OperationStore(config.llmwiki_dir)
+    store = OperationStore(operational_directory(config, create=True))
     record = OperationRecord.create(run_id="old-run", source="https://example.test/a")
     store.save(record)
     store.transition(record, OperationStatus.CANCELLED, error="interrupted")
@@ -222,11 +223,11 @@ def test_resume_retries_cancelled_source_and_clears_marker(tmp_path, monkeypatch
     )
 
     assert result.exit_code == 0, result.output
-    operations_path = config.llmwiki_dir / "operations.json"
+    operations_path = operational_directory(config) / "operations.json"
     persisted = json.loads(operations_path.read_text(encoding="utf-8"))["operations"]
     assert persisted[0]["status"] == "succeeded"
     assert persisted[0]["attempt"] == 2
-    assert not (config.llmwiki_dir / "ingest-resume.json").exists()
+    assert not (operational_directory(config) / "ingest-resume.json").exists()
 
 
 def test_resume_recovers_running_operation_after_unclean_exit_without_marker(
@@ -244,14 +245,14 @@ def test_resume_recovers_running_operation_after_unclean_exit_without_marker(
     from obsidian_llm_wiki.core.registry import VaultRegistry
 
     config = Config(vault_path=str(tmp_path))
-    store = OperationStore(config.llmwiki_dir)
+    store = OperationStore(operational_directory(config, create=True))
     record = OperationRecord.create(
         run_id="crashed-run",
         source="https://example.test/crashed",
     )
     store.save(record)
     store.transition(record, OperationStatus.RUNNING)
-    with VaultRegistry(config.llmwiki_dir) as registry:
+    with VaultRegistry(operational_directory(config, create=True)) as registry:
         queue_id = registry.enqueue_dirty(
             "ingest",
             record.source,
@@ -276,7 +277,7 @@ def test_resume_recovers_running_operation_after_unclean_exit_without_marker(
     assert recovered is not None
     assert recovered.status is OperationStatus.SUCCEEDED
     assert recovered.attempt == 2
-    with VaultRegistry(config.llmwiki_dir) as registry:
+    with VaultRegistry(operational_directory(config, create=True)) as registry:
         assert registry.list_dirty(state="running", limit=10) == []
 
 
@@ -307,7 +308,7 @@ def test_failed_resume_keeps_marker_for_another_retry(tmp_path, monkeypatch) -> 
     from obsidian_llm_wiki.core.operations import OperationRecord, OperationStatus, OperationStore
 
     config = Config(vault_path=str(tmp_path))
-    store = OperationStore(config.llmwiki_dir)
+    store = OperationStore(operational_directory(config, create=True))
     record = OperationRecord.create(run_id="old-run", source="https://example.test/a")
     store.save(record)
     store.transition(record, OperationStatus.CANCELLED, error="interrupted")
@@ -341,7 +342,7 @@ def test_resume_preserves_clipping_kind_and_removes_each_success(tmp_path, monke
     config = Config(vault_path=str(tmp_path))
     clipping_path = config.clippings_dir / "saved.md"
     clipping = SourceDoc(title="Saved clipping", content="clipped text")
-    store = OperationStore(config.llmwiki_dir)
+    store = OperationStore(operational_directory(config, create=True))
     store.write_resume_marker(
         "old-run",
         [

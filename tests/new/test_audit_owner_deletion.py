@@ -14,11 +14,18 @@ from obsidian_llm_wiki.core.models import (
     SourceSynthesis,
 )
 from obsidian_llm_wiki.core.registry import ArtifactVersions, VaultRegistry
+from tests.new.bilateral_fixture_helpers import assess_same, upsert_reviewed
 
 OWNER_TEXT = {
     "a.md": "Copper conducts heat.",
     "b.md": "Silver conducts heat in a much longer description of a different experiment.",
 }
+# Both sources describe the same entity ("Metals") through different experiments.
+# The shared fact below is the explicit source evidence the fixture assessor
+# requires on BOTH sides before it calls them the same referent; the per-owner
+# text stays distinct so deletion of either contribution remains observable.
+SHARED_FACT = "Both experiments measure the thermal conductivity of elemental metals."
+SOURCE_TEXT = {name: f"{text} {SHARED_FACT}\n" for name, text in OWNER_TEXT.items()}
 
 
 def add_owners(registry, order=("a.md", "b.md")):
@@ -34,10 +41,17 @@ def add_owners(registry, order=("a.md", "b.md")):
                 claims=[Claim(f"{token} claim", "metals", filename)],
             )],
         )
-        registry.upsert_synthesis(
-            filename, SourceDoc(filename, OWNER_TEXT[filename]), synthesis,
-            ArtifactVersions("extractor", f"prompt-{token}", "schema", f"model-{token}"),
-        )
+        source = SourceDoc(filename, SOURCE_TEXT[filename])
+        versions = ArtifactVersions("extractor", f"prompt-{token}", "schema", f"model-{token}")
+        if canonical_id:
+            # Same title + different definitions is not identity evidence; the
+            # second owner co-owns the entity through an explicit bilateral
+            # assessment keyed to the shared source fact.
+            assert len(assess_same(registry, synthesis, source, SHARED_FACT)) == 1
+            registry.upsert_synthesis(filename, source, synthesis, versions)
+            assert registry.binding_evidence()[(filename, canonical_id)] == "assessed same entity"
+        else:
+            upsert_reviewed(registry, filename, source, synthesis, versions)
         canonical_id = synthesis.concepts[0].canonical_id
     assert registry.connection.execute("SELECT count(*) FROM concept").fetchone()[0] == 1
     assert registry.connection.execute("SELECT count(*) FROM concept_source").fetchone()[0] == 2

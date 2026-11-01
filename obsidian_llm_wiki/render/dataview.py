@@ -19,11 +19,11 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import re
 from pathlib import Path
 from typing import Any
 
 from obsidian_llm_wiki.core.models import SynthesisBundle
+from obsidian_llm_wiki.render.links import generated_folder, generated_link, navigation_shards
 
 logger = logging.getLogger("obswiki.render.dataview")
 
@@ -63,7 +63,7 @@ def render_concepts_by_confidence_view(bundle: SynthesisBundle) -> str:
         "TABLE",
         "  confidence AS \"Confidence\",",
         "  tags AS \"Tags\"",
-        'FROM "concepts"',
+        f'FROM "{generated_folder("concepts")}"',
         "WHERE type = \"Concept\"",
         "SORT confidence DESC",
         "```",
@@ -75,7 +75,8 @@ def render_concepts_by_confidence_view(bundle: SynthesisBundle) -> str:
     ]
     for c in sorted(bundle.concepts, key=lambda x: (-x.confidence, x.slug)):
         tags = ", ".join(c.tags) if c.tags else "—"
-        lines.append(f"| [[{c.slug}|{c.title}]] | {c.confidence:.2f} | {tags} |")
+        link = generated_link("concepts", c.slug, c.title)
+        lines.append(f"| {link} | {c.confidence:.2f} | {tags} |")
     lines.append("")
     return "\n".join(lines)
 
@@ -93,7 +94,7 @@ def render_mocs_by_count_view(bundle: SynthesisBundle) -> str:
         "TABLE",
         "  length(concept_slugs) AS \"Concepts\",",
         "  tags AS \"Tags\"",
-        'FROM "mocs"',
+        f'FROM "{generated_folder("mocs")}"',
         "WHERE type = \"Map of Content\"",
         "SORT length(concept_slugs) DESC",
         "```",
@@ -106,7 +107,7 @@ def render_mocs_by_count_view(bundle: SynthesisBundle) -> str:
     for m in sorted(bundle.maps, key=lambda x: (-len(x.concept_slugs), x.slug)):
         tags = ", ".join(m.tags) if m.tags else "—"
         lines.append(
-            f"| [[{m.slug}|{m.title}]] | {len(m.concept_slugs)} | {tags} |"
+            f"| {generated_link('mocs', m.slug, m.title)} | {len(m.concept_slugs)} | {tags} |"
         )
     lines.append("")
     return "\n".join(lines)
@@ -185,7 +186,7 @@ def render_sources_by_freshness_view(
         "  timestamp AS \"Generated\",",
         "  source_type AS \"Type\",",
         "  url AS \"URL\"",
-        'FROM "sources"',
+        f'FROM "{generated_folder("sources")}"',
         "WHERE type = \"Source\"",
         "SORT timestamp DESC",
         "```",
@@ -209,9 +210,8 @@ def render_sources_by_freshness_view(
     source_info.sort(key=lambda x: (x[1] or "", x[0]), reverse=True)
     for title, retrieved, source_type, url, stem in source_info:
         display_retrieved = retrieved or "—"
-        lines.append(
-            f"| [[sources/{stem}|{title}]] | {display_retrieved} | {source_type} | {url} |"
-        )
+        link = generated_link("sources", stem, title, legacy_target=f"sources/{stem}")
+        lines.append(f"| {link} | {display_retrieved} | {source_type} | {url} |")
     lines.append("")
     return "\n".join(lines)
 
@@ -252,9 +252,8 @@ def _shard_static_rows(
                     ]
                 ),
             )
-            links.append(
-                f"- [[{Path(filename).stem}|Bucket {bucket.upper()} · {part + 1}]]"
-            )
+            label = f"Bucket {bucket.upper()} · {part + 1}"
+            links.append(f"- {generated_link('views', Path(filename).stem, label)}")
     root = "\n".join(
         [
             f"# {title}",
@@ -307,7 +306,8 @@ def render_dataview_views(
             concept_rows = [
                 (
                     concept.slug,
-                    f"| [[{concept.slug}|{concept.title}]] | {concept.confidence:.2f} | "
+                    f"| {generated_link('concepts', concept.slug, concept.title)} | "
+                    f"{concept.confidence:.2f} | "
                     f"{', '.join(concept.tags) or '—'} |",
                 )
                 for concept in sorted(
@@ -322,7 +322,7 @@ def render_dataview_views(
                     "",
                     "```dataview",
                     'TABLE confidence AS "Confidence", tags AS "Tags"',
-                    'FROM "concepts"',
+                    f'FROM "{generated_folder("concepts")}"',
                     "SORT confidence DESC",
                     "```",
                 ],
@@ -344,7 +344,7 @@ def render_dataview_views(
             moc_rows = [
                 (
                     moc.slug,
-                    f"| [[{moc.slug}|{moc.title}]] | {len(moc.concept_slugs)} | "
+                    f"| {generated_link('mocs', moc.slug, moc.title)} | {len(moc.concept_slugs)} | "
                     f"{', '.join(moc.tags) or '—'} |",
                 )
                 for moc in sorted(
@@ -380,8 +380,11 @@ def render_dataview_views(
                 source_type = getattr(source, "source_type", "") or "—"
                 url = getattr(source, "url", "") or "—"
                 stem = filename.removesuffix(".md")
+                link = generated_link(
+                    "sources", stem, source.title, legacy_target=f"sources/{stem}",
+                )
                 row = (
-                    f"| [[sources/{stem}|{source.title}]] | {retrieved or '—'} | "
+                    f"| {link} | {retrieved or '—'} | "
                     f"{source_type} | {url} |"
                 )
                 source_rows.append((retrieved, stem, row))
@@ -423,20 +426,11 @@ def render_dataview_views(
     )
 
     def referenced_shards(content: str) -> set[str]:
-        references: set[str] = set()
-        for prefix in shard_prefixes:
-            references.update(
-                f"{stem}.md"
-                for stem in re.findall(
-                    rf"\[\[({re.escape(prefix)}[^|\]]+)(?:\|[^\]]*)?\]\]",
-                    content,
-                )
-            )
-        return references
+        return {f"{stem}.md" for stem in navigation_shards(content, "views", shard_prefixes)}
 
     old_shard_names: set[str] = set()
     for root_name, _content in views:
-        if not any(root_name.startswith(prefix) for prefix in shard_prefixes):
+        if root_name.removesuffix(".md") + "-" not in shard_prefixes:
             continue
         old_shard_names.update(referenced_shards(safe_read_file(views_dir / root_name)))
 
@@ -455,7 +449,7 @@ def render_dataview_views(
 
     actual_shard_names: set[str] = set(shard_documents)
     for root_name, _content in views:
-        if not any(root_name.startswith(prefix) for prefix in shard_prefixes):
+        if root_name.removesuffix(".md") + "-" not in shard_prefixes:
             continue
         actual_shard_names.update(
             referenced_shards(safe_read_file(views_dir / root_name))
@@ -472,10 +466,10 @@ def render_dataview_views(
         "",
         "> Live views powered by the Dataview plugin / Obsidian Bases.",
         "",
-        "- [[concepts-by-confidence|Concepts by Confidence]]",
-        "- [[mocs-by-count|MoCs by Concept Count]]",
-        "- [[contradictions-by-status|Contradictions by Status]]",
-        "- [[sources-by-freshness|Sources by Freshness]]",
+        f"- {generated_link('views', 'concepts-by-confidence', 'Concepts by Confidence')}",
+        f"- {generated_link('views', 'mocs-by-count', 'MoCs by Concept Count')}",
+        f"- {generated_link('views', 'contradictions-by-status', 'Contradictions by Status')}",
+        f"- {generated_link('views', 'sources-by-freshness', 'Sources by Freshness')}",
         "",
     ]
     if _write_generated_artifact(

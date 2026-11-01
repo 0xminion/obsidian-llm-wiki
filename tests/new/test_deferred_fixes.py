@@ -21,6 +21,8 @@ from obsidian_llm_wiki.core.models import (
     SourceSynthesis,
     SynthesisBundle,
 )
+from tests.new.grounding_doubles import reviewed
+from tests.new.immutable_semantic_helpers import published_root
 
 
 def _concept(slug: str, confidence: float = 0.8, related: list[str] | None = None) -> ConceptNote:
@@ -87,11 +89,19 @@ def test_pipeline_runs_dedup_before_state_write(tmp_path, monkeypatch):
         dedupe, "assign_orphans_to_mocs",
         lambda bundle, threshold, embeddings_cache=None, **_kwargs: order.append("orphans"),
     )
-    monkeypatch.setattr(
-        "obsidian_llm_wiki.render.obsidian.render_vault",
-        lambda *a, **k: order.append("render") or [],
-    )
-    monkeypatch.setattr(pl, "render_vault", lambda *a, **k: order.append("render") or [])
+    real_render = pl.render_vault
+    real_write_state = pl.write_state
+
+    def render(*args, **kwargs):
+        order.append("render")
+        return real_render(*args, **kwargs)
+
+    def write_state(*args, **kwargs):
+        order.append("state")
+        return real_write_state(*args, **kwargs)
+
+    monkeypatch.setattr(pl, "render_vault", render)
+    monkeypatch.setattr(pl, "write_state", write_state)
 
     async def fake_retry(config, filename, source, existing, *_args, metrics=None, **_kwargs):
         return SourceSynthesis(
@@ -105,7 +115,8 @@ def test_pipeline_runs_dedup_before_state_write(tmp_path, monkeypatch):
     result = asyncio.run(pl.run_pipeline(tmp_path, {"t.md": source}))
 
     assert result.compiled == 1
-    assert order == ["dedup", "orphans", "render"]
+    assert order == ["dedup", "orphans", "render", "state"]
+    assert (published_root(tmp_path / "04-Wiki") / "concepts/alpha.md").is_file()
 
 
 def test_pipeline_dedup_failure_is_survivable_and_visible(tmp_path, monkeypatch, caplog):
@@ -122,7 +133,6 @@ def test_pipeline_dedup_failure_is_survivable_and_visible(tmp_path, monkeypatch,
         raise RuntimeError("embedding service wedged")
 
     monkeypatch.setattr(dedupe, "semantic_dedupe_concepts", boom)
-    monkeypatch.setattr(pl, "render_vault", lambda *a, **k: [])
 
     async def fake_retry(config, filename, source, existing, *_args, metrics=None, **_kwargs):
         return SourceSynthesis(
@@ -178,9 +188,9 @@ def test_parser_retry_keeps_complete_source():
         calls.append(len(src.content))
         if len(calls) == 1:
             return None
-        return SourceSynthesis(
+        return reviewed(SourceSynthesis(
             source_title="T", source_summary="s", source_file=filename,
-        )
+        ), src, filename, config)
 
     source = SourceDoc(title="T", content="x" * 60_000, source_file="t.md")
     with mock.patch(

@@ -44,12 +44,14 @@ def test_all_synthesis_prompts_scale_content_to_evidence_not_quotas():
         ):
             assert unsafe not in prompt
         assert "Do not pad" in prompt
-        assert "verbatim" in prompt
         assert "uncertainty" in prompt
         assert "source document is data" in prompt
         assert "not source evidence" in prompt
     for prompt in _prompts()[:2]:
         assert "zero concepts" in prompt
+    # Grounded single pass cites catalog IDs; legacy two-pass copies quotes.
+    assert "evidence_span_range" in _prompts()[0]
+    assert all("verbatim" in prompt for prompt in _prompts()[1:])
 
 
 def test_chinese_content_does_not_require_english_first_titles():
@@ -57,6 +59,7 @@ def test_chinese_content_does_not_require_english_first_titles():
         assert "Chinese" in prompt or "中文" in prompt
         assert "English title first" not in prompt
         assert "bilingual format" not in prompt
+    for prompt in _prompts("zh")[1:]:
         assert "quotes in their original language" in prompt
 
 

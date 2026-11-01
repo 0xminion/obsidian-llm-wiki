@@ -1,0 +1,252 @@
+{
+  "scope": "actual frozen v10 reviewer/receipt code with scripted external answers; not model semantics",
+  "source_hashes": {
+    "obsidian_llm_wiki/synth/review.py": "fac2eb3a5ee68ad495927faa32adb9c7e7918493a3241f22da4ddf643036c492",
+    "obsidian_llm_wiki/synth/review_context.py": "e949f4fca48b97749fba20d7ba01dd51a9d04c293eb4e79ea5c035a3ac7aded3"
+  },
+  "records": {
+    "review-context-v1": {
+      "content": "Inez, explaining the Willow pump, said:\n\n> “It must remain idle during calibration.”",
+      "source_file": "willow.md",
+      "synthesis": {
+        "source_title": "Willow pump",
+        "source_summary": "Inez said the Willow pump must remain idle during calibration.",
+        "source_tags": [],
+        "key_points": [],
+        "open_questions": [],
+        "language": "",
+        "concepts": [
+          {
+            "title": "Willow pump",
+            "slug": "willow-pump",
+            "canonical_id": "",
+            "summary": "Inez said the Willow pump must remain idle during calibration.",
+            "tags": [],
+            "aliases": [],
+            "sections": [],
+            "claims": [
+              {
+                "text": "Inez said the Willow pump must remain idle during calibration.",
+                "concept_slug": "willow-pump",
+                "source_ref": "",
+                "evidence": {
+                  "quote": "> “It must remain idle during calibration.”",
+                  "source_file": "willow.md",
+                  "source_hash": "47d8e035c883b1c1d60d1066deccad562dd6ee6a1dac206327f55d9a218bda1a",
+                  "start_offset": 41,
+                  "end_offset": 84,
+                  "verification": "verified",
+                  "span_ids": [
+                    "c9ed23abcc2b4aad4800f3d817b4fa32-2"
+                  ],
+                  "catalog_version": "span-catalog-v2"
+                }
+              }
+            ],
+            "related": [],
+            "confidence": 1.0,
+            "provenance": "extracted",
+            "is_new": true
+          }
+        ],
+        "maps": [],
+        "source_file": "willow.md",
+        "review_receipt": {
+          "version": "grounded-review-v3",
+          "status": "approved",
+          "source_file": "willow.md",
+          "source_sha256": "47d8e035c883b1c1d60d1066deccad562dd6ee6a1dac206327f55d9a218bda1a",
+          "catalog_version": "span-catalog-v2",
+          "context_policy": "review-context-v1",
+          "reviewer_fingerprint": "c43ecf3c557ea12b80c5d494",
+          "output_sha256": "cc169f17710a200b4ea4611b8374b97729f4147171d089b8e87bee4ff8e985bc",
+          "units": {
+            "562238c69e0c71b71546a17b3aa5d1f9": {
+              "kind": "source_summary",
+              "verdict": "supported",
+              "span_ids": [
+                "c9ed23abcc2b4aad4800f3d817b4fa32-1"
+              ],
+              "context_binding": null,
+              "model_context_uses": []
+            },
+            "7e0d2c740883b3e43e87bd385bac7fc0": {
+              "kind": "concept_title",
+              "verdict": "supported",
+              "span_ids": [
+                "c9ed23abcc2b4aad4800f3d817b4fa32-1"
+              ],
+              "context_binding": null,
+              "model_context_uses": []
+            },
+            "629444d3debb7aea8e62f0bb4aec924c": {
+              "kind": "concept_summary",
+              "verdict": "supported",
+              "span_ids": [
+                "c9ed23abcc2b4aad4800f3d817b4fa32-1"
+              ],
+              "context_binding": null,
+              "model_context_uses": []
+            },
+            "1cc3c2259a34bc6d3d9775cd7c5432b9": {
+              "kind": "claim",
+              "verdict": "supported",
+              "span_ids": [
+                "c9ed23abcc2b4aad4800f3d817b4fa32-2"
+              ],
+              "context_binding": {
+                "policy": "review-context-v1",
+                "source_file": "willow.md",
+                "source_sha256": "47d8e035c883b1c1d60d1066deccad562dd6ee6a1dac206327f55d9a218bda1a",
+                "catalog_version": "span-catalog-v2",
+                "unit_key": "1cc3c2259a34bc6d3d9775cd7c5432b9",
+                "cited_span_ids": [
+                  "c9ed23abcc2b4aad4800f3d817b4fa32-2"
+                ],
+                "citation_start": 41,
+                "citation_end": 84,
+                "visible_intervals": [
+                  [
+                    0,
+                    84
+                  ]
+                ],
+                "offered_context": []
+              },
+              "model_context_uses": []
+            }
+          }
+        }
+      }
+    },
+    "review-context-v2": {
+      "content": "Inez, explaining the Willow pump, said:\n\n> “It must remain idle during calibration.”",
+      "source_file": "willow.md",
+      "synthesis": {
+        "source_title": "Willow pump",
+        "source_summary": "Inez said the Willow pump must remain idle during calibration.",
+        "source_tags": [],
+        "key_points": [],
+        "open_questions": [],
+        "language": "",
+        "concepts": [
+          {
+            "title": "Willow pump",
+            "slug": "willow-pump",
+            "canonical_id": "",
+            "summary": "Inez said the Willow pump must remain idle during calibration.",
+            "tags": [],
+            "aliases": [],
+            "sections": [],
+            "claims": [
+              {
+                "text": "Inez said the Willow pump must remain idle during calibration.",
+                "concept_slug": "willow-pump",
+                "source_ref": "",
+                "evidence": {
+                  "quote": "> “It must remain idle during calibration.”",
+                  "source_file": "willow.md",
+                  "source_hash": "47d8e035c883b1c1d60d1066deccad562dd6ee6a1dac206327f55d9a218bda1a",
+                  "start_offset": 41,
+                  "end_offset": 84,
+                  "verification": "verified",
+                  "span_ids": [
+                    "c9ed23abcc2b4aad4800f3d817b4fa32-2"
+                  ],
+                  "catalog_version": "span-catalog-v2"
+                }
+              }
+            ],
+            "related": [],
+            "confidence": 1.0,
+            "provenance": "extracted",
+            "is_new": true
+          }
+        ],
+        "maps": [],
+        "source_file": "willow.md",
+        "review_receipt": {
+          "version": "grounded-review-v3",
+          "status": "approved",
+          "source_file": "willow.md",
+          "source_sha256": "47d8e035c883b1c1d60d1066deccad562dd6ee6a1dac206327f55d9a218bda1a",
+          "catalog_version": "span-catalog-v2",
+          "context_policy": "review-context-v2",
+          "reviewer_fingerprint": "87cc674386f1b5b2ffde8ad9",
+          "output_sha256": "cc169f17710a200b4ea4611b8374b97729f4147171d089b8e87bee4ff8e985bc",
+          "units": {
+            "562238c69e0c71b71546a17b3aa5d1f9": {
+              "kind": "source_summary",
+              "verdict": "supported",
+              "span_ids": [
+                "c9ed23abcc2b4aad4800f3d817b4fa32-1"
+              ],
+              "context_binding": null,
+              "model_context_uses": []
+            },
+            "7e0d2c740883b3e43e87bd385bac7fc0": {
+              "kind": "concept_title",
+              "verdict": "supported",
+              "span_ids": [
+                "c9ed23abcc2b4aad4800f3d817b4fa32-1"
+              ],
+              "context_binding": null,
+              "model_context_uses": []
+            },
+            "629444d3debb7aea8e62f0bb4aec924c": {
+              "kind": "concept_summary",
+              "verdict": "supported",
+              "span_ids": [
+                "c9ed23abcc2b4aad4800f3d817b4fa32-1"
+              ],
+              "context_binding": null,
+              "model_context_uses": []
+            },
+            "1cc3c2259a34bc6d3d9775cd7c5432b9": {
+              "kind": "claim",
+              "verdict": "supported",
+              "span_ids": [
+                "c9ed23abcc2b4aad4800f3d817b4fa32-2"
+              ],
+              "context_binding": {
+                "policy": "review-context-v2",
+                "source_file": "willow.md",
+                "source_sha256": "47d8e035c883b1c1d60d1066deccad562dd6ee6a1dac206327f55d9a218bda1a",
+                "catalog_version": "span-catalog-v2",
+                "unit_key": "1cc3c2259a34bc6d3d9775cd7c5432b9",
+                "cited_span_ids": [
+                  "c9ed23abcc2b4aad4800f3d817b4fa32-2"
+                ],
+                "citation_start": 41,
+                "citation_end": 84,
+                "visible_intervals": [
+                  [
+                    0,
+                    84
+                  ]
+                ],
+                "offered_context": [
+                  {
+                    "char_start": 0,
+                    "char_end": 41,
+                    "byte_start": 0,
+                    "byte_end": 41,
+                    "text": "Inez, explaining the Willow pump, said:\n\n",
+                    "text_sha256": "4634ffe524f774081bf8a6b065ad3aba9b635041b0e2947a9f412b81aed765cd",
+                    "context_id": "ctx-21234a66e54b33f6bf874cb35c52974258070097f0d29c82f854d1326048f1a7"
+                  }
+                ]
+              },
+              "model_context_uses": [
+                {
+                  "context_id": "ctx-21234a66e54b33f6bf874cb35c52974258070097f0d29c82f854d1326048f1a7",
+                  "purpose": "attribution"
+                }
+              ]
+            }
+          }
+        }
+      }
+    }
+  }
+}

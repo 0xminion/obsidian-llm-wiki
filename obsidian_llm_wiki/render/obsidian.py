@@ -16,8 +16,6 @@ import hashlib
 import json
 import logging
 import os
-import re
-import shutil
 import tempfile
 from contextlib import suppress
 from contextvars import ContextVar
@@ -39,6 +37,7 @@ from obsidian_llm_wiki.core.models import (
     normalize_slug,
     source_synthesis_to_dict,
 )
+from obsidian_llm_wiki.core.publication_transaction import _state as _publication_file_state
 from obsidian_llm_wiki.core.text_quality import dedupe_statements
 from obsidian_llm_wiki.synth.language import detect_language
 
@@ -85,6 +84,13 @@ from obsidian_llm_wiki.render.frontmatter import (
 )
 from obsidian_llm_wiki.render.frontmatter import (
     timestamp as _timestamp,
+)
+from obsidian_llm_wiki.render.links import (
+    ACTIVE_LINK_PRESENTATION,
+    LinkPresentation,
+    generated_link,
+    navigation_shards,
+    validate_link_targets,
 )
 
 logger = logging.getLogger("obswiki.render.obsidian")
@@ -182,19 +188,19 @@ def render_source_page(source: SourceDoc, timestamp: str | None = None) -> str:
     provenance = _render_provenance(source)
     if provenance:
         fm["provenance"] = provenance
-    content = source.content.strip()
+    content = source.content
     title_clean = source.title.strip()
 
     # Check if content already starts with the title as a heading or plain text
     starts_with_heading = content.startswith(f"# {title_clean}")
-    starts_with_plain = content.startswith(title_clean)
+    starts_with_plain = bool(title_clean and content) and content.splitlines()[0] == title_clean
 
     if starts_with_heading:
         # Content already has the heading — don't duplicate
         body = content
     elif starts_with_plain:
-        # Content starts with title text (not as heading) — add heading, strip duplicate
-        body = f"# {source.title}\n\n{content[len(title_clean):].lstrip()}"
+        # Prefix a heading marker without slicing or normalizing captured bytes.
+        body = f"# {content}"
     else:
         body = f"# {source.title}\n\n{content}"
     return f"{build_frontmatter(fm)}\n{body}"
@@ -310,6 +316,9 @@ def _write_generated_page(path: Path, page: str, bundle_dir: Path) -> bool:
         transaction.before_change(path)
 
     _check_generated_path(path, bundle_dir)
+    from obsidian_llm_wiki.core.publication_transaction import generated_source_output
+
+    generated_source_output(path)
     atomic_write(path, page)
     _remember_generated_page(path, page, bundle_dir)
     if transaction is not None:
@@ -356,6 +365,13 @@ def _delete_generated_artifact(path: Path, bundle_dir: Path) -> bool:
     if transaction is not None:
         transaction.before_change(path)
         transaction.record_delete(path)
+    from obsidian_llm_wiki.core.publication_transaction import (
+        generated_source_output,
+        record_delete,
+    )
+
+    generated_source_output(path)
+    record_delete(path)
     path.unlink()
     return True
 
@@ -399,13 +415,96 @@ def _entry_slug(synthesis: SourceSynthesis) -> str:
     return normalized
 
 
+_STATUS_TEXT = {
+    "stale": (
+        "earlier source revision: the current revision was not admitted by grounding "
+        "review in the latest build. Content and evidence anchors below refer to the "
+        "earlier revision and are not current verified content.",
+        "较早的来源版本：当前版本未在最近一次构建中通过溯源审查。以下内容与证据锚点来自较早版本，"
+        "不是当前已验证内容。",
+    ),
+    "unadmitted": (
+        "no grounding-review receipt admits this content under the current configuration "
+        "(for example unchecked output under required review). It is retained from an "
+        "earlier build and is not current verified content.",
+        "当前配置下没有溯源审查凭据认可此内容（例如在必需审查下的未检查输出）。它保留自较早的构建，"
+        "不是当前已验证内容。",
+    ),
+    "unchecked": (
+        "grounding review is off (GROUNDING_REVIEW=off): this content was not reviewed "
+        "against the source. Evidence quotes are machine-located only; claims are not "
+        "verified content.",
+        "溯源审查已关闭（GROUNDING_REVIEW=off）：此内容未经来源审查。证据引文仅由程序定位，"
+        "论断不是已验证内容。",
+    ),
+    "unbound": (
+        "this source's content was reviewed under a different subject than this page's "
+        "title, so it is not bound to this page. It is shown for transparency and is not "
+        "current verified content here.",
+        "此来源的内容是在与本页标题不同的主题下审查的，未绑定到本页。仅为透明起见显示，"
+        "在此不是当前已验证内容。",
+    ),
+}
+
+_EVIDENCE_SUFFIX = {
+    "unchecked": (
+        " *(grounding review off; claim not reviewed)*",
+        " *（溯源审查已关闭；论断未经审查）*",
+    ),
+    "unbound": (
+        " *(reviewed under another subject; not bound to this page)*",
+        " *（在其他主题下审查；未绑定到本页）*",
+    ),
+}
+_RETAINED_SUFFIX = (
+    " *(retained from an earlier build; not current verified evidence)*",
+    " *（保留自较早版本，当前未验证）*",
+)
+
+
+def _status_note(status: str, zh: bool) -> str:
+    """Short inline status for derived/linked items of non-admitted content."""
+    if not status:
+        return ""
+    english = {
+        "stale": "from an earlier source revision; not current verified",
+        "unadmitted": "not admitted under the current review configuration",
+        "unchecked": "grounding review off; not reviewed",
+        "unbound": "reviewed under another subject",
+    }.get(status, status)
+    chinese = {
+        "stale": "来自较早来源版本；当前未验证",
+        "unadmitted": "当前审查配置下未获认可",
+        "unchecked": "溯源审查已关闭；未经审查",
+        "unbound": "在其他主题下审查",
+    }.get(status, status)
+    return f" *（{chinese}）*" if zh else f" *({english})*"
+
+
+def _publication_callout(statuses: dict[str, str], zh: bool) -> list[str]:
+    """Obsidian warning callout for retained, not-currently-admitted sources."""
+    if not statuses:
+        return []
+    lines = ["> [!warning] " + ("非当前已验证内容" if zh else "Not current verified content")]
+    for source_file, status in sorted(statuses.items()):
+        english, chinese = _STATUS_TEXT.get(status, _STATUS_TEXT["unadmitted"])
+        lines.append(f"> - `{source_file}` — {chinese if zh else english}")
+    return [*lines, ""]
+
+
 def render_entry_page(
     synthesis: SourceSynthesis,
     source_slug: str,
     concept_slugs: list[str],
     timestamp: str | None = None,
+    *,
+    publication_status: str = "",
 ) -> str:
-    """Render an Entry-type page (synthesis of one source)."""
+    """Render an Entry-type page (synthesis of one source).
+
+    ``publication_status`` (``stale``/``unadmitted``) adds a warning callout:
+    retained content is never presented as current verified output.
+    """
     ts = timestamp or _timestamp()
     zh = (synthesis.language or detect_language(synthesis.source_summary)) == "zh"
     entry_tags = list(
@@ -423,6 +522,10 @@ def render_entry_page(
     }
 
     parts: list[str] = [f"# {synthesis.source_title}", ""]
+    if publication_status:
+        parts.extend(_publication_callout(
+            {synthesis.source_file or synthesis.source_title: publication_status}, zh,
+        ))
 
     if synthesis.source_summary:
         parts.extend([synthesis.source_summary, ""])
@@ -436,7 +539,7 @@ def render_entry_page(
     if concept_slugs:
         parts.extend(["## 相关概念" if zh else "## Linked Concepts", ""])
         for slug in concept_slugs:
-            parts.append(f"- {make_wikilink(slug)}")
+            parts.append(f"- {generated_link('concepts', slug)}")
         parts.append("")
 
     if synthesis.open_questions:
@@ -445,11 +548,10 @@ def render_entry_page(
             parts.append(f"- {q}")
         parts.append("")
 
-    parts.extend([
-        "## 来源" if zh else "## Source",
-        "",
-        f"- {make_wikilink(f'sources/{source_slug}', synthesis.source_title)}",
-    ])
+    source_link = generated_link(
+        "sources", source_slug, synthesis.source_title, legacy_target=f"sources/{source_slug}",
+    )
+    parts.extend(["## 来源" if zh else "## Source", "", f"- {source_link}"])
 
     body = "\n".join(parts)
     return f"{build_frontmatter(fm)}\n{body}"
@@ -459,8 +561,24 @@ def render_concept_page(
     concept: ConceptNote,
     timestamp: str | None = None,
     all_concepts: dict[str, ConceptNote] | None = None,
+    *,
+    retained_sources: dict[str, str] | None = None,
+    unresolved_relations: list[Any] | None = None,
+    derived_backlinks: list[Any] | None = None,
+    link_status: dict[tuple[str, str], str] | None = None,
+    claim_subjects: dict[tuple, str] | None = None,
 ) -> str:
     """Render a Concept-type page (evergreen atomic note).
+
+    ``unresolved_relations``/``derived_backlinks``/``link_status`` come from
+    the publication plan (:mod:`obsidian_llm_wiki.synth.publication`): reviewed
+    relations without a bound target are shown unlinked; derived inverse links
+    are typed app structure, never listed as reviewed relations.
+
+    ``retained_sources`` maps contributing source files whose content is
+    retained but not currently admitted to their status. The page then carries
+    a warning callout, and evidence from those sources is not labelled as
+    current verified evidence.
 
     Args:
         concept: The concept to render.
@@ -498,8 +616,14 @@ def render_concept_page(
         fm["relations"] = [
             f"{r.slug}|{r.relation}|{r.display or r.slug}" for r in related
         ]
+    if unresolved_relations:
+        fm["unresolved_relations"] = [
+            f"{item.relation}|{item.display}" for item in unresolved_relations
+        ]
 
     parts: list[str] = [f"# {concept.title}", ""]
+    retained = dict(retained_sources or {})
+    parts.extend(_publication_callout(retained, zh))
 
     if concept.summary:
         parts.extend([concept.summary, ""])
@@ -515,44 +639,81 @@ def render_concept_page(
 
     if concept.claims:
         parts.extend(["## 论断" if zh else "## Claims", ""])
-        evidence_entries: list[tuple[int, str, str, bool]] = []
-        # (number, quote, source_file, verified)
+        evidence_entries: list[tuple[int, str, str, bool, str]] = []
+        # (number, quote, source_file, verified, catalog anchor)
+        from obsidian_llm_wiki.synth.publication import claim_key
+
+        subjects = claim_subjects or {}
         for claim in concept.claims:
-            evidence = claim.evidence
-            has_quote = evidence is not None and bool(evidence.quote)
-            has_source = evidence is not None and bool(evidence.source_file)
-            verified = (
-                has_quote
-                and has_source
-                and str(evidence.verification) == "verified"
-            )
-            unverified_with_quote = (
-                has_quote
-                and has_source
-                and str(evidence.verification) != "verified"
-            )
+            from obsidian_llm_wiki.core.models import evidence_fragments
+
             marker = ""
-            if verified or unverified_with_quote:
-                marker_number = len(evidence_entries) + 1
-                marker = f" [{marker_number}]" if verified else f" [{marker_number}*]"
-                evidence_entries.append(
-                    (marker_number, evidence.quote, evidence.source_file, verified)
+            for evidence in evidence_fragments(claim.evidence):
+                has_quote = evidence is not None and bool(evidence.quote)
+                has_source = evidence is not None and bool(evidence.source_file)
+                verified = (
+                    has_quote
+                    and has_source
+                    and str(evidence.verification) == "verified"
                 )
+                unverified_with_quote = (
+                    has_quote
+                    and has_source
+                    and str(evidence.verification) != "verified"
+                )
+                if verified and evidence.source_file in retained:
+                    # Anchored to a retained (stale/unadmitted) source revision.
+                    verified = False
+                    unverified_with_quote = True
+                if verified or unverified_with_quote:
+                    marker_number = len(evidence_entries) + 1
+                    marker += f" [{marker_number}]" if verified else f" [{marker_number}*]"
+                    anchor = ""
+                    if verified and evidence.span_ids:
+                        # Machine-built catalog anchor: span IDs + exact char offsets.
+                        anchor = (
+                            f" · {', '.join(evidence.span_ids)}"
+                            f" @{evidence.start_offset}–{evidence.end_offset}"
+                        )
+                    subject = subjects.get(claim_key(claim))
+                    if subject:
+                        # Bound via a reviewed alias of another subject: show it.
+                        anchor += (
+                            f" · 审查主题“{subject}”" if zh
+                            else f" · reviewed under \u201c{subject}\u201d"
+                        )
+                    evidence_entries.append(
+                        (marker_number, evidence.quote, evidence.source_file, verified, anchor)
+                    )
             parts.append(f"- {claim.text}{marker}")
         parts.append("")
         if evidence_entries:
             from obsidian_llm_wiki.core.source_files import validate_source_filename
 
             parts.extend(["## 证据" if zh else "## Evidence", ""])
-            for number, quote, source_file, verified in evidence_entries:
+            for number, quote, source_file, verified, anchor in evidence_entries:
                 try:
                     safe_source_file = validate_source_filename(source_file)
                     source_stem = Path(safe_source_file).stem
-                    source_link = make_wikilink(f"sources/{source_stem}", source_stem)
+                    source_link = generated_link(
+                        "sources", source_stem, source_stem,
+                        legacy_target=f"sources/{source_stem}",
+                    )
                 except ValueError:
                     source_link = source_file
-                suffix = "" if verified else (" *（未经验证）*" if zh else " *(unverified)*")
-                parts.extend([f'{number}. \u201c{quote}\u201d{suffix}', f"   \u2014 {source_link}"])
+                if verified:
+                    suffix = ""
+                elif source_file in retained:
+                    english, chinese = _EVIDENCE_SUFFIX.get(
+                        retained[source_file], _RETAINED_SUFFIX,
+                    )
+                    suffix = chinese if zh else english
+                else:
+                    suffix = " *（未经验证）*" if zh else " *(unverified)*"
+                parts.extend([
+                    f'{number}. \u201c{quote}\u201d{suffix}',
+                    f"   \u2014 {source_link}{anchor}",
+                ])
             parts.append("")
 
     # ── 关联图谱 / Cross-References ──────────────────────────────────
@@ -570,9 +731,45 @@ def render_concept_page(
             parts.append("")
             # Clickable cross-links outside the code block
             cross_links = _build_cross_links(rendered_concept, all_concepts)
+            statuses = link_status or {}
+            for index, link in enumerate(rendered_concept.related):
+                note = _status_note(statuses.get((link.slug, link.relation), ""), zh)
+                if note and index < len(cross_links):
+                    cross_links[index] += note
             if cross_links:
                 parts.extend(cross_links)
                 parts.append("")
+
+    if unresolved_relations:
+        parts.extend(["## 未解析关系" if zh else "## Unresolved Relations", ""])
+        for item in unresolved_relations:
+            display = item.display.replace("[[", "［［").replace("]]", "］］")
+            provenance = (
+                f" — source `{item.source_file}`, revision `{item.source_revision}`, "
+                f"occurrence `{item.occurrence}`"
+                if getattr(item, "source_file", "") else ""
+            )
+            parts.append(
+                f"- {display} ({item.relation}) — "
+                + ("本维基中没有绑定到此标签的页面" if zh
+                   else "no page in this wiki is bound to this label")
+                + _status_note(item.status, zh) + provenance
+            )
+        parts.append("")
+
+    if derived_backlinks:
+        parts.extend(["## 派生反向链接" if zh else "## Derived Backlinks", ""])
+        for item in derived_backlinks:
+            explanation = (
+                f"程序派生自已审查关系“{item.forward_text}”的反向链接；未单独审查" if zh
+                else f"app-derived inverse of the relation \u201c{item.forward_text}\u201d; "
+                "not separately reviewed"
+            )
+            parts.append(
+                f"- \u2190 {generated_link('concepts', item.slug, item.display)} {item.relation} — "
+                f"{explanation}{_status_note(item.status, zh)}"
+            )
+        parts.append("")
 
     body = "\n".join(parts)
     return f"{build_frontmatter(fm)}\n{body}"
@@ -586,8 +783,17 @@ def render_moc_page(
     all_concepts: dict[str, ConceptNote] | None = None,
     cross_lingual_links: dict[str, list[tuple[str, float, str]]] | None = None,
     confirmed_cross_lingual_pairs: set[tuple[str, str]] | None = None,
+    *,
+    member_provenance: dict[str, str] | None = None,
+    retained_sources: dict[str, str] | None = None,
+    unresolved_members: list[dict] | None = None,
 ) -> str:
     """Render a Map of Content page.
+
+    ``member_provenance`` (from the publication plan) maps members whose
+    membership a contributing source reviewed to ``reviewed`` (or that
+    source's retained status). Any other member was added by the application
+    (similarity assignment, confirmed equivalence) and is typed as derived.
 
     Args:
         moc: The MOC to render.
@@ -611,6 +817,7 @@ def render_moc_page(
     parts: list[str] = [f"# {moc.title}", ""]
     language = detect_language(moc.summary or moc.title)
     zh = language == "zh"
+    parts.extend(_publication_callout(dict(retained_sources or {}), zh))
 
     if moc.summary:
         parts.extend([moc.summary, ""])
@@ -643,8 +850,30 @@ def render_moc_page(
                         badge = f" · {zh_alias}"
                 # Include brief definition from concept summary
                 if entry.summary and detect_language(entry.summary) == language:
-                    definition = f" — {entry.summary}"
-            parts.append(f"- {make_wikilink(slug)}{badge}{definition}")
+                    # Merged multi-window summaries are blank-line separated
+                    # paragraphs; keep every one, on the single list line.
+                    definition = " — " + " ".join(entry.summary.split("\n\n"))
+            provenance = ""
+            if member_provenance is not None:
+                state = member_provenance.get(slug, "derived")
+                if state == "derived":
+                    provenance = (
+                        " *（程序派生的成员关系；未经审查）*" if zh
+                        else " *(app-derived membership; not reviewed)*"
+                    )
+                elif state != "reviewed":
+                    provenance = _status_note(state, zh)
+            parts.append(f"- {generated_link('concepts', slug)}{badge}{definition}{provenance}")
+        parts.append("")
+
+    if unresolved_members:
+        parts.extend(["## Unresolved members", ""])
+        for record in unresolved_members:
+            text = record["original_text"].replace("[[", "［［").replace("]]", "］］")
+            parts.append(
+                f"- {text} — unresolved ({record.get('source_file', '')}; "
+                f"revision {record.get('source_revision', '')}; {record.get('reason', 'unbound')})"
+            )
         parts.append("")
 
     # ── 关联图谱 / Cross-References in MoC ──────────────────────────
@@ -744,7 +973,7 @@ def render_directory_index(
         raw = safe_read_file(f)
         meta, _ = parse_frontmatter(raw)
         title = meta.get("title", f.stem)
-        parts.append(f"- [[{f.stem}|{title}]]")
+        parts.append(f"- {generated_link(dir_name, f.stem, title)}")
 
     parts.append("")
     return "\n".join(parts)
@@ -782,13 +1011,11 @@ def _render_directory_indexes(
     index_path = dir_path / f"{_directory_index_stem(items)}.md"
     occupied.add(index_path.stem.casefold())
     previous_index = safe_read_file(index_path)
-    old_shard_stems = set(
-        re.findall(r"\[\[(index-[^|\]]+)(?:\|[^\]]*)?\]\]", previous_index)
-    )
+    old_shard_stems = navigation_shards(previous_index, dir_name, ("index-",))
 
     if len(ordered) <= shard_size:
         body = [f"# {dir_name.title()}", ""]
-        body.extend(f"- [[{slug}|{title}]]" for slug, title in ordered)
+        body.extend(f"- {generated_link(dir_name, slug, title)}" for slug, title in ordered)
         body.append("")
         if _write_generated_page(index_path, "\n".join(body), bundle_dir):
             written.append(str(index_path))
@@ -811,14 +1038,13 @@ def _render_directory_indexes(
                 occupied.add(stem.casefold())
                 shard_path = dir_path / f"{stem}.md"
                 body = [f"# {dir_name.title()} · {bucket.upper()} · {part + 1}", ""]
-                body.extend(f"- [[{slug}|{title}]]" for slug, title in chunk)
+                body.extend(f"- {generated_link(dir_name, slug, title)}" for slug, title in chunk)
                 body.append("")
                 if _write_generated_page(shard_path, "\n".join(body), bundle_dir):
                     written.append(str(shard_path))
                 keep.add(shard_path)
-                shard_links.append(
-                    f"- [[{shard_path.stem}|Bucket {bucket.upper()} · {part + 1}]]"
-                )
+                label = f"Bucket {bucket.upper()} · {part + 1}"
+                shard_links.append(f"- {generated_link(dir_name, shard_path.stem, label)}")
         index_body = [
             f"# {dir_name.title()}",
             "",
@@ -831,9 +1057,7 @@ def _render_directory_indexes(
             written.append(str(index_path))
 
     actual_index = safe_read_file(index_path)
-    actual_shard_stems = set(
-        re.findall(r"\[\[(index-[^|\]]+)(?:\|[^\]]*)?\]\]", actual_index)
-    )
+    actual_shard_stems = navigation_shards(actual_index, dir_name, ("index-",))
     keep.update(dir_path / f"{stem}.md" for stem in actual_shard_stems)
     for stale_stem in sorted(old_shard_stems - actual_shard_stems):
         stale = dir_path / f"{stale_stem}.md"
@@ -852,6 +1076,12 @@ def render_bundle_index(
 ) -> str:
     """Render the bundle-root ``index.md``."""
     nav = index_stems or {}
+    sections = []
+    for kind, label in (("sources", "Sources"), ("entries", "Entries"),
+                        ("concepts", "Concepts"), ("mocs", "Maps of Content")):
+        stem = nav.get(kind, "index")
+        link = generated_link(kind, stem, label, legacy_target=f"{kind}/{stem}")
+        sections.append(f"- {link}")
     parts: list[str] = [
         "# Knowledge Wiki",
         "",
@@ -866,10 +1096,7 @@ def render_bundle_index(
         "",
         "## Sections",
         "",
-        f"- [[sources/{nav.get('sources', 'index')}|Sources]]",
-        f"- [[entries/{nav.get('entries', 'index')}|Entries]]",
-        f"- [[concepts/{nav.get('concepts', 'index')}|Concepts]]",
-        f"- [[mocs/{nav.get('mocs', 'index')}|Maps of Content]]",
+        *sections,
         "",
     ]
     return "\n".join(parts)
@@ -898,7 +1125,7 @@ class _RenderTransaction:
         self._original_files: set[Path] = set()
         self._passthrough_files: set[Path] = set()
         self._original_dirs: set[Path] = set()
-        self._expected_outputs: dict[Path, str | None] = {}
+        self._expected_outputs: dict[Path, dict | None] = {}
         self.live_paths: set[Path] = set()
         if not lazy:
             self._snapshot()
@@ -914,19 +1141,24 @@ class _RenderTransaction:
         if path.is_file():
             destination = self._staging_dir / relative
             destination.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(path, destination)
+            from obsidian_llm_wiki.core.publication_transaction import _atomic_bytes
+
+            _atomic_bytes(destination, path.read_bytes(), _publication_file_state(path))
             self._original_files.add(relative)
 
     def record_created(self, path: Path) -> None:
         """Track a new append-only artifact such as a page backup."""
         checked_generated_path(path, self.bundle_dir)
-        if self._lazy and path.is_file():
+        if path.is_file():
             relative = path.relative_to(self.bundle_dir)
-            self._expected_outputs[relative] = safe_read_file(path)
+            self._expected_outputs[relative] = _publication_file_state(path)
 
     def record_write(self, path: Path, content: str) -> None:
         checked_generated_path(path, self.bundle_dir)
-        self._expected_outputs[path.relative_to(self.bundle_dir)] = content
+        state = _publication_file_state(path)
+        if state is None or state["sha256"] != _content_hash(content):
+            raise RuntimeError(f"publication conflict after render write: {path}")
+        self._expected_outputs[path.relative_to(self.bundle_dir)] = state
 
     def record_delete(self, path: Path) -> None:
         checked_generated_path(path, self.bundle_dir)
@@ -965,7 +1197,9 @@ class _RenderTransaction:
                 continue
             destination = self._staging_dir / relative
             destination.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(path, destination)
+            from obsidian_llm_wiki.core.publication_transaction import _atomic_bytes
+
+            _atomic_bytes(destination, path.read_bytes(), _publication_file_state(path))
             self._original_files.add(relative)
 
     def commit(self) -> None:
@@ -987,16 +1221,13 @@ class _RenderTransaction:
                 relative = path.relative_to(self.bundle_dir)
                 if relative not in self._original_files:
                     expected = self._expected_outputs.get(relative)
-                    is_renderer_backup = relative.parts[:2] == (".llmwiki", "backups")
-                    if is_renderer_backup or (
-                        expected is not None and safe_read_file(path) == expected
-                    ):
+                    if expected is not None and _publication_file_state(path) == expected:
                         path.unlink()
                     elif relative in self._expected_outputs:
                         logger.warning("Preserving concurrent edit during rollback: %s", path)
 
         for relative in self._original_files:
-            if relative in self._passthrough_files:
+            if relative in self._passthrough_files or relative not in self._expected_outputs:
                 continue
             source = self._staging_dir / relative
             destination = self.bundle_dir / relative
@@ -1010,7 +1241,7 @@ class _RenderTransaction:
                     )
                     continue
                 if expected is not None and (
-                    not destination.exists() or safe_read_file(destination) != expected
+                    not destination.exists() or _publication_file_state(destination) != expected
                 ):
                     logger.warning("Preserving concurrent edit during rollback: %s", destination)
                     continue
@@ -1035,7 +1266,6 @@ class _RenderTransaction:
 
     def _rollback_lazy(self) -> None:
         """Restore only paths touched by a scalable render transaction."""
-        expected_paths = set(self._expected_outputs)
         for relative, expected in sorted(
             self._expected_outputs.items(),
             key=lambda item: len(item[0].parts),
@@ -1051,7 +1281,7 @@ class _RenderTransaction:
                     or (
                         expected is not None
                         and destination.is_file()
-                        and safe_read_file(destination) == expected
+                        and _publication_file_state(destination) == expected
                     )
                 )
                 if not current_matches:
@@ -1060,18 +1290,12 @@ class _RenderTransaction:
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 os.replace(original, destination)
             elif destination.is_file() and expected is not None:
-                if safe_read_file(destination) == expected:
+                if _publication_file_state(destination) == expected:
                     destination.unlink()
                 else:
                     logger.warning("Preserving concurrent edit during rollback: %s", destination)
 
-        for relative in self._original_files - expected_paths:
-            source = self._staging_dir / relative
-            destination = self.bundle_dir / relative
-            if not self._rollback_path_is_safe(destination):
-                continue
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            os.replace(source, destination)
+        # A prepared snapshot without a recorded mutation is not ours to restore.
         self._staging.cleanup()
 
 
@@ -1087,6 +1311,9 @@ def _render_vault(
     force_render: bool = False,
     preserve_source_filenames: set[str] | None = None,
     protected_stale_paths: set[str] | None = None,
+    publication_status: dict[str, str] | None = None,
+    publication_plan: Any = None,
+    identity_plan: Any = None,
 ) -> list[str]:
     """Render a complete vault from a SynthesisBundle.
 
@@ -1111,19 +1338,22 @@ def _render_vault(
     ] = []
     ts = _timestamp()
 
-    # ── Backlink propagation ─────────────────────────────────────────
-    # NOTE: propagate_backlinks is called in run_pipeline() before rendering.
-    # It is NOT called here to avoid double-propagation with incorrect
-    # reverse relation types on the second pass. If render_vault is called
-    # standalone (e.g. from a test), the caller is responsible for calling
-    # propagate_backlinks first.
+    # ── Backlinks ────────────────────────────────────────────────────
+    # Inverse backlinks are app-derived structure from the publication plan
+    # (synth/publication.py): derived only from live, label-bound forward
+    # edges, rendered in their own typed section with the forward edge's
+    # status, and never inserted into ``related`` as reviewed relations.
 
     # Make the language policy deterministic. The synthesis prompt asks Chinese
     # sources to use English-first bilingual titles, but smaller/local models do
     # not always comply. Rendering is the last safe choke point before filenames
     # and wikilinks are written, so normalize here and remap slugs consistently.
-    slug_map = _normalize_bilingual_titles_and_slugs(bundle)
-    _normalize_bundle_output_slugs(bundle)
+    if identity_plan is None:
+        slug_map = _normalize_bilingual_titles_and_slugs(bundle)
+        _normalize_bundle_output_slugs(bundle)
+    else:
+        identity_plan.check_render(bundle, publication_plan)
+        slug_map = {}
     confirmed_cross_lingual_pairs = {
         (slug_map.get(a, a), slug_map.get(b, b))
         for a, b in (confirmed_cross_lingual_pairs or set())
@@ -1145,6 +1375,29 @@ def _render_vault(
     # Source-local synthesis data can retain cached concepts that semantic
     # deduplication removed from the bundle. Entry pages must only link to
     # concepts this render will materialize.
+    status_by_source = dict(publication_status or {})
+    # Final publication consistency gate (after every renderer-local transform).
+    from obsidian_llm_wiki.synth.publication import plan_publication, verify_publication
+
+    if publication_plan is None:
+        plan = plan_publication(bundle, status_by_source)
+    else:
+        drift = verify_publication(bundle, publication_plan)
+        plan = publication_plan
+        if drift:
+            for problem in drift:
+                logger.error("%s", problem)
+            replanned = plan_publication(
+                bundle, publication_plan.source_status,
+                identity_evidence=getattr(publication_plan, "identity_evidence", None),
+            )
+            for name in ("concept_status", "moc_status", "unresolved", "derived",
+                         "link_status", "moc_members", "fingerprint"):
+                setattr(publication_plan, name, getattr(replanned, name))
+            publication_plan.errors.extend(drift)
+            publication_plan.errors.extend(
+                error for error in replanned.errors if error not in publication_plan.errors
+            )
     current_concept_slugs = {concept.slug for concept in bundle.concepts}
 
     # ── Render source pages ──────────────────────────────────────────
@@ -1270,6 +1523,7 @@ def _render_vault(
                     "synthesis": source_synthesis_to_dict(synthesis),
                     "source_stem": actual_source_stem,
                     "concept_slugs": concept_slugs,
+                    "publication_status": status_by_source.get(synthesis.source_file, ""),
                 }
             ),
         )
@@ -1284,7 +1538,10 @@ def _render_vault(
     for key, synthesis, actual_source_stem, concept_slugs, path in entry_records:
         if key not in dirty_entries:
             continue
-        page = render_entry_page(synthesis, actual_source_stem, concept_slugs, ts)
+        page = render_entry_page(
+            synthesis, actual_source_stem, concept_slugs, ts,
+            publication_status=status_by_source.get(synthesis.source_file, ""),
+        )
         if _write_generated_page(path, page, bundle_dir):
             written.append(str(path))
 
@@ -1292,6 +1549,16 @@ def _render_vault(
     concept_map: dict[str, ConceptNote] = {
         c.slug: c for c in bundle.concepts
     }
+    # Which retained (not currently admitted) sources contributed to a concept.
+    retained_by_concept: dict[str, dict[str, str]] = {}
+    for synthesis in bundle.sources:
+        status = status_by_source.get(synthesis.source_file)
+        if not status:
+            continue
+        for concept in synthesis.concepts:
+            retained_by_concept.setdefault(concept.slug, {})[synthesis.source_file] = status
+    for slug, statuses in plan.concept_status.items():
+        retained_by_concept.setdefault(slug, {}).update(statuses)
 
     # ── Cross-lingual embedding links ────────────────────────────────
     # Find semantically similar concepts across languages using embeddings.
@@ -1348,6 +1615,8 @@ def _render_vault(
                         for link in concept.related
                         if link.slug in concept_map
                     },
+                    "retained_sources": retained_by_concept.get(concept.slug, {}),
+                    "publication": plan.concept_render_payload(concept.slug),
                 }
             ),
         )
@@ -1370,7 +1639,17 @@ def _render_vault(
     for concept in bundle.concepts:
         if concept.slug not in dirty_concepts:
             continue
-        page = render_concept_page(concept, ts, all_concepts=concept_map)
+        page = render_concept_page(
+            concept, ts, all_concepts=concept_map,
+            retained_sources=retained_by_concept.get(concept.slug),
+            unresolved_relations=plan.unresolved.get(concept.slug),
+            derived_backlinks=[
+                item for item in plan.derived.get(concept.slug, [])
+                if item.slug in concept_map
+            ],
+            link_status=plan.link_status.get(concept.slug),
+            claim_subjects=plan.claim_subjects.get(concept.slug),
+        )
         path = concept_paths[concept.slug]
         if _write_generated_page(path, page, bundle_dir):
             written.append(str(path))
@@ -1416,6 +1695,7 @@ def _render_vault(
                         slug: (cross_lingual_links or {}).get(slug, [])
                         for slug in moc.concept_slugs
                     },
+                    "publication": plan.moc_render_payload(moc.slug),
                 }
             ),
         )
@@ -1438,6 +1718,9 @@ def _render_vault(
         page = render_moc_page(
             moc, ts,
             all_concepts=concept_map,
+            member_provenance=plan.moc_members.get(moc.slug, {}),
+            retained_sources=plan.moc_status.get(moc.slug),
+            unresolved_members=plan.unresolved_members.get(moc.slug),
         )
         path = moc_paths[moc.slug]
         if _write_generated_page(path, page, bundle_dir):
@@ -1603,8 +1886,18 @@ def render_vault(
     force_render: bool = False,
     preserve_source_filenames: set[str] | None = None,
     protected_stale_paths: set[str] | None = None,
+    publication_status: dict[str, str] | None = None,
+    publication_plan: Any = None,
+    identity_plan: Any = None,
+    link_prefix: str = "",
 ) -> list[str]:
     """Render a vault atomically with respect to generated output.
+
+    ``publication_plan`` is the caller's
+    :class:`~obsidian_llm_wiki.synth.publication.PublicationPlan`. The renderer
+    re-verifies it after its own output normalization; any drift is appended
+    to ``publication_plan.errors`` and the bundle is re-planned under its
+    actual identities. Without a plan the renderer plans the bundle itself.
 
     Every pre-existing vault file (including reviewed metadata, indexes, and
     backup history) is restored if any render step raises. Rendering operates
@@ -1615,6 +1908,8 @@ def render_vault(
     transaction = _RenderTransaction(bundle_dir, lazy=True)
     render_bundle = deepcopy(bundle)
     token = _ACTIVE_RENDER_TRANSACTION.set(transaction)
+    presentation = LinkPresentation(link_prefix) if link_prefix else None
+    link_token = ACTIVE_LINK_PRESENTATION.set(presentation)
     try:
         written = _render_vault(
             bundle_dir,
@@ -1627,14 +1922,37 @@ def render_vault(
             force_render=force_render,
             preserve_source_filenames=preserve_source_filenames,
             protected_stale_paths=protected_stale_paths,
+            publication_status=publication_status,
+            publication_plan=publication_plan,
+            identity_plan=identity_plan,
         )
+        if identity_plan is not None:
+            identity_plan.check_render(render_bundle, publication_plan)
+        if presentation is not None:
+            payload = presentation.payload()
+            validate_link_targets(bundle_dir, payload, prefix=link_prefix)
+            _write_generated_artifact(
+                bundle_dir / ".llmwiki/generated-links.json",
+                json.dumps(payload, sort_keys=True), bundle_dir,
+            )
     except BaseException:
         try:
-            transaction.rollback()
+            from obsidian_llm_wiki.core.publication_transaction import (
+                publication_write_transaction_active,
+            )
+
+            if publication_write_transaction_active():
+                # The durable journal is authoritative. An inner text-only
+                # rollback could erase concurrent byte/metadata conflicts
+                # before that journal has a chance to detect them.
+                transaction.commit()  # discard only the inner scratch snapshot
+            else:
+                transaction.rollback()
         except BaseException:
             logger.exception("Could not fully roll back failed vault render")
         raise
     finally:
         _ACTIVE_RENDER_TRANSACTION.reset(token)
+        ACTIVE_LINK_PRESENTATION.reset(link_token)
     transaction.commit()
     return written

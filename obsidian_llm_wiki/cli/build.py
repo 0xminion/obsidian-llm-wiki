@@ -55,7 +55,16 @@ class _ReadOnlyPlanState:
 
 def _print_build_plan(config: Config, *, force: bool, refresh_render: bool) -> None:
     """Report a content-only plan using the same fail-closed source inventory."""
-    state = _ReadOnlyPlanState(config.state_file)
+    from obsidian_llm_wiki.core.immutable_publication import current_publication
+    from obsidian_llm_wiki.core.publication_transaction import require_publication_ready
+    committed = current_publication(config.wiki_dir)
+    if committed:
+        print('Immutable generation: ' + committed[1]['generation'])
+    else:
+        require_publication_ready(config.llmwiki_dir)
+    state = _ReadOnlyPlanState(
+        committed[0] / '.llmwiki/state.json' if committed else config.state_file
+    )
     # Structural adapter: the loader only uses these two read-only methods.
     loaded = load_sources_incremental(config.sources_dir, cast(VaultRegistry, state))
     groups: dict[str, list[str]] = {key: [] for key in ("new", "changed", "unchanged", "deleted")}
@@ -100,6 +109,10 @@ def build(
         False, "--refresh-render",
         help="Reconcile generated pages without forcing LLM re-synthesis",
     ),
+    annotation_templates: bool = typer.Option(
+        False, "--annotation-templates",
+        help="Exclusively create missing human annotation templates",
+    ),
     model: str | None = typer.Option(
         None, "--model", "-m", help="Override the LLM model"
     ),
@@ -126,7 +139,7 @@ def build(
     if dry_run:
         try:
             _print_build_plan(config, force=force, refresh_render=refresh_render)
-        except (OSError, ValueError) as exc:
+        except (OSError, ValueError, RuntimeError) as exc:
             typer.echo(f"Build plan failed; no files written: {exc}", err=True)
             raise typer.Exit(code=1) from exc
         return
@@ -134,12 +147,10 @@ def build(
     # Enumerate the full corpus but read bodies only for new/changed sources.
     # Registry metadata stubs preserve source indexes for unchanged pages.
     try:
-        with VaultRegistry(config.llmwiki_dir) as registry:
-            source_load = load_sources_incremental(
-                config.sources_dir,
-                registry,
-                force=force,
-            )
+        # Inventory reads human inputs; never open/migrate a legacy database.
+        from obsidian_llm_wiki.core.application import source_inventory
+
+        source_load = source_inventory(config)
     except (OSError, ValueError) as exc:
         typer.echo(f"Source inventory failed; no build performed: {exc}", err=True)
         raise typer.Exit(code=1) from exc
@@ -161,6 +172,7 @@ def build(
                 unchanged_filenames=source_load.unchanged_filenames,
                 source_file_signatures=source_load.signatures,
                 refresh_render=refresh_render,
+                annotation_templates=annotation_templates,
             )
         )
     except KeyboardInterrupt:

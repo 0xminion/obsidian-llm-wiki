@@ -8,6 +8,8 @@ present in that mapping; dangling references are retained nowhere.
 
 from __future__ import annotations
 
+import hashlib
+import json
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -31,6 +33,16 @@ class WikiPage:
     title: str
     aliases: tuple[str, ...]
     body: str
+    orphaned: bool = False
+    orphaned_reason: str = ""
+    publication_status: str = "unverifiable"
+    status_reasons: tuple[str, ...] = ()
+    source_statuses: tuple[tuple[str, str], ...] = ()
+    rendered_sha256: str = ""
+
+    @property
+    def current_eligible(self) -> bool:
+        return not self.orphaned and self.publication_status == "eligible"
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,7 +96,17 @@ def build_graph(pages: Mapping[str, str]) -> WikiGraph:
         meta, body = parse_frontmatter(raw_markdown)
         title = str(meta.get("title") or PurePosixPath(path).stem)
         page_aliases = _string_values(meta.get("aliases"))
-        page = WikiPage(path=path, title=title, aliases=page_aliases, body=body)
+        orphaned = bool(meta.get("orphaned", False))
+        reason = str(meta.get("orphaned_reason") or "")
+        page = WikiPage(
+            path=path, title=title, aliases=page_aliases, body=body,
+            orphaned=orphaned, orphaned_reason=reason,
+            publication_status="orphaned" if orphaned else "unverifiable",
+            status_reasons=(reason or "Source owners deleted",) if orphaned else (),
+            # File-backed callers decode exact UTF-8 bytes without newline
+            # normalization. Bind the very text parsed here, not a later read.
+            rendered_sha256=hashlib.sha256(raw_markdown.encode("utf-8")).hexdigest(),
+        )
         parsed[path] = page
         metadata[path] = meta
         for reference in (path, PurePosixPath(path).stem, title, *page_aliases):
@@ -127,19 +149,94 @@ def build_graph(pages: Mapping[str, str]) -> WikiGraph:
     )
 
 
-def build_graph_from_vault(vault_path: str | Path) -> WikiGraph:
-    """Read Markdown below ``vault_path`` and build a graph using relative paths."""
+def publication_read_token(wiki_dir: str | Path) -> str:
+    """Read a durable-generation token without opening or modifying a registry."""
+    from obsidian_llm_wiki.core.generated_paths import checked_generated_path
+    from obsidian_llm_wiki.core.publication_transaction import require_publication_ready
+
+    wiki = Path(wiki_dir)
+    from obsidian_llm_wiki.core.immutable_publication import current_publication
+    committed = current_publication(wiki)
+    if committed:
+        return committed[1]['generation']
+    metadata = wiki / ".llmwiki"
+    require_publication_ready(metadata)
+    marker = checked_generated_path(metadata / "identity-publication.json", wiki)
+    raw = marker.read_bytes() if marker.exists() else b""
+    if marker.exists():
+        try:
+            data = json.loads(raw)
+        except (ValueError, TypeError) as exc:
+            raise RuntimeError("invalid publication marker; recovery must be resolved") from exc
+        if not isinstance(data, dict) or data.get("status") != "committed":
+            raise RuntimeError("publication is not committed; recovery must be resolved")
+    require_publication_ready(metadata)
+    return hashlib.sha256(raw).hexdigest()
+
+
+def build_graph_from_vault(
+    vault_path: str | Path, *, committed=None, config=None,
+) -> WikiGraph:
+    """Inspect one pinned generation, retaining lifecycle data for safe retrieval.
+
+    Omitted config resolves only the independent review policy with CLI vault
+    precedence. Receipt integrity alone never establishes current eligibility.
+    Unavailable policy leaves pages inspectable as unverified history.
+    """
     vault = Path(vault_path)
+    from obsidian_llm_wiki.core.immutable_publication import current_publication
+    if committed is None:
+        committed = current_publication(vault)
+    if committed:
+        directory, manifest = committed
+        # Read the pinned directory only, never historical generations or legacy
+        # human prose. Fully qualified keys match native vault-root wikilinks.
+        pages = {
+            '04-Wiki/' + path.relative_to(vault).as_posix(): path.read_bytes().decode('utf-8')
+            for name in manifest['files']
+            if name.endswith('.md') and '.llmwiki' not in Path(name).parts
+            for path in [directory / name]
+        }
+        from obsidian_llm_wiki.core.query_freshness import classify_pages
+
+        policy_problem = ""
+        if config is None:
+            from obsidian_llm_wiki.config import load_review_policy
+            from obsidian_llm_wiki.core.generated_paths import checked_generated_path
+
+            # Resolve from the caller's vault, never a receipt or historical root.
+            # This is the same pure resolver used by migration inspection; it
+            # constructs no Config, provider, directories or mutable registry.
+            try:
+                root = vault.resolve().parent
+                env = checked_generated_path(root / ".env", root)
+                config = load_review_policy(
+                    str(env) if env.exists() else None, VAULT_PATH=str(root),
+                )
+                if config.grounding_review != "required":
+                    policy_problem = "Current review policy does not require admission review"
+            except (OSError, ValueError, TypeError) as exc:
+                policy_problem = f"Current review policy unavailable: {exc}"
+        return classify_pages(
+            build_graph(pages), directory, manifest, config, policy_problem=policy_problem,
+        )
+    token = publication_read_token(vault)
     if not vault.is_dir():
         return build_graph({})
     pages: dict[str, str] = {}
     for path in sorted(vault.rglob("*.md")):
+        relative = path.relative_to(vault)
+        if any(part in {".llmwiki", ".obsidian", ".git", "OLW-Publications"}
+               for part in relative.parts):
+            continue
         if not path.is_file():
             continue
         try:
-            pages[path.relative_to(vault).as_posix()] = path.read_text(encoding="utf-8")
+            pages[relative.as_posix()] = path.read_bytes().decode("utf-8")
         except (OSError, UnicodeDecodeError):
             continue
+    if publication_read_token(vault) != token:
+        raise RuntimeError("publication changed during retrieval; retry the query")
     return build_graph(pages)
 
 

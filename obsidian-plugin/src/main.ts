@@ -124,6 +124,11 @@ export default class ObsidianLlmWikiBridge extends Plugin {
     this.addSettingTab(new BridgeSettingsTab(this.app, this));
 
     this.addCommand({
+      id: "olw-current-generation",
+      name: "OLW: Open current generated wiki",
+      callback: () => void this.run({ operation: "current", vaultPath: this.vaultPath() }),
+    });
+    this.addCommand({
       id: "olw-ingest-url",
       name: "OLW: Ingest URL",
       callback: () => this.promptForUrl("Ingest URL", "https://…", "ingest"),
@@ -226,10 +231,25 @@ export default class ObsidianLlmWikiBridge extends Plugin {
       await this.showHistory();
       this.record(`$ ${this.settings.executable} ${request.operation} — started`);
       const client = new CliClient({ executable: this.settings.executable });
-      const run = client.start(request, (event) => this.recordEvent(event));
+      let entrypoint: string | null = null;
+      const run = client.start(request, (event) => {
+        this.recordEvent(event);
+        if (request.operation === "current" && event.kind === "event") {
+          const generation = event.event.generation;
+          const path = event.event.entrypoint;
+          if (typeof generation === "string" && /^[0-9a-f]{32}$/.test(generation) &&
+              path === `04-Wiki/OLW-Publications/generations/${generation}/index.md`) {
+            entrypoint = path;
+          }
+        }
+      });
       this.activeRun = run;
       this.startingRun = false;
       const result = await run.completed;
+      if (request.operation === "current" && result.exitCode === 0 && !result.cancelled) {
+        if (!entrypoint) throw new Error("CLI did not return a valid current-generation entrypoint.");
+        await this.app.workspace.openLinkText(entrypoint, "", false);
+      }
       const outcome = result.cancelled
         ? "cancelled"
         : result.exitCode === 0

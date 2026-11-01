@@ -11,7 +11,20 @@ from typer.testing import CliRunner
 
 from obsidian_llm_wiki.cli import app
 from obsidian_llm_wiki.config import Config
+from obsidian_llm_wiki.core.immutable_publication import current_publication
 from obsidian_llm_wiki.core.models import SourceDoc
+from tests.new.grounding_doubles import (
+    ground_legacy_response,
+    legacy_fixture_llm,
+    producer_call_count,
+    review_answer,
+)
+
+
+def _published(config):
+    snapshot = current_publication(config.wiki_dir)
+    assert snapshot is not None
+    return snapshot[0]
 
 
 @pytest.fixture
@@ -70,9 +83,10 @@ def test_extraction_failures_exit_one_with_honest_terminal_event(vault, monkeypa
 
 def test_failed_clipping_is_not_a_successful_noop(vault, monkeypatch):
     # A resumed clipping may disappear before it can be extracted.
+    from obsidian_llm_wiki.core.application import operational_directory
     from obsidian_llm_wiki.core.operations import OperationStore
 
-    store = OperationStore(vault.llmwiki_dir)
+    store = OperationStore(operational_directory(vault, create=True))
     store.write_resume_marker(
         "old",
         [
@@ -347,7 +361,11 @@ def test_model_override_reaches_ingest_provider_without_global_mutation(
     class FixtureClient:
         def chat(self, _system, _user, **kwargs):
             requests.append(kwargs)
-            return FAKE_SYNTH_A
+            schema = kwargs.get("format") or {}
+            if "reviews" in schema.get("properties", {}):
+                # Mandatory grounding review: explicit approving test double.
+                return json.dumps(review_answer(_user, schema, {}))
+            return ground_legacy_response(FAKE_SYNTH_A, _user)
 
     monkeypatch.setattr(
         "obsidian_llm_wiki.providers.llm.create_llm_client", lambda _: FixtureClient()
@@ -383,7 +401,7 @@ def test_extraction_failure_does_not_erase_successful_synthesis(vault, monkeypat
         return SourceDoc("Good", "Source evidence. " * 80, url=url)
 
     monkeypatch.setattr("obsidian_llm_wiki.ingest.extractors.extract", extract)
-    provider = AsyncMock(return_value=FAKE_SYNTH_A)
+    provider = AsyncMock(side_effect=legacy_fixture_llm(FAKE_SYNTH_A))
     monkeypatch.setattr("obsidian_llm_wiki.providers.llm.acall_llm", provider)
     result = CliRunner().invoke(
         app,
@@ -400,9 +418,10 @@ def test_extraction_failure_does_not_erase_successful_synthesis(vault, monkeypat
         ],
     )
     assert result.exit_code == 1, result.output
-    assert provider.await_count == 1
-    assert "good.md" in json.loads(vault.state_file.read_text())["sources"]
-    assert (vault.concepts_dir / "concept-a1.md").is_file()
+    assert producer_call_count(provider) == 1
+    state = json.loads((_published(vault) / ".llmwiki" / "state.json").read_text())
+    assert "good.md" in state["sources"]
+    assert (_published(vault) / "concepts" / "concept-a1.md").is_file()
     assert "✅ Complete" not in result.output
     if json_output:
         terminal = _events(result)[-1]
@@ -425,7 +444,8 @@ def test_failed_extraction_with_existing_compiled_corpus_is_partial_failure(vaul
 
     monkeypatch.setattr("obsidian_llm_wiki.ingest.extractors.extract", failed)
     monkeypatch.setattr(
-        "obsidian_llm_wiki.providers.llm.acall_llm", AsyncMock(return_value=FAKE_SYNTH_A)
+        "obsidian_llm_wiki.providers.llm.acall_llm",
+        AsyncMock(side_effect=legacy_fixture_llm(FAKE_SYNTH_A)),
     )
     result = CliRunner().invoke(
         app,
@@ -443,7 +463,8 @@ def test_failed_extraction_with_existing_compiled_corpus_is_partial_failure(vaul
     terminal = _events(result)[-1]
     assert terminal["event"] == "partial_failure"
     assert terminal["compiled"] == 1
-    assert "existing.md" in json.loads(vault.state_file.read_text())["sources"]
+    state = json.loads((_published(vault) / ".llmwiki" / "state.json").read_text())
+    assert "existing.md" in state["sources"]
 
 
 def test_ingest_noop_and_build_noop_and_recompile_success_keep_zero_status(vault, monkeypatch):
@@ -451,7 +472,7 @@ def test_ingest_noop_and_build_noop_and_recompile_success_keep_zero_status(vault
 
     from tests.new.test_incremental_cache import FAKE_SYNTH_A
 
-    provider = AsyncMock(return_value=FAKE_SYNTH_A)
+    provider = AsyncMock(side_effect=legacy_fixture_llm(FAKE_SYNTH_A))
     monkeypatch.setattr("obsidian_llm_wiki.providers.llm.acall_llm", provider)
     result = CliRunner().invoke(app, ["ingest", str(vault.vault), "--json"])
     assert result.exit_code == 0, result.output
@@ -464,11 +485,45 @@ def test_ingest_noop_and_build_noop_and_recompile_success_keep_zero_status(vault
     noop = CliRunner().invoke(app, ["build", str(vault.vault)])
     assert noop.exit_code == 0, noop.output
     assert "Already up-to-date" in noop.output
-    assert provider.await_count == 1
+    assert producer_call_count(provider) == 1
     retried = CliRunner().invoke(app, ["recompile", str(vault.vault), "alpha.md"])
     assert retried.exit_code == 0, retried.output
     assert "Recompiled" in retried.output
-    assert provider.await_count == 2
+    assert producer_call_count(provider) == 2
+
+
+def test_same_size_same_mtime_source_change_resynthesizes(vault, monkeypatch):
+    import os
+    from unittest.mock import AsyncMock
+
+    from tests.new.test_incremental_cache import FAKE_SYNTH_A
+
+    provider = AsyncMock(side_effect=legacy_fixture_llm(FAKE_SYNTH_A))
+    monkeypatch.setattr("obsidian_llm_wiki.providers.llm.acall_llm", provider)
+    vault.sources_dir.mkdir(parents=True)
+    source = vault.sources_dir / "alpha.md"
+    original = "Evidence Alpha. " * 80
+    changed = "Evidence Bravo. " * 80
+    assert len(original.encode()) == len(changed.encode())
+    source.write_text(original)
+    first = CliRunner().invoke(app, ["build", str(vault.vault)])
+    assert first.exit_code == 0, first.output
+    first_snapshot = _published(vault)
+    stat = source.stat()
+    source.write_text(changed)
+    os.utime(source, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+    assert source.stat().st_mtime_ns == stat.st_mtime_ns
+    second = CliRunner().invoke(app, ["build", str(vault.vault)])
+    assert second.exit_code == 0, second.output
+    assert producer_call_count(provider) == 2
+    assert _published(vault) != first_snapshot
+    from obsidian_llm_wiki.core.state import hash_content
+    from obsidian_llm_wiki.ingest.sources import load_source_file
+
+    loaded = load_source_file(source)
+    assert loaded is not None and "Bravo" in loaded.content and "Alpha" not in loaded.content
+    state = json.loads((_published(vault) / ".llmwiki" / "state.json").read_text())
+    assert state["sources"]["alpha.md"]["hash"] == hash_content(loaded.content)
 
 
 def test_known_source_read_oserror_is_a_structured_inventory_failure(vault, monkeypatch):
@@ -561,8 +616,7 @@ def test_inbox_read_oserror_never_becomes_a_successful_partial_inventory(vault, 
     extract.assert_not_called()
 
 
-def test_refresh_title_only_is_not_discarded_as_body_duplicate(vault, monkeypatch):
-    from obsidian_llm_wiki.ingest.sources import load_source_file
+def test_refresh_refuses_mutation_but_preview_and_duplicate_are_safe(vault, monkeypatch):
 
     title = "Original"
     monkeypatch.setattr(
@@ -574,13 +628,21 @@ def test_refresh_title_only_is_not_discarded_as_body_duplicate(vault, monkeypatc
     assert first.exit_code == 0, first.output
     path = vault.sources_dir / "original.md"
     before = path.read_bytes()
+    before_vault = _snapshot(vault.vault)
     title = "Revised title"
     refreshed = CliRunner().invoke(app, [*args, "--refresh"])
-    assert refreshed.exit_code == 0, refreshed.output
-    source = load_source_file(path)
-    assert source is not None and source.title == "Revised title"
+    assert refreshed.exit_code != 0
+    assert "Refusing --refresh" in refreshed.output
+    assert _snapshot(vault.vault) == before_vault
+    assert path.read_bytes() == before
+    preview = CliRunner().invoke(app, [*args, "--refresh", "--preview", "--json"])
+    assert preview.exit_code == 0, preview.output
+    assert any(event.get("title") == "Revised title" for event in _events(preview))
+    assert _snapshot(vault.vault) == before_vault
+    duplicate = CliRunner().invoke(app, args)
+    assert duplicate.exit_code == 0, duplicate.output
+    assert path.read_bytes() == before
     assert list(vault.sources_dir.glob("*.md")) == [path]
-    assert any(p.read_bytes() == before for p in (vault.llmwiki_dir / "backups").rglob("*.bak"))
 
 
 def test_reingest_recovers_failed_synthesis_after_backoff(vault, monkeypatch):
@@ -596,7 +658,8 @@ def test_reingest_recovers_failed_synthesis_after_backoff(vault, monkeypatch):
     args = ["ingest", str(vault.vault), "--url", "https://example.test/retry", "--json"]
     failed = CliRunner().invoke(app, args)
     assert failed.exit_code == 1, failed.output
-    provider.return_value = FAKE_SYNTH_A
+    provider.return_value = None
+    provider.side_effect = legacy_fixture_llm(FAKE_SYNTH_A)
 
     class DueClock(datetime):
         @classmethod
@@ -607,7 +670,7 @@ def test_reingest_recovers_failed_synthesis_after_backoff(vault, monkeypatch):
     recovered = CliRunner().invoke(app, args)
     assert recovered.exit_code == 0, recovered.output
     assert _events(recovered)[-1]["compiled"] == 1
-    assert (vault.wiki_dir / "entries" / "good.md").exists()
+    assert (_published(vault) / "entries" / "good.md").exists()
     assert extract.call_count == 1
 
 
@@ -621,7 +684,7 @@ def test_reserved_source_titles_are_allocated_loadable_filenames(vault, monkeypa
         "obsidian_llm_wiki.ingest.extractors.extract",
         lambda url: SourceDoc(title, "Source evidence. " * 80, url=url),
     )
-    provider = AsyncMock(return_value=FAKE_SYNTH_A)
+    provider = AsyncMock(side_effect=legacy_fixture_llm(FAKE_SYNTH_A))
     monkeypatch.setattr("obsidian_llm_wiki.providers.llm.acall_llm", provider)
     result = CliRunner().invoke(
         app,
@@ -636,7 +699,7 @@ def test_reserved_source_titles_are_allocated_loadable_filenames(vault, monkeypa
     assert result.exit_code == 0, result.output
     terminal = _events(result)[-1]
     assert terminal.get("compiled") == 1
-    assert provider.await_count == 1
+    assert producer_call_count(provider) == 1
     filename = next(e["output_file"] for e in _events(result) if e["type"] == "source")
     assert filename not in {"index.md", "index-bab-000.md"}
-    assert (vault.wiki_dir / "entries" / filename).is_file()
+    assert (_published(vault) / "entries" / filename).is_file()
